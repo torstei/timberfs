@@ -1,0 +1,26 @@
+[package]
+name = "timberfs"
+version = "0.1.0"
+edition = "2021"
+description = "Experimental append-only, transparently compressed, write-time-indexed filesystem for log files"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/torstei/timberfs"
+
+[[bin]]
+name = "timberfs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+# default-features off: skip the libfuse C linkage (pure-Rust mount via
+# fusermount3). abi-7-19 enables the notify API (Notifier::inval_inode),
+# used to invalidate kernel caches after rotation; ABI 7.19 is ancient
+# (kernel 3.x) so this doesn't restrict where timberfs runs.
+fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
+libc = "0.2"
+zstd = "0.13"
+
+[profile.release]
+lto = true
