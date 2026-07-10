@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive"] }
 fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
 libc = "0.2"
 regex = "1"
+tar = "0.4"
 zstd = "0.13"
 
 [profile.release]

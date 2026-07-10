@@ -160,10 +160,29 @@ timberfs import /var/log/old-app.log.* /var/log/old-app.log logs-backing/app.log
 timberfs import /shipped/app-2026-07-09.log central-backing/hostA-app.log
 ```
 
-That last one closes the shipping loop: `timberfs rotate` cuts old chunks
-into a segment on the producer, the segment's two files get shipped, and
-`timberfs import` merges them into a central archive at compressed-bytes
-cost — the shipping format *is* the storage format.
+And `timberfs export` is the read-side twin: carve any time window (or a
+whole log) out of an archive as a fresh timberfs log — or as a
+single-file **`.timber` bundle** for shipping (a plain uncompressed tar,
+`.rings` member first, so `tar xf` + `zstd -dc` always recovers it and a
+hand-tarred pair is a valid bundle):
+
+```sh
+timberfs export backing/archive.log incident.timber --from 13:40 --to 14:10
+timberfs query incident.timber --from 13:52 --to 13:53 | grep ERROR
+timberfs import incident.timber elsewhere/incident.log
+```
+
+Note the middle line: bundles are first-class *read-only* logs — `query`,
+`index` and `export` operate on a `.timber` file directly (tar keeps its
+members contiguous and uncompressed, so the trunk member is just a trunk
+at an offset). A directory of `.timber` case files is a queryable cold
+archive; unpacking or importing is only ever needed to append.
+
+Together these close the shipping loop: `rotate` cuts history out of live
+logs, `export` carves arbitrary windows out of anything, `.timber` bundles
+travel as single files, and `import` merges them anywhere, idempotently —
+every step a verbatim copy of compressed chunks. The shipping format *is*
+the storage format.
 
 Re-importing is idempotent: the target is its own checkpoint. Already
 imported bytes are verified against the source (all chunks, or

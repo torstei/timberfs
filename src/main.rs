@@ -1,4 +1,5 @@
 mod append;
+mod export;
 mod format;
 mod fs;
 mod import;
@@ -102,6 +103,22 @@ enum Command {
         /// chunks against the source instead of all of them
         #[arg(long)]
         quick: bool,
+    },
+    /// Export a time window (or everything) from a timberfs log into a NEW
+    /// timberfs log, chunks copied verbatim — no recompression. A DEST
+    /// ending in .timber writes the single-file transfer bundle (plain
+    /// tar: .rings first, .trunk second), which import accepts directly.
+    Export {
+        /// Source backing file: logical name, .trunk or .rings path
+        source: PathBuf,
+        /// Destination: new backing file, or a *.timber bundle
+        dest: PathBuf,
+        /// Start of the window (same formats as query); default: beginning
+        #[arg(long)]
+        from: Option<String>,
+        /// End of the window; default: end
+        #[arg(long)]
+        to: Option<String>,
     },
     /// Print the bytes written between --from and --to, reading the backing
     /// files directly (works with or without an active mount)
@@ -211,6 +228,14 @@ fn main() -> anyhow::Result<()> {
                 utc,
                 quick,
             )?;
+        }
+        Command::Export {
+            source,
+            dest,
+            from,
+            to,
+        } => {
+            export::cmd_export(&source, &dest, from.as_deref(), to.as_deref())?;
         }
         Command::Query { file, from, to } => {
             query::cmd_query(&file, from.as_deref(), to.as_deref())?;

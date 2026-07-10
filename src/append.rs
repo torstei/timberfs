@@ -142,6 +142,14 @@ pub fn cmd_append(
 ) -> anyhow::Result<()> {
     let max_age_ms = retain.map(parse_duration_ms).transpose()?;
     let max_comp_bytes = retain_size.map(parse_size_bytes).transpose()?;
+    if crate::query::is_bundle(target) {
+        bail!(
+            "{} is a .timber transfer bundle — bundles are read-only \
+             (query/index/export work directly on them); import it into a \
+             log to write",
+            target.display()
+        );
+    }
     let (dir, name) = resolve_backing(target)?;
     fs::create_dir_all(&dir)?;
 

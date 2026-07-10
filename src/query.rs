@@ -82,17 +82,75 @@ pub fn resolve_backing(input: &Path) -> anyhow::Result<(PathBuf, String)> {
     Ok((dir, base.to_string()))
 }
 
-fn backing_paths(input: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+/// True when the path names a `.timber` transfer bundle.
+pub fn is_bundle(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("timber")
+}
+
+/// A readable timberfs source: index records plus the file the compressed
+/// frames live in, with comp offsets absolute in that file. Backing pairs
+/// and `.timber` bundles look identical from here on — bundles are
+/// first-class read-only logs (tar stores members contiguously and
+/// uncompressed, so the trunk member is just a trunk at an offset).
+pub struct SourceHandle {
+    pub records: Vec<ChunkRecord>,
+    pub file: File,
+}
+
+pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
+    if is_bundle(input) {
+        let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
+        let mut archive = tar::Archive::new(&file);
+        let mut rings_bytes: Option<Vec<u8>> = None;
+        let mut trunk_pos: Option<(u64, u64)> = None;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let member = entry.path()?.to_string_lossy().to_string();
+            if member.ends_with(&format!(".{}", format::RINGS_EXT)) {
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut v)?;
+                rings_bytes = Some(v);
+            } else if member.ends_with(&format!(".{}", format::TRUNK_EXT)) {
+                trunk_pos = Some((entry.raw_file_position(), entry.header().entry_size()?));
+            }
+        }
+        let rings_bytes = rings_bytes.with_context(|| {
+            format!(
+                "{} has no .rings member — not a timberfs bundle",
+                input.display()
+            )
+        })?;
+        let (trunk_base, trunk_size) = trunk_pos.with_context(|| {
+            format!(
+                "{} has no .trunk member — not a timberfs bundle",
+                input.display()
+            )
+        })?;
+        let mut records = format::parse_index_bytes(&rings_bytes)?;
+        if records.last().is_some_and(|c| c.comp_end() > trunk_size) {
+            bail!(
+                "bundle {} is corrupt: the index points past the trunk member",
+                input.display()
+            );
+        }
+        for r in &mut records {
+            r.comp_start += trunk_base;
+        }
+        return Ok(SourceHandle { records, file });
+    }
     let (dir, base) = resolve_backing(input)?;
-    let trunk = format::trunk_path(&dir, &base);
     let rings = format::rings_path(&dir, &base);
     if !rings.exists() {
         bail!(
-            "no index file {} (expected a timberfs backing file or its logical name)",
+            "no index file {} (expected a timberfs backing file, its logical name, \
+             or a .timber bundle)",
             rings.display()
         );
     }
-    Ok((trunk, rings))
+    let records =
+        format::read_index(&rings).with_context(|| format!("reading index {}", rings.display()))?;
+    let file = File::open(format::trunk_path(&dir, &base))?;
+    Ok(SourceHandle { records, file })
 }
 
 /// Print the bytes stamped inside [from, to]. Selection is at chunk
@@ -102,9 +160,8 @@ fn backing_paths(input: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
 /// whose windows are only mostly sorted. The index is 48 bytes per chunk,
 /// so scanning it is negligible next to decompressing one chunk.)
 pub fn cmd_query(file: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::Result<()> {
-    let (trunk_path, rings_path) = backing_paths(file)?;
-    let chunks = format::read_index(&rings_path)
-        .with_context(|| format!("reading index {}", rings_path.display()))?;
+    let source = open_source(file)?;
+    let chunks = source.records;
     let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
     let to_ms = to.map(parse_time).transpose()?.unwrap_or(u64::MAX);
     if from_ms > to_ms {
@@ -117,7 +174,7 @@ pub fn cmd_query(file: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::R
         .copied()
         .collect();
 
-    let trunk = File::open(&trunk_path)?;
+    let trunk = source.file;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut uncomp_total = 0u64;
@@ -140,9 +197,7 @@ pub fn cmd_query(file: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::R
 
 /// Human-readable dump of the write-time index.
 pub fn cmd_index(file: &Path) -> anyhow::Result<()> {
-    let (_trunk_path, rings_path) = backing_paths(file)?;
-    let chunks = format::read_index(&rings_path)
-        .with_context(|| format!("reading index {}", rings_path.display()))?;
+    let chunks = open_source(file)?.records;
     println!(
         "{:>5}  {:>12}  {:>10}  {:>10}  {:>6}  {:<23}  {:<23}",
         "chunk", "uncomp@", "bytes", "comp", "ratio", "first write", "last write"

@@ -263,10 +263,26 @@ fn segment_present(
     false
 }
 
-/// A path names a timberfs source if it is a .trunk/.rings path, or if no
-/// plain file exists at the exact path but the backing pair does.
+/// A path names a timberfs source if it is a .trunk/.rings path, a
+/// .timber bundle, or if no plain file exists at the exact path but the
+/// backing pair does.
 fn classify_source(path: &Path, extractor: &Extractor) -> anyhow::Result<(u64, Source)> {
     let ext = path.extension().and_then(|e| e.to_str());
+    if crate::query::is_bundle(path) {
+        // A bundle reads in place: open_source already shifted the record
+        // offsets to the trunk member's position within the tar.
+        let records = crate::query::open_source(path)?.records;
+        if records.is_empty() {
+            bail!("timberfs bundle {} is empty", path.display());
+        }
+        return Ok((
+            records[0].first_write_ms,
+            Source::Timber {
+                trunk: path.to_path_buf(),
+                records,
+            },
+        ));
+    }
     let pair_path = matches!(
         ext,
         Some(crate::format::TRUNK_EXT) | Some(crate::format::RINGS_EXT)
@@ -309,6 +325,14 @@ pub fn cmd_import(
     quick: bool,
 ) -> anyhow::Result<()> {
     let extractor = Extractor::new(custom_regex, custom_format, utc)?;
+    if crate::query::is_bundle(dest) {
+        bail!(
+            "{} is a .timber transfer bundle — bundles are read-only \
+             (query/index/export work directly on them); import it into a \
+             log to write",
+            dest.display()
+        );
+    }
     let (dir, name) = resolve_backing(dest)?;
     fs::create_dir_all(&dir)?;
     let multi = sources_in.len() > 1;
