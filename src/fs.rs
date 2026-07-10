@@ -284,6 +284,7 @@ impl Filesystem for TimberFs {
         };
         if let Some(sz) = size {
             let mut store = self.store.lock().unwrap();
+            let dir = store.dir.clone();
             let f = match store.files.get_mut(&name) {
                 Some(f) => f,
                 None => {
@@ -292,7 +293,7 @@ impl Filesystem for TimberFs {
                 }
             };
             if sz == 0 && f.size() > 0 {
-                if let Err(e) = f.reset() {
+                if let Err(e) = f.reset(&dir, &name) {
                     reply.error(io_errno(&e));
                     return;
                 }

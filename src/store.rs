@@ -235,7 +235,8 @@ impl FileStore {
     }
 
     /// Truncate-to-zero, i.e. copytruncate-style rotation: start over.
-    pub fn reset(&mut self) -> io::Result<()> {
+    pub fn reset(&mut self, dir: &Path, name: &str) -> io::Result<()> {
+        let _ = fs::remove_file(format::grain_path(dir, name));
         self.trunk.set_len(0)?;
         self.rings.set_len(RINGS_HEADER_LEN)?;
         self.chunks.clear();
@@ -376,6 +377,9 @@ impl FileStore {
         }
         fs::rename(&trunk_tmp, &trunk_p)?;
         fs::rename(&rings_tmp, &rings_p)?;
+        // Sidecar contract: a rings rewrite invalidates chunk numbering,
+        // so derived indexes are deleted (rebuild with `timberfs reindex`).
+        let _ = fs::remove_file(format::grain_path(dir, name));
         self.trunk = OpenOptions::new().read(true).write(true).open(&trunk_p)?;
         self.rings = OpenOptions::new().read(true).write(true).open(&rings_p)?;
         self.chunks.drain(..k);
@@ -440,6 +444,7 @@ impl Store {
         }
         let _ = fs::remove_file(format::trunk_path(&self.dir, name));
         let _ = fs::remove_file(format::rings_path(&self.dir, name));
+        let _ = fs::remove_file(format::grain_path(&self.dir, name));
         Ok(())
     }
 
@@ -467,6 +472,10 @@ impl Store {
             format::rings_path(&self.dir, old),
             format::rings_path(&self.dir, new),
         )?;
+        let _ = fs::rename(
+            format::grain_path(&self.dir, old),
+            format::grain_path(&self.dir, new),
+        );
         self.files.insert(new.to_string(), f);
         Ok(())
     }

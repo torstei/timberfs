@@ -24,6 +24,7 @@ pub const RINGS_HEADER_LEN: u64 = 8;
 pub const RECORD_LEN: usize = 48;
 pub const TRUNK_EXT: &str = "trunk";
 pub const RINGS_EXT: &str = "rings";
+pub const GRAIN_EXT: &str = "grain";
 
 pub fn trunk_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{TRUNK_EXT}"))
@@ -31,6 +32,10 @@ pub fn trunk_path(dir: &Path, name: &str) -> PathBuf {
 
 pub fn rings_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{RINGS_EXT}"))
+}
+
+pub fn grain_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.{GRAIN_EXT}"))
 }
 
 /// One chunk: a contiguous run of appended bytes, compressed as a single

@@ -2,6 +2,8 @@ mod append;
 mod export;
 mod format;
 mod fs;
+mod grain;
+mod grep;
 mod import;
 mod query;
 mod rotate;
@@ -132,9 +134,62 @@ enum Command {
         /// End of the time window (same formats); default: end
         #[arg(long)]
         to: Option<String>,
+        /// Only chunks that (probably) contain this token, via the .grain
+        /// Bloom index (build with `timberfs reindex`); repeatable = AND;
+        /// an argument with separators must match all its tokens
+        #[arg(long)]
+        has: Vec<String>,
+    },
+    /// Entry-aware grep: matches PATTERN against whole log entries (a
+    /// timestamped line plus its continuation lines — stack traces stay
+    /// attached to their entry). Reads raw log from stdin or a plain
+    /// file, or a timberfs log/bundle where --from/--to/--has pre-select
+    /// chunks first. Pipe several greps for entry-level AND.
+    Grep {
+        /// Regex to match against each entry (-F for a fixed string)
+        pattern: String,
+        /// Raw log file, timberfs backing file, or .timber bundle
+        /// (default: raw log on stdin)
+        file: Option<PathBuf>,
+        /// Case-insensitive matching
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        /// Print entries that do NOT match
+        #[arg(short = 'v', long)]
+        invert: bool,
+        /// PATTERN is a fixed string, not a regex
+        #[arg(short = 'F', long)]
+        fixed: bool,
+        /// Print only the number of matching entries
+        #[arg(short = 'c', long)]
+        count: bool,
+        /// Start of the time window (timberfs sources only)
+        #[arg(long)]
+        from: Option<String>,
+        /// End of the time window (timberfs sources only)
+        #[arg(long)]
+        to: Option<String>,
+        /// .grain chunk pre-filter (timberfs sources only); repeatable
+        #[arg(long)]
+        has: Vec<String>,
+        /// Custom entry-boundary timestamp: regex with one capture group
+        #[arg(long, requires = "timestamp_format")]
+        timestamp_regex: Option<String>,
+        /// chrono format string for the captured timestamp
+        #[arg(long, requires = "timestamp_regex")]
+        timestamp_format: Option<String>,
     },
     /// Show the write-time chunk index of a backing file
     Index {
+        /// Backing file: logical name, .trunk or .rings path
+        file: PathBuf,
+    },
+    /// Build or rebuild the .grain token index for a log: one Bloom filter
+    /// per chunk over every token in it (~1% false positives), letting
+    /// `query --has` skip chunks — e.g. find a request id with no known
+    /// time range. Derived data: safe to delete, cheap to rebuild; rotation
+    /// and retention drop it (rebuild afterwards).
+    Reindex {
         /// Backing file: logical name, .trunk or .rings path
         file: PathBuf,
     },
@@ -237,11 +292,46 @@ fn main() -> anyhow::Result<()> {
         } => {
             export::cmd_export(&source, &dest, from.as_deref(), to.as_deref())?;
         }
-        Command::Query { file, from, to } => {
-            query::cmd_query(&file, from.as_deref(), to.as_deref())?;
+        Command::Query {
+            file,
+            from,
+            to,
+            has,
+        } => {
+            query::cmd_query(&file, from.as_deref(), to.as_deref(), &has)?;
+        }
+        Command::Grep {
+            pattern,
+            file,
+            ignore_case,
+            invert,
+            fixed,
+            count,
+            from,
+            to,
+            has,
+            timestamp_regex,
+            timestamp_format,
+        } => {
+            grep::cmd_grep(
+                &pattern,
+                file.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                &has,
+                ignore_case,
+                invert,
+                fixed,
+                count,
+                timestamp_regex.as_deref(),
+                timestamp_format.as_deref(),
+            )?;
         }
         Command::Index { file } => {
             query::cmd_index(&file)?;
+        }
+        Command::Reindex { file } => {
+            grain::cmd_reindex(&file)?;
         }
         Command::Rotate {
             source,

@@ -84,8 +84,9 @@ fast ones, so that's the worst-case slop at the edges of the window.
 
 The intended workflow is: `timberfs query` does the coarse seek into a huge
 file (cheap, no parsing, immune to multiline entries and timestamp-less
-lines), then ordinary `grep`/`awk` on the small extract trims exactly using
-the timestamps the log lines carry anyway. The slop is a feature there:
+lines), then `timberfs grep` (entry-aware) or ordinary `grep`/`awk` on the
+small extract trims exactly using the timestamps the log lines carry
+anyway. The slop is a feature there:
 buffered loggers write lines slightly after the timestamp they print, so a
 byte-exact write-time cut could miss edge lines that grep-on-content
 catches.
@@ -105,6 +106,11 @@ grep ERROR logs/app.log
 # the killer feature: extract by wall-clock write time, O(log n)
 timberfs query logs-backing/app.log --from 13:42 --to 13:43
 timberfs query logs-backing/app.log --from "2026-07-09 13:42:00" --to "2026-07-09 13:43:00"
+
+# entry-aware grep: matches whole log ENTRIES (a timestamped line plus
+# its continuations — stack traces stay attached); pipe for AND
+timberfs grep ERROR logs-backing/app.log --from 13:42 --to 13:43
+cat any.log | timberfs grep 'tenantId=FOO' | timberfs grep -v DEBUG
 
 # inspect the chunk index (offsets, compression ratio, time windows)
 timberfs index logs-backing/app.log
@@ -245,36 +251,34 @@ run against a live mount (chunks are immutable, the index is append-only).
 Note they only see flushed chunks — the still-buffered tail (≤ flush-age
 old) is visible through the mount but not yet in the backing files.
 
-## Custom indexes (design contract — not yet implemented)
+## Custom indexes: the .grain token index
 
 The write-time index generalizes: `.rings` is just a per-chunk summary
 (byte ranges + a searchable time window), and queries never touch the
-trunk except for the chunks the summary selects. Any index over log
-*content* — the logged timestamp, request IDs, arbitrary identifiers — has
-the same shape, and the design is fixed here so implementations don't
-drift into format changes.
+trunk except for the chunks the summary selects. The first content index
+is implemented: **`.grain`**, one Bloom filter per chunk over every token
+in it (~10 bits per distinct token, k=7, ~1% false positives — measured
+0.86% on a 2.7 GB production log). Build it with `timberfs reindex`, use
+it with `query --has`:
 
-Two index families cover the useful cases (both are standard practice in
-column stores — ClickHouse skip indexes, Parquet statistics and bloom
-filters, Loki's label index):
+```sh
+timberfs reindex logs-backing/app.log          # 2.7 GB indexed in ~6 s
+timberfs query logs-backing/app.log --has F454567068093ZHGZCL   # no time bound!
+timberfs query logs-backing/app.log --from 13:00 --to 14:00 --has ERROR \
+    | timberfs grep 'tenantId=FOO'
+```
 
-- **Zone maps** for ordered-ish values: per chunk, store `(min, max)` of
-  the extracted value; a range query selects overlapping chunks. The
-  *logged* timestamp is the flagship — and zone maps stay correct under
-  out-of-order logging (threads, imports, replays); mostly-increasing data
-  just makes them sharper. This is what makes logs *imported* through
-  `append` time-searchable, where write time says nothing.
-- **Bloom filters** for identifiers: per chunk, a filter over extracted
-  (or simply all) tokens; a lookup decompresses only chunks whose filter
-  matches. ~1–2 KB per 256 KiB chunk covers thousands of distinct tokens
-  at ~1% false positives. Sharp for rare identifiers (the "find this
-  request across 30 days" case); honest about ubiquitous ones. A
-  config-free tokenize-everything default gives an indexed `grep`;
-  regex/JSON field extraction is an advanced layer that only changes what
-  goes into the filter, never the file structure.
+Tokens are ASCII-alphanumeric runs of 3–64 characters, exact case,
+config-free: rare tokens (request keys, message ids) skip nearly every
+chunk, ubiquitous ones skip nothing and cost only the test. `--has` is a
+**chunk-level pre-filter with whole-token matching** — an argument with
+separators (`req-8f3a`) must match all its tokens in the same chunk, AND
+across repeated `--has` flags is also chunk-level, and substrings of
+tokens do not match; exact, entry-level filtering stays downstream in
+`timberfs grep`. A false positive costs one needless chunk
+decompression. The design contract that made this a sidecar:
 
-The contract that keeps the core format frozen — **custom indexes are
-sidecars**: one file per index next to the `.trunk`/`.rings` pair (the
+**Custom indexes are sidecars**: one file per index next to the `.trunk`/`.rings` pair (the
 metaphor extends: `.rings` is time, content indexes are *grain*), with a
 self-describing header (index type + extractor description) and one
 append-only entry per chunk. Three rules:
@@ -292,15 +296,15 @@ append-only entry per chunk. Three rules:
    class. (Prefix-trimming sidecars in the same pass is a later
    optimization, since head-drops remove exactly a chunk prefix.)
 
-Consequences worth knowing: chunk size becomes an index-selectivity knob
-(smaller chunks → sharper lookups, more overhead), and extraction can run
-inline at flush time or lazily over cold chunks — both fit, per file.
-A chunk-sequence-number field in the rings header was considered to let
+Consequences worth knowing: chunk size is an index-selectivity knob
+(smaller chunks → sharper lookups, more overhead), the grain lags a live
+appender until the next `reindex` (lagging entries just mean scanning
+those chunks), and `.timber` bundles carry no grain yet. A
+chunk-sequence-number field in the rings header was considered to let
 sidecars survive head-drops without deletion, and rejected: rule 3 makes
-it unnecessary, and the on-disk format stays `RING0001`.
-
-Build order when this happens: logged-timestamp zone map first, token
-blooms second.
+it unnecessary, and the on-disk format stays `RING0001`. (Logged-timestamp
+zone maps, the other planned index family, became largely moot: import
+already writes logged time into the rings.)
 
 ## Install
 
@@ -360,8 +364,6 @@ unit unmounts first, so the daemon flushes everything and exits cleanly.
 
 ## Ideas / future work
 
-- **Custom indexes**: logged-timestamp zone maps, then token blooms — the
-  design contract is fixed above; only implementation remains.
 - **zstd seekable format / dictionaries**: adopt the official seekable-zstd
   framing for ecosystem compat; train a dictionary per file for much better
   small-chunk ratios; long-range mode for cold recompression.
