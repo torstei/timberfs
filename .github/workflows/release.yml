@@ -75,21 +75,23 @@ jobs:
       - name: Test the exact release artifact in a VM
         run: tests/vm/run-vm-test.sh
 
+      # Assets are staged OUTSIDE the checkout: cargo publish refuses to
+      # run from a dirty working tree, and rightly so.
       - name: Stage release assets
         run: |
-          mkdir -p dist
-          cp target/debian/timberfs_*_amd64.deb dist/
-          cp target/debian/timberfs_*_amd64.deb dist/timberfs_amd64.deb
+          mkdir -p "$RUNNER_TEMP/dist"
+          cp target/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/"
+          cp target/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/timberfs_amd64.deb"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/*
+          subject-path: ${{ runner.temp }}/dist/*
 
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+        run: gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/dist/* --generate-notes --verify-tag
 
       - name: Get a crates.io token via Trusted Publishing (OIDC)
         id: crates_auth
