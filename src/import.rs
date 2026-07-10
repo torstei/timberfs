@@ -1,0 +1,576 @@
+//! `timberfs import`: convert an existing plain log file into a timberfs
+//! backing pair, stamping chunks with timestamps PARSED FROM THE LOG LINES
+//! (the write time of historical data is meaningless).
+//!
+//!     timberfs import /var/log/old-app.log backing/app.log
+//!
+//! Timestamp extraction per line, first match wins. Auto-detected
+//! timestamps must sit at the START of the line (which also makes
+//! indented continuation lines inherit naturally):
+//!   - RFC3339/ISO-8601 and friends: `2026-07-10T09:23:45.123+02:00`,
+//!     space instead of T, `.` as the date separator, and `.`/`,`/`:`
+//!     before the fraction (logback's `yyyy.MM.dd HH:mm:ss:SSS` included)
+//!   - a leading epoch in seconds or milliseconds
+//!   - Apache/CLF `[10/Jul/2026:09:23:45 +0200]` — the one non-anchored
+//!     exception, since CLF puts the bracketed timestamp mid-line
+//!   - --timestamp-regex + --timestamp-format for everything else (the
+//!     regex is searched, not anchored; use ^ to anchor)
+//!
+//! Naive timestamps (no zone) are taken as local time unless --utc. Lines
+//! with no parseable timestamp (stack traces, continuations) inherit the
+//! previous line's stamp, so multiline entries land in the right window.
+//! Real logs are only mostly sorted; chunk windows are the min/max of the
+//! stamps they contain, and queries select by interval overlap, so mild
+//! disorder widens windows without losing data.
+
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use regex::Regex;
+
+use crate::query::{fmt_ms, resolve_backing};
+use crate::store::{self, Config, Store};
+
+/// Give up if none of the first this-many lines have a timestamp.
+const DETECT_WINDOW: usize = 1000;
+
+pub struct Extractor {
+    custom: Option<(Regex, String)>,
+    iso: Regex,
+    clf: Regex,
+    epoch: Regex,
+    utc: bool,
+}
+
+impl Extractor {
+    pub fn new(
+        custom_regex: Option<&str>,
+        custom_format: Option<&str>,
+        utc: bool,
+    ) -> anyhow::Result<Extractor> {
+        let custom = match (custom_regex, custom_format) {
+            (Some(re), Some(f)) => {
+                let re = Regex::new(re).context("bad --timestamp-regex")?;
+                if re.captures_len() < 2 {
+                    bail!("--timestamp-regex needs one capture group around the timestamp");
+                }
+                Some((re, f.to_string()))
+            }
+            (None, None) => None,
+            _ => bail!("--timestamp-regex and --timestamp-format go together"),
+        };
+        Ok(Extractor {
+            custom,
+            iso: Regex::new(
+                r"^(\d{4})[.-](\d{2})[.-](\d{2})[T ](\d{2}:\d{2}:\d{2})(?:[.,:](\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?",
+            )
+            .unwrap(),
+            clf: Regex::new(r"\[(\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4})\]")
+                .unwrap(),
+            epoch: Regex::new(r"^(\d{13}|\d{10})\b").unwrap(),
+            utc,
+        })
+    }
+
+    fn naive_to_ms(&self, naive: NaiveDateTime) -> Option<i64> {
+        if self.utc {
+            Some(Utc.from_utc_datetime(&naive).timestamp_millis())
+        } else {
+            Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .map(|dt| dt.timestamp_millis())
+        }
+    }
+
+    /// Extract a unix-ms timestamp from the head of a log line, if there
+    /// is one. The caller passes only the line's head — no slicing here.
+    pub fn extract(&self, head: &str) -> Option<u64> {
+        if let Some((re, fmt)) = &self.custom {
+            let m = re.captures(head)?.get(1)?.as_str().to_string();
+            let ms = DateTime::parse_from_str(&m, fmt)
+                .map(|dt| dt.timestamp_millis())
+                .ok()
+                .or_else(|| {
+                    NaiveDateTime::parse_from_str(&m, fmt)
+                        .ok()
+                        .and_then(|n| self.naive_to_ms(n))
+                })?;
+            return u64::try_from(ms).ok();
+        }
+
+        if let Some(c) = self.iso.captures(head) {
+            // reassemble as strict RFC3339-ish regardless of which
+            // separators the log used
+            let normalized = format!(
+                "{}-{}-{}T{}{}",
+                c.get(1).unwrap().as_str(),
+                c.get(2).unwrap().as_str(),
+                c.get(3).unwrap().as_str(),
+                c.get(4).unwrap().as_str(),
+                c.get(5)
+                    .map(|f| format!(".{}", f.as_str()))
+                    .unwrap_or_default(),
+            );
+            let ms = match c.get(6) {
+                Some(zone) => {
+                    // normalize +0200 -> +02:00 for RFC3339 parsing
+                    let z = zone.as_str();
+                    let z = if z.len() == 5 && !z.contains(':') {
+                        format!("{}:{}", &z[..3], &z[3..])
+                    } else {
+                        z.to_string()
+                    };
+                    DateTime::parse_from_rfc3339(&format!("{normalized}{z}"))
+                        .ok()?
+                        .timestamp_millis()
+                }
+                None => {
+                    let naive =
+                        NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
+                    self.naive_to_ms(naive)?
+                }
+            };
+            return u64::try_from(ms).ok();
+        }
+
+        if let Some(c) = self.clf.captures(head) {
+            let ms = DateTime::parse_from_str(c.get(1).unwrap().as_str(), "%d/%b/%Y:%H:%M:%S %z")
+                .ok()?
+                .timestamp_millis();
+            return u64::try_from(ms).ok();
+        }
+
+        if let Some(c) = self.epoch.captures(head) {
+            let digits = c.get(1).unwrap().as_str();
+            let n: u64 = digits.parse().ok()?;
+            return Some(if digits.len() == 13 { n } else { n * 1000 });
+        }
+
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Re-import safety: the target is its own checkpoint. The source must be
+/// a pure-growth descendant of what was imported, which we prove by
+/// comparing already-imported chunks against the same source byte ranges
+/// (all chunks, or first/middle/last with `quick`) BEFORE writing anything.
+fn verify_prefix(
+    chunks: &[crate::format::ChunkRecord],
+    trunk_path: &Path,
+    src: &File,
+    quick: bool,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let trunk = File::open(trunk_path)?;
+    let picks: Vec<usize> = if quick && chunks.len() > 3 {
+        vec![0, chunks.len() / 2, chunks.len() - 1]
+    } else {
+        (0..chunks.len()).collect()
+    };
+    for i in picks {
+        let c = chunks[i];
+        let mut comp = vec![0u8; c.comp_len as usize];
+        trunk.read_exact_at(&mut comp, c.comp_start)?;
+        let imported = zstd::stream::decode_all(&comp[..])?;
+        let mut current = vec![0u8; c.uncomp_len as usize];
+        src.read_exact_at(&mut current, c.uncomp_start)
+            .context("reading the source range matching already-imported data")?;
+        if imported != current {
+            bail!(
+                "already-imported data differs from the source (bytes {}..{}) — \
+                 rotated or rewritten file? import it to a new target instead",
+                c.uncomp_start,
+                c.uncomp_end()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// First parsed timestamp in a file, scanning at most DETECT_WINDOW lines.
+fn first_stamp(path: &Path, extractor: &Extractor) -> anyhow::Result<u64> {
+    let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = BufReader::new(f);
+    let mut line: Vec<u8> = Vec::new();
+    for _ in 0..DETECT_WINDOW {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if let Some(ts) = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]))
+        {
+            return Ok(ts);
+        }
+    }
+    bail!(
+        "no timestamp found in the first {DETECT_WINDOW} lines of {}; \
+         try --timestamp-regex/--timestamp-format",
+        path.display()
+    )
+}
+
+/// A source is either a plain log (lines get parsed and stamped) or an
+/// existing timberfs log — a shipped rotation segment, say — whose chunks
+/// merge verbatim, index included.
+enum Source {
+    Plain(PathBuf),
+    Timber {
+        trunk: PathBuf,
+        records: Vec<crate::format::ChunkRecord>,
+    },
+}
+
+impl Source {
+    fn display(&self) -> String {
+        match self {
+            Source::Plain(p) => p.display().to_string(),
+            Source::Timber { trunk, .. } => format!("{} (timberfs)", trunk.display()),
+        }
+    }
+}
+
+/// Is this exact segment (as a consecutive run of records, compared by
+/// lengths and time windows) already in the target's index? Candidates are
+/// located by the first record, so this is O(target + segment).
+fn segment_present(
+    target: &[crate::format::ChunkRecord],
+    seg: &[crate::format::ChunkRecord],
+) -> bool {
+    let same = |a: &crate::format::ChunkRecord, b: &crate::format::ChunkRecord| {
+        a.uncomp_len == b.uncomp_len
+            && a.comp_len == b.comp_len
+            && a.first_write_ms == b.first_write_ms
+            && a.last_write_ms == b.last_write_ms
+    };
+    if seg.len() > target.len() {
+        return false;
+    }
+    for start in 0..=(target.len() - seg.len()) {
+        if same(&target[start], &seg[0])
+            && target[start..start + seg.len()]
+                .iter()
+                .zip(seg)
+                .all(|(a, b)| same(a, b))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// A path names a timberfs source if it is a .trunk/.rings path, or if no
+/// plain file exists at the exact path but the backing pair does.
+fn classify_source(path: &Path, extractor: &Extractor) -> anyhow::Result<(u64, Source)> {
+    let ext = path.extension().and_then(|e| e.to_str());
+    let pair_path = matches!(
+        ext,
+        Some(crate::format::TRUNK_EXT) | Some(crate::format::RINGS_EXT)
+    );
+    if !pair_path && path.is_file() {
+        return Ok((
+            first_stamp(path, extractor)?,
+            Source::Plain(path.to_path_buf()),
+        ));
+    }
+    let (sdir, sname) = resolve_backing(path)?;
+    let rings = crate::format::rings_path(&sdir, &sname);
+    if !rings.exists() {
+        bail!(
+            "{} is neither a log file nor a timberfs log",
+            path.display()
+        );
+    }
+    let records = crate::format::read_index(&rings)?;
+    if records.is_empty() {
+        bail!("timberfs source {} is empty", path.display());
+    }
+    Ok((
+        records[0].first_write_ms,
+        Source::Timber {
+            trunk: crate::format::trunk_path(&sdir, &sname),
+            records,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_import(
+    sources_in: &[PathBuf],
+    dest: &Path,
+    cfg: Config,
+    custom_regex: Option<&str>,
+    custom_format: Option<&str>,
+    utc: bool,
+    quick: bool,
+) -> anyhow::Result<()> {
+    let extractor = Extractor::new(custom_regex, custom_format, utc)?;
+    let (dir, name) = resolve_backing(dest)?;
+    fs::create_dir_all(&dir)?;
+    let multi = sources_in.len() > 1;
+
+    // Multiple sources are one logical stream: order them chronologically
+    // by their own first timestamp (rotation numbering and glob order are
+    // unreliable) and show the stitch plan.
+    let mut sources: Vec<(u64, Source)> = Vec::new();
+    for p in sources_in {
+        sources.push(classify_source(p, &extractor)?);
+    }
+    sources.sort_by_key(|(ts, _)| *ts);
+    let any_plain = sources.iter().any(|(_, s)| matches!(s, Source::Plain(_)));
+    if multi {
+        for w in sources.windows(2) {
+            if w[0].0 == w[1].0 {
+                bail!(
+                    "{} and {} start at the same timestamp ({}) — the same file twice?",
+                    w[0].1.display(),
+                    w[1].1.display(),
+                    fmt_ms(w[0].0)
+                );
+            }
+        }
+        eprintln!(
+            "timberfs: stitching {} files in timestamp order:",
+            sources.len()
+        );
+        for (i, (ts, s)) in sources.iter().enumerate() {
+            eprintln!(
+                "timberfs:   {}. {}  (starts {})",
+                i + 1,
+                s.display(),
+                fmt_ms(*ts)
+            );
+        }
+    }
+    let total_bytes: u64 = sources
+        .iter()
+        .map(|(_, s)| match s {
+            Source::Plain(p) => fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            Source::Timber { trunk, .. } => fs::metadata(trunk).map(|m| m.len()).unwrap_or(0),
+        })
+        .sum();
+
+    // Same writer locks as the appender: shared on the directory,
+    // exclusive on the file.
+    let _dir_lock = match store::lock_backing_shared(&dir)? {
+        Some(f) => f,
+        None => bail!(
+            "backing directory {} is served by a timberfs mount; unmount first",
+            dir.display()
+        ),
+    };
+    let _file_lock = match store::lock_file_exclusive(&dir, &name)? {
+        Some(f) => f,
+        None => bail!("{name} already has a writer (appender or rotation)"),
+    };
+
+    let mut st = Store {
+        dir: dir.clone(),
+        cfg,
+        files: std::collections::BTreeMap::new(),
+    };
+    st.create(&name)?;
+
+    // A non-empty target: for a single plain source, verify the imported
+    // prefix and resume; timberfs sources append behind the ordering guard
+    // (segments already covered are skipped below). Stitching that
+    // involves plain sources needs an empty target.
+    let mut resume_from: u64 = 0;
+    let mut last_ts: Option<u64> = None;
+    {
+        let f = st.files.get(&name).unwrap();
+        if f.size() > 0 {
+            if multi && any_plain {
+                bail!(
+                    "{name} already contains data; stitching plain log files needs an \
+                     empty target"
+                );
+            }
+            if let (false, (_, Source::Plain(src_path))) = (multi, &sources[0]) {
+                resume_from = f.size();
+                if total_bytes < resume_from {
+                    bail!(
+                        "source ({total_bytes} bytes) is smaller than the {resume_from} bytes \
+                         already imported — rotated or truncated file? import it to a new target"
+                    );
+                }
+                let src = File::open(src_path)?;
+                verify_prefix(
+                    &f.chunks,
+                    &crate::format::trunk_path(&dir, &name),
+                    &src,
+                    quick,
+                )?;
+                eprintln!(
+                    "timberfs: {} of {} bytes already imported and verified{}; resuming",
+                    resume_from,
+                    total_bytes,
+                    if quick { " (quick)" } else { "" }
+                );
+            }
+            // Seed timestamp inheritance with the last imported stamp.
+            last_ts = f.last_write_ms();
+        }
+    }
+
+    let mut line: Vec<u8> = Vec::new();
+    let mut leading: Vec<Vec<u8>> = Vec::new(); // lines before the first stamp
+    let mut lines: u64 = 0;
+    let mut stamped: u64 = 0;
+    let mut inherited: u64 = 0;
+    let mut merged_chunks: u64 = 0;
+    let mut merged_segments: u64 = 0;
+    let mut skipped_segments: u64 = 0;
+    let mut bytes_done: u64 = resume_from;
+    let mut next_progress = total_bytes / 10;
+    while total_bytes >= 10 && next_progress <= bytes_done {
+        next_progress += total_bytes / 10;
+    }
+    let cfg = st.cfg;
+
+    for (source_idx, (_, source)) in sources.iter().enumerate() {
+        let source_path = match source {
+            Source::Timber { trunk, records } => {
+                // A shipped segment: merge the chunks verbatim — unless the
+                // target's index already CONTAINS this exact segment (same
+                // consecutive run of records), which makes re-running a
+                // shipping script a no-op. An older-but-absent segment is
+                // NOT skipped; it falls through to the ordering guard.
+                let f = st.files.get_mut(&name).unwrap();
+                if segment_present(&f.chunks, records) {
+                    eprintln!(
+                        "timberfs: {} skipped — the target already contains this segment \
+                         (chunks through {})",
+                        source.display(),
+                        fmt_ms(records.last().unwrap().last_write_ms)
+                    );
+                    skipped_segments += 1;
+                } else {
+                    let trunk_file = File::open(trunk)
+                        .with_context(|| format!("opening {}", trunk.display()))?;
+                    f.append_frames(&trunk_file, records, &cfg)
+                        .with_context(|| format!("merging {}", source.display()))?;
+                    merged_chunks += records.len() as u64;
+                    merged_segments += 1;
+                    last_ts = Some(records.last().unwrap().last_write_ms);
+                }
+                bytes_done += fs::metadata(trunk).map(|m| m.len()).unwrap_or(0);
+                continue;
+            }
+            Source::Plain(p) => p,
+        };
+        let mut src = File::open(source_path)
+            .with_context(|| format!("opening {}", source_path.display()))?;
+        if source_idx == 0 && resume_from > 0 {
+            use std::io::Seek;
+            src.seek(std::io::SeekFrom::Start(resume_from))?;
+        }
+        let mut reader = BufReader::with_capacity(1 << 20, src);
+
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            lines += 1;
+            bytes_done += line.len() as u64;
+
+            let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
+            match (ts, last_ts) {
+                (Some(t), _) => {
+                    if !leading.is_empty() {
+                        // stamp the pre-first-timestamp lines with the first one
+                        let f = st.files.get_mut(&name).unwrap();
+                        for l in leading.drain(..) {
+                            f.append_stamped(&l, t, &cfg)?;
+                            inherited += 1;
+                        }
+                    }
+                    st.files
+                        .get_mut(&name)
+                        .unwrap()
+                        .append_stamped(&line, t, &cfg)?;
+                    stamped += 1;
+                    last_ts = Some(t);
+                }
+                (None, Some(t)) => {
+                    st.files
+                        .get_mut(&name)
+                        .unwrap()
+                        .append_stamped(&line, t, &cfg)?;
+                    inherited += 1;
+                }
+                (None, None) => {
+                    leading.push(line.clone());
+                    if leading.len() > DETECT_WINDOW {
+                        bail!(
+                            "no timestamp found in the first {DETECT_WINDOW} lines; \
+                         try --timestamp-regex/--timestamp-format"
+                        );
+                    }
+                }
+            }
+
+            if total_bytes > 0 && bytes_done >= next_progress && bytes_done < total_bytes {
+                eprintln!(
+                    "timberfs: import {}% ({} of {} bytes)",
+                    bytes_done * 100 / total_bytes,
+                    bytes_done,
+                    total_bytes
+                );
+                next_progress += total_bytes / 10;
+            }
+        }
+    }
+
+    if !leading.is_empty() {
+        bail!(
+            "no timestamp found in any of the {} line(s); \
+             try --timestamp-regex/--timestamp-format",
+            leading.len()
+        );
+    }
+
+    st.flush_all();
+    let f = st.files.get(&name).unwrap();
+    let (first, last) = (f.first_write_ms(), f.last_write_ms());
+    if lines == 0 && merged_segments == 0 && (resume_from > 0 || skipped_segments > 0) {
+        eprintln!("timberfs: {name} is already up to date; nothing imported");
+        return Ok(());
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if lines > 0 {
+        parts.push(format!(
+            "{lines} lines ({stamped} stamped, {inherited} inherited)"
+        ));
+    }
+    if merged_segments > 0 {
+        parts.push(format!(
+            "{merged_chunks} chunk(s) merged verbatim from {merged_segments} timberfs source(s)"
+        ));
+    }
+    if skipped_segments > 0 {
+        parts.push(format!("{skipped_segments} segment(s) already covered"));
+    }
+    eprintln!(
+        "timberfs: imported {}{}; now {} chunk(s), {} bytes, {} compressed ({:.1}x), \
+         spanning {} .. {}",
+        parts.join(", "),
+        if resume_from > 0 {
+            format!(" after {resume_from} bytes already imported")
+        } else {
+            String::new()
+        },
+        f.chunks.len(),
+        f.size(),
+        f.comp_size,
+        f.size() as f64 / f.comp_size.max(1) as f64,
+        first.map(fmt_ms).unwrap_or_default(),
+        last.map(fmt_ms).unwrap_or_default(),
+    );
+    Ok(())
+}

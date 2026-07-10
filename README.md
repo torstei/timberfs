@@ -137,6 +137,42 @@ appended to — never both (the mount daemon owns in-memory state for the
 whole directory). End of input, `SIGTERM` or `SIGINT` flush and sync
 everything before exit.
 
+**Importing existing logs** works the same way, but with a twist that
+matters: chunk time windows come from timestamps *parsed out of the log
+lines* (auto-detected RFC3339/ISO, Apache/CLF, or leading epochs;
+`--timestamp-regex`/`--timestamp-format` for anything else), because the
+write time of historical data says nothing. Lines without a timestamp —
+stack traces, continuations — inherit the previous line's, and mildly
+out-of-order lines just widen chunk windows (queries select by interval
+overlap, so nothing is lost):
+
+```sh
+timberfs import /var/log/old-app.log logs-backing/app.log
+timberfs query logs-backing/app.log --from "2026-06-03 14:00" --to "2026-06-03 15:00"
+
+# a whole rotated set, in any order — files are stitched chronologically
+# by their own first timestamps (rotation numbering and glob order lie)
+timberfs import /var/log/old-app.log.* /var/log/old-app.log logs-backing/app.log
+
+# a timberfs source (say, a rotation segment shipped from another box)
+# is detected automatically and merged VERBATIM — no decompression, no
+# parsing, index included; re-shipping the same segment is a no-op
+timberfs import /shipped/app-2026-07-09.log central-backing/hostA-app.log
+```
+
+That last one closes the shipping loop: `timberfs rotate` cuts old chunks
+into a segment on the producer, the segment's two files get shipped, and
+`timberfs import` merges them into a central archive at compressed-bytes
+cost — the shipping format *is* the storage format.
+
+Re-importing is idempotent: the target is its own checkpoint. Already
+imported bytes are verified against the source (all chunks, or
+first/middle/last with `--quick`), then only the growth is appended —
+an unchanged source is a no-op, a rotated/rewritten one is refused before
+anything is written. So a periodic `timberfs import` of a growing file
+is a safe, cheap catch-up (full verification of a multi-GB target runs
+in well under a second).
+
 The appender is also where **retention** lives, because it already owns
 the file: `--retain 30d` continuously drops data older than 30 days, and
 `--retain-size 200G` keeps the compressed on-disk size under a hard

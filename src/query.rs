@@ -95,11 +95,12 @@ fn backing_paths(input: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     Ok((trunk, rings))
 }
 
-/// Print the bytes written in [from, to]. Selection is at chunk
-/// granularity: every chunk whose write-time window overlaps the requested
-/// range is emitted in full. Chunks are appended in time order, so both
-/// bounds are found by binary search — the cost is independent of how much
-/// log lies outside the range.
+/// Print the bytes stamped inside [from, to]. Selection is at chunk
+/// granularity: every chunk whose time window overlaps the requested range
+/// is emitted in full, chosen by an interval-overlap scan of the index.
+/// (A scan, not a binary search: imported files carry logged timestamps
+/// whose windows are only mostly sorted. The index is 48 bytes per chunk,
+/// so scanning it is negligible next to decompressing one chunk.)
 pub fn cmd_query(file: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::Result<()> {
     let (trunk_path, rings_path) = backing_paths(file)?;
     let chunks = format::read_index(&rings_path)
@@ -110,15 +111,17 @@ pub fn cmd_query(file: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::R
         bail!("--from is after --to");
     }
 
-    let start = chunks.partition_point(|c| c.last_write_ms < from_ms);
-    let end = chunks.partition_point(|c| c.first_write_ms <= to_ms);
-    let selected: &[ChunkRecord] = &chunks[start..end.max(start)];
+    let selected: Vec<ChunkRecord> = chunks
+        .iter()
+        .filter(|c| c.last_write_ms >= from_ms && c.first_write_ms <= to_ms)
+        .copied()
+        .collect();
 
     let trunk = File::open(&trunk_path)?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut uncomp_total = 0u64;
-    for c in selected {
+    for c in &selected {
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
         let data = zstd::stream::decode_all(&comp[..])?;

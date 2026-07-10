@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 # (kernel 3.x) so this doesn't restrict where timberfs runs.
 fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
 libc = "0.2"
+regex = "1"
 zstd = "0.13"
 
 [profile.release]

@@ -138,9 +138,14 @@ pub fn cmd_rotate(
         _ => bail!("give a destination file, or --delete to drop the rotated data"),
     };
 
-    // Preview from the on-disk index (chunk-granular, like queries).
+    // Preview from the on-disk index (chunk-granular, like queries; a
+    // prefix scan, not a binary search — imported files' windows are only
+    // mostly sorted).
     let chunks = format::read_index(&rings)?;
-    let k = chunks.partition_point(|c| c.last_write_ms < cutoff_ms);
+    let k = chunks
+        .iter()
+        .take_while(|c| c.last_write_ms < cutoff_ms)
+        .count();
     println!(
         "cutoff {}: {} of {} chunk(s) written entirely before it ({} uncompressed)",
         fmt_ms(cutoff_ms),

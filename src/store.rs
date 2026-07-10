@@ -133,11 +133,21 @@ impl FileStore {
     }
 
     pub fn append(&mut self, data: &[u8], cfg: &Config) -> io::Result<()> {
-        let now = now_ms();
+        self.append_stamped(data, now_ms(), cfg)
+    }
+
+    /// Append with an explicit timestamp (`timberfs import`: the parsed
+    /// log-line time rather than the wall clock). The chunk window is the
+    /// min/max of the stamps it saw, so mildly out-of-order input simply
+    /// widens windows — it never loses data.
+    pub fn append_stamped(&mut self, data: &[u8], ts_ms: u64, cfg: &Config) -> io::Result<()> {
         if self.buffer.is_empty() {
-            self.buffer_first_ms = Some(now);
+            self.buffer_first_ms = Some(ts_ms);
+            self.buffer_last_ms = ts_ms;
+        } else {
+            self.buffer_first_ms = Some(self.buffer_first_ms.unwrap_or(ts_ms).min(ts_ms));
+            self.buffer_last_ms = self.buffer_last_ms.max(ts_ms);
         }
-        self.buffer_last_ms = now;
         self.buffer.extend_from_slice(data);
         if self.buffer.len() >= cfg.chunk_size {
             self.flush_chunk(cfg)?;
@@ -256,43 +266,60 @@ impl FileStore {
         self.buffer_first_ms.map(|t| now.saturating_sub(t))
     }
 
-    /// Number of leading chunks written entirely before the cutoff.
+    /// Number of leading chunks written entirely before the cutoff. An
+    /// explicit prefix scan, not a binary search: imported files carry
+    /// logged timestamps whose chunk windows are only mostly sorted.
     fn rotation_split(&self, cutoff_ms: u64) -> usize {
-        self.chunks.partition_point(|c| c.last_write_ms < cutoff_ms)
+        self.chunks
+            .iter()
+            .take_while(|c| c.last_write_ms < cutoff_ms)
+            .count()
     }
 
     fn has_buffer_before(&self, cutoff_ms: u64) -> bool {
         self.buffer_first_ms.map(|t| t < cutoff_ms).unwrap_or(false)
     }
 
-    /// Append rotated head chunks from another file: the compressed frames
-    /// are copied verbatim (no recompression) and the index records are
-    /// rebased into this file's offset space.
-    fn receive_rotated_head(
+    /// Append another timberfs file's chunks verbatim: the compressed
+    /// frames are copied as-is (no recompression) and the index records
+    /// are rebased into this file's offset space. Used by rotation and by
+    /// timberfs-to-timberfs import. The records must be one contiguous
+    /// run in their trunk; the time ordering of this file's index is
+    /// protected.
+    pub fn append_frames(
         &mut self,
-        src: &FileStore,
-        moved: &[ChunkRecord],
+        src_trunk: &File,
+        records: &[ChunkRecord],
         cfg: &Config,
     ) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
         self.flush_chunk(cfg)?;
         if let Some(last_ms) = self.last_write_ms() {
-            if last_ms > moved[0].first_write_ms {
+            if last_ms > records[0].first_write_ms {
                 return Err(invalid_input(
-                    "target already contains data newer than the rotated chunks \
+                    "target already contains data newer than the incoming chunks \
                      (would break the index time ordering)",
                 ));
             }
         }
         let uncomp_base = self.buffer_start;
         let comp_base = self.comp_size;
-        let total_comp = moved.last().unwrap().comp_end();
-        // The rotated chunks are the head of the source, so their frames
-        // are one contiguous run starting at offset 0.
-        copy_range(&src.trunk, 0, total_comp, &self.trunk, comp_base)?;
-        for c in moved {
+        let src_comp_start = records[0].comp_start;
+        let src_uncomp_start = records[0].uncomp_start;
+        let total_comp = records.last().unwrap().comp_end() - src_comp_start;
+        copy_range(
+            src_trunk,
+            src_comp_start,
+            total_comp,
+            &self.trunk,
+            comp_base,
+        )?;
+        for c in records {
             let rec = ChunkRecord {
-                uncomp_start: uncomp_base + c.uncomp_start,
-                comp_start: comp_base + c.comp_start,
+                uncomp_start: uncomp_base + (c.uncomp_start - src_uncomp_start),
+                comp_start: comp_base + (c.comp_start - src_comp_start),
                 ..*c
             };
             let off = RINGS_HEADER_LEN + (self.chunks.len() * RECORD_LEN) as u64;
@@ -300,7 +327,7 @@ impl FileStore {
             self.chunks.push(rec);
         }
         self.comp_size = comp_base + total_comp;
-        self.buffer_start = uncomp_base + moved.last().unwrap().uncomp_end();
+        self.buffer_start = uncomp_base + (records.last().unwrap().uncomp_end() - src_uncomp_start);
         self.cache = None;
         self.trunk.sync_all()?;
         self.rings.sync_all()?;
@@ -505,7 +532,7 @@ impl Store {
             // alongside an immutable borrow of the source.
             let mut tgt = self.files.remove(tname).unwrap();
             let src = self.files.get(source).unwrap();
-            let res = tgt.receive_rotated_head(src, &moved, &cfg);
+            let res = tgt.append_frames(&src.trunk, &moved, &cfg);
             self.files.insert(tname.to_string(), tgt);
             res?;
         }

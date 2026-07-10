@@ -196,6 +196,37 @@ retain_size_budget() {
         && timberfs query "$PIPE_BACKING/cap.log" | tail -1 | grep -qx 100000
 }
 
+import_historical_log() {
+    python3 -c "
+import datetime
+d = datetime.datetime(2026, 6, 3, 14, 0, 0)
+with open('/tmp/old.log', 'w') as f:
+    for i in range(5000):
+        ts = d + datetime.timedelta(seconds=i)
+        f.write(f'{ts.isoformat()} INFO event number {i}\n')
+"
+    # small chunks so the 83-minute file spans many windows, not one
+    timberfs import /tmp/old.log "$PIPE_BACKING/imported.log" --chunk-size 4096 \
+        && zstd -dc "$PIPE_BACKING/imported.log.trunk" | cmp - /tmp/old.log \
+        && timberfs query "$PIPE_BACKING/imported.log" \
+               --from "2026-06-03 14:30:00" --to "2026-06-03 14:31:00" \
+           | grep -q "event number 1800" \
+        && ! timberfs query "$PIPE_BACKING/imported.log" \
+               --from "2026-06-03 14:30:00" --to "2026-06-03 14:31:00" \
+           | grep -q "event number 3000"
+}
+
+import_resume_grown() {
+    # identical re-import: verified no-op
+    timberfs import /tmp/old.log "$PIPE_BACKING/imported.log" 2>&1 \
+        | grep -q "already up to date" || return 1
+    # grown source: only the delta is appended, byte-exact
+    echo "2026-06-03T15:30:00 INFO late event" >> /tmp/old.log
+    timberfs import /tmp/old.log "$PIPE_BACKING/imported.log" 2>&1 \
+        | grep -q "imported 1 lines" || return 1
+    zstd -dc "$PIPE_BACKING/imported.log.trunk" | cmp - /tmp/old.log
+}
+
 purge_package() {
     systemctl disable --now timberfs@test
     apt-get purge -y -qq timberfs
@@ -241,6 +272,33 @@ run_test "appender: file lock blocks rotate while live" appender_lock_blocks_rot
 run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
+import_segment_merge() {
+    # ship a rotated segment into an archive: verbatim merge, idempotent
+    timberfs rotate "$PIPE_BACKING/imported.log" seg-old.log \
+        --cutoff "2026-06-03 14:40:00" > /dev/null
+    timberfs import "$PIPE_BACKING/seg-old.log" "$PIPE_BACKING/archive.log" 2>&1 \
+        | grep -q "merged verbatim" || return 1
+    timberfs import "$PIPE_BACKING/seg-old.log" "$PIPE_BACKING/archive.log" 2>&1 \
+        | grep -q "already up to date" || return 1
+    timberfs query "$PIPE_BACKING/archive.log" --to "2026-06-03 14:10:00" \
+        | grep -q "event number 100"
+}
+
+import_leading_backfill() {
+    # a file starting mid-entry (rotation cut a stack trace): head lines
+    # are backfilled with the first timestamp found
+    printf '    at Frame.one\n    at Frame.two\n2026-06-02T08:00:00 INFO head test\n' \
+        > /tmp/headless.log
+    timberfs import /tmp/headless.log "$PIPE_BACKING/headless.log" 2>&1 \
+        | grep -q "(1 stamped, 2 inherited)" \
+        && timberfs query "$PIPE_BACKING/headless.log" --to "2026-06-02 08:00:00" \
+           | grep -q "Frame.one"
+}
+
+run_test "import: historical log queryable by logged time" import_historical_log
+run_test "import: mid-entry file head backfilled with first stamp" import_leading_backfill
+run_test "import: idempotent re-import and grown-source resume" import_resume_grown
+run_test "import: shipped segment merges verbatim, idempotently" import_segment_merge
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 
