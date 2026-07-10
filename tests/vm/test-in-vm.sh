@@ -312,7 +312,39 @@ export_bundle_roundtrip() {
 }
 
 run_test "import: shipped segment merges verbatim, idempotently" import_segment_merge
+grain_needle_search() {
+    python3 -c "
+import datetime
+d = datetime.datetime(2026, 6, 4, 9, 0, 0)
+with open('/tmp/haystack.log', 'w') as f:
+    for i in range(20000):
+        ts = (d + datetime.timedelta(seconds=i)).isoformat()
+        if i == 15000:
+            f.write(f'{ts} INFO request NEEDLE77AB31CD99 handled\n')
+        else:
+            f.write(f'{ts} INFO routine work {i}\n')
+"
+    timberfs import /tmp/haystack.log "$PIPE_BACKING/haystack.log" --chunk-size 4096 \
+        && timberfs reindex "$PIPE_BACKING/haystack.log" \
+        && [ -s "$PIPE_BACKING/haystack.log.grain" ] \
+        && timberfs query "$PIPE_BACKING/haystack.log" --has NEEDLE77AB31CD99 2>/tmp/sel.txt \
+           | grep -q "NEEDLE77AB31CD99" \
+        && SEL=$(grep -oE '^timberfs: [0-9]+' /tmp/sel.txt | grep -oE '[0-9]+') \
+        && [ "$SEL" -lt 20 ]
+}
+
 run_test "export: window to .timber bundle, import round trip" export_bundle_roundtrip
+grep_entry_aware() {
+    printf '2026-06-05T08:00:00 ERROR boom\n    at Frame.one\nCaused by: NEEDFRAME\n2026-06-05T08:00:01 INFO fine\n' > /tmp/entries.log
+    # stdin: matching a continuation line prints the whole 3-line entry
+    [ "$(timberfs grep NEEDFRAME < /tmp/entries.log | wc -l)" = 3 ] \
+        && [ "$(timberfs grep -c -v ERROR < /tmp/entries.log)" = 1 ] \
+        && timberfs grep NEEDLE77AB31CD99 "$PIPE_BACKING/haystack.log" \
+               --has NEEDLE77AB31CD99 | grep -q "NEEDLE77AB31CD99"
+}
+
+run_test "grain: reindex + --has finds a needle, skipping chunks" grain_needle_search
+run_test "grep: entry-aware matching, stdin and grain-accelerated source" grep_entry_aware
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 

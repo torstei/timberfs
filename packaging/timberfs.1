@@ -31,7 +31,15 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .IR TIME ]
 .I FILE
 .br
+.B timberfs grep
+.RI [ options ]
+.I PATTERN
+.RI [ FILE ]
+.br
 .B timberfs index
+.I FILE
+.br
+.B timberfs reindex
 .I FILE
 .br
 .B timberfs rotate
@@ -263,6 +271,25 @@ Start of the window (default: beginning of the file).
 .TP
 .BI \-\-to " TIME"
 End of the window (default: end of the file).
+.TP
+.BI \-\-has " TOKEN"
+Only chunks that (probably) contain
+.IR TOKEN ,
+tested against the
+.B .grain
+Bloom index (build it with
+.BR "timberfs reindex" ;
+without one, \-\-has warns and scans the window). Matching is by WHOLE
+token \(em ASCII-alphanumeric runs of 3\(en64 characters, exact case;
+substrings do not match. An argument containing separators
+.RB ( req\-8f3a )
+must match all its tokens in the same chunk; repeat
+.B \-\-has
+for chunk-level AND. About 1% of non-matching chunks pass anyway (Bloom
+false positives) \(em the exact, entry-level filtering belongs in
+.B timberfs grep
+downstream. The killer use: finding a unique identifier with NO time
+bound.
 .PP
 Selection is
 .B chunk-granular
@@ -273,12 +300,59 @@ slop at each edge. The intended workflow is to let
 do the coarse seek into a huge file, then trim exactly with
 .BR grep (1)
 on the timestamps the log lines carry anyway.
+.SS grep
+.B timberfs grep
+.I PATTERN
+.RI [ FILE ]
+is an entry-aware grep: a log ENTRY is a line carrying a timestamp plus
+all its continuation lines (stack traces, wrapped output), detected with
+the same timestamp auto-detection as
+.B import
+(and the same
+.BR \-\-timestamp\-regex / \-\-timestamp\-format
+escape hatch). The pattern \(em a regex, or a fixed string with
+.B \-F
+\(em is matched against the whole entry, and matching entries print
+whole; pipe several
+.B grep
+invocations for entry-level AND. Flags:
+.B \-i
+(case-insensitive),
+.B \-v
+(print non-matching entries),
+.B \-c
+(count matching entries).
+.PP
+Input is a raw log on standard input, a plain log file, or a timberfs
+log/bundle \(em in the timberfs case
+.BR \-\-from / \-\-to / \-\-has
+pre-select chunks first (time index and .grain Bloom filters), the
+selection is padded one chunk each way so entries straddling a boundary
+arrive whole, and the pattern then matches exactly:
+.PP
+.nf
+.RS
+timberfs grep req\-8f3a backing/app.log \-\-has req\-8f3a
+cat any.log | timberfs grep 'tenantId=FOO' | timberfs grep \-v DEBUG
+.RE
+.fi
 .SS index
 .B timberfs index
 .I FILE
 prints the chunk index of a backing file: per chunk the uncompressed
 offset and length, compressed length, compression ratio, and first/last
 write time, plus totals.
+.SS reindex
+.B timberfs reindex
+.I FILE
+builds (or rebuilds) the
+.B .grain
+token index for a log: one Bloom filter per chunk over every distinct
+token in it, ~10 bits per token, ~1% false positives \(em roughly 1\(en2%
+of the raw data size. Derived data under the sidecar contract: safe to
+delete, cheap to rebuild, and rotation/retention drop it (rebuild
+afterwards). A grain that lags a growing log is still correct \(em
+uncovered chunks are simply scanned.
 .SS rotate
 .B timberfs rotate \-\-cutoff
 .I TIME SOURCE

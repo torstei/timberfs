@@ -153,13 +153,70 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
     Ok(SourceHandle { records, file })
 }
 
+/// Window + --has chunk selection, shared by query and grep: an
+/// interval-overlap scan of the index, then the .grain Bloom pre-filter
+/// (every token of every --has argument must probably be in the chunk).
+/// Exact, entry-level filtering stays downstream.
+pub fn select_chunks(
+    file: &Path,
+    chunks: &[ChunkRecord],
+    from_ms: u64,
+    to_ms: u64,
+    has: &[String],
+) -> anyhow::Result<(Vec<(usize, ChunkRecord)>, usize)> {
+    let mut selected: Vec<(usize, ChunkRecord)> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.last_write_ms >= from_ms && c.first_write_ms <= to_ms)
+        .map(|(i, c)| (i, *c))
+        .collect();
+    let in_window = selected.len();
+
+    if !has.is_empty() {
+        let mut tokens: Vec<Vec<u8>> = Vec::new();
+        for h in has {
+            let t = crate::grain::tokenize_query(h);
+            if t.is_empty() {
+                bail!(
+                    "--has {h:?} contains no indexable tokens \
+                     (runs of 3-64 alphanumeric characters)"
+                );
+            }
+            tokens.extend(t);
+        }
+        let grain = if is_bundle(file) {
+            None
+        } else {
+            let (dir, base) = resolve_backing(file)?;
+            crate::grain::load(&crate::format::grain_path(&dir, &base)).ok()
+        };
+        match grain {
+            Some(g) => {
+                selected.retain(|(i, _)| g.may_contain_all(*i, &tokens));
+            }
+            None => {
+                eprintln!(
+                    "timberfs: no .grain index — --has cannot skip anything here \
+                     (run `timberfs reindex` on the log to build one); scanning the window"
+                );
+            }
+        }
+    }
+    Ok((selected, in_window))
+}
+
 /// Print the bytes stamped inside [from, to]. Selection is at chunk
 /// granularity: every chunk whose time window overlaps the requested range
 /// is emitted in full, chosen by an interval-overlap scan of the index.
 /// (A scan, not a binary search: imported files carry logged timestamps
 /// whose windows are only mostly sorted. The index is 48 bytes per chunk,
 /// so scanning it is negligible next to decompressing one chunk.)
-pub fn cmd_query(file: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::Result<()> {
+pub fn cmd_query(
+    file: &Path,
+    from: Option<&str>,
+    to: Option<&str>,
+    has: &[String],
+) -> anyhow::Result<()> {
     let source = open_source(file)?;
     let chunks = source.records;
     let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
@@ -168,17 +225,13 @@ pub fn cmd_query(file: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::R
         bail!("--from is after --to");
     }
 
-    let selected: Vec<ChunkRecord> = chunks
-        .iter()
-        .filter(|c| c.last_write_ms >= from_ms && c.first_write_ms <= to_ms)
-        .copied()
-        .collect();
+    let (selected, in_window) = select_chunks(file, &chunks, from_ms, to_ms, has)?;
 
     let trunk = source.file;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut uncomp_total = 0u64;
-    for c in &selected {
+    for (_, c) in &selected {
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
         let data = zstd::stream::decode_all(&comp[..])?;
@@ -187,9 +240,14 @@ pub fn cmd_query(file: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::R
     }
     out.flush()?;
     eprintln!(
-        "timberfs: {} of {} chunk(s), {} bytes (chunk granularity; unflushed tail not included)",
+        "timberfs: {} of {} chunk(s){}, {} bytes (chunk granularity; unflushed tail not included)",
         selected.len(),
         chunks.len(),
+        if has.is_empty() {
+            String::new()
+        } else {
+            format!(" ({in_window} in window before --has)")
+        },
         uncomp_total
     );
     Ok(())
