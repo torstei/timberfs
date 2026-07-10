@@ -1,0 +1,79 @@
+name: apt-repo
+
+# Rebuilds the apt repository at https://torstei.github.io/timberfs from
+# scratch and deploys it to GitHub Pages. The repo is a pure function of
+# the GitHub releases: every released versioned .deb goes into the pool,
+# apt-ftparchive generates the metadata, and the Release file is signed
+# with the key in the APT_SIGNING_KEY secret (public half:
+# packaging/apt/timberfs-archive-keyring.gpg, served as /key.gpg).
+#
+# Runs after every release (called from release.yml) and on manual
+# dispatch (e.g. to rebuild after deleting a release).
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download every released versioned .deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/pool/main
+          for tag in $(gh release list --json tagName -q '.[].tagName'); do
+            gh release download "$tag" --pattern 'timberfs_*-*_amd64.deb' \
+              --dir site/pool/main
+          done
+          ls -l site/pool/main
+
+      - name: Import the signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: echo "$APT_SIGNING_KEY" | gpg --batch --import
+
+      - name: Generate and sign the repository metadata
+        run: |
+          cd site
+          mkdir -p dists/stable/main/binary-amd64
+          apt-ftparchive --arch amd64 packages pool \
+            > dists/stable/main/binary-amd64/Packages
+          gzip -k -9 dists/stable/main/binary-amd64/Packages
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=timberfs \
+            -o APT::FTPArchive::Release::Label=timberfs \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures=amd64 \
+            -o APT::FTPArchive::Release::Components=main \
+            release dists/stable > Release.tmp
+          mv Release.tmp dists/stable/Release
+          gpg --batch --yes --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes -abs -o dists/stable/Release.gpg dists/stable/Release
+
+      - name: Add the public key and landing page
+        run: |
+          cp packaging/apt/timberfs-archive-keyring.gpg site/key.gpg
+          cp packaging/apt/index.html site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4

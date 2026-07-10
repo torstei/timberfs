@@ -249,18 +249,31 @@ blooms second.
 
 ## Install
 
-Debian/Ubuntu, from the latest GitHub release (the `.deb` is built, tested
-in a VM, and provenance-attested by CI):
+Debian/Ubuntu, from the apt repository (rebuilt by CI from the GitHub
+releases on every release, GPG-signed, `apt upgrade` works):
+
+```sh
+sudo curl -fsSL https://torstei.github.io/timberfs/key.gpg \
+     -o /usr/share/keyrings/timberfs.gpg
+
+sudo tee /etc/apt/sources.list.d/timberfs.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://torstei.github.io/timberfs
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/timberfs.gpg
+EOF
+
+sudo apt update && sudo apt install timberfs
+```
+
+Or grab a single `.deb` from the latest GitHub release (built, VM-tested
+and provenance-attested by CI — verify with
+`gh attestation verify timberfs_amd64.deb --repo torstei/timberfs`):
 
 ```sh
 curl -LO https://github.com/torstei/timberfs/releases/latest/download/timberfs_amd64.deb
 sudo apt install ./timberfs_amd64.deb
-```
-
-Optionally verify the artifact really came from this repo's CI:
-
-```sh
-gh attestation verify timberfs_amd64.deb --repo torstei/timberfs
 ```
 
 Or from crates.io with a Rust toolchain: `cargo install timberfs`.
