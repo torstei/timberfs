@@ -1,0 +1,103 @@
+name: Release
+
+# Tag-driven releases: push a tag `vX.Y.Z` (matching the Cargo.toml
+# version) and this builds the .deb, re-runs the full VM package suite
+# against that exact artifact, attests its build provenance, creates the
+# GitHub release with generated notes, and publishes to crates.io.
+#
+# crates.io publishing uses Trusted Publishing (OIDC) — no stored secret.
+# One-time setup on crates.io: the timberfs crate -> Settings -> Trusted
+# Publishing -> GitHub, repository torstei/timberfs, workflow release.yml.
+# Until that's configured, the publish step skips with a note.
+#
+# The .deb is attached twice: with its versioned name, and as the stable
+# `timberfs_amd64.deb` so
+#   curl -LO https://github.com/torstei/timberfs/releases/latest/download/timberfs_amd64.deb
+# always fetches the newest release. Verify a download with:
+#   gh attestation verify timberfs_amd64.deb --repo torstei/timberfs
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches the Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$TAG" != "$VER" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VER}" >&2
+            exit 1
+          fi
+
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install QEMU and ISO tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache Debian cloud base image
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/timberfs-vm-tests
+          key: debian-13-genericcloud-amd64
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build the .deb
+        run: cargo deb
+
+      - name: Test the exact release artifact in a VM
+        run: tests/vm/run-vm-test.sh
+
+      - name: Stage release assets
+        run: |
+          mkdir -p dist
+          cp target/debian/timberfs_*_amd64.deb dist/
+          cp target/debian/timberfs_*_amd64.deb dist/timberfs_amd64.deb
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+
+      - name: Get a crates.io token via Trusted Publishing (OIDC)
+        id: crates_auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io (skipped when Trusted Publishing is not configured)
+        if: steps.crates_auth.outcome == 'success'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
+        run: cargo publish

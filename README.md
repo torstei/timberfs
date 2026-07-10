@@ -247,6 +247,24 @@ it unnecessary, and the on-disk format stays `RING0001`.
 Build order when this happens: logged-timestamp zone map first, token
 blooms second.
 
+## Install
+
+Debian/Ubuntu, from the latest GitHub release (the `.deb` is built, tested
+in a VM, and provenance-attested by CI):
+
+```sh
+curl -LO https://github.com/torstei/timberfs/releases/latest/download/timberfs_amd64.deb
+sudo apt install ./timberfs_amd64.deb
+```
+
+Optionally verify the artifact really came from this repo's CI:
+
+```sh
+gh attestation verify timberfs_amd64.deb --repo torstei/timberfs
+```
+
+Or from crates.io with a Rust toolchain: `cargo install timberfs`.
+
 ## Build
 
 Needs the Rust toolchain and a C compiler (for the vendored zstd), plus
