@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>timberfs apt repository</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
+  pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; border-radius: 6px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #111; color: #ddd; }
+    pre { background: #222; }
+    a { color: #8cf; }
+  }
+</style>
+</head>
+<body>
+<h1>timberfs apt repository</h1>
+<p><a href="https://github.com/torstei/timberfs">timberfs</a> — an
+append-only, transparently compressed, write-time-indexed filesystem for
+log files.</p>
+<p>Add the repository and install (Debian/Ubuntu):</p>
+<pre>sudo curl -fsSL https://torstei.github.io/timberfs/key.gpg \
+     -o /usr/share/keyrings/timberfs.gpg
+
+sudo tee /etc/apt/sources.list.d/timberfs.sources &gt;/dev/null &lt;&lt;'EOF'
+Types: deb
+URIs: https://torstei.github.io/timberfs
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/timberfs.gpg
+EOF
+
+sudo apt update &amp;&amp; sudo apt install timberfs</pre>
+<p>Signing key fingerprint:
+<code>B07E E67A AABF 0C6D 2674 79DD 66C1 43E8 8913 4319</code></p>
+<p>This repository is rebuilt from the
+<a href="https://github.com/torstei/timberfs/releases">GitHub releases</a>
+by CI on every release; the .debs carry
+<a href="https://github.com/torstei/timberfs/attestations">build provenance
+attestations</a>.</p>
+</body>
+</html>
