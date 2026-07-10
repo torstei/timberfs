@@ -11,6 +11,11 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .RI [ options ]
 .I FILE
 .br
+.B timberfs import
+.RI [ options ]
+.IR SOURCE .\|.\|.
+.I DEST
+.br
 .B timberfs query
 .RB [ \-\-from
 .IR TIME ]
@@ -136,10 +141,69 @@ data, so enforcement is batched: age-expired data is dropped once it makes
 up about a tenth of the file, and a size overrun is trimmed down to 95% of
 the budget. Compaction briefly needs free disk space proportional to the
 retained data.
+.SS import
+.B timberfs import
+.IR SOURCE .\|.\|.
+.I DEST
+converts existing plain log files into a timberfs log (the destination is
+the LAST argument). Several sources \(em a rotated set \(em may be given
+in any order: each file's first parsed timestamp determines the stitch
+order (rotation numbering and glob order lie), the plan is printed before
+anything is written, and stitching plain files requires an empty
+destination. Two sources starting at the same timestamp are refused as
+likely duplicates.
+.PP
+A source that is itself a timberfs log \(em a rotation segment shipped
+from another machine, say \(em is detected automatically (a
+.BR .trunk / .rings
+path, or a logical name whose pair exists) and its chunks are merged
+.B verbatim
+into the destination: no decompression, no timestamp parsing, index
+included, cost proportional to the compressed size. A segment whose exact
+chunks are already in the destination is skipped, so re-running a
+shipping script is a no-op; merging refuses to break the destination's
+time ordering (import segments oldest-first). Plain and timberfs sources
+can be stitched together. Chunk time
+windows come from timestamps
+.B parsed from the log lines
+(historical data's write time is meaningless), so
+.B query
+works by the times the log actually talks about. Auto-detected timestamps
+must sit at the start of the line: RFC 3339 / ISO 8601 and common
+variants (space instead of
+.BR T ,
+dotted dates, and
+.BR . / , / :
+before the milliseconds \(em logback's
+.B yyyy.MM.dd HH:mm:ss:SSS
+included) and leading epoch seconds/milliseconds; Apache/CLF
+.RB ( [10/Jul/2026:09:23:45\ +0200] )
+is the one mid-line exception. Anything else via
+.B \-\-timestamp\-regex
+(one capture group, searched \(em anchor with
+.B ^
+if wanted) plus
+.B \-\-timestamp\-format
+(chrono strftime). Zoneless timestamps are taken as local time unless
+.BR \-\-utc .
+Lines without a timestamp (stack traces, continuations) inherit the
+previous line's, so multiline entries land in the right window. Mildly
+out-of-order lines widen chunk windows instead of getting lost. Accepts
+.B \-\-chunk\-size
+and
+.BR \-\-level .
+.PP
+Re-importing is idempotent: a non-empty destination is treated as a
+checkpoint. The already-imported bytes are verified against the same
+source ranges (every chunk, or first/middle/last with
+.BR \-\-quick ),
+then only what the source has grown by is appended; an identical source
+is a no-op, and a source that shrank or changed is refused before
+anything is written (rotated files should be imported to a new target).
 .SS query
 .B timberfs query
 .I FILE
-prints the bytes written inside the given time window to standard output,
+prints the bytes stamped inside the given time window to standard output,
 reading the backing files directly \(em it works with or without an active
 mount, but only sees flushed chunks (the still-buffered tail, at most
 flush-age old, is visible only through the mount).
