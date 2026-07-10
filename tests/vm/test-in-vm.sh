@@ -284,7 +284,19 @@ import_segment_merge() {
         | grep -q "event number 100"
 }
 
+import_leading_backfill() {
+    # a file starting mid-entry (rotation cut a stack trace): head lines
+    # are backfilled with the first timestamp found
+    printf '    at Frame.one\n    at Frame.two\n2026-06-02T08:00:00 INFO head test\n' \
+        > /tmp/headless.log
+    timberfs import /tmp/headless.log "$PIPE_BACKING/headless.log" 2>&1 \
+        | grep -q "(1 stamped, 2 inherited)" \
+        && timberfs query "$PIPE_BACKING/headless.log" --to "2026-06-02 08:00:00" \
+           | grep -q "Frame.one"
+}
+
 run_test "import: historical log queryable by logged time" import_historical_log
+run_test "import: mid-entry file head backfilled with first stamp" import_leading_backfill
 run_test "import: idempotent re-import and grown-source resume" import_resume_grown
 run_test "import: shipped segment merges verbatim, idempotently" import_segment_merge
 run_test "apt-get purge removes package" purge_package

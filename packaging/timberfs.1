@@ -187,8 +187,11 @@ if wanted) plus
 (chrono strftime). Zoneless timestamps are taken as local time unless
 .BR \-\-utc .
 Lines without a timestamp (stack traces, continuations) inherit the
-previous line's, so multiline entries land in the right window. Mildly
-out-of-order lines widen chunk windows instead of getting lost. Accepts
+previous line's, so multiline entries land in the right window; a file
+that STARTS mid-entry backfills its head lines with the first timestamp
+found, and in a stitch they inherit the previous file's last stamp \(em
+exactly right for entries split by rotation. Mildly out-of-order lines
+widen chunk windows instead of getting lost. Accepts
 .B \-\-chunk\-size
 and
 .BR \-\-level .
