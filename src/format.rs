@@ -97,13 +97,18 @@ pub fn read_index_file(f: &File) -> io::Result<Vec<ChunkRecord>> {
     let len = f.metadata()?.len() as usize;
     let mut buf = vec![0u8; len];
     f.read_exact_at(&mut buf, 0)?;
-    if len < RINGS_HEADER_LEN as usize || &buf[..8] != RINGS_MAGIC {
+    parse_index_bytes(&buf)
+}
+
+/// Parse rings content wherever it came from (a file, a bundle member).
+pub fn parse_index_bytes(buf: &[u8]) -> io::Result<Vec<ChunkRecord>> {
+    if buf.len() < RINGS_HEADER_LEN as usize || &buf[..8] != RINGS_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "not a timberfs index file (bad magic)",
+            "not a timberfs index (bad magic)",
         ));
     }
-    let n = (len - RINGS_HEADER_LEN as usize) / RECORD_LEN;
+    let n = (buf.len() - RINGS_HEADER_LEN as usize) / RECORD_LEN;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let off = RINGS_HEADER_LEN as usize + i * RECORD_LEN;

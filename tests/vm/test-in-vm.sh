@@ -298,7 +298,21 @@ import_leading_backfill() {
 run_test "import: historical log queryable by logged time" import_historical_log
 run_test "import: mid-entry file head backfilled with first stamp" import_leading_backfill
 run_test "import: idempotent re-import and grown-source resume" import_resume_grown
+export_bundle_roundtrip() {
+    # export a window as a .timber bundle, query it in place, import it
+    # elsewhere, compare (archive.log holds the pre-14:40 chunks, which
+    # the segment-merge test rotated out of imported.log)
+    timberfs export "$PIPE_BACKING/archive.log" /tmp/win.timber \
+        --from "2026-06-03 14:30:00" --to "2026-06-03 14:35:00" \
+        && timberfs query /tmp/win.timber | grep -q "event number 1900" \
+        && timberfs import /tmp/win.timber "$PIPE_BACKING/from-bundle.log" 2>&1 \
+           | grep -q "merged verbatim" \
+        && timberfs query "$PIPE_BACKING/from-bundle.log" | grep -q "event number 1900" \
+        && tar tf /tmp/win.timber | head -1 | grep -q ".rings"
+}
+
 run_test "import: shipped segment merges verbatim, idempotently" import_segment_merge
+run_test "export: window to .timber bundle, import round trip" export_bundle_roundtrip
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 

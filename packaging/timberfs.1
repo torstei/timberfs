@@ -16,6 +16,14 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .IR SOURCE .\|.\|.
 .I DEST
 .br
+.B timberfs export
+.RB [ \-\-from
+.IR TIME ]
+.RB [ \-\-to
+.IR TIME ]
+.I SOURCE
+.I DEST
+.br
 .B timberfs query
 .RB [ \-\-from
 .IR TIME ]
@@ -203,6 +211,39 @@ source ranges (every chunk, or first/middle/last with
 then only what the source has grown by is appended; an identical source
 is a no-op, and a source that shrank or changed is refused before
 anything is written (rotated files should be imported to a new target).
+.SS export
+.B timberfs export
+.I SOURCE DEST
+copies the chunks overlapping the given window (default: everything) into
+a NEW timberfs log \(em verbatim, no recompression, cost proportional to
+the compressed size of the window. The source needs no lock and may be
+live. A
+.I DEST
+ending in
+.B .timber
+writes the single-file transfer bundle instead: a plain uncompressed tar
+(the payload is already zstd) holding the
+.B .rings
+member first and the
+.B .trunk
+member second.
+Bundles are first-class READ-ONLY logs:
+.BR query ,
+.B index
+and
+.B export
+operate on a
+.B .timber
+file directly (tar stores its members contiguously and uncompressed, so
+the trunk member is simply a trunk at an offset), and
+.B import
+merges them — unpacking is only ever needed to append. Stock tools always
+suffice to recover one:
+.B tar xf x.timber && zstd \-dc x.trunk
+(a pair tarred by hand follows the same convention). Export always
+creates; merging into an existing log is
+.BR import 's
+job.
 .SS query
 .B timberfs query
 .I FILE

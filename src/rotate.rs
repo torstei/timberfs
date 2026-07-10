@@ -124,6 +124,14 @@ pub fn cmd_rotate(
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let cutoff_ms = parse_time(cutoff)?;
+    if crate::query::is_bundle(source) {
+        bail!(
+            "{} is a .timber transfer bundle — bundles are read-only \
+             (query/index/export work directly on them); import it into a \
+             log to write",
+            source.display()
+        );
+    }
     let (dir, src_name) = resolve_backing(source)?;
     let rings = format::rings_path(&dir, &src_name);
     if !rings.exists() {
