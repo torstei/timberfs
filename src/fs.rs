@@ -26,9 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::consts::FOPEN_DIRECT_IO;
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
-    Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
 use crate::query::fmt_ms_rfc3339;
@@ -469,11 +468,25 @@ impl Filesystem for TimberFs {
         }
     }
 
-    fn flush(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
         self.flush_file(ino, false, reply);
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         self.flush_file(ino, true, reply);
     }
 
@@ -576,7 +589,10 @@ impl Filesystem for TimberFs {
             reply.error(libc::ENOTSUP);
             return;
         }
-        let req = match std::str::from_utf8(value).ok().and_then(parse_rotate_request) {
+        let req = match std::str::from_utf8(value)
+            .ok()
+            .and_then(parse_rotate_request)
+        {
             Some(r) => r,
             None => {
                 eprintln!("timberfs: {fname}: malformed rotate request");
@@ -584,11 +600,11 @@ impl Filesystem for TimberFs {
                 return;
             }
         };
-        let res = self
-            .store
-            .lock()
-            .unwrap()
-            .rotate_head(&fname, req.target.as_deref(), req.cutoff_ms);
+        let res =
+            self.store
+                .lock()
+                .unwrap()
+                .rotate_head(&fname, req.target.as_deref(), req.cutoff_ms);
         match res {
             Ok(stats) => {
                 if let Some(t) = &req.target {
@@ -706,19 +722,41 @@ impl Filesystem for TimberFs {
 pub fn mount(store: Store, mountpoint: &Path, allow_other: bool) -> anyhow::Result<()> {
     let mountpoint = std::fs::canonicalize(mountpoint)?;
     let mountpoint = mountpoint.as_path();
-    // Claim exclusive ownership of the backing dir and advertise our
-    // mountpoint so `timberfs rotate` can route requests through the mount.
-    let lock = match crate::store::try_lock_backing(&store.dir)? {
+    // Claim the backing dir exclusively (a mount owns in-memory state for
+    // every file in it) and advertise our mountpoint so `timberfs rotate`
+    // can route requests through the mount.
+    let lock = match crate::store::lock_backing_exclusive(&store.dir)? {
         Some(f) => f,
-        None => anyhow::bail!(
-            "backing directory {} is already served by another timberfs daemon{}",
-            store.dir.display(),
-            crate::store::read_lock_mountpoint(&store.dir)
-                .map(|m| format!(" (mounted on {})", m.display()))
-                .unwrap_or_default()
-        ),
+        None => {
+            let appenders = crate::store::active_file_locks(&store.dir);
+            if appenders.is_empty() {
+                anyhow::bail!(
+                    "backing directory {} is already in use by another timberfs process{}",
+                    store.dir.display(),
+                    crate::store::read_lock_raw(&store.dir)
+                        .map(|s| format!(
+                            " ({})",
+                            s.split_whitespace().collect::<Vec<_>>().join(", ")
+                        ))
+                        .unwrap_or_default()
+                );
+            } else {
+                anyhow::bail!(
+                    "backing directory {} has active appender(s) on: {} — stop them before mounting",
+                    store.dir.display(),
+                    appenders.join(", ")
+                );
+            }
+        }
     };
-    crate::store::write_lock_info(&lock, mountpoint)?;
+    crate::store::write_lock_info(
+        &lock,
+        &format!(
+            "mountpoint={}\npid={}\n",
+            mountpoint.display(),
+            std::process::id()
+        ),
+    )?;
     let _lock = lock; // hold the flock until we return
 
     let store = Arc::new(Mutex::new(store));

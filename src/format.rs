@@ -61,7 +61,7 @@ impl ChunkRecord {
         self.comp_start + self.comp_len
     }
 
-    pub fn to_bytes(&self) -> [u8; RECORD_LEN] {
+    pub fn to_bytes(self) -> [u8; RECORD_LEN] {
         let mut b = [0u8; RECORD_LEN];
         b[0..8].copy_from_slice(&self.uncomp_start.to_le_bytes());
         b[8..16].copy_from_slice(&self.uncomp_len.to_le_bytes());

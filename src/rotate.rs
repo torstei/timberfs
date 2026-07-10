@@ -75,8 +75,8 @@ fn resolve_dest(dir: &Path, dest: &str, src_name: &str) -> anyhow::Result<String
         .unwrap_or(fname);
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() {
-            let dir_c = fs::canonicalize(dir)
-                .with_context(|| format!("backing dir {}", dir.display()))?;
+            let dir_c =
+                fs::canonicalize(dir).with_context(|| format!("backing dir {}", dir.display()))?;
             let par_c = fs::canonicalize(parent)
                 .with_context(|| format!("destination dir {}", parent.display()))?;
             if par_c != dir_c {
@@ -149,13 +149,25 @@ pub fn cmd_rotate(
         human_bytes(chunks[..k].iter().map(|c| c.uncomp_len).sum::<u64>())
     );
     if dry_run {
-        println!("dry run: nothing changed (a live mount may also flush buffered data at rotation time)");
+        println!(
+            "dry run: nothing changed (a live mount may also flush buffered data at rotation time)"
+        );
         return Ok(());
     }
 
-    match store::try_lock_backing(&dir)? {
-        Some(_guard) => {
-            // Offline: we hold the lock, so no daemon can start mid-rewrite.
+    match store::lock_backing_shared(&dir)? {
+        Some(_dir_guard) => {
+            // No mount daemon. Take the per-file writer locks: the source
+            // (and destination, which may belong to a live appender too).
+            let _src_lock = store::lock_file_exclusive(&dir, &src_name)?.with_context(|| {
+                format!("{src_name} has an active writer (appender?); stop it and retry")
+            })?;
+            let _dst_lock = match &target_name {
+                Some(t) => Some(store::lock_file_exclusive(&dir, t)?.with_context(|| {
+                    format!("{t} has an active writer (appender?); stop it and retry")
+                })?),
+                None => None,
+            };
             let cfg = Config {
                 chunk_size: 256 * 1024,
                 level: 3,
@@ -171,20 +183,30 @@ pub fn cmd_rotate(
             report(&stats, target_name.as_deref());
         }
         None => {
-            let mp = store::read_lock_mountpoint(&dir).context(
-                "backing dir is locked by a daemon but the lock file names no mountpoint",
-            )?;
+            let Some(mp) = store::read_lock_mountpoint(&dir) else {
+                let holder = store::read_lock_raw(&dir)
+                    .map(|s| s.split_whitespace().collect::<Vec<_>>().join(", "))
+                    .unwrap_or_else(|| "unknown holder".to_string());
+                bail!(
+                    "backing directory is locked by another timberfs process ({holder}); \
+                     stop it and retry"
+                );
+            };
             let value = match &target_name {
                 Some(t) => format!("cutoff={cutoff_ms};target={t}"),
                 None => format!("cutoff={cutoff_ms};delete"),
             };
-            setxattr(&mp.join(&src_name), "user.timberfs.rotate", value.as_bytes())
-                .with_context(|| {
-                    format!(
-                        "rotate request via live mount {} failed (see the timberfs daemon's stderr)",
-                        mp.display()
-                    )
-                })?;
+            setxattr(
+                &mp.join(&src_name),
+                "user.timberfs.rotate",
+                value.as_bytes(),
+            )
+            .with_context(|| {
+                format!(
+                    "rotate request via live mount {} failed (see the timberfs daemon's stderr)",
+                    mp.display()
+                )
+            })?;
             println!("rotated through the live mount on {}", mp.display());
             let after = format::read_index(&rings)?;
             println!("  source keeps {} chunk(s)", after.len());
