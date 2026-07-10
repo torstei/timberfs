@@ -112,6 +112,11 @@ timberfs query logs-backing/app.log --from "2026-07-09 13:42:00" --to "2026-07-0
 timberfs grep ERROR logs-backing/app.log --from 13:42 --to 13:43
 cat any.log | timberfs grep 'tenantId=FOO' | timberfs grep -v DEBUG
 
+# the fleet view: store one log per host/app, merge at READ time —
+# chunks interleave by time across files, lines carry "path:" prefixes
+timberfs query --from 13:42 --to 13:43 collector/host*-app.log
+timberfs grep req-8f3a collector/*.log --has req-8f3a   # which hosts saw it?
+
 # inspect the chunk index (offsets, compression ratio, time windows)
 timberfs index logs-backing/app.log
 

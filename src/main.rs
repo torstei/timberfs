@@ -125,8 +125,10 @@ enum Command {
     /// Print the bytes written between --from and --to, reading the backing
     /// files directly (works with or without an active mount)
     Query {
-        /// Backing file: logical name, .trunk or .rings path
-        file: PathBuf,
+        /// Backing file(s) or .timber bundle(s); several are interleaved
+        /// by chunk time-windows with grep-style "path:" line prefixes
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
         /// Start of the time window (RFC3339, 'YYYY-MM-DD HH:MM:SS',
         /// 'HH:MM[:SS]' = today, or unix seconds); default: beginning
         #[arg(long)]
@@ -139,6 +141,9 @@ enum Command {
         /// an argument with separators must match all its tokens
         #[arg(long)]
         has: Vec<String>,
+        /// Never prefix output lines with the file name
+        #[arg(long)]
+        no_filename: bool,
     },
     /// Entry-aware grep: matches PATTERN against whole log entries (a
     /// timestamped line plus its continuation lines — stack traces stay
@@ -148,9 +153,10 @@ enum Command {
     Grep {
         /// Regex to match against each entry (-F for a fixed string)
         pattern: String,
-        /// Raw log file, timberfs backing file, or .timber bundle
-        /// (default: raw log on stdin)
-        file: Option<PathBuf>,
+        /// Raw log file(s), timberfs backing file(s), or .timber
+        /// bundle(s), processed in order with "path:" prefixes when
+        /// several (default: raw log on stdin)
+        files: Vec<PathBuf>,
         /// Case-insensitive matching
         #[arg(short = 'i', long)]
         ignore_case: bool,
@@ -172,6 +178,9 @@ enum Command {
         /// .grain chunk pre-filter (timberfs sources only); repeatable
         #[arg(long)]
         has: Vec<String>,
+        /// Never prefix output lines with the file name
+        #[arg(long)]
+        no_filename: bool,
         /// Custom entry-boundary timestamp: regex with one capture group
         #[arg(long, requires = "timestamp_format")]
         timestamp_regex: Option<String>,
@@ -217,6 +226,11 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Die quietly when a pipe closes (query | head), like any Unix tool,
+    // instead of Rust's default panic-on-EPIPE.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Mount {
@@ -293,16 +307,17 @@ fn main() -> anyhow::Result<()> {
             export::cmd_export(&source, &dest, from.as_deref(), to.as_deref())?;
         }
         Command::Query {
-            file,
+            files,
             from,
             to,
             has,
+            no_filename,
         } => {
-            query::cmd_query(&file, from.as_deref(), to.as_deref(), &has)?;
+            query::cmd_query(&files, from.as_deref(), to.as_deref(), &has, no_filename)?;
         }
         Command::Grep {
             pattern,
-            file,
+            files,
             ignore_case,
             invert,
             fixed,
@@ -310,12 +325,13 @@ fn main() -> anyhow::Result<()> {
             from,
             to,
             has,
+            no_filename,
             timestamp_regex,
             timestamp_format,
         } => {
             grep::cmd_grep(
                 &pattern,
-                file.as_deref(),
+                &files,
                 from.as_deref(),
                 to.as_deref(),
                 &has,
@@ -323,6 +339,7 @@ fn main() -> anyhow::Result<()> {
                 invert,
                 fixed,
                 count,
+                no_filename,
                 timestamp_regex.as_deref(),
                 timestamp_format.as_deref(),
             )?;

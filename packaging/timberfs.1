@@ -29,12 +29,12 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .IR TIME ]
 .RB [ \-\-to
 .IR TIME ]
-.I FILE
+.IR FILE .\|.\|.
 .br
 .B timberfs grep
 .RI [ options ]
 .I PATTERN
-.RI [ FILE ]
+.RI [ FILE .\|.\|.]
 .br
 .B timberfs index
 .I FILE
@@ -291,6 +291,18 @@ false positives) \(em the exact, entry-level filtering belongs in
 downstream. The killer use: finding a unique identifier with NO time
 bound.
 .PP
+Several
+.I FILE
+arguments give the fleet view over per-stream logs: chunks are selected
+per file (each file's own rings and grain) and interleaved across files
+by their time windows, with within-file order preserved; every output
+line carries a grep-style
+.RB \(lq path: \(rq
+prefix
+.RB ( \-\-no\-filename
+to suppress). Attribution lives in the filename \(em store one log per
+host/app and merge at read time.
+.PP
 Selection is
 .B chunk-granular
 by design: every chunk whose write-time window overlaps the requested
@@ -334,8 +346,16 @@ arrive whole, and the pattern then matches exactly:
 .RS
 timberfs grep req\-8f3a backing/app.log \-\-has req\-8f3a
 cat any.log | timberfs grep 'tenantId=FOO' | timberfs grep \-v DEBUG
+timberfs grep req\-8f3a collector/*.log \-\-has req\-8f3a
 .RE
 .fi
+.PP
+Several files process in argument order with grep-style
+.RB \(lq path: \(rq
+line prefixes
+.RB ( \-\-no\-filename
+to suppress) and per-file counts under
+.BR \-c .
 .SS index
 .B timberfs index
 .I FILE
