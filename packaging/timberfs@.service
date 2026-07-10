@@ -1,0 +1,31 @@
+# Systemd template unit for a timberfs mount.
+#
+# Each instance reads /etc/timberfs/<instance>.conf, which must define
+# BACKING and MOUNTPOINT (and may define EXTRA_OPTS). Example:
+#
+#   /etc/timberfs/applogs.conf:
+#     BACKING=/var/log/timberfs-backing/applogs
+#     MOUNTPOINT=/var/log/apps
+#     EXTRA_OPTS=--allow-other
+#
+#   systemctl enable --now timberfs@applogs
+#
+# Stopping the unit unmounts first (ExecStop), which makes the daemon flush
+# all buffers and exit cleanly.
+
+[Unit]
+Description=timberfs compressed log filesystem (%i)
+Documentation=https://github.com/torstei/timberfs
+After=local-fs.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/timberfs/%i.conf
+ExecStartPre=/usr/bin/mkdir -p ${BACKING} ${MOUNTPOINT}
+ExecStart=/usr/bin/timberfs mount ${BACKING} ${MOUNTPOINT} $EXTRA_OPTS
+ExecStop=/usr/bin/fusermount3 -u ${MOUNTPOINT}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

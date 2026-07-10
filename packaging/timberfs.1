@@ -1,0 +1,326 @@
+.TH TIMBERFS 1 "2026-07-10" "timberfs 0.1.0" "User Commands"
+.SH NAME
+timberfs \- append-only, transparently compressed, write-time-indexed filesystem for log files
+.SH SYNOPSIS
+.B timberfs mount
+.RI [ options ]
+.I BACKING
+.I MOUNTPOINT
+.br
+.B timberfs append
+.RI [ options ]
+.I FILE
+.br
+.B timberfs query
+.RB [ \-\-from
+.IR TIME ]
+.RB [ \-\-to
+.IR TIME ]
+.I FILE
+.br
+.B timberfs index
+.I FILE
+.br
+.B timberfs rotate
+.B \-\-cutoff
+.I TIME
+.I SOURCE
+.RI [ DEST ]
+.RB [ \-\-delete ]
+.RB [ \-\-dry\-run ]
+.SH DESCRIPTION
+.B timberfs
+is a FUSE filesystem purpose-built for log files. Files in the mount look
+and behave like ordinary log files \(em loggers append,
+.BR tail (1)
+and
+.BR grep (1)
+work unmodified \(em but the data is stored in a backing directory as
+chunks compressed with zstd, together with a per-chunk
+.B write-time index
+that records when each chunk was written. Asking \(lqwhat was written
+between 13:42 and 13:43?\(rq is a binary search plus a few frame
+decompressions, independent of file size.
+.PP
+Files are append-only: writes anywhere but the end of the file fail with
+.BR EPERM .
+Truncating a file to zero is allowed and starts it over
+(copytruncate-style rotation); rename and unlink work normally.
+.B ls \-l
+shows the logical (uncompressed) size while
+.B du
+shows the real, compressed disk usage.
+.SH SUBCOMMANDS
+.SS mount
+.B timberfs mount
+.I BACKING MOUNTPOINT
+serves the logical view of backing directory
+.I BACKING
+on
+.IR MOUNTPOINT ,
+in the foreground. Unmount with
+.B fusermount3 \-u
+.IR MOUNTPOINT .
+.TP
+.BI \-\-chunk\-size " BYTES"
+Uncompressed buffer size that triggers a chunk flush (default 262144).
+.TP
+.BI \-\-level " N"
+zstd compression level (default 3).
+.TP
+.BI \-\-flush\-age " SECONDS"
+Maximum time appended data may sit unflushed (default 5). Bounds both the
+time granularity of the index and the data lost in a crash without
+.BR fsync (2).
+.TP
+.B \-\-allow\-other
+Let other users access the mount. Unprivileged users need
+.B user_allow_other
+in
+.IR /etc/fuse.conf ;
+root (e.g. the systemd unit) does not.
+.SS append
+.B timberfs append
+.I FILE
+reads standard input and appends it to a log in the backing store directly,
+with no FUSE mount involved \(em the
+.BR svlogd (8)/s6-log
+pattern:
+.PP
+.nf
+.RS
+myapp 2>&1 | timberfs append logs\-backing/app.log
+.RE
+.fi
+.PP
+Each log has exactly one writer (an exclusive per-file lock), but
+appenders for different files happily share a backing directory; a
+directory served by a
+.B timberfs mount
+is unavailable to appenders and vice versa. Appending to an existing log
+continues it. Data is flushed into chunks by the same size and age rules
+as the mount; end of input,
+.B SIGTERM
+or
+.B SIGINT
+flush and sync everything before exit. Accepts the same
+.BR \-\-chunk\-size ,
+.B \-\-level
+and
+.B \-\-flush\-age
+options as
+.BR mount ,
+plus:
+.TP
+.BI \-\-retain " DURATION"
+Continuously drop data older than
+.I DURATION
+(e.g.
+.BR 30d ,
+.BR 12h ,
+.BR 90m ).
+.TP
+.BI \-\-retain\-size " SIZE"
+Keep the on-disk (compressed) size of the log at or under
+.I SIZE
+(e.g.
+.BR 200G ,
+.BR 512M ;
+powers of 1024), dropping the oldest data first. Combines with
+.BR \-\-retain :
+whichever limit bites first wins.
+.PP
+Retention is checked every second, at startup and once more at shutdown.
+Dropping the head currently compacts the log by rewriting the remaining
+data, so enforcement is batched: age-expired data is dropped once it makes
+up about a tenth of the file, and a size overrun is trimmed down to 95% of
+the budget. Compaction briefly needs free disk space proportional to the
+retained data.
+.SS query
+.B timberfs query
+.I FILE
+prints the bytes written inside the given time window to standard output,
+reading the backing files directly \(em it works with or without an active
+mount, but only sees flushed chunks (the still-buffered tail, at most
+flush-age old, is visible only through the mount).
+.I FILE
+is a backing file: the logical name, or its
+.B .trunk
+or
+.B .rings
+path.
+.TP
+.BI \-\-from " TIME"
+Start of the window (default: beginning of the file).
+.TP
+.BI \-\-to " TIME"
+End of the window (default: end of the file).
+.PP
+Selection is
+.B chunk-granular
+by design: every chunk whose write-time window overlaps the requested
+range is emitted in full, so the result carries at most flush-age worth of
+slop at each edge. The intended workflow is to let
+.B query
+do the coarse seek into a huge file, then trim exactly with
+.BR grep (1)
+on the timestamps the log lines carry anyway.
+.SS index
+.B timberfs index
+.I FILE
+prints the chunk index of a backing file: per chunk the uncompressed
+offset and length, compressed length, compression ratio, and first/last
+write time, plus totals.
+.SS rotate
+.B timberfs rotate \-\-cutoff
+.I TIME SOURCE
+.RI [ DEST ]
+moves every chunk written entirely before
+.I TIME
+out of
+.I SOURCE
+and appends it to
+.I DEST
+(created if missing, must be in the same backing directory). Compressed
+frames are relocated verbatim \(em nothing is recompressed \(em so the
+cost is proportional to the compressed size. A chunk straddling the cutoff
+stays in the source. Appending to an existing
+.I DEST
+is refused if it would break the destination's time ordering.
+.PP
+Rotation auto-detects a live mount: if a daemon serves the backing
+directory (advertised via the lock file), the request is routed through it
+and performed atomically; otherwise the backing files are rewritten
+directly under the same lock.
+.TP
+.B \-\-delete
+Drop the rotated chunks instead of moving them (retention). Mutually
+exclusive with
+.IR DEST .
+.TP
+.B \-\-dry\-run
+Show what would move without changing anything.
+.SH TIME FORMATS
+.I TIME
+arguments accept RFC 3339
+.RB ( 2026\-07\-10T13:42:00+02:00 ),
+.BR "YYYY\-MM\-DD HH:MM" [ :SS ]
+(local time, a
+.B T
+separator also works),
+.BR HH:MM [ :SS ]
+(today, local time), and unix epoch seconds or milliseconds.
+.SH ON-DISK FORMAT
+Each logical file
+.I name
+is backed by two files in the backing directory:
+.TP
+.IB name .trunk
+The data: a plain concatenation of zstd frames, one per chunk, with no
+wrapper bytes. The full uncompressed content is therefore always
+recoverable with stock tools:
+.B zstd \-dc
+.IB name .trunk
+.TP
+.IB name .rings
+The index: an 8-byte magic
+.RB \(lq RING0001 \(rq
+followed by fixed-size 48-byte records (little-endian u64 fields:
+uncompressed start/length, compressed start/length, first/last write time
+in unix milliseconds), appended in write order.
+.PP
+Chunks are written data-first, index-second; on open, index records
+pointing past the end of the data are dropped and orphaned data bytes are
+overwritten.
+.BR fsync (2)
+through the mount flushes the buffer as a chunk and syncs both backing
+files.
+.PP
+The daemon holds an exclusive
+.BR flock (2)
+on
+.IB backingdir /.timberfs.lock
+recording its mountpoint; offline rotation takes the same lock.
+.SH EXTENDED ATTRIBUTES
+Files in the mount expose read-only metadata via
+.BR getfattr (1):
+.BR user.timberfs.chunks ,
+.BR user.timberfs.compressed_size ,
+.BR user.timberfs.first_write ,
+.BR user.timberfs.last_write .
+The attribute
+.B user.timberfs.rotate
+is a write-only control interface used internally by
+.BR "timberfs rotate" .
+.SH SYSTEMD
+The Debian package ships a template unit
+.BR timberfs@.service :
+create
+.IB /etc/timberfs/ instance .conf
+defining
+.BR BACKING ,
+.B MOUNTPOINT
+and optionally
+.BR EXTRA_OPTS ,
+then
+.B systemctl enable \-\-now
+.BI timberfs@ instance .
+Stopping the unit unmounts first, so the daemon flushes all buffers and
+exits cleanly. An example configuration is installed under
+.IR /usr/share/doc/timberfs/examples/ .
+.SH EXAMPLES
+Mount and use:
+.PP
+.nf
+.RS
+timberfs mount ./logs\-backing ./logs &
+myapp >> logs/app.log
+tail \-f logs/app.log
+.RE
+.fi
+.PP
+Or skip FUSE entirely and pipe:
+.PP
+.nf
+.RS
+myapp 2>&1 | timberfs append logs\-backing/app.log
+.RE
+.fi
+.PP
+Extract a time window from a huge log, then trim with grep:
+.PP
+.nf
+.RS
+timberfs query logs\-backing/app.log \-\-from 13:42 \-\-to 13:43 | grep ERROR
+.RE
+.fi
+.PP
+Daily rotation and 30-day retention, no recompression:
+.PP
+.nf
+.RS
+timberfs rotate logs\-backing/app.log app\-$(date \-d yesterday +%F).log \\
+    \-\-cutoff "$(date +%F) 00:00"
+timberfs rotate logs\-backing/app.log \-\-delete \\
+    \-\-cutoff "$(date \-d '30 days ago' +%F) 00:00"
+.RE
+.fi
+.PP
+Disaster recovery with stock tools only:
+.PP
+.nf
+.RS
+zstd \-dc logs\-backing/app.log.trunk > app.log.recovered
+.RE
+.fi
+.SH EXIT STATUS
+0 on success, non-zero on any error (2 for command-line usage errors).
+.SH SEE ALSO
+.BR fusermount3 (1),
+.BR zstd (1),
+.BR getfattr (1),
+.BR systemd.unit (5)
+.PP
+Project page and full design notes:
+.UR https://github.com/torstei/timberfs
+.UE

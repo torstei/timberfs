@@ -1,0 +1,12 @@
+Instance configurations for timberfs@.service live in this directory.
+
+Each <instance>.conf defines the environment for one timberfs mount:
+
+    BACKING=/var/log/timberfs-backing/applogs
+    MOUNTPOINT=/var/log/apps
+    EXTRA_OPTS=--allow-other
+
+Then: systemctl enable --now timberfs@<instance>
+
+A commented example: /usr/share/doc/timberfs/examples/timberfs.conf.example
+Manual: man 1 timberfs

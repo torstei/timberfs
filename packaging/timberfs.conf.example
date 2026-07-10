@@ -1,0 +1,11 @@
+# Example instance configuration for timberfs@.service.
+# Copy to /etc/timberfs/<instance>.conf and start with:
+#   systemctl enable --now timberfs@<instance>
+#
+# Compressed + indexed store lives here (the .trunk/.rings pairs):
+BACKING=/var/log/timberfs-backing/applogs
+# Loggers append to ordinary-looking files here:
+MOUNTPOINT=/var/log/apps
+# Extra flags for `timberfs mount`. --allow-other lets all users read the
+# mount (the service runs as root, so no /etc/fuse.conf change is needed).
+EXTRA_OPTS=--allow-other

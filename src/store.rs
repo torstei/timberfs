@@ -84,11 +84,13 @@ impl FileStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(format::trunk_path(dir, name))?;
         let rings = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(format::rings_path(dir, name))?;
 
         let mut chunks = Vec::new();
@@ -321,10 +323,17 @@ impl FileStore {
         let rings_tmp = dir.join(format!("{name}.{}.tmp", format::RINGS_EXT));
         {
             let new_trunk = File::create(&trunk_tmp)?;
-            copy_range(&self.trunk, comp_cut, self.comp_size - comp_cut, &new_trunk, 0)?;
+            copy_range(
+                &self.trunk,
+                comp_cut,
+                self.comp_size - comp_cut,
+                &new_trunk,
+                0,
+            )?;
             new_trunk.sync_all()?;
-            let mut idx =
-                Vec::with_capacity(RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN);
+            let mut idx = Vec::with_capacity(
+                RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN,
+            );
             idx.extend_from_slice(format::RINGS_MAGIC);
             for c in &self.chunks[k..] {
                 let rec = ChunkRecord {
@@ -521,24 +530,95 @@ impl Store {
             }
         }
     }
+
+    /// Continuous retention (the appender's --retain / --retain-size):
+    /// drop head chunks older than `max_age_ms`, and keep the compressed
+    /// size at or under `max_comp_bytes`. Dropping the head compacts the
+    /// backing pair by rewriting what remains, so it triggers with
+    /// hysteresis: age-expired data goes once it makes up at least a tenth
+    /// of the file, a size overrun drops down to 95% of the budget. The
+    /// unflushed buffer (newest data) is never touched. Returns stats when
+    /// something was dropped.
+    pub fn enforce_retention(
+        &mut self,
+        name: &str,
+        max_age_ms: Option<u64>,
+        max_comp_bytes: Option<u64>,
+    ) -> io::Result<Option<RotateStats>> {
+        let f = self
+            .files
+            .get_mut(name)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        if f.chunks.is_empty() {
+            return Ok(None);
+        }
+        let mut k = 0usize;
+        if let Some(age) = max_age_ms {
+            let cutoff = now_ms().saturating_sub(age);
+            let kt = f.rotation_split(cutoff);
+            if kt > 0 && f.chunks[kt - 1].comp_end() * 10 >= f.comp_size {
+                k = k.max(kt);
+            }
+        }
+        if let Some(budget) = max_comp_bytes {
+            if f.comp_size > budget {
+                let low_water = budget.saturating_sub(budget / 20);
+                let ks = f
+                    .chunks
+                    .partition_point(|c| f.comp_size - c.comp_start > low_water);
+                k = k.max(ks);
+            }
+        }
+        if k == 0 {
+            return Ok(None);
+        }
+        let k = k.min(f.chunks.len());
+        let stats = RotateStats {
+            chunks_moved: k,
+            uncomp_bytes: f.chunks[k - 1].uncomp_end(),
+            comp_bytes: f.chunks[k - 1].comp_end(),
+            first_write_ms: f.chunks[0].first_write_ms,
+            last_write_ms: f.chunks[k - 1].last_write_ms,
+            chunks_remaining: f.chunks.len() - k,
+        };
+        f.remove_head(k, &self.dir, name)?;
+        Ok(Some(stats))
+    }
 }
 
-/// Exclusive-ownership lock for a backing directory. The mount daemon holds
-/// it (with its mountpoint recorded in the file) for as long as it serves
-/// the directory; offline tools that rewrite backing files (rotation) hold
-/// it for the duration of the operation. flock-based, so it can never go
-/// stale: the lock dies with the process.
+/// Locking, two levels, all flock-based (locks die with their process):
+///
+/// - the directory lock `.timberfs.lock`: the mount daemon holds it
+///   EXCLUSIVE (it owns in-memory state for every file in the directory);
+///   appenders and offline rotation hold it SHARED — they coexist with
+///   each other but never with a mount.
+/// - a per-file lock `<name>.lock`: held exclusive by the writer of that
+///   one file (an appender, or rotation for its source/destination). A
+///   separate always-stable file, never the .rings itself, because
+///   head-removal replaces the .rings inode by rename and a lock on a
+///   renamed-over inode would silently stop excluding anyone.
+///
+/// Lock files are never deleted (unlink+recreate would let two processes
+/// hold "the" lock on different inodes).
 pub const LOCK_FILE_NAME: &str = ".timberfs.lock";
 
-/// Ok(Some(file)) = lock acquired, keep the File alive to hold it.
-/// Ok(None) = someone else (normally a mount daemon) holds it.
-pub fn try_lock_backing(dir: &Path) -> io::Result<Option<File>> {
-    let f = OpenOptions::new()
+pub fn file_lock_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.lock"))
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(dir.join(LOCK_FILE_NAME))?;
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        .truncate(false)
+        .open(path)
+}
+
+/// Ok(Some(file)) = lock acquired, keep the File alive to hold it.
+/// Ok(None) = held by someone else in a conflicting mode.
+fn try_flock(f: File, op: libc::c_int) -> io::Result<Option<File>> {
+    let rc = unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) };
     if rc == 0 {
         Ok(Some(f))
     } else {
@@ -551,15 +631,56 @@ pub fn try_lock_backing(dir: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/// Record which mountpoint the lock-holding daemon serves, so tools can
-/// route requests through the live mount.
-pub fn write_lock_info(f: &File, mountpoint: &Path) -> io::Result<()> {
+/// Directory lock, exclusive: the mount daemon.
+pub fn lock_backing_exclusive(dir: &Path) -> io::Result<Option<File>> {
+    try_flock(open_lock_file(&dir.join(LOCK_FILE_NAME))?, libc::LOCK_EX)
+}
+
+/// Directory lock, shared: appenders and offline rotation. Fails only
+/// while a mount daemon holds the directory exclusively.
+pub fn lock_backing_shared(dir: &Path) -> io::Result<Option<File>> {
+    try_flock(open_lock_file(&dir.join(LOCK_FILE_NAME))?, libc::LOCK_SH)
+}
+
+/// Per-file writer lock, exclusive.
+pub fn lock_file_exclusive(dir: &Path, name: &str) -> io::Result<Option<File>> {
+    try_flock(open_lock_file(&file_lock_path(dir, name))?, libc::LOCK_EX)
+}
+
+/// Names of files in the directory whose per-file writer lock is currently
+/// held (probed non-destructively), for diagnostics in refusal messages.
+pub fn active_file_locks(dir: &Path) -> Vec<String> {
+    let mut active = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return active;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(base) = file_name.strip_suffix(".lock") else {
+            continue;
+        };
+        if file_name == LOCK_FILE_NAME || base.is_empty() {
+            continue;
+        }
+        if let Ok(f) = File::open(entry.path()) {
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                active.push(base.to_string());
+            }
+            // drop(f) releases the probe lock if we got it
+        }
+    }
+    active.sort();
+    active
+}
+
+/// Record who holds the lock (`mountpoint=...` for the mount daemon,
+/// `appender=...` for a pipe appender), so tools can route or explain.
+pub fn write_lock_info(f: &File, info: &str) -> io::Result<()> {
     f.set_len(0)?;
-    let info = format!(
-        "mountpoint={}\npid={}\n",
-        mountpoint.display(),
-        std::process::id()
-    );
     f.write_all_at(info.as_bytes(), 0)?;
     f.sync_all()?;
     Ok(())
@@ -569,4 +690,9 @@ pub fn read_lock_mountpoint(dir: &Path) -> Option<PathBuf> {
     let s = fs::read_to_string(dir.join(LOCK_FILE_NAME)).ok()?;
     s.lines()
         .find_map(|l| l.strip_prefix("mountpoint=").map(PathBuf::from))
+}
+
+/// Raw lock-file content, for describing the current holder in messages.
+pub fn read_lock_raw(dir: &Path) -> Option<String> {
+    fs::read_to_string(dir.join(LOCK_FILE_NAME)).ok()
 }
