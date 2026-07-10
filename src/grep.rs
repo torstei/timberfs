@@ -106,6 +106,7 @@ fn run<R: BufRead>(
     re: &Regex,
     invert: bool,
     count: bool,
+    prefix: Option<&[u8]>,
 ) -> anyhow::Result<u64> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -114,7 +115,16 @@ fn run<R: BufRead>(
         if re.is_match(&entry) != invert {
             matched += 1;
             if !count {
-                out.write_all(&entry)?;
+                match prefix {
+                    None => out.write_all(&entry)?,
+                    Some(label) => {
+                        for line in entry.split_inclusive(|&b| b == b'\n') {
+                            out.write_all(label)?;
+                            out.write_all(b":")?;
+                            out.write_all(line)?;
+                        }
+                    }
+                }
             }
         }
     }
@@ -123,9 +133,93 @@ fn run<R: BufRead>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn grep_one(
+    p: &Path,
+    re: &Regex,
+    extractor: Extractor,
+    from: Option<&str>,
+    to: Option<&str>,
+    has: &[String],
+    invert: bool,
+    count: bool,
+    prefix: Option<&[u8]>,
+) -> anyhow::Result<u64> {
+    let is_timberfs_source = is_bundle(p)
+        || matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some(crate::format::TRUNK_EXT) | Some(crate::format::RINGS_EXT)
+        )
+        || !p.is_file();
+
+    if !is_timberfs_source {
+        // a plain log file at the exact path
+        if from.is_some() || to.is_some() || !has.is_empty() {
+            bail!(
+                "--from/--to/--has need a timberfs log or bundle; {} is a plain file",
+                p.display()
+            );
+        }
+        return run(
+            Entries {
+                reader: BufReader::new(
+                    File::open(p).with_context(|| format!("opening {}", p.display()))?,
+                ),
+                extractor,
+                pending: None,
+                warned_cap: false,
+            },
+            re,
+            invert,
+            count,
+            prefix,
+        );
+    }
+    let source = open_source(p)?;
+    let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
+    let to_ms = to.map(parse_time).transpose()?.unwrap_or(u64::MAX);
+    if from_ms > to_ms {
+        bail!("--from is after --to");
+    }
+    let (selected, _) = select_chunks(p, &source.records, from_ms, to_ms, has)?;
+    // Pad the selection by one chunk on each side: an entry whose
+    // timestamped first line sits at the tail of the previous chunk
+    // arrives whole. (Entries spanning further are subject to the usual
+    // chunk-granularity slop.)
+    let mut padded = std::collections::BTreeSet::new();
+    for (i, _) in &selected {
+        padded.insert(i.saturating_sub(1));
+        padded.insert(*i);
+        padded.insert(i + 1);
+    }
+    let chunks: Vec<ChunkRecord> = padded
+        .into_iter()
+        .filter_map(|i| source.records.get(i).copied())
+        .collect();
+    let stream = ChunkStream {
+        file: source.file,
+        chunks,
+        idx: 0,
+        buf: Vec::new(),
+        pos: 0,
+    };
+    run(
+        Entries {
+            reader: BufReader::with_capacity(1 << 20, stream),
+            extractor,
+            pending: None,
+            warned_cap: false,
+        },
+        re,
+        invert,
+        count,
+        prefix,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_grep(
     pattern: &str,
-    file: Option<&Path>,
+    files: &[std::path::PathBuf],
     from: Option<&str>,
     to: Option<&str>,
     has: &[String],
@@ -133,6 +227,7 @@ pub fn cmd_grep(
     invert: bool,
     fixed: bool,
     count: bool,
+    no_filename: bool,
     ts_regex: Option<&str>,
     ts_format: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -146,101 +241,56 @@ pub fn cmd_grep(
         .multi_line(true)
         .build()
         .with_context(|| format!("bad pattern {pattern:?}"))?;
-    let extractor = Extractor::new(ts_regex, ts_format, false)?;
 
-    let is_timberfs_source = |p: &Path| {
-        is_bundle(p)
-            || matches!(
-                p.extension().and_then(|e| e.to_str()),
-                Some(crate::format::TRUNK_EXT) | Some(crate::format::RINGS_EXT)
-            )
-            || !p.is_file()
-    };
+    if files.is_empty() {
+        if from.is_some() || to.is_some() || !has.is_empty() {
+            bail!("--from/--to/--has need a timberfs log or bundle, not stdin");
+        }
+        let extractor = Extractor::new(ts_regex, ts_format, false)?;
+        let stdin = io::stdin();
+        let matched = run(
+            Entries {
+                reader: stdin.lock(),
+                extractor,
+                pending: None,
+                warned_cap: false,
+            },
+            &re,
+            invert,
+            count,
+            None,
+        )?;
+        if count {
+            println!("{matched}");
+        }
+        return Ok(());
+    }
 
-    let matched = match file {
-        None => {
-            if from.is_some() || to.is_some() || !has.is_empty() {
-                bail!("--from/--to/--has need a timberfs log or bundle, not stdin");
-            }
-            let stdin = io::stdin();
-            run(
-                Entries {
-                    reader: stdin.lock(),
-                    extractor,
-                    pending: None,
-                    warned_cap: false,
-                },
-                &re,
-                invert,
-                count,
-            )?
+    // Files process in argument order (grep semantics); multiple files get
+    // grep-style "path:" line prefixes and per-file -c counts.
+    let multi = files.len() > 1 && !no_filename;
+    let mut total: u64 = 0;
+    for p in files {
+        let extractor = Extractor::new(ts_regex, ts_format, false)?;
+        let label = p.display().to_string().into_bytes();
+        let matched = grep_one(
+            p,
+            &re,
+            extractor,
+            from,
+            to,
+            has,
+            invert,
+            count,
+            if multi { Some(&label) } else { None },
+        )?;
+        total += matched;
+        if count && multi {
+            println!("{}:{matched}", p.display());
         }
-        Some(p) if !is_timberfs_source(p) => {
-            // a plain log file at the exact path
-            if from.is_some() || to.is_some() || !has.is_empty() {
-                bail!(
-                    "--from/--to/--has need a timberfs log or bundle; {} is a plain file",
-                    p.display()
-                );
-            }
-            run(
-                Entries {
-                    reader: BufReader::new(
-                        File::open(p).with_context(|| format!("opening {}", p.display()))?,
-                    ),
-                    extractor,
-                    pending: None,
-                    warned_cap: false,
-                },
-                &re,
-                invert,
-                count,
-            )?
-        }
-        Some(p) => {
-            let source = open_source(p)?;
-            let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
-            let to_ms = to.map(parse_time).transpose()?.unwrap_or(u64::MAX);
-            if from_ms > to_ms {
-                bail!("--from is after --to");
-            }
-            let (selected, _) = select_chunks(p, &source.records, from_ms, to_ms, has)?;
-            // Pad the selection by one chunk on each side: an entry whose
-            // timestamped first line sits at the tail of the previous
-            // chunk arrives whole. (Entries spanning further are subject
-            // to the usual chunk-granularity slop.)
-            let mut padded = std::collections::BTreeSet::new();
-            for (i, _) in &selected {
-                padded.insert(i.saturating_sub(1));
-                padded.insert(*i);
-                padded.insert(i + 1);
-            }
-            let chunks: Vec<ChunkRecord> = padded
-                .into_iter()
-                .filter_map(|i| source.records.get(i).copied())
-                .collect();
-            let stream = ChunkStream {
-                file: source.file,
-                chunks,
-                idx: 0,
-                buf: Vec::new(),
-                pos: 0,
-            };
-            run(
-                Entries {
-                    reader: BufReader::with_capacity(1 << 20, stream),
-                    extractor,
-                    pending: None,
-                    warned_cap: false,
-                },
-                &re,
-                invert,
-                count,
-            )?
-        }
-    };
-    if count {
-        println!("{matched}");
+    }
+    if count && !multi {
+        println!("{total}");
     }
     Ok(())
 }

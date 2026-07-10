@@ -344,7 +344,22 @@ grep_entry_aware() {
 }
 
 run_test "grain: reindex + --has finds a needle, skipping chunks" grain_needle_search
+multi_file_fleet_view() {
+    printf '2026-06-06T10:00:00 INFO alpha one\n2026-06-06T10:00:02 INFO alpha two\n' > /tmp/hA.log
+    printf '2026-06-06T10:00:01 INFO beta one\n2026-06-06T10:00:03 ERROR beta boom\n' > /tmp/hB.log
+    timberfs import /tmp/hA.log "$PIPE_BACKING/hA.log" --chunk-size 1 2>/dev/null
+    timberfs import /tmp/hB.log "$PIPE_BACKING/hB.log" --chunk-size 1 2>/dev/null
+    # interleaved and attributed
+    OUT=$(timberfs query "$PIPE_BACKING/hA.log" "$PIPE_BACKING/hB.log" 2>/dev/null)
+    [ "$(echo "$OUT" | head -2 | grep -c 'one')" = 2 ] \
+        && echo "$OUT" | head -1 | grep -q "hA.log:" \
+        && echo "$OUT" | sed -n 2p | grep -q "hB.log:" \
+        && timberfs grep -c ERROR "$PIPE_BACKING/hA.log" "$PIPE_BACKING/hB.log" \
+           | grep -q "hB.log:1"
+}
+
 run_test "grep: entry-aware matching, stdin and grain-accelerated source" grep_entry_aware
+run_test "multi-file: interleaved attributed query, per-file grep counts" multi_file_fleet_view
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 

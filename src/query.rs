@@ -212,19 +212,26 @@ pub fn select_chunks(
 /// whose windows are only mostly sorted. The index is 48 bytes per chunk,
 /// so scanning it is negligible next to decompressing one chunk.)
 pub fn cmd_query(
-    file: &Path,
+    files: &[std::path::PathBuf],
     from: Option<&str>,
     to: Option<&str>,
     has: &[String],
+    no_filename: bool,
 ) -> anyhow::Result<()> {
-    let source = open_source(file)?;
-    let chunks = source.records;
     let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
     let to_ms = to.map(parse_time).transpose()?.unwrap_or(u64::MAX);
     if from_ms > to_ms {
         bail!("--from is after --to");
     }
+    if files.len() == 1 {
+        return query_single(&files[0], from_ms, to_ms, has);
+    }
+    query_multi(files, from_ms, to_ms, has, no_filename)
+}
 
+fn query_single(file: &Path, from_ms: u64, to_ms: u64, has: &[String]) -> anyhow::Result<()> {
+    let source = open_source(file)?;
+    let chunks = source.records;
     let (selected, in_window) = select_chunks(file, &chunks, from_ms, to_ms, has)?;
 
     let trunk = source.file;
@@ -249,6 +256,98 @@ pub fn cmd_query(
             format!(" ({in_window} in window before --has)")
         },
         uncomp_total
+    );
+    Ok(())
+}
+
+/// Multiple sources: per-file selection, then a k-way merge interleaving
+/// chunks across files by their time windows (within-file order is
+/// preserved — it is the content order). Output lines carry a grep-style
+/// "path:" prefix unless suppressed, with partial lines at chunk
+/// boundaries carried per file so every output line gets exactly one
+/// prefix. Attribution lives in the filename — this is the fleet view
+/// over per-stream logs.
+fn query_multi(
+    files: &[std::path::PathBuf],
+    from_ms: u64,
+    to_ms: u64,
+    has: &[String],
+    no_filename: bool,
+) -> anyhow::Result<()> {
+    struct Src {
+        label: Vec<u8>,
+        file: File,
+        chunks: Vec<ChunkRecord>,
+        pos: usize,
+        carry: Vec<u8>,
+    }
+    let mut srcs: Vec<Src> = Vec::new();
+    let mut total_chunks = 0usize;
+    let mut total_selected = 0usize;
+    for f in files {
+        let source = open_source(f)?;
+        let (selected, _) = select_chunks(f, &source.records, from_ms, to_ms, has)?;
+        eprintln!(
+            "timberfs: {}: {} of {} chunk(s)",
+            f.display(),
+            selected.len(),
+            source.records.len()
+        );
+        total_chunks += source.records.len();
+        total_selected += selected.len();
+        srcs.push(Src {
+            label: f.display().to_string().into_bytes(),
+            file: source.file,
+            chunks: selected.into_iter().map(|(_, c)| c).collect(),
+            pos: 0,
+            carry: Vec::new(),
+        });
+    }
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    loop {
+        let next = srcs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.pos < s.chunks.len())
+            .min_by_key(|(_, s)| s.chunks[s.pos].first_write_ms)
+            .map(|(i, _)| i);
+        let Some(i) = next else { break };
+        let s = &mut srcs[i];
+        let c = s.chunks[s.pos];
+        s.pos += 1;
+        let mut comp = vec![0u8; c.comp_len as usize];
+        s.file.read_exact_at(&mut comp, c.comp_start)?;
+        let data = zstd::stream::decode_all(&comp[..])?;
+        if no_filename {
+            out.write_all(&data)?;
+        } else {
+            s.carry.extend_from_slice(&data);
+            let complete = s.carry.iter().rposition(|&b| b == b'\n').map(|p| p + 1);
+            if let Some(end) = complete {
+                for line in s.carry[..end].split_inclusive(|&b| b == b'\n') {
+                    out.write_all(&s.label)?;
+                    out.write_all(b":")?;
+                    out.write_all(line)?;
+                }
+                s.carry.drain(..end);
+            }
+        }
+    }
+    for s in &srcs {
+        if !s.carry.is_empty() {
+            out.write_all(&s.label)?;
+            out.write_all(b":")?;
+            out.write_all(&s.carry)?;
+        }
+    }
+    out.flush()?;
+    eprintln!(
+        "timberfs: total {} of {} chunk(s) across {} file(s)",
+        total_selected,
+        total_chunks,
+        srcs.len()
     );
     Ok(())
 }
