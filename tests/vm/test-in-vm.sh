@@ -205,7 +205,8 @@ with open('/tmp/old.log', 'w') as f:
         ts = d + datetime.timedelta(seconds=i)
         f.write(f'{ts.isoformat()} INFO event number {i}\n')
 "
-    timberfs import /tmp/old.log "$PIPE_BACKING/imported.log" \
+    # small chunks so the 83-minute file spans many windows, not one
+    timberfs import /tmp/old.log "$PIPE_BACKING/imported.log" --chunk-size 4096 \
         && zstd -dc "$PIPE_BACKING/imported.log.trunk" | cmp - /tmp/old.log \
         && timberfs query "$PIPE_BACKING/imported.log" \
                --from "2026-06-03 14:30:00" --to "2026-06-03 14:31:00" \
