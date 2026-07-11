@@ -227,10 +227,32 @@ converts existing plain log files into a timberfs log. The destination is
 a named flag on purpose: a shell glob among the sources can never
 swallow it. Several sources \(em a rotated set \(em may be given
 in any order: each file's first parsed timestamp determines the stitch
-order (rotation numbering and glob order lie), the plan is printed before
-anything is written, and stitching plain files requires an empty
-destination. Two sources starting at the same timestamp are refused as
-likely duplicates.
+order (rotation numbering and glob order lie), and the plan is printed
+before anything is written. Two sources starting at the same timestamp
+are refused as likely duplicates.
+.PP
+Each plain source is placed by its
+.B first timestamp
+relative to what the destination already holds. Starting
+.I after
+the destination's last write, it simply appends (the daily bulk-load).
+Starting
+.I inside
+the destination's window \(em day files cut with slack, an import re-run
+\(em the overlap is deduplicated
+.BR "line by line" :
+lines the destination already has are skipped, genuinely new lines in
+the covered window are imported (with a warning, since that usually
+means the captures disagreed), and re-importing an already-covered file
+is a clean no-op. Counts are reported. Starting
+.I before
+everything in the destination is refused \(em import in chronological
+order or to a new target. A source starting exactly
+.B where the destination starts
+is treated as the same file, regrown: the already-imported prefix is
+byte-verified and only the growth is appended (truncated or rewritten
+files are refused before anything is written; see
+.BR \-\-quick ).
 .PP
 A source that is itself a timberfs log \(em a rotation segment shipped
 from another machine, say \(em is detected automatically (a

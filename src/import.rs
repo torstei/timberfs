@@ -23,6 +23,7 @@
 //! stamps they contain, and queries select by interval overlap, so mild
 //! disorder widens windows without losing data.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -190,6 +191,79 @@ fn verify_prefix(
         }
     }
     Ok(())
+}
+
+/// FNV-1a 128 of a line (trailing newline stripped). Overlap dedup only
+/// needs collisions to be unlikelier than hardware failure, not
+/// cryptography: for 10^8 distinct lines the collision odds are ~10^-23.
+fn line_hash(line: &[u8]) -> u128 {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
+    for &b in line {
+        h ^= b as u128;
+        h = h.wrapping_mul(0x0000000001000000000000000000013b);
+    }
+    h
+}
+
+/// Multiset of the store's lines from the first chunk whose window
+/// reaches `t0` to the end — what an overlapping source will be
+/// deduplicated against. Chunks may start mid-line (FUSE writers flush at
+/// byte thresholds), so the partial line spilling in from earlier chunks
+/// is carried for exact reconstruction. Memory is one chunk plus ~50
+/// bytes per distinct overlap line.
+fn overlap_line_counts(
+    chunks: &[crate::format::ChunkRecord],
+    trunk_path: &Path,
+    t0: u64,
+) -> anyhow::Result<HashMap<u128, u32>> {
+    use std::os::unix::fs::FileExt;
+    let trunk = File::open(trunk_path)?;
+    let decomp = |c: &crate::format::ChunkRecord| -> anyhow::Result<Vec<u8>> {
+        let mut comp = vec![0u8; c.comp_len as usize];
+        trunk.read_exact_at(&mut comp, c.comp_start)?;
+        Ok(zstd::stream::decode_all(&comp[..])?)
+    };
+    let k = chunks.iter().take_while(|c| c.last_write_ms < t0).count();
+    // The tail of the line the overlap region starts inside, if any.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut j = k;
+    while j > 0 {
+        let mut bytes = decomp(&chunks[j - 1])?;
+        if let Some(p) = bytes.iter().rposition(|&b| b == b'\n') {
+            bytes.drain(..=p);
+            bytes.extend_from_slice(&carry);
+            carry = bytes;
+            break;
+        }
+        bytes.extend_from_slice(&carry);
+        carry = bytes;
+        j -= 1;
+    }
+    let mut counts: HashMap<u128, u32> = HashMap::new();
+    for c in &chunks[k..] {
+        let bytes = decomp(c)?;
+        let mut start = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                let key = if carry.is_empty() {
+                    line_hash(&bytes[start..i])
+                } else {
+                    carry.extend_from_slice(&bytes[start..i]);
+                    let key = line_hash(&carry);
+                    carry.clear();
+                    key
+                };
+                *counts.entry(key).or_insert(0) += 1;
+                start = i + 1;
+            }
+        }
+        carry.extend_from_slice(&bytes[start..]);
+    }
+    if !carry.is_empty() {
+        *counts.entry(line_hash(&carry)).or_insert(0) += 1;
+    }
+    Ok(counts)
 }
 
 /// First parsed timestamp in a file, scanning at most DETECT_WINDOW lines.
@@ -360,7 +434,6 @@ pub fn cmd_import(
     }
     sources.sort_by_key(|(ts, _)| *ts);
     let multi = sources.len() > 1;
-    let any_plain = sources.iter().any(|(_, s)| matches!(s, Source::Plain(_)));
     if multi {
         for w in sources.windows(2) {
             if w[0].0 == w[1].0 {
@@ -436,42 +509,43 @@ pub fn cmd_import(
         return Ok(());
     }
 
-    // A non-empty target: for a single plain source, verify the imported
-    // prefix and resume; timberfs sources append behind the ordering guard
-    // (segments already covered are skipped below). Stitching that
-    // involves plain sources needs an empty target.
+    // A non-empty target. A single plain source STARTING WHERE THE STORE
+    // STARTS is the same file, regrown: verify the imported prefix and
+    // resume (truncated/rewritten files are refused here). Every other
+    // plain source is handled per-source below by its first timestamp —
+    // after the store's end it simply appends; inside the store's window
+    // it is deduplicated line-by-line against the overlap. Timberfs
+    // sources append behind the ordering guard (segments already covered
+    // are skipped below).
     let mut resume_from: u64 = 0;
     let mut last_ts: Option<u64> = None;
     {
         let f = st.files.get(&name).unwrap();
         if f.size() > 0 {
-            if multi && any_plain {
-                bail!(
-                    "{name} already contains data; stitching plain log files needs an \
-                     empty target"
-                );
-            }
-            if let (false, (_, Source::Plain(src_path))) = (multi, &sources[0]) {
-                resume_from = f.size();
-                if total_bytes < resume_from {
-                    bail!(
-                        "source ({total_bytes} bytes) is smaller than the {resume_from} bytes \
-                         already imported — rotated or truncated file? import it to a new target"
+            let store_first = f.chunks.first().map(|c| c.first_write_ms);
+            if let (false, (t0, Source::Plain(src_path))) = (multi, &sources[0]) {
+                if Some(*t0) == store_first {
+                    resume_from = f.size();
+                    if total_bytes < resume_from {
+                        bail!(
+                            "source ({total_bytes} bytes) is smaller than the {resume_from} bytes \
+                             already imported — rotated or truncated file? import it to a new target"
+                        );
+                    }
+                    let src = File::open(src_path)?;
+                    verify_prefix(
+                        &f.chunks,
+                        &crate::format::trunk_path(&dir, &name),
+                        &src,
+                        quick,
+                    )?;
+                    eprintln!(
+                        "timberfs: {} of {} bytes already imported and verified{}; resuming",
+                        resume_from,
+                        total_bytes,
+                        if quick { " (quick)" } else { "" }
                     );
                 }
-                let src = File::open(src_path)?;
-                verify_prefix(
-                    &f.chunks,
-                    &crate::format::trunk_path(&dir, &name),
-                    &src,
-                    quick,
-                )?;
-                eprintln!(
-                    "timberfs: {} of {} bytes already imported and verified{}; resuming",
-                    resume_from,
-                    total_bytes,
-                    if quick { " (quick)" } else { "" }
-                );
             }
             // Seed timestamp inheritance with the last imported stamp.
             last_ts = f.last_write_ms();
@@ -492,8 +566,10 @@ pub fn cmd_import(
         next_progress += total_bytes / 10;
     }
     let cfg = st.cfg;
+    let mut ov_skipped: u64 = 0; // duplicate lines dropped in overlaps
+    let mut ov_new: u64 = 0; // lines imported INTO an already-covered window
 
-    for (source_idx, (_, source)) in sources.iter().enumerate() {
+    for (source_idx, (t0, source)) in sources.iter().enumerate() {
         let source_path = match source {
             Source::Timber { trunk, records } => {
                 // A shipped segment: merge the chunks verbatim — unless the
@@ -524,6 +600,47 @@ pub fn cmd_import(
             }
             Source::Plain(p) => p,
         };
+        // Where does this plain source land relative to the store? After
+        // the store's end: plain append. Inside the store's window (day
+        // files cut with slack, re-runs): deduplicate the overlap line by
+        // line — duplicates are skipped, genuinely new lines are
+        // imported. Before the store's window: refused. The resume path
+        // above (same file, regrown) already seeks past its verified
+        // prefix and needs none of this.
+        let mut dedup: Option<(HashMap<u128, u32>, u64)> = None;
+        if !(source_idx == 0 && resume_from > 0) {
+            let f = st.files.get_mut(&name).unwrap();
+            if f.last_write_ms().is_some_and(|last| *t0 <= last) {
+                f.flush_chunk(&cfg)?; // make buffered lines comparable
+                let store_last = f.last_write_ms().unwrap();
+                let store_first = f
+                    .chunks
+                    .first()
+                    .map(|c| c.first_write_ms)
+                    .unwrap_or(u64::MAX);
+                if *t0 < store_first {
+                    bail!(
+                        "{} (starts {}) predates everything in {} (starts {}) — \
+                         import in chronological order, or to a new target",
+                        source_path.display(),
+                        fmt_ms(*t0),
+                        name,
+                        fmt_ms(store_first)
+                    );
+                }
+                let counts =
+                    overlap_line_counts(&f.chunks, &crate::format::trunk_path(&dir, &name), *t0)?;
+                eprintln!(
+                    "timberfs: {} starts at {}, inside already-imported data (through {}) — \
+                     deduplicating the overlap",
+                    source_path.display(),
+                    fmt_ms(*t0),
+                    fmt_ms(store_last)
+                );
+                dedup = Some((counts, store_last));
+            }
+        }
+
         let mut src = File::open(source_path)
             .with_context(|| format!("opening {}", source_path.display()))?;
         if source_idx == 0 && resume_from > 0 {
@@ -541,6 +658,31 @@ pub fn cmd_import(
             bytes_done += line.len() as u64;
 
             let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
+
+            // Past the overlap window: every further line is new, stop
+            // consulting (and free) the multiset.
+            if dedup
+                .as_ref()
+                .is_some_and(|(_, until)| ts.or(last_ts).is_some_and(|e| e > *until))
+            {
+                dedup = None;
+            }
+            if let Some((counts, _)) = dedup.as_mut() {
+                if let Some(c) = counts.get_mut(&line_hash(&line)) {
+                    if *c > 0 {
+                        *c -= 1;
+                        ov_skipped += 1;
+                        // The store already has this line; its stamp still
+                        // seeds inheritance for following unstamped lines.
+                        if let Some(t) = ts {
+                            last_ts = Some(t);
+                        }
+                        continue;
+                    }
+                }
+                ov_new += 1;
+            }
+
             match (ts, last_ts) {
                 (Some(t), _) => {
                     if !leading.is_empty() {
@@ -593,6 +735,21 @@ pub fn cmd_import(
             "no timestamp found in any of the {} line(s); \
              try --timestamp-regex/--timestamp-format",
             leading.len()
+        );
+    }
+
+    if ov_skipped > 0 || ov_new > 0 {
+        eprintln!(
+            "timberfs: overlap: {ov_skipped} duplicate line(s) skipped{}",
+            if ov_new > 0 {
+                format!(
+                    "; {ov_new} line(s) imported into the already-covered window — \
+                     the overlap held content the store lacked (double-check the source \
+                     if that is unexpected)"
+                )
+            } else {
+                String::new()
+            }
         );
     }
 
