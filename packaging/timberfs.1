@@ -7,14 +7,21 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .I BACKING
 .I MOUNTPOINT
 .br
+.B timberfs create
+.RB [ \-\-index ]
+.RB [ \-\-set
+.IR KEY=VALUE ]...
+.I DEST
+.br
 .B timberfs append
 .RI [ options ]
 .I FILE
 .br
 .B timberfs import
 .RI [ options ]
-.IR SOURCE .\|.\|.
+.B \-\-into
 .I DEST
+.IR SOURCE .\|.\|.
 .br
 .B timberfs export
 .RB [ \-\-from
@@ -100,6 +107,61 @@ Let other users access the mount. Unprivileged users need
 in
 .IR /etc/fuse.conf ;
 root (e.g. the systemd unit) does not.
+.SS create
+.B timberfs create
+.I DEST
+makes an empty log with its properties declared up front in a
+.B .bark
+manifest \(em one flat, optional, human-editable JSON object beside the
+pair.
+.B \-\-index
+declares the token index, database-style: once declared, EVERY import
+maintains the
+.B .grain
+automatically (extended incrementally for new chunks, rebuilt if it went
+missing \(em say, dropped by rotation or retention), so there is no
+per-import flag to forget.
+.B \-\-set
+.I KEY=VALUE
+records free-form provenance
+.RB ( host ,
+.BR path ,
+.BR format ,
+\|.\|.\|.). Every manifest is minted with a durable identity on first write:
+.B id
+(a random UUID, constant across renames, moves and hosts \(em the
+identity of the store, where paths are merely its current address) and
+.B created
+(RFC3339). Artifacts made by
+.B export
+and by rotation into a new segment are NEW stores: they get a fresh
+identity, a
+.B derived_from
+pointer to the source's id (lineage chains compose across re-carves and
+shipping), a
+.B derived_op
+of
+.BR export / rotate
+(copy vs move \(em whether the source still holds the data), and inherit
+the data-provenance fields; settings
+.RB ( index )
+do not inherit. Rotation mints its source's identity when missing (it
+holds the writer locks); export never writes its source. Content facts
+\(em actual spans, sizes \(em are deliberately NOT recorded in bark: the
+artifact's own rings state them authoritatively. The REQUESTED window is
+different \(em an operation fact, like
+.B derived_op
+\(em and a windowed export records it as
+.BR window_from / window_to
+(RFC3339 UTC; only the bounds given; never inherited). Content can never
+state coverage \(em an artifact whose last line is 17:00 doesn't say
+whether 17:00\(en24:00 was covered-but-silent or not covered \(em and for
+an EMPTY artifact the declared window is its entire meaning. Unlike the
+derived
+.BR .grain ,
+bark survives head-drops, travels on rename, and ships inside
+.B .timber
+bundles.
 .SS append
 .B timberfs append
 .I FILE
@@ -158,11 +220,12 @@ up about a tenth of the file, and a size overrun is trimmed down to 95% of
 the budget. Compaction briefly needs free disk space proportional to the
 retained data.
 .SS import
-.B timberfs import
-.IR SOURCE .\|.\|.
+.B timberfs import \-\-into
 .I DEST
-converts existing plain log files into a timberfs log (the destination is
-the LAST argument). Several sources \(em a rotated set \(em may be given
+.IR SOURCE .\|.\|.
+converts existing plain log files into a timberfs log. The destination is
+a named flag on purpose: a shell glob among the sources can never
+swallow it. Several sources \(em a rotated set \(em may be given
 in any order: each file's first parsed timestamp determines the stitch
 order (rotation numbering and glob order lie), the plan is printed before
 anything is written, and stitching plain files requires an empty
@@ -210,7 +273,16 @@ exactly right for entries split by rotation. Mildly out-of-order lines
 widen chunk windows instead of getting lost. Accepts
 .B \-\-chunk\-size
 and
-.BR \-\-level .
+.BR \-\-level ,
+and
+.B \-\-index
+declares and builds the
+.B .grain
+token index \(em needed once per log (the declaration persists in the
+.B .bark
+manifest; see
+.BR create ),
+after which every import maintains the index automatically.
 .PP
 Re-importing is idempotent: a non-empty destination is treated as a
 checkpoint. The already-imported bytes are verified against the same
@@ -252,6 +324,18 @@ suffice to recover one:
 creates; merging into an existing log is
 .BR import 's
 job.
+.PP
+A window that selects nothing still exports: an empty artifact whose bark
+records the requested window is evidence of absence (\(lqSaturday was
+covered, nothing was there \(em ingest Sunday\(rq), where a MISSING file
+is absence of evidence (\(lqa day is missing \(em don't ingest past the
+gap\(rq). Opposite signals to a consumer, so an empty result is a result,
+not an error;
+.B \-\-fail\-on\-empty
+makes it one for pipelines that want a quiet day to be loud.
+.B import
+treats empty sources the same way: skipped with a note, never fatal, and
+an all-empty import into a new destination still creates it.
 .SS query
 .B timberfs query
 .I FILE
@@ -394,6 +478,13 @@ Rotation auto-detects a live mount: if a daemon serves the backing
 directory (advertised via the lock file), the request is routed through it
 and performed atomically; otherwise the backing files are rewritten
 directly under the same lock.
+.PP
+Rotating nothing into a new
+.I DEST
+still creates it, empty \(em the same present-but-empty vs missing
+distinction as an empty
+.BR export ,
+for pipelines that rotate-then-ship.
 .TP
 .B \-\-delete
 Drop the rotated chunks instead of moving them (retention). Mutually
@@ -402,6 +493,9 @@ exclusive with
 .TP
 .B \-\-dry\-run
 Show what would move without changing anything.
+.TP
+.B \-\-fail\-on\-empty
+Error when nothing rotates instead of attesting the empty result.
 .SH TIME FORMATS
 .I TIME
 arguments accept RFC 3339

@@ -163,9 +163,76 @@ pub fn cmd_reindex(file: &Path) -> anyhow::Result<()> {
     })?;
     let _file_lock = store::lock_file_exclusive(&dir, &name)?
         .with_context(|| format!("{name} has an active writer; stop it and retry"))?;
+    crate::bark::declare_index(&dir, &name)?;
+    build_grain(&dir, &name)
+}
 
+/// Extend an existing grain to cover chunks appended since it was built —
+/// only the new chunks are tokenized, so maintenance is proportional to
+/// the new data, like a database index. Anything unexpected (bad magic,
+/// more grain records than rings) falls back to a full rebuild. The
+/// caller holds the writer locks.
+pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
+    let gpath = format::grain_path(dir, name);
+    let existing = match fs::read(&gpath) {
+        Ok(b) => b,
+        Err(_) => return build_grain(dir, name),
+    };
+    if existing.len() < HEADER_LEN || &existing[..8] != GRAIN_MAGIC {
+        return build_grain(dir, name);
+    }
+    let mut off = HEADER_LEN;
+    let mut covered = 0usize;
+    loop {
+        if off + 4 > existing.len() {
+            break;
+        }
+        let len = u32::from_le_bytes(existing[off..off + 4].try_into().unwrap()) as usize;
+        if off + 4 + len > existing.len() {
+            break; // partial tail (crash): overwritten below
+        }
+        off += 4 + len;
+        covered += 1;
+    }
+    let records = format::read_index(&format::rings_path(dir, name))?;
+    if covered > records.len() {
+        return build_grain(dir, name);
+    }
+    if covered == records.len() {
+        return Ok(());
+    }
+    let trunk = File::open(format::trunk_path(dir, name))?;
+    let out = OpenOptions::new().write(true).open(&gpath)?;
+    out.set_len(off as u64)?;
+    let mut woff = off as u64;
+    let mut total_tokens = 0u64;
+    for c in &records[covered..] {
+        let mut comp = vec![0u8; c.comp_len as usize];
+        trunk.read_exact_at(&mut comp, c.comp_start)?;
+        let data = zstd::stream::decode_all(&comp[..])?;
+        let tokens = tokenize(&data);
+        total_tokens += tokens.len() as u64;
+        let filter = build_filter(&tokens);
+        out.write_all_at(&(filter.len() as u32).to_le_bytes(), woff)?;
+        woff += 4;
+        out.write_all_at(&filter, woff)?;
+        woff += filter.len() as u64;
+    }
+    out.sync_all()?;
+    eprintln!(
+        "timberfs: grain extended: {} new chunk(s) indexed ({} tokens), {} total",
+        records.len() - covered,
+        total_tokens,
+        records.len()
+    );
+    Ok(())
+}
+
+/// The grain build itself; the caller holds the writer locks.
+pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
+    let rings_p = format::rings_path(dir, name);
     let records = format::read_index(&rings_p)?;
-    let trunk = File::open(format::trunk_path(&dir, &name))?;
+    let trunk = File::open(format::trunk_path(dir, name))?;
     let tmp = dir.join(format!("{name}.{}.tmp", format::GRAIN_EXT));
     let out = OpenOptions::new()
         .write(true)
@@ -205,7 +272,7 @@ pub fn cmd_reindex(file: &Path) -> anyhow::Result<()> {
         }
     }
     out.sync_all()?;
-    fs::rename(&tmp, format::grain_path(&dir, &name))?;
+    fs::rename(&tmp, format::grain_path(dir, name))?;
     eprintln!(
         "timberfs: indexed {} chunk(s), {} distinct tokens ({} avg/chunk), grain is {} bytes \
          ({} bytes/chunk avg)",

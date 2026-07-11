@@ -62,6 +62,42 @@ bytes are overwritten. `fsync()` through the mount flushes the buffer as a
 chunk and syncs both backing files, so fsync = durable. Unsynced buffered
 data is lost on a crash, bounded by `--flush-age`.
 
+### The .bark manifest
+
+An optional `<name>.bark` holds the log's *declared* facts as one flat,
+human-editable JSON object — the label on the timber:
+
+```json
+{
+  "id": "6f9c2a1e-…",             // identity: random UUID, minted on first write,
+  "created": "2026-07-11T09:14:02Z", //   constant across renames, moves and hosts
+  "host": "imap03.example.com",   // provenance: free-form, yours (--set k=v)
+  "index": true,                  // settings: CREATE INDEX — imports maintain the grain
+  "derived_from": "41d0…",        // lineage: source store's id
+  "derived_op": "export",         // …and how: export (copy) or rotate (move)
+  "window_from": "2026-07-04T22:00:00.000Z", // the REQUESTED window (operation
+  "window_to": "2026-07-05T22:00:00.000Z"    //   fact — what was asked)
+}
+```
+
+Artifacts made by `export` and by rotation into a new segment are new
+stores: fresh `id`, `derived_from`/`derived_op` lineage (chains compose
+across re-carves and shipping), provenance inherited, settings and window
+facts not. Content facts — actual spans, sizes — are never recorded (the
+artifact's own rings state them authoritatively); the *requested* window
+is recorded, because content can't state coverage: a file whose last line
+is 17:00 doesn't say whether 17:00–24:00 was covered-but-silent or simply
+not exported.
+
+Which is why **an empty result is a result**: exporting or rotating a
+window that contains nothing still produces the (empty) artifact.
+Present-but-empty ("Saturday was covered, nothing was there — ingest
+Sunday") and missing ("a day is missing — don't ingest past the gap") are
+opposite signals to a consumer; `--fail-on-empty` turns a quiet day back
+into an error for pipelines that want one. `import` skips empty sources
+with a note, never an error. Unlike the derived `.grain`, bark survives
+head-drops, travels on rename, and ships inside `.timber` bundles.
+
 ## Semantics
 
 | Operation            | Behaviour                                                        |
@@ -158,17 +194,17 @@ out-of-order lines just widen chunk windows (queries select by interval
 overlap, so nothing is lost):
 
 ```sh
-timberfs import /var/log/old-app.log logs-backing/app.log
+timberfs import /var/log/old-app.log --into logs-backing/app.log
 timberfs query logs-backing/app.log --from "2026-06-03 14:00" --to "2026-06-03 15:00"
 
 # a whole rotated set, in any order — files are stitched chronologically
 # by their own first timestamps (rotation numbering and glob order lie)
-timberfs import /var/log/old-app.log.* /var/log/old-app.log logs-backing/app.log
+timberfs import /var/log/old-app.log.* /var/log/old-app.log --into logs-backing/app.log
 
 # a timberfs source (say, a rotation segment shipped from another box)
 # is detected automatically and merged VERBATIM — no decompression, no
 # parsing, index included; re-shipping the same segment is a no-op
-timberfs import /shipped/app-2026-07-09.log central-backing/hostA-app.log
+timberfs import /shipped/app-2026-07-09.log --into central-backing/hostA-app.log
 ```
 
 And `timberfs export` is the read-side twin: carve any time window (or a
@@ -180,7 +216,7 @@ hand-tarred pair is a valid bundle):
 ```sh
 timberfs export backing/archive.log incident.timber --from 13:40 --to 14:10
 timberfs query incident.timber --from 13:52 --to 13:53 | grep ERROR
-timberfs import incident.timber elsewhere/incident.log
+timberfs import incident.timber --into elsewhere/incident.log
 ```
 
 Note the middle line: bundles are first-class *read-only* logs — `query`,
@@ -266,8 +302,18 @@ in it (~10 bits per distinct token, k=7, ~1% false positives — measured
 0.86% on a 2.7 GB production log). Build it with `timberfs reindex`, use
 it with `query --has`:
 
+The index is a property of the LOG, declared once in its `.bark`
+manifest — after that, every import maintains the grain automatically
+(extended incrementally for new chunks, rebuilt if rotation/retention
+dropped it). There is no per-import flag to forget:
+
 ```sh
-timberfs reindex logs-backing/app.log          # 2.7 GB indexed in ~6 s
+timberfs create --index --set host=foo.bar.com logs-backing/app.log
+timberfs import day1/* --into logs-backing/app.log     # grain maintained
+timberfs import day2/* --into logs-backing/app.log     # still maintained
+
+timberfs import huge.log --into logs-backing/app.log --index  # or declare+build in one go
+timberfs reindex logs-backing/app.log          # or later: 2.7 GB indexed in ~6 s
 timberfs query logs-backing/app.log --has F454567068093ZHGZCL   # no time bound!
 timberfs query logs-backing/app.log --from 13:00 --to 14:00 --has ERROR \
     | timberfs grep 'tenantId=FOO'
@@ -369,6 +415,24 @@ unit unmounts first, so the daemon flushes everything and exits cleanly.
 
 ## Ideas / future work
 
+- **More `.bark`**: an `annotate` command for existing logs, attribution
+  labels from manifest fields in multi-file output (`--label '{host}'`),
+  auto-seeded provenance on import, bark-aware routing in the future
+  sawmill server.
+- **`grep --into`**: let `timberfs grep` emit a timberfs artifact instead
+  of raw text — a filtered store with `derived_op: "grep"` and the pattern
+  recorded as an operation fact, lineage intact. The empty-result rule
+  already anticipates it: a pattern that matches nothing yields a valid
+  empty artifact, same as an empty export window.
+- **A timberfs server ("sawmill")**: bundles shipped in over HTTP (PUT +
+  idempotent import = at-least-once ingest for free), routed to per-stream
+  archives by their `.bark` manifests, queried over a thin REST layer
+  wrapping query/grep. Tiering: keep rings+grain LOCAL, ship trunks to
+  object storage — queries plan locally (time windows + blooms) and fetch
+  candidate chunks as single S3 ranged GETs. Principle: the directory
+  stays the database; the server owns no state that is not a plain
+  timberfs file. Path: lib refactor → .bark → read-only serve → ingest →
+  tiering.
 - **zstd seekable format / dictionaries**: adopt the official seekable-zstd
   framing for ecosystem compat; train a dictionary per file for much better
   small-chunk ratios; long-range mode for cold recompression.

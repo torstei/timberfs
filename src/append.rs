@@ -150,6 +150,7 @@ pub fn cmd_append(
             target.display()
         );
     }
+    crate::query::ensure_dest_is_not_plain_file(target, "append")?;
     let (dir, name) = resolve_backing(target)?;
     fs::create_dir_all(&dir)?;
 

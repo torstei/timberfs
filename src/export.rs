@@ -17,6 +17,11 @@
 //! The source needs no lock (chunks are immutable, the index append-only —
 //! the same guarantee query relies on). Export always creates; merging
 //! into existing logs is import's job.
+//!
+//! An empty window still exports (an empty artifact whose bark records
+//! the requested window as window_from/window_to — evidence of absence,
+//! as opposed to the absence of evidence a MISSING file signals); pass
+//! --fail-on-empty to get an error instead.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -123,6 +128,7 @@ fn write_pair(
 fn write_bundle(
     dest: &Path,
     rings_bytes: &[u8],
+    bark_bytes: Option<Vec<u8>>,
     src_trunk: &File,
     selected: &[ChunkRecord],
     total_comp: u64,
@@ -144,6 +150,14 @@ fn write_bundle(
     header.set_mtime(mtime_secs);
     header.set_size(rings_bytes.len() as u64);
     builder.append_data(&mut header, format!("{stem}.rings"), rings_bytes)?;
+
+    if let Some(bark) = bark_bytes {
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(0o644);
+        header.set_mtime(mtime_secs);
+        header.set_size(bark.len() as u64);
+        builder.append_data(&mut header, format!("{stem}.bark"), &bark[..])?;
+    }
 
     let mut header = tar::Header::new_ustar();
     header.set_mode(0o644);
@@ -167,6 +181,7 @@ pub fn cmd_export(
     dest: &Path,
     from: Option<&str>,
     to: Option<&str>,
+    fail_on_empty: bool,
 ) -> anyhow::Result<()> {
     let handle = open_source(source)?;
     let chunks = handle.records;
@@ -181,9 +196,32 @@ pub fn cmd_export(
         .filter(|c| c.last_write_ms >= from_ms && c.first_write_ms <= to_ms)
         .copied()
         .collect();
-    if selected.is_empty() {
-        bail!("no chunks overlap the requested window");
+    // An empty selection still yields an artifact: present-but-empty
+    // ("the window was covered, nothing was there") and missing ("wait,
+    // don't ingest past this gap") are opposite signals to a consumer.
+    if selected.is_empty() && fail_on_empty {
+        bail!("no chunks overlap the requested window (--fail-on-empty)");
     }
+    // The derived artifact is a NEW store: fresh identity, lineage to the
+    // source when it is identified, inherited data provenance, settings
+    // dropped. Export never writes the source (read-only), so an
+    // unidentified source simply yields no derived_from. The requested
+    // window is an operation fact (what was asked, which content can
+    // never state) and goes in the bark when given.
+    let mut derived = crate::bark::derived_map(handle.bark.as_ref(), "export");
+    if from.is_some() {
+        derived.insert(
+            "window_from".to_string(),
+            serde_json::Value::String(crate::bark::ms_rfc3339(from_ms)),
+        );
+    }
+    if to.is_some() {
+        derived.insert(
+            "window_to".to_string(),
+            serde_json::Value::String(crate::bark::ms_rfc3339(to_ms)),
+        );
+    }
+    let derived_bark = crate::bark::with_identity(derived)?;
 
     // Rebase into a fresh offset space (chunk-by-chunk: the selection may
     // be non-contiguous in the source).
@@ -206,11 +244,24 @@ pub fn cmd_export(
     }
 
     let bundled = is_bundle(dest);
+    if !bundled {
+        crate::query::ensure_dest_is_not_plain_file(dest, "export")?;
+    }
+    let bark_text = serde_json::to_string_pretty(&serde_json::Value::Object(derived_bark))? + "\n";
     if bundled {
-        let mtime_secs = selected.last().unwrap().last_write_ms / 1000;
+        let mtime_secs = selected
+            .last()
+            .map(|c| c.last_write_ms / 1000)
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
         write_bundle(
             dest,
             &rings_bytes,
+            Some(bark_text.into_bytes()),
             &src_trunk,
             &selected,
             comp_off,
@@ -218,17 +269,28 @@ pub fn cmd_export(
         )?;
     } else {
         write_pair(dest, &rings_bytes, &src_trunk, &selected)?;
+        let (ddir, dname) = resolve_backing(dest)?;
+        fs::write(format::bark_path(&ddir, &dname), bark_text)?;
     }
-    eprintln!(
-        "timberfs: exported {} of {} chunk(s), {} bytes ({} compressed), spanning {} .. {} -> {}{}",
-        selected.len(),
-        chunks.len(),
-        uncomp_off,
-        comp_off,
-        fmt_ms(selected.first().unwrap().first_write_ms),
-        fmt_ms(selected.last().unwrap().last_write_ms),
-        dest.display(),
-        if bundled { " (bundle)" } else { "" }
-    );
+    match (selected.first(), selected.last()) {
+        (Some(first), Some(last)) => eprintln!(
+            "timberfs: exported {} of {} chunk(s), {} bytes ({} compressed), spanning {} .. {} -> {}{}",
+            selected.len(),
+            chunks.len(),
+            uncomp_off,
+            comp_off,
+            fmt_ms(first.first_write_ms),
+            fmt_ms(last.last_write_ms),
+            dest.display(),
+            if bundled { " (bundle)" } else { "" }
+        ),
+        _ => eprintln!(
+            "timberfs: exported 0 of {} chunk(s) — empty window; the artifact attests it \
+             (--fail-on-empty to error instead) -> {}{}",
+            chunks.len(),
+            dest.display(),
+            if bundled { " (bundle)" } else { "" }
+        ),
+    }
     Ok(())
 }
