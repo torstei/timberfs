@@ -28,8 +28,11 @@ pub fn fmt_ms(ms: u64) -> String {
     }
 }
 
-/// Accepts RFC3339, "YYYY-MM-DD HH:MM[:SS]", bare "HH:MM[:SS[.mmm]]"
-/// (today, local time), or unix seconds/milliseconds.
+/// Accepts RFC3339, "YYYY-MM-DD HH:MM[:SS]" (dots as date separators
+/// also work — paste straight from logback-style logs), a bare
+/// "YYYY-MM-DD" (midnight, so --from 2026-07-10 --to 2026-07-11 selects
+/// exactly that day), bare "HH:MM[:SS[.mmm]]" (today, local time), or
+/// unix seconds/milliseconds. Zoneless forms are local time.
 pub fn parse_time(s: &str) -> anyhow::Result<u64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.timestamp_millis() as u64);
@@ -39,9 +42,22 @@ pub fn parse_time(s: &str) -> anyhow::Result<u64> {
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%Y-%m-%dT%H:%M",
+        "%Y.%m.%d %H:%M:%S",
+        "%Y.%m.%d %H:%M",
     ] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
             if let Some(dt) = Local.from_local_datetime(&naive).earliest() {
+                return Ok(dt.timestamp_millis() as u64);
+            }
+        }
+    }
+    // A bare date is midnight local time.
+    for fmt in ["%Y-%m-%d", "%Y.%m.%d"] {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, fmt) {
+            if let Some(dt) = Local
+                .from_local_datetime(&d.and_time(NaiveTime::MIN))
+                .earliest()
+            {
                 return Ok(dt.timestamp_millis() as u64);
             }
         }
@@ -59,7 +75,7 @@ pub fn parse_time(s: &str) -> anyhow::Result<u64> {
         return Ok(if n > 100_000_000_000 { n } else { n * 1000 });
     }
     bail!(
-        "unrecognized time {s:?} (try RFC3339, 'YYYY-MM-DD HH:MM:SS', 'HH:MM[:SS]', \
+        "unrecognized time {s:?} (try RFC3339, 'YYYY-MM-DD [HH:MM[:SS]]', 'HH:MM[:SS]', \
          or unix seconds)"
     )
 }
@@ -251,13 +267,13 @@ pub fn select_chunks(
 /// so scanning it is negligible next to decompressing one chunk.)
 pub fn cmd_query(
     files: &[std::path::PathBuf],
-    from: Option<&str>,
-    to: Option<&str>,
+    from: Option<u64>,
+    to: Option<u64>,
     has: &[String],
     no_filename: bool,
 ) -> anyhow::Result<()> {
-    let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
-    let to_ms = to.map(parse_time).transpose()?.unwrap_or(u64::MAX);
+    let from_ms = from.unwrap_or(0);
+    let to_ms = to.unwrap_or(u64::MAX);
     if from_ms > to_ms {
         bail!("--from is after --to");
     }

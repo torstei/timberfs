@@ -31,7 +31,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 
 use crate::format::{self, ChunkRecord};
-use crate::query::{fmt_ms, is_bundle, open_source, parse_time, resolve_backing};
+use crate::query::{fmt_ms, is_bundle, open_source, resolve_backing};
 use crate::store;
 
 /// Streams the selected chunks' compressed frames in order, so a bundle's
@@ -179,15 +179,15 @@ fn write_bundle(
 pub fn cmd_export(
     source: &Path,
     dest: &Path,
-    from: Option<&str>,
-    to: Option<&str>,
+    from: Option<u64>,
+    to: Option<u64>,
     fail_on_empty: bool,
 ) -> anyhow::Result<()> {
     let handle = open_source(source)?;
     let chunks = handle.records;
     let src_trunk = handle.file;
-    let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
-    let to_ms = to.map(parse_time).transpose()?.unwrap_or(u64::MAX);
+    let from_ms = from.unwrap_or(0);
+    let to_ms = to.unwrap_or(u64::MAX);
     if from_ms > to_ms {
         bail!("--from is after --to");
     }
