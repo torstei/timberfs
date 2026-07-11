@@ -144,9 +144,27 @@ timberfs query logs-backing/app.log --from 13:42 --to 13:43
 timberfs query logs-backing/app.log --from "2026-07-09 13:42:00" --to "2026-07-09 13:43:00"
 
 # entry-aware grep: matches whole log ENTRIES (a timestamped line plus
-# its continuations — stack traces stay attached); pipe for AND
+# its continuations — stack traces stay attached); pipe for AND.
+# The default is WORD matching (ERROR, not ERRORS) — the .grain's own
+# semantics, so indexed logs skip chunks automatically and exactly
 timberfs grep ERROR logs-backing/app.log --from 13:42 --to 13:43
 cat any.log | timberfs grep 'tenantId=FOO' | timberfs grep -v DEBUG
+
+# the pattern may be left out when --has/--from/--to select instead:
+# entries containing every --has token (or the whole window) match
+timberfs grep --has ERROR -c logs-backing/app.log
+
+# -F = raw substring (partial ids), --regex = full regex: both read
+# EVERYTHING — don't reach for them unless you need them (a note tells
+# you when the index sat idle, and --scan forces the full scan)
+timberfs grep -F 8454XK logs-backing/app.log
+timberfs grep --regex 'ERROR|FATAL' logs-backing/app.log
+
+# the investigation as an artifact: --into writes the matching entries
+# to a NEW store (or .timber bundle to attach to the ticket) whose .bark
+# records the command line, pattern, window and lineage — it says what
+# question produced it; an empty result is an (empty) artifact too
+timberfs grep 'tenantId=FOO' logs-backing/app.log --from 13:00 --into case.timber
 
 # the fleet view: store one log per host/app, merge at READ time —
 # chunks interleave by time across files, lines carry "path:" prefixes
@@ -434,11 +452,15 @@ unit unmounts first, so the daemon flushes everything and exits cleanly.
   labels from manifest fields in multi-file output (`--label '{host}'`),
   auto-seeded provenance on import, bark-aware routing in the future
   sawmill server.
-- **`grep --into`**: let `timberfs grep` emit a timberfs artifact instead
-  of raw text — a filtered store with `derived_op: "grep"` and the pattern
-  recorded as an operation fact, lineage intact. The empty-result rule
-  already anticipates it: a pattern that matches nothing yields a valid
-  empty artifact, same as an empty export window.
+- **Docs: "why is my grep slow?"**: a short troubleshooting section
+  walking the modes table — word mode + grain = fast; --regex/-F/-i/-v =
+  full scan and why; how to build the index (`create --index`/`reindex`)
+  and read the full-scan notes.
+- **`timberfs merge`**: entry-aware N-way merge — split sources (raw logs
+  or timberfs) into log entries, merge-sort them by timestamp, emit one
+  timberfs store or raw stream. Subsumes "grep a fleet into one artifact"
+  (merge, then `grep --into`) and gives shipped per-host segments a
+  single-timeline view at write time rather than only at read time.
 - **A timberfs server ("sawmill")**: bundles shipped in over HTTP (PUT +
   idempotent import = at-least-once ingest for free), routed to per-stream
   archives by their `.bark` manifests, queried over a thin REST layer
