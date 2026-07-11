@@ -89,24 +89,31 @@ timeout "$TIMEOUT" qemu-system-x86_64 $KVM_ARGS \
 QEMU_RC=$?
 set -e
 
+# Materialize the CR-stripped log ONCE: piping it into an early-exiting
+# consumer (grep -q) under pipefail flips the verdict to FAILED when tr
+# catches EPIPE — a pipe-buffer race that only shows up once the log
+# grows big enough. No pipes in the verdict path.
+CLEAN="$WORK/serial.clean"
+tr -d '\r' < "$WORK/serial.log" > "$CLEAN"
+
 if [ "$QEMU_RC" = 124 ]; then
     echo "=== VM timed out after ${TIMEOUT}s; last serial output: ===" >&2
-    tr -d '\r' < "$WORK/serial.log" | tail -30 >&2
+    tail -30 "$CLEAN" >&2
     exit 1
 fi
 
 echo "=== test results ==="
-tr -d '\r' < "$WORK/serial.log" | grep -E "^(TEST (PASS|FAIL)|TIMBERFS-VM-TESTS)" || {
+grep -E "^(TEST (PASS|FAIL)|TIMBERFS-VM-TESTS)" "$CLEAN" || {
     echo "no test output found on serial console; last serial output:" >&2
-    tr -d '\r' < "$WORK/serial.log" | tail -30 >&2
+    tail -30 "$CLEAN" >&2
     exit 1
 }
 
-if tr -d '\r' < "$WORK/serial.log" | grep -q "^TIMBERFS-VM-TESTS: ALL PASSED"; then
+if grep -q "^TIMBERFS-VM-TESTS: ALL PASSED" "$CLEAN"; then
     echo "OK (full log: $WORK/serial.log)"
     exit 0
 else
     echo "FAILED — failing test output above; full log: $WORK/serial.log" >&2
-    tr -d '\r' < "$WORK/serial.log" | grep -A5 "^TEST FAIL" >&2 || true
+    grep -A5 "^TEST FAIL" "$CLEAN" >&2 || true
     exit 1
 fi
