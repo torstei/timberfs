@@ -430,10 +430,23 @@ daily_bulk_load() {
         && [ "$(timberfs query /tmp/blstore/app.log 2>/dev/null | wc -l)" = 3 ]
 }
 
+grep_into_artifact() {
+    # the investigation as an artifact: matching entries + a bark that
+    # says what question produced it; readable in place as a bundle
+    printf '2026-06-11T10:00:00 ERROR tenant=FOO boom\n  at deep.Stack\n2026-06-11T10:00:01 INFO tenant=BAR fine\n' > /tmp/gi.log
+    timberfs import /tmp/gi.log --into /tmp/gistore/app.log 2>/dev/null \
+        && timberfs grep 'tenant=FOO' /tmp/gistore/app.log --into /tmp/gicase.timber 2>/dev/null \
+        && [ "$(timberfs query /tmp/gicase.timber 2>/dev/null | wc -l)" = 2 ] \
+        && timberfs query /tmp/gicase.timber 2>/dev/null | grep -q "deep.Stack" \
+        && tar xOf /tmp/gicase.timber gicase.bark | grep -q '"derived_op": "grep"' \
+        && tar xOf /tmp/gicase.timber gicase.bark | grep -q '"command": "timberfs grep '
+}
+
 run_test "write guards: forgotten destination after a glob is refused" forgotten_destination_refused
 run_test "bark: create --index makes imports maintain the grain" sticky_declared_index
 run_test "empty results are results: export ships, import no-ops" empty_results_are_results
 run_test "daily bulk-load: day-2 appends, overlap dedups, re-run no-ops" daily_bulk_load
+run_test "grep --into: the investigation as an artifact" grep_into_artifact
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 

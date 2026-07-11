@@ -428,10 +428,8 @@ the same timestamp auto-detection as
 .B import
 (and the same
 .BR \-\-timestamp\-regex / \-\-timestamp\-format
-escape hatch). The pattern \(em a regex, or a fixed string with
-.B \-F
-\(em is matched against the whole entry, and matching entries print
-whole; pipe several
+escape hatch). The pattern is matched against the whole entry, and
+matching entries print whole; pipe several
 .B grep
 invocations for entry-level AND. Flags:
 .B \-i
@@ -440,6 +438,39 @@ invocations for entry-level AND. Flags:
 (print non-matching entries),
 .B \-c
 (count matching entries).
+.PP
+The default matching mode is a
+.B literal at token boundaries
+(\(lqword mode\(rq: ERROR finds the word ERROR \(em [ERROR], \(lqERROR:\(rq
+\(em not ERRORS or PROTOCOLERROR). That is the
+.BR .grain 's
+own whole-token semantics, so on an indexed log the pattern's tokens
+pre-filter chunks
+.B automatically and exactly
+\(em
+.B grep 'FOO BAR ERROR'
+is
+.B \-\-has FOO \-\-has BAR \-\-has ERROR
+at chunk level, then \(lqthe entry contains the anchored phrase\(rq at
+entry level; an entry matching the phrase must contain every token
+whole, so the skip is conservative, never wrong. (For scattered
+word-AND instead of a phrase, use the pattern-less
+.B \-\-has
+form, or pipe greps.)
+.B \-F
+matches a raw substring (reaches inside tokens \(em partial ids) and
+.B \-\-regex
+a full regular expression:
+.B both read every chunk, so don't reach for them unless you need them.
+.B \-i
+(the grain is exact-case) and
+.B \-v
+(non-matches must be read to be printed \(em an index proving \(lqno
+matches here\(rq means print the whole chunk, not skip it) also scan.
+Whenever a grain exists but cannot be used, a one-line note on standard
+error says why;
+.B \-\-scan
+forces the full scan.
 .PP
 Input is a raw log on standard input, a plain log file, or a timberfs
 log/bundle \(em in the timberfs case
@@ -462,6 +493,53 @@ line prefixes
 .RB ( \-\-no\-filename
 to suppress) and per-file counts under
 .BR \-c .
+.PP
+The
+.I PATTERN
+may be left out when
+.BR \-\-has / \-\-from / \-\-to
+select instead:
+.B timberfs grep \-\-has ERROR \-c backing/app.log
+counts the entries containing ERROR \(em the first argument, naming an
+existing timberfs log, is taken as the file, and entries containing
+every
+.B \-\-has
+token match (with a pure
+.BR \-\-from / \-\-to
+window, every entry in it). A note on standard error says what was
+matched. (Without this, the file would silently become the PATTERN \(em
+grep's first positional \(em and the resulting errors blamed stdin.)
+.PP
+.B \-\-into
+.I DEST
+writes the matching entries into a NEW timberfs log (or
+.B .timber
+bundle) instead of printing them \(em the investigation shipped as an
+artifact, the third derivation after
+.B export
+and rotation. It takes exactly one timberfs source (lineage stays
+unambiguous); the artifact's bark records
+.B derived_from
+plus the operation, fully told:
+.B command
+(the invocation as typed \(em what question produced this),
+.B pattern
+and the requested window. Multiline entries stay glued, chunk windows
+come from the entries' own timestamps, and the result is a normal store:
+queryable, indexable, exportable, importable. Unlike
+.B export
+(verbatim chunk copies), entries are decompressed, matched and
+recompressed \(em cost follows the uncompressed window. A pattern that
+matches nothing yields an (empty) artifact attesting exactly that;
+.B \-\-fail\-on\-empty
+errors instead.
+.PP
+.nf
+.RS
+timberfs grep 'tenantId=FOO' backing/app.log \-\-from 13:00 \-\-to 14:10 \-\-into case.timber
+timberfs query case.timber | less        # attach case.timber to the ticket
+.RE
+.fi
 .SS index
 .B timberfs index
 .I FILE

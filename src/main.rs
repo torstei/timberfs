@@ -183,7 +183,11 @@ enum Command {
     /// file, or a timberfs log/bundle where --from/--to/--has pre-select
     /// chunks first. Pipe several greps for entry-level AND.
     Grep {
-        /// Regex to match against each entry (-F for a fixed string)
+        /// Text matched at token boundaries — the fast default, index-
+        /// accelerated on grain-indexed logs (ERROR finds the word ERROR,
+        /// not ERRORS). -F matches raw substrings, --regex full regexes;
+        /// both read everything. May be left out when --has/--from/--to
+        /// select instead: the first argument is then the file
         pattern: String,
         /// Raw log file(s), timberfs backing file(s), or .timber
         /// bundle(s), processed in order with "path:" prefixes when
@@ -195,7 +199,8 @@ enum Command {
         /// Print entries that do NOT match
         #[arg(short = 'v', long)]
         invert: bool,
-        /// PATTERN is a fixed string, not a regex
+        /// PATTERN is a raw substring: matches inside tokens too
+        /// (partial ids). Reads every chunk
         #[arg(short = 'F', long)]
         fixed: bool,
         /// Print only the number of matching entries
@@ -219,6 +224,25 @@ enum Command {
         /// chrono format string for the captured timestamp
         #[arg(long, requires = "timestamp_regex")]
         timestamp_format: Option<String>,
+        /// Write matching entries into a NEW timberfs log or .timber
+        /// bundle instead of printing — the investigation as an artifact:
+        /// its manifest records the command line, pattern, window and
+        /// lineage. Takes exactly one timberfs source
+        #[arg(long = "into", value_name = "DEST", conflicts_with_all = ["count", "no_filename"])]
+        into: Option<PathBuf>,
+        /// With --into: error instead of writing an empty artifact when
+        /// nothing matches
+        #[arg(long, requires = "into")]
+        fail_on_empty: bool,
+        /// Full scan: never pre-filter chunks via the .grain (word-mode
+        /// patterns otherwise use it automatically when one exists)
+        #[arg(long)]
+        scan: bool,
+        /// PATTERN is a regular expression. Reads every chunk — don't
+        /// reach for this unless you need it; the word-mode default is
+        /// index-accelerated
+        #[arg(long, conflicts_with = "fixed")]
+        regex: bool,
     },
     /// Show the write-time chunk index of a backing file
     Index {
@@ -376,6 +400,10 @@ fn main() -> anyhow::Result<()> {
             no_filename,
             timestamp_regex,
             timestamp_format,
+            into,
+            fail_on_empty,
+            scan,
+            regex,
         } => {
             grep::cmd_grep(
                 &pattern,
@@ -390,6 +418,10 @@ fn main() -> anyhow::Result<()> {
                 no_filename,
                 timestamp_regex.as_deref(),
                 timestamp_format.as_deref(),
+                into.as_deref(),
+                fail_on_empty,
+                scan,
+                regex,
             )?;
         }
         Command::Index { file } => {
