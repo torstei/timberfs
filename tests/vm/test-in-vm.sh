@@ -446,7 +446,13 @@ run_test "write guards: forgotten destination after a glob is refused" forgotten
 run_test "bark: create --index makes imports maintain the grain" sticky_declared_index
 run_test "empty results are results: export ships, import no-ops" empty_results_are_results
 run_test "daily bulk-load: day-2 appends, overlap dedups, re-run no-ops" daily_bulk_load
+info_vital_signs() {
+    # one screen of truth: data, coverage, index state, writer
+    OUT=$(timberfs info "$PIPE_BACKING/sticky.log")         && echo "$OUT" | grep -qE 'identity  [0-9a-f-]{36}'         && echo "$OUT" | grep -qE 'data      .* chunk\(s\)'         && echo "$OUT" | grep -q 'covers    '         && echo "$OUT" | grep -q 'writer    none'         && timberfs info "$PIPE_BACKING/sticky.log" --json | grep -q '"kind": "pair"'
+}
+
 run_test "grep --into: the investigation as an artifact" grep_into_artifact
+run_test "info: a store's vital signs on one screen" info_vital_signs
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 

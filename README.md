@@ -171,6 +171,10 @@ timberfs grep 'tenantId=FOO' logs-backing/app.log --from 13:00 --into case.timbe
 timberfs query --from 13:42 --to 13:43 collector/host*-app.log
 timberfs grep req-8f3a collector/*.log --has req-8f3a   # which hosts saw it?
 
+# the store's vital signs: identity, lineage, size/compression, time
+# covered, index coverage, writer state (--json for scripting)
+timberfs info logs-backing/app.log
+
 # inspect the chunk index (offsets, compression ratio, time windows)
 timberfs index logs-backing/app.log
 

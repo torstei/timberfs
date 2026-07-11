@@ -407,6 +407,268 @@ fn query_multi(
 }
 
 /// Human-readable dump of the write-time index.
+/// `timberfs info`: a store's vital signs on one screen — identity,
+/// lineage, provenance, data/compression, time covered, index sizes and
+/// coverage, writer state. The `\d+` of the database metaphor. Read-only;
+/// works identically on backing pairs and .timber bundles.
+pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
+    let bundled = is_bundle(input);
+    let handle = open_source(input)?;
+    let records = &handle.records;
+
+    let chunks = records.len();
+    let logical = match (records.first(), records.last()) {
+        (Some(f), Some(l)) => l.uncomp_end() - f.uncomp_start,
+        _ => 0,
+    };
+    let compressed = match (records.first(), records.last()) {
+        (Some(f), Some(l)) => l.comp_end() - f.comp_start,
+        _ => 0,
+    };
+    // Mostly-sorted windows: scan for the true extremes (48 B per chunk).
+    let (mut min_ms, mut max_ms) = (u64::MAX, 0u64);
+    for r in records {
+        min_ms = min_ms.min(r.first_write_ms);
+        max_ms = max_ms.max(r.last_write_ms);
+    }
+
+    let bark = handle.bark.clone().unwrap_or_default();
+    let get = |k: &str| bark.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let id = get("id");
+    let created = get("created");
+    let derived_from = get("derived_from");
+    let derived_op = get("derived_op");
+    let window_from = get("window_from");
+    let window_to = get("window_to");
+    let index_declared = bark.get("index").and_then(|v| v.as_bool()).unwrap_or(false);
+    let command = get("command");
+    let pattern = get("pattern");
+    const RESERVED: &[&str] = &[
+        "id",
+        "created",
+        "derived_from",
+        "derived_op",
+        "window_from",
+        "window_to",
+        "index",
+        "command",
+        "pattern",
+    ];
+    let provenance: Vec<(String, String)> = bark
+        .iter()
+        .filter(|(k, _)| !RESERVED.contains(&k.as_str()))
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string()),
+            )
+        })
+        .collect();
+
+    // Pair-only facts: sidecar sizes, grain coverage, writer state.
+    let mut name = input
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut location = String::new();
+    let mut rings_bytes: Option<u64> = None;
+    let mut grain: Option<(u64, usize)> = None; // (bytes, chunks covered)
+    let mut writer: Option<String> = None;
+    let mut bundle_bytes: Option<u64> = None;
+    if bundled {
+        bundle_bytes = std::fs::metadata(input).map(|m| m.len()).ok();
+    } else {
+        let (dir, base) = resolve_backing(input)?;
+        name = base.clone();
+        location = dir.display().to_string();
+        rings_bytes = std::fs::metadata(format::rings_path(&dir, &base))
+            .map(|m| m.len())
+            .ok();
+        let gpath = format::grain_path(&dir, &base);
+        if let Ok(m) = std::fs::metadata(&gpath) {
+            if let Ok(g) = crate::grain::load(&gpath) {
+                grain = Some((m.len(), g.chunk_count()));
+            }
+        }
+        // Who is writing? flock presence is the truth (lock files persist
+        // and their contents go stale); probe without blocking anyone.
+        writer = Some(match crate::store::lock_backing_shared(&dir)? {
+            None => match crate::store::read_lock_mountpoint(&dir) {
+                Some(mp) => format!("mounted at {}", mp.display()),
+                None => "another timberfs process holds the directory".to_string(),
+            },
+            Some(_dir_guard) => match crate::store::lock_file_exclusive(&dir, &base)? {
+                None => "active writer (appender, import or rotation)".to_string(),
+                Some(_lock) => "none".to_string(),
+            },
+        });
+    }
+
+    if json {
+        let mut o = serde_json::Map::new();
+        let mut put = |k: &str, v: serde_json::Value| {
+            o.insert(k.to_string(), v);
+        };
+        put("name", name.clone().into());
+        put("kind", if bundled { "bundle" } else { "pair" }.into());
+        if let Some(id) = &id {
+            put("id", id.clone().into());
+        }
+        if let Some(c) = &created {
+            put("created", c.clone().into());
+        }
+        if let Some(d) = &derived_from {
+            put("derived_from", d.clone().into());
+        }
+        if let Some(d) = &derived_op {
+            put("derived_op", d.clone().into());
+        }
+        if let Some(w) = &window_from {
+            put("window_from", w.clone().into());
+        }
+        if let Some(w) = &window_to {
+            put("window_to", w.clone().into());
+        }
+        if let Some(c) = &command {
+            put("command", c.clone().into());
+        }
+        if let Some(pt) = &pattern {
+            put("pattern", pt.clone().into());
+        }
+        put("index_declared", index_declared.into());
+        put(
+            "provenance",
+            serde_json::Value::Object(
+                provenance
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect(),
+            ),
+        );
+        put("chunks", chunks.into());
+        put("logical_bytes", logical.into());
+        put("compressed_bytes", compressed.into());
+        if compressed > 0 {
+            put(
+                "ratio",
+                ((logical as f64 / compressed as f64 * 10.0).round() / 10.0).into(),
+            );
+        }
+        if chunks > 0 {
+            put("first_write_ms", min_ms.into());
+            put("last_write_ms", max_ms.into());
+        }
+        if let Some(b) = rings_bytes {
+            put("rings_bytes", b.into());
+        }
+        if let Some((b, n)) = grain {
+            put("grain_bytes", b.into());
+            put("grain_chunks", n.into());
+        }
+        if let Some(b) = bundle_bytes {
+            put("bundle_bytes", b.into());
+        }
+        if let Some(w) = &writer {
+            put("writer", w.clone().into());
+        }
+        println!("{}", serde_json::to_string_pretty(&o)?);
+        return Ok(());
+    }
+
+    if bundled {
+        println!(
+            "{name} — .timber bundle ({}), read-only",
+            crate::rotate::human_bytes(bundle_bytes.unwrap_or(0))
+        );
+    } else {
+        println!("{name} — timberfs log in {location}/");
+    }
+    if let Some(id) = &id {
+        println!(
+            "  identity  {id}, created {}",
+            created.as_deref().unwrap_or("?")
+        );
+    }
+    if let Some(from) = &derived_from {
+        let window = match (&window_from, &window_to) {
+            (None, None) => String::new(),
+            (f, t) => format!(
+                ", window {} .. {}",
+                f.as_deref().unwrap_or("start"),
+                t.as_deref().unwrap_or("end")
+            ),
+        };
+        println!(
+            "  lineage   derived from {from} by {}{window}",
+            derived_op.as_deref().unwrap_or("?")
+        );
+    }
+    // The operation, as typed — an investigation artifact explains itself.
+    if let Some(c) = &command {
+        println!("  question  {c}");
+    } else if let Some(pt) = &pattern {
+        println!("  pattern   {pt}");
+    }
+    if !provenance.is_empty() || index_declared {
+        let mut parts: Vec<String> = provenance.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        if index_declared {
+            parts.push("index declared".to_string());
+        }
+        println!("  manifest  {}", parts.join(", "));
+    }
+    if chunks == 0 {
+        println!("  data      empty (an attested empty result is still a result)");
+    } else {
+        println!(
+            "  data      {} in {chunks} chunk(s) -> {} on disk ({:.1}x)",
+            crate::rotate::human_bytes(logical),
+            crate::rotate::human_bytes(compressed),
+            logical as f64 / compressed.max(1) as f64
+        );
+        println!(
+            "  covers    {} .. {}  ({})",
+            fmt_ms(min_ms),
+            fmt_ms(max_ms),
+            human_duration(max_ms.saturating_sub(min_ms))
+        );
+    }
+    if !bundled {
+        let rings = crate::rotate::human_bytes(rings_bytes.unwrap_or(0));
+        match grain {
+            Some((b, n)) => println!(
+                "  index     rings {rings}; grain {}, covers {n}/{chunks} chunk(s){}",
+                crate::rotate::human_bytes(b),
+                if n < chunks { " (rest is scanned)" } else { "" }
+            ),
+            None if index_declared => println!(
+                "  index     rings {rings}; grain declared but MISSING — next import \
+                 rebuilds it (or run reindex)"
+            ),
+            None => println!("  index     rings {rings}; no grain (reindex to build one)"),
+        }
+        if let Some(w) = &writer {
+            println!("  writer    {w}");
+        }
+    }
+    Ok(())
+}
+
+fn human_duration(ms: u64) -> String {
+    let s = ms / 1000;
+    let (d, h, m) = (s / 86400, (s % 86400) / 3600, (s % 3600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {}s", s % 60)
+    } else {
+        format!("{}.{:03}s", s, ms % 1000)
+    }
+}
+
 pub fn cmd_index(file: &Path) -> anyhow::Result<()> {
     let chunks = open_source(file)?.records;
     println!(

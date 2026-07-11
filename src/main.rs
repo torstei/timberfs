@@ -246,6 +246,16 @@ enum Command {
         #[arg(long, conflicts_with = "fixed")]
         regex: bool,
     },
+    /// Show a store's vital signs on one screen: identity, lineage,
+    /// data and compression, time covered, index sizes and coverage,
+    /// writer state. Works on backing pairs and .timber bundles alike
+    Info {
+        /// Backing file (logical name, .trunk/.rings path) or bundle
+        file: PathBuf,
+        /// Machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the write-time chunk index of a backing file
     Index {
         /// Backing file: logical name, .trunk or .rings path
@@ -420,6 +430,9 @@ fn main() -> anyhow::Result<()> {
                 scan,
                 regex,
             )?;
+        }
+        Command::Info { file, json } => {
+            query::cmd_info(&file, json)?;
         }
         Command::Index { file } => {
             query::cmd_index(&file)?;
