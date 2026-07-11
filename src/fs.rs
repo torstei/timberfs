@@ -109,19 +109,28 @@ pub struct TimberFs {
     notifier: Arc<Mutex<Option<fuser::Notifier>>>,
     ino_to_name: HashMap<u64, String>,
     name_to_ino: HashMap<String, u64>,
+    /// Mirror of name_to_ino shared with the flusher thread, which needs
+    /// name -> ino to invalidate kernel attrs after a retention head-drop
+    /// (same stale-O_APPEND-offset hazard as rotation).
+    shared_inos: Arc<Mutex<HashMap<String, u64>>>,
     next_ino: u64,
     uid: u32,
     gid: u32,
 }
 
 impl TimberFs {
-    fn new(store: Arc<Mutex<Store>>, notifier: Arc<Mutex<Option<fuser::Notifier>>>) -> TimberFs {
+    fn new(
+        store: Arc<Mutex<Store>>,
+        notifier: Arc<Mutex<Option<fuser::Notifier>>>,
+        shared_inos: Arc<Mutex<HashMap<String, u64>>>,
+    ) -> TimberFs {
         let names: Vec<String> = store.lock().unwrap().files.keys().cloned().collect();
         let mut fs = TimberFs {
             store,
             notifier,
             ino_to_name: HashMap::new(),
             name_to_ino: HashMap::new(),
+            shared_inos,
             next_ino: 2,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -140,6 +149,10 @@ impl TimberFs {
         self.next_ino += 1;
         self.ino_to_name.insert(ino, name.to_string());
         self.name_to_ino.insert(name.to_string(), ino);
+        self.shared_inos
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), ino);
         ino
     }
 
@@ -532,6 +545,7 @@ impl Filesystem for TimberFs {
                 if let Some(ino) = self.name_to_ino.remove(&name) {
                     self.ino_to_name.remove(&ino);
                 }
+                self.shared_inos.lock().unwrap().remove(&name);
                 reply.ok();
             }
             Err(e) => reply.error(io_errno(&e)),
@@ -567,7 +581,12 @@ impl Filesystem for TimberFs {
                 }
                 if let Some(ino) = self.name_to_ino.remove(&old) {
                     self.ino_to_name.insert(ino, new.clone());
-                    self.name_to_ino.insert(new, ino);
+                    self.name_to_ino.insert(new.clone(), ino);
+                    let mut mirror = self.shared_inos.lock().unwrap();
+                    mirror.remove(&old);
+                    mirror.insert(new, ino);
+                } else {
+                    self.shared_inos.lock().unwrap().remove(&old);
                 }
                 reply.ok();
             }
@@ -813,14 +832,84 @@ pub fn mount(store: Store, mountpoint: &Path, allow_other: bool) -> anyhow::Resu
     let _lock = lock; // hold the flock until we return
 
     let store = Arc::new(Mutex::new(store));
+    let notifier_slot: Arc<Mutex<Option<fuser::Notifier>>> = Arc::new(Mutex::new(None));
+    let shared_inos: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Background flusher: bounds both data loss on a crash and the
-    // write-time granularity of the index for slow writers.
+    // write-time granularity of the index for slow writers — and enforces
+    // each file's DECLARED retention (from its .bark, re-read every tick:
+    // `timberfs set retain=30d` on a live mount takes effect within a
+    // second). A manifest that stops parsing keeps the last good policy.
     {
         let store = Arc::clone(&store);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(1000));
-            store.lock().unwrap().flush_aged();
+        let notifier = Arc::clone(&notifier_slot);
+        let inos = Arc::clone(&shared_inos);
+        thread::spawn(move || {
+            type Stamp = Option<(Option<std::time::SystemTime>, u64)>;
+            let mut last_good: HashMap<String, crate::bark::Retention> = HashMap::new();
+            let mut stamps: HashMap<String, Stamp> = HashMap::new();
+            let mut warned: std::collections::HashSet<String> = std::collections::HashSet::new();
+            loop {
+                thread::sleep(Duration::from_millis(1000));
+                let (dir, names) = {
+                    let s = store.lock().unwrap();
+                    (s.dir.clone(), s.files.keys().cloned().collect::<Vec<_>>())
+                };
+                for name in names {
+                    // The manifest almost never changes: stat first, and
+                    // only re-parse when (mtime, len) moved.
+                    let cur: Stamp = std::fs::metadata(crate::format::bark_path(&dir, &name))
+                        .ok()
+                        .map(|m| (m.modified().ok(), m.len()));
+                    let policy = if stamps.get(&name) == Some(&cur) {
+                        last_good.get(&name).copied().unwrap_or_default()
+                    } else {
+                        stamps.insert(name.clone(), cur);
+                        match crate::bark::declared_retention(&dir, &name) {
+                            Ok(p) => {
+                                warned.remove(&name);
+                                last_good.insert(name.clone(), p);
+                                p
+                            }
+                            Err(e) => {
+                                if warned.insert(name.clone()) {
+                                    eprintln!(
+                                        "timberfs: {name}: manifest unreadable ({e}); keeping \
+                                         the previous retention policy"
+                                    );
+                                }
+                                last_good.get(&name).copied().unwrap_or_default()
+                            }
+                        }
+                    };
+                    if !policy.is_some() {
+                        continue;
+                    }
+                    let res = store.lock().unwrap().enforce_retention(
+                        &name,
+                        policy.max_age_ms,
+                        policy.max_comp_bytes,
+                    );
+                    match res {
+                        Ok(Some(stats)) => {
+                            eprintln!(
+                                "timberfs: {name}: retention dropped {} chunk(s), {} \
+                                 compressed bytes",
+                                stats.chunks_moved, stats.comp_bytes
+                            );
+                            // The file shrank behind the kernel: drop its
+                            // cached attrs or O_APPEND writers go stale.
+                            let ino = inos.lock().unwrap().get(&name).copied();
+                            if let (Some(ino), Some(n)) = (ino, notifier.lock().unwrap().as_ref()) {
+                                let _ = n.inval_inode(ino, 0, 0);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("timberfs: {name}: retention failed: {e}"),
+                    }
+                }
+                store.lock().unwrap().flush_aged();
+            }
         });
     }
 
@@ -831,7 +920,7 @@ pub fn mount(store: Store, mountpoint: &Path, allow_other: bool) -> anyhow::Resu
     if allow_other {
         options.push(MountOption::AllowOther);
     }
-    let result = run_session(&store, mountpoint, &options);
+    let result = run_session(&store, &notifier_slot, &shared_inos, mountpoint, &options);
     let result = match result {
         Err(e) if !allow_other => {
             // auto_unmount can require allow_other rights (user_allow_other
@@ -842,7 +931,7 @@ pub fn mount(store: Store, mountpoint: &Path, allow_other: bool) -> anyhow::Resu
                 mountpoint.display()
             );
             let options = vec![MountOption::FSName("timberfs".to_string())];
-            run_session(&store, mountpoint, &options)
+            run_session(&store, &notifier_slot, &shared_inos, mountpoint, &options)
         }
         r => r,
     };
@@ -855,11 +944,16 @@ pub fn mount(store: Store, mountpoint: &Path, allow_other: bool) -> anyhow::Resu
 /// filesystem a Notifier for kernel cache invalidation after rotations.
 fn run_session(
     store: &Arc<Mutex<Store>>,
+    notifier_slot: &Arc<Mutex<Option<fuser::Notifier>>>,
+    shared_inos: &Arc<Mutex<HashMap<String, u64>>>,
     mountpoint: &Path,
     options: &[MountOption],
 ) -> std::io::Result<()> {
-    let notifier_slot = Arc::new(Mutex::new(None));
-    let fs = TimberFs::new(Arc::clone(store), Arc::clone(&notifier_slot));
+    let fs = TimberFs::new(
+        Arc::clone(store),
+        Arc::clone(notifier_slot),
+        Arc::clone(shared_inos),
+    );
     let mut session = fuser::Session::new(fs, mountpoint, options)?;
     *notifier_slot.lock().unwrap() = Some(session.notifier());
     session.run()

@@ -104,19 +104,61 @@ pub fn parse_size_bytes(s: &str) -> anyhow::Result<u64> {
     Ok((v * mult as f64) as u64)
 }
 
-fn run_retention(
-    store: &Mutex<Store>,
-    name: &str,
-    max_age_ms: Option<u64>,
-    max_comp_bytes: Option<u64>,
-) {
-    if max_age_ms.is_none() && max_comp_bytes.is_none() {
+/// The store's retention policy, re-read from the manifest on every
+/// tick: `timberfs set retain=30d` on a LIVE log takes effect within a
+/// second, no restart (restarting the writer means restarting whatever
+/// pipes into it — usually user-visible). A manifest that stops parsing
+/// mid-flight keeps the LAST GOOD policy with one warning: never
+/// silently unbounded, never a dead producer.
+struct LivePolicy {
+    dir: std::path::PathBuf,
+    name: String,
+    last: crate::bark::Retention,
+    warned: bool,
+    /// (mtime, len) of the manifest at the last parse: the file almost
+    /// never changes, so the once-a-second re-read is a stat until it does.
+    stamp: Option<(Option<std::time::SystemTime>, u64)>,
+}
+
+impl LivePolicy {
+    fn refresh(&mut self) -> crate::bark::Retention {
+        let cur = std::fs::metadata(crate::format::bark_path(&self.dir, &self.name))
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()));
+        if cur == self.stamp {
+            return self.last;
+        }
+        self.stamp = cur;
+        match crate::bark::declared_retention(&self.dir, &self.name) {
+            Ok(p) => {
+                self.warned = false;
+                self.last = p;
+                p
+            }
+            Err(e) => {
+                if !self.warned {
+                    eprintln!(
+                        "timberfs: {}: manifest unreadable ({e}); keeping the previous \
+                         retention policy (fix it with `timberfs set`)",
+                        self.name
+                    );
+                    self.warned = true;
+                }
+                self.last
+            }
+        }
+    }
+}
+
+fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Retention) {
+    if !policy.is_some() {
         return;
     }
-    let result = store
-        .lock()
-        .unwrap()
-        .enforce_retention(name, max_age_ms, max_comp_bytes);
+    let result =
+        store
+            .lock()
+            .unwrap()
+            .enforce_retention(name, policy.max_age_ms, policy.max_comp_bytes);
     match result {
         Ok(Some(stats)) => {
             eprintln!(
@@ -140,8 +182,9 @@ pub fn cmd_append(
     retain: Option<&str>,
     retain_size: Option<&str>,
 ) -> anyhow::Result<()> {
-    let max_age_ms = retain.map(parse_duration_ms).transpose()?;
-    let max_comp_bytes = retain_size.map(parse_size_bytes).transpose()?;
+    // Validate the flags up front; they are persisted below.
+    retain.map(parse_duration_ms).transpose()?;
+    retain_size.map(parse_size_bytes).transpose()?;
     if crate::query::is_bundle(target) {
         bail!(
             "{} is a .timber transfer bundle — bundles are read-only \
@@ -186,18 +229,48 @@ pub fn cmd_append(
     st.create(&name)?;
     let store = Arc::new(Mutex::new(st));
 
+    // --retain/--retain-size DECLARE (like import --index): the policy is
+    // written into the manifest, and this run — like every writer — reads
+    // it from there. Retention is a property of the log, not of whoever
+    // happens to be writing it.
+    if retain.is_some() || retain_size.is_some() {
+        let mut map = crate::bark::load(&dir, &name).unwrap_or_default();
+        if let Some(r) = retain {
+            map.insert(
+                "retain".to_string(),
+                serde_json::Value::String(r.to_string()),
+            );
+        }
+        if let Some(r) = retain_size {
+            map.insert(
+                "retain_size".to_string(),
+                serde_json::Value::String(r.to_string()),
+            );
+        }
+        crate::bark::save(&dir, &name, &map)?;
+    }
+    let policy = Arc::new(Mutex::new(LivePolicy {
+        dir: dir.clone(),
+        name: name.clone(),
+        last: crate::bark::Retention::default(),
+        warned: false,
+        stamp: None,
+    }));
+
     // Catch up on retention from before this run, then keep enforcing.
-    run_retention(&store, &name, max_age_ms, max_comp_bytes);
+    run_retention(&store, &name, policy.lock().unwrap().refresh());
 
     // Background thread: age-based chunk flushing (same as the mount) and
-    // the once-a-second retention check.
+    // the once-a-second retention check, policy re-read each time.
     {
         let store = Arc::clone(&store);
         let name = name.clone();
+        let policy = Arc::clone(&policy);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(1000));
             store.lock().unwrap().flush_aged();
-            run_retention(&store, &name, max_age_ms, max_comp_bytes);
+            let p = policy.lock().unwrap().refresh();
+            run_retention(&store, &name, p);
         });
     }
 
@@ -241,7 +314,8 @@ pub fn cmd_append(
     }
 
     store.lock().unwrap().flush_all();
-    run_retention(&store, &name, max_age_ms, max_comp_bytes);
+    let p = policy.lock().unwrap().refresh();
+    run_retention(&store, &name, p);
     eprintln!(
         "timberfs: appended {} bytes to {} ({})",
         total,

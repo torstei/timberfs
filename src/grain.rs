@@ -226,7 +226,7 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         woff += filter.len() as u64;
     }
     out.sync_all()?;
-    eprintln!(
+    crate::note!(
         "timberfs: grain extended: {} new chunk(s) indexed ({} tokens), {} total",
         records.len() - covered,
         total_tokens,
@@ -269,7 +269,7 @@ pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         out.write_all_at(&filter, off)?;
         off += filter.len() as u64;
         if records.len() >= 10 && i + 1 >= next_progress && i + 1 < records.len() {
-            eprintln!(
+            crate::note!(
                 "timberfs: reindex {}% ({} of {} chunks)",
                 (i + 1) * 100 / records.len(),
                 i + 1,
@@ -280,7 +280,7 @@ pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     }
     out.sync_all()?;
     fs::rename(&tmp, format::grain_path(dir, name))?;
-    eprintln!(
+    crate::note!(
         "timberfs: indexed {} chunk(s), {} distinct tokens ({} avg/chunk), grain is {} bytes \
          ({} bytes/chunk avg)",
         records.len(),

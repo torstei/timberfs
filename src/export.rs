@@ -273,7 +273,7 @@ pub fn cmd_export(
         fs::write(format::bark_path(&ddir, &dname), bark_text)?;
     }
     match (selected.first(), selected.last()) {
-        (Some(first), Some(last)) => eprintln!(
+        (Some(first), Some(last)) => crate::note!(
             "timberfs: exported {} of {} chunk(s), {} bytes ({} compressed), spanning {} .. {} -> {}{}",
             selected.len(),
             chunks.len(),
@@ -284,7 +284,7 @@ pub fn cmd_export(
             dest.display(),
             if bundled { " (bundle)" } else { "" }
         ),
-        _ => eprintln!(
+        _ => crate::note!(
             "timberfs: exported 0 of {} chunk(s) — empty window; the artifact attests it \
              (--fail-on-empty to error instead) -> {}{}",
             chunks.len(),

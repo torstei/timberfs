@@ -177,18 +177,92 @@ fn padded_chunks(
     from_ms: u64,
     to_ms: u64,
     has: &[String],
-) -> anyhow::Result<Vec<ChunkRecord>> {
-    let (selected, _) = select_chunks(p, records, from_ms, to_ms, has)?;
+) -> anyhow::Result<(Vec<ChunkRecord>, usize, usize)> {
+    let (selected, in_window) = select_chunks(p, records, from_ms, to_ms, has)?;
+    let kept = selected.len();
     let mut padded = std::collections::BTreeSet::new();
     for (i, _) in &selected {
         padded.insert(i.saturating_sub(1));
         padded.insert(*i);
         padded.insert(i + 1);
     }
-    Ok(padded
-        .into_iter()
-        .filter_map(|i| records.get(i).copied())
-        .collect())
+    Ok((
+        padded
+            .into_iter()
+            .filter_map(|i| records.get(i).copied())
+            .collect(),
+        in_window,
+        kept,
+    ))
+}
+
+/// One honest line about what a narrowed scan will actually read —
+/// printed AFTER selection, with the numbers the operation used. A
+/// window that selects nothing says so, with the store's real coverage:
+/// that is usually the whole answer to "why did I get 0 matches".
+#[allow(clippy::too_many_arguments)]
+fn report_scan(
+    p: &Path,
+    records: &[ChunkRecord],
+    windowed: bool,
+    has: &[String],
+    auto: bool,
+    scanning: usize,
+    in_window: usize,
+    kept: usize,
+) {
+    if !windowed && has.is_empty() {
+        return; // a plain full scan needs no narration
+    }
+    if windowed && in_window == 0 {
+        let (mut a, mut b) = (u64::MAX, 0u64);
+        for r in records {
+            a = a.min(r.first_write_ms);
+            b = b.max(r.last_write_ms);
+        }
+        if records.is_empty() {
+            crate::note!(
+                "timberfs: {}: --from/--to select nothing — the store is empty",
+                p.display()
+            );
+        } else {
+            crate::note!(
+                "timberfs: {}: --from/--to select nothing — the store covers {} .. {}",
+                p.display(),
+                fmt_ms(a),
+                fmt_ms(b)
+            );
+        }
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if windowed {
+        parts.push(format!("time window keeps {in_window}"));
+    }
+    if !has.is_empty() {
+        let toks = crate::grain::tokenize_query(&has.join(" "))
+            .iter()
+            .map(|t| String::from_utf8_lossy(t).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("tokens ({toks}) keep {kept}"));
+    }
+    let padding = if scanning > kept {
+        ", plus entry-boundary padding"
+    } else {
+        ""
+    };
+    crate::note!(
+        "timberfs: {}: scanning {scanning} of {} chunk(s) ({}{padding}){}",
+        p.display(),
+        records.len(),
+        parts.join(", "),
+        if auto {
+            "; --scan reads everything"
+        } else {
+            ""
+        }
+    );
 }
 
 /// Does this string name an EXISTING timberfs source (backing pair by
@@ -248,25 +322,15 @@ fn engage_auto_has(
         // There IS an index here, and we are about to ignore it — say why
         // once, so the cost is never a mystery.
         if let Some(reason) = scan_reason {
-            eprintln!(
-                "timberfs: full scan of {} chunk(s): {reason} cannot use the .grain \
+            crate::note!(
+                "timberfs: {}: full scan of {} chunk(s): {reason} cannot use the .grain \
                  token index",
+                p.display(),
                 records.len()
             );
         }
         return Ok(Vec::new());
     }
-    let tokens = crate::grain::tokenize_query(&auto_has.join(" "));
-    eprintln!(
-        "timberfs: .grain: pre-filtering {} chunk(s) on the pattern's tokens ({}) — \
-         chunk-level, like --has; --scan forces a full scan",
-        records.len(),
-        tokens
-            .iter()
-            .map(|t| String::from_utf8_lossy(t).into_owned())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
     Ok(auto_has.to_vec())
 }
 
@@ -315,8 +379,19 @@ fn grep_into(
     if from_ms > to_ms {
         bail!("--from is after --to");
     }
+    let auto = has.is_empty() && !auto_has.is_empty();
     let has = engage_auto_has(p, has, auto_has, scan_reason, &source.records)?;
-    let chunks = padded_chunks(p, &source.records, from_ms, to_ms, &has)?;
+    let (chunks, in_window, kept) = padded_chunks(p, &source.records, from_ms, to_ms, &has)?;
+    report_scan(
+        p,
+        &source.records,
+        from.is_some() || to.is_some(),
+        &has,
+        auto && !has.is_empty(),
+        chunks.len(),
+        in_window,
+        kept,
+    );
 
     // The pair is built in place for a pair destination, or in a scratch
     // directory for a .timber bundle (assembled into the tar afterwards).
@@ -469,7 +544,7 @@ fn grep_into(
         fs::write(crate::format::bark_path(&pair_dir, &pair_name), bark_text)?;
     }
     match span {
-        Some((a, b)) => eprintln!(
+        Some((a, b)) => crate::note!(
             "timberfs: grep: {matched} of {seen} entr{} matched, spanning {} .. {} -> {}{}",
             if matched == 1 { "y" } else { "ies" },
             fmt_ms(a),
@@ -477,7 +552,7 @@ fn grep_into(
             dest.display(),
             if bundled { " (bundle)" } else { "" }
         ),
-        None => eprintln!(
+        None => crate::note!(
             "timberfs: grep: 0 of {seen} entries matched — empty result; the artifact \
              attests it (--fail-on-empty to error instead) -> {}{}",
             dest.display(),
@@ -582,8 +657,19 @@ fn grep_one(
     if from_ms > to_ms {
         bail!("--from is after --to");
     }
+    let auto = has.is_empty() && !auto_has.is_empty();
     let has = engage_auto_has(p, has, auto_has, scan_reason, &source.records)?;
-    let chunks = padded_chunks(p, &source.records, from_ms, to_ms, &has)?;
+    let (chunks, in_window, kept) = padded_chunks(p, &source.records, from_ms, to_ms, &has)?;
+    report_scan(
+        p,
+        &source.records,
+        from.is_some() || to.is_some(),
+        &has,
+        auto && !has.is_empty(),
+        chunks.len(),
+        in_window,
+        kept,
+    );
     let stream = ChunkStream {
         file: source.file,
         chunks,
@@ -637,10 +723,10 @@ pub fn cmd_grep(
     let pattern_is_matchless = if selection_given && names_timberfs_source(&pattern) {
         files.insert(0, std::path::PathBuf::from(&pattern));
         if has.is_empty() {
-            eprintln!("timberfs: no PATTERN given; every entry in the window matches");
+            crate::note!("timberfs: no PATTERN given; every entry in the window matches");
             pattern = String::new();
         } else {
-            eprintln!(
+            crate::note!(
                 "timberfs: no PATTERN given; matching entries that contain: {}",
                 has.join(", ")
             );

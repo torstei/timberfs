@@ -82,9 +82,72 @@ pub fn with_identity(mut map: Map<String, Value>) -> anyhow::Result<Map<String, 
 pub fn save(dir: &Path, name: &str, map: &Map<String, Value>) -> anyhow::Result<()> {
     let map = with_identity(map.clone())?;
     let text = serde_json::to_string_pretty(&Value::Object(map))?;
-    fs::write(format::bark_path(dir, name), text + "\n")
-        .with_context(|| format!("writing {}", format::bark_path(dir, name).display()))?;
+    // Atomic (tmp + rename): live writers re-read the manifest on their
+    // retention tick, and a torn read must be impossible.
+    let path = format::bark_path(dir, name);
+    let tmp = dir.join(format!("{name}.{}.tmp", format::BARK_EXT));
+    fs::write(&tmp, text + "\n").with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok(())
+}
+
+/// Like `load`, but an EXISTING-yet-invalid manifest is an Err instead of
+/// a warn-and-None — callers with retention at stake must distinguish
+/// "no declaration" (fine: no limits) from "declaration unreadable"
+/// (keep the last good policy; never silently drop to unbounded).
+pub fn try_load(dir: &Path, name: &str) -> anyhow::Result<Option<Map<String, Value>>> {
+    let path = format::bark_path(dir, name);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(map)) => Ok(Some(map)),
+        _ => bail!("{} is not a JSON object", path.display()),
+    }
+}
+
+/// A declared retention policy, parsed and validated. Absent keys mean
+/// no limit on that axis; an entirely absent manifest means no limits at
+/// all (a case file carved by grep has no business expiring).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Retention {
+    pub max_age_ms: Option<u64>,
+    pub max_comp_bytes: Option<u64>,
+}
+
+impl Retention {
+    pub fn is_some(&self) -> bool {
+        self.max_age_ms.is_some() || self.max_comp_bytes.is_some()
+    }
+}
+
+pub fn retention_from_map(map: &Map<String, Value>) -> anyhow::Result<Retention> {
+    let get = |k: &str| -> anyhow::Result<Option<&str>> {
+        match map.get(k) {
+            None => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(v) => bail!("\"{k}\" must be a string, got {v}"),
+        }
+    };
+    Ok(Retention {
+        max_age_ms: get("retain")?
+            .map(crate::append::parse_duration_ms)
+            .transpose()?,
+        max_comp_bytes: get("retain_size")?
+            .map(crate::append::parse_size_bytes)
+            .transpose()?,
+    })
+}
+
+/// The store's declared retention. Err = a manifest exists but cannot be
+/// read/parsed (the caller decides: warn + last-good, never unbounded).
+pub fn declared_retention(dir: &Path, name: &str) -> anyhow::Result<Retention> {
+    match try_load(dir, name)? {
+        None => Ok(Retention::default()),
+        Some(map) => retention_from_map(&map),
+    }
 }
 
 /// Is the index declared for this log?
@@ -120,6 +183,8 @@ const NON_INHERITED: &[&str] = &[
     "window_from",
     "window_to",
     "index",
+    "retain",
+    "retain_size",
 ];
 
 /// Window bounds are operation facts, recorded as RFC3339 UTC.
@@ -169,7 +234,13 @@ pub fn ensure_identified(dir: &Path, name: &str) -> anyhow::Result<Map<String, V
 }
 
 /// `timberfs create`: make an empty log with declared properties.
-pub fn cmd_create(dest: &Path, index: bool, sets: &[String]) -> anyhow::Result<()> {
+pub fn cmd_create(
+    dest: &Path,
+    index: bool,
+    retain: Option<&str>,
+    retain_size: Option<&str>,
+    sets: &[String],
+) -> anyhow::Result<()> {
     ensure_dest_is_not_plain_file(dest, "create")?;
     let (dir, name) = resolve_backing(dest)?;
     fs::create_dir_all(&dir)?;
@@ -188,6 +259,14 @@ pub fn cmd_create(dest: &Path, index: bool, sets: &[String]) -> anyhow::Result<(
     let mut map = Map::new();
     if index {
         map.insert("index".to_string(), Value::Bool(true));
+    }
+    if let Some(r) = retain {
+        crate::append::parse_duration_ms(r)?;
+        map.insert("retain".to_string(), Value::String(r.to_string()));
+    }
+    if let Some(r) = retain_size {
+        crate::append::parse_size_bytes(r)?;
+        map.insert("retain_size".to_string(), Value::String(r.to_string()));
     }
     for kv in sets {
         let Some((k, v)) = kv.split_once('=') else {
@@ -210,7 +289,7 @@ pub fn cmd_create(dest: &Path, index: bool, sets: &[String]) -> anyhow::Result<(
     if !map.is_empty() {
         save(&dir, &name, &map)?;
     }
-    eprintln!(
+    crate::note!(
         "timberfs: created {}/{}{}{}",
         dir.display(),
         name,
@@ -224,5 +303,78 @@ pub fn cmd_create(dest: &Path, index: bool, sets: &[String]) -> anyhow::Result<(
             )
         }
     );
+    Ok(())
+}
+
+/// Identity and lineage are facts, not settings — never user-settable.
+const PROTECTED: &[&str] = &["id", "created", "derived_from", "derived_op"];
+
+/// `timberfs set`: declare or change a store's properties in its manifest
+/// — validated and atomic, which hand-editing the JSON is not. Known
+/// settings are parse-checked (retain/retain_size/index); everything else
+/// is free-form provenance. Works on live stores: writers re-read the
+/// manifest on their retention tick, so a change takes effect within
+/// seconds, no restart.
+pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Result<()> {
+    if crate::query::is_bundle(store) {
+        bail!(
+            "{} is a .timber transfer bundle — bundles are read-only",
+            store.display()
+        );
+    }
+    if sets.is_empty() && unsets.is_empty() {
+        bail!("nothing to do — give KEY=VALUE to set, or --unset KEY");
+    }
+    let (dir, name) = resolve_backing(store)?;
+    if !format::rings_path(&dir, &name).exists() {
+        bail!("no timberfs log {name} in {}", dir.display());
+    }
+    let mut map = try_load(&dir, &name)
+        .with_context(|| {
+            format!(
+                "the existing manifest is unreadable — fix or remove {} first \
+                 (rewriting it here would mint a NEW identity)",
+                format::bark_path(&dir, &name).display()
+            )
+        })?
+        .unwrap_or_default();
+
+    for kv in sets {
+        let Some((k, v)) = kv.split_once('=') else {
+            bail!("set wants KEY=VALUE, got {kv:?}");
+        };
+        let (k, v) = (k.trim(), v.to_string());
+        if PROTECTED.contains(&k) {
+            bail!("\"{k}\" is identity/lineage — a fact, not a setting");
+        }
+        let value = match k {
+            "retain" => {
+                crate::append::parse_duration_ms(&v)?;
+                Value::String(v)
+            }
+            "retain_size" => {
+                crate::append::parse_size_bytes(&v)?;
+                Value::String(v)
+            }
+            "index" => match v.as_str() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => bail!("\"index\" is true or false"),
+            },
+            _ => Value::String(v),
+        };
+        map.insert(k.to_string(), value);
+    }
+    for k in unsets {
+        let k = k.trim();
+        if PROTECTED.contains(&k) {
+            bail!("\"{k}\" is identity/lineage — a fact, not a setting");
+        }
+        map.remove(k);
+    }
+
+    save(&dir, &name, &map)?;
+    let saved = load(&dir, &name).context("re-reading the manifest")?;
+    println!("{}", serde_json::to_string_pretty(&Value::Object(saved))?);
     Ok(())
 }

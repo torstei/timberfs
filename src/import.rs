@@ -424,7 +424,7 @@ pub fn cmd_import(
             Source::Plain(p) => fs::metadata(p).map(|m| m.len()).unwrap_or(1) == 0,
         };
         if empty {
-            eprintln!(
+            crate::note!(
                 "timberfs: {} is empty — nothing to append from it",
                 s.display()
             );
@@ -445,12 +445,12 @@ pub fn cmd_import(
                 );
             }
         }
-        eprintln!(
+        crate::note!(
             "timberfs: stitching {} files in timestamp order:",
             sources.len()
         );
         for (i, (ts, s)) in sources.iter().enumerate() {
-            eprintln!(
+            crate::note!(
                 "timberfs:   {}. {}  (starts {})",
                 i + 1,
                 s.display(),
@@ -498,7 +498,7 @@ pub fn cmd_import(
         if index || crate::bark::index_declared(&dir, &name) {
             crate::grain::extend_grain(&dir, &name)?;
         }
-        eprintln!(
+        crate::note!(
             "timberfs: all sources are empty; {name} {}",
             if dest_existed {
                 "unchanged"
@@ -539,7 +539,7 @@ pub fn cmd_import(
                         &src,
                         quick,
                     )?;
-                    eprintln!(
+                    crate::note!(
                         "timberfs: {} of {} bytes already imported and verified{}; resuming",
                         resume_from,
                         total_bytes,
@@ -579,7 +579,7 @@ pub fn cmd_import(
                 // NOT skipped; it falls through to the ordering guard.
                 let f = st.files.get_mut(&name).unwrap();
                 if segment_present(&f.chunks, records) {
-                    eprintln!(
+                    crate::note!(
                         "timberfs: {} skipped — the target already contains this segment \
                          (chunks through {})",
                         source.display(),
@@ -630,7 +630,7 @@ pub fn cmd_import(
                 }
                 let counts =
                     overlap_line_counts(&f.chunks, &crate::format::trunk_path(&dir, &name), *t0)?;
-                eprintln!(
+                crate::note!(
                     "timberfs: {} starts at {}, inside already-imported data (through {}) — \
                      deduplicating the overlap",
                     source_path.display(),
@@ -719,7 +719,7 @@ pub fn cmd_import(
             }
 
             if total_bytes > 0 && bytes_done >= next_progress && bytes_done < total_bytes {
-                eprintln!(
+                crate::note!(
                     "timberfs: import {}% ({} of {} bytes)",
                     bytes_done * 100 / total_bytes,
                     bytes_done,
@@ -739,7 +739,7 @@ pub fn cmd_import(
     }
 
     if ov_skipped > 0 || ov_new > 0 {
-        eprintln!(
+        crate::note!(
             "timberfs: overlap: {ov_skipped} duplicate line(s) skipped{}",
             if ov_new > 0 {
                 format!(
@@ -754,6 +754,24 @@ pub fn cmd_import(
     }
 
     st.flush_all();
+    // Declared retention is maintained by every writer (the manifest is
+    // the truth). Trim BEFORE index maintenance: a head-drop deletes the
+    // grain, and the declared-index pass right below rebuilds it.
+    match crate::bark::declared_retention(&dir, &name) {
+        Ok(policy) if policy.is_some() => {
+            if let Some(stats) =
+                st.enforce_retention(&name, policy.max_age_ms, policy.max_comp_bytes)?
+            {
+                crate::note!(
+                    "timberfs: {name}: retention dropped {} chunk(s), {} compressed bytes",
+                    stats.chunks_moved,
+                    stats.comp_bytes
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("timberfs: {name}: manifest unreadable ({e}); retention not applied"),
+    }
     // The index is a property of the LOG, declared in its .bark manifest
     // (like a database index): --index persists the declaration, and any
     // import into a declared log maintains the grain — extended
@@ -768,7 +786,7 @@ pub fn cmd_import(
     let f = st.files.get(&name).unwrap();
     let (first, last) = (f.first_write_ms(), f.last_write_ms());
     if lines == 0 && merged_segments == 0 && (resume_from > 0 || skipped_segments > 0) {
-        eprintln!("timberfs: {name} is already up to date; nothing imported");
+        crate::note!("timberfs: {name} is already up to date; nothing imported");
         return Ok(());
     }
     let mut parts: Vec<String> = Vec::new();
@@ -785,7 +803,7 @@ pub fn cmd_import(
     if skipped_segments > 0 {
         parts.push(format!("{skipped_segments} segment(s) already covered"));
     }
-    eprintln!(
+    crate::note!(
         "timberfs: imported {}{}; now {} chunk(s), {} bytes, {} compressed ({:.1}x), \
          spanning {} .. {}",
         parts.join(", "),

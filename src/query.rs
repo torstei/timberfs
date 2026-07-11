@@ -443,6 +443,8 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     let index_declared = bark.get("index").and_then(|v| v.as_bool()).unwrap_or(false);
     let command = get("command");
     let pattern = get("pattern");
+    let retain = get("retain");
+    let retain_size = get("retain_size");
     const RESERVED: &[&str] = &[
         "id",
         "created",
@@ -453,6 +455,8 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         "index",
         "command",
         "pattern",
+        "retain",
+        "retain_size",
     ];
     let provenance: Vec<(String, String)> = bark
         .iter()
@@ -536,6 +540,12 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         }
         if let Some(pt) = &pattern {
             put("pattern", pt.clone().into());
+        }
+        if let Some(r) = &retain {
+            put("retain", r.clone().into());
+        }
+        if let Some(r) = &retain_size {
+            put("retain_size", r.clone().into());
         }
         put("index_declared", index_declared.into());
         put(
@@ -647,6 +657,31 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                  rebuilds it (or run reindex)"
             ),
             None => println!("  index     rings {rings}; no grain (reindex to build one)"),
+        }
+        if retain.is_some() || retain_size.is_some() {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(r) = &retain {
+                parts.push(format!("keep {r}"));
+            }
+            if let Some(r) = &retain_size {
+                parts.push(format!("disk <= {r}"));
+            }
+            // Retention only acts while a writer runs: an idle store with
+            // a policy doesn't shrink — say so instead of surprising.
+            let over = retain_size
+                .as_deref()
+                .and_then(|r| crate::append::parse_size_bytes(r).ok())
+                .is_some_and(|budget| compressed > budget)
+                && writer.as_deref() == Some("none");
+            println!(
+                "  retention {} — enforced by writers{}",
+                parts.join(", "),
+                if over {
+                    " (currently OVER budget, and none is running)"
+                } else {
+                    ""
+                }
+            );
         }
         if let Some(w) = &writer {
             println!("  writer    {w}");
