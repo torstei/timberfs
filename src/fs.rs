@@ -60,16 +60,20 @@ fn io_errno(e: &std::io::Error) -> i32 {
 }
 
 /// A rotation request arriving through the setxattr control channel:
-/// "cutoff=<unix_ms>;target=<name>" or "cutoff=<unix_ms>;delete".
+/// "cutoff=<unix_ms>;target=<name>" or "cutoff=<unix_ms>;delete", with an
+/// optional ";fail-on-empty" (refuse with ENODATA instead of attesting an
+/// empty result).
 struct RotateReq {
     cutoff_ms: u64,
     target: Option<String>,
+    fail_on_empty: bool,
 }
 
 fn parse_rotate_request(s: &str) -> Option<RotateReq> {
     let mut cutoff = None;
     let mut target = None;
     let mut delete = false;
+    let mut fail_on_empty = false;
     for part in s.split(';') {
         if let Some(v) = part.strip_prefix("cutoff=") {
             cutoff = v.parse().ok();
@@ -80,6 +84,8 @@ fn parse_rotate_request(s: &str) -> Option<RotateReq> {
             target = Some(v.to_string());
         } else if part == "delete" {
             delete = true;
+        } else if part == "fail-on-empty" {
+            fail_on_empty = true;
         } else if !part.is_empty() {
             return None;
         }
@@ -88,7 +94,11 @@ fn parse_rotate_request(s: &str) -> Option<RotateReq> {
     if delete == target.is_some() {
         return None;
     }
-    Some(RotateReq { cutoff_ms, target })
+    Some(RotateReq {
+        cutoff_ms,
+        target,
+        fail_on_empty,
+    })
 }
 
 pub struct TimberFs {
@@ -601,15 +611,57 @@ impl Filesystem for TimberFs {
                 return;
             }
         };
-        let res =
-            self.store
-                .lock()
-                .unwrap()
-                .rotate_head(&fname, req.target.as_deref(), req.cutoff_ms);
+        let (res, dir, target_was_new) = {
+            let mut store = self.store.lock().unwrap();
+            let dir = store.dir.clone();
+            let was_new = req
+                .target
+                .as_deref()
+                .is_some_and(|t| !store.files.contains_key(t));
+            let res = store.rotate_head(&fname, req.target.as_deref(), req.cutoff_ms);
+            if matches!(&res, Ok(stats) if stats.chunks_moved == 0) {
+                if req.fail_on_empty {
+                    // The caller wants a gap to be loud. Nothing has
+                    // changed (a zero-chunk rotation is a no-op), so
+                    // refuse: ENODATA, literally.
+                    eprintln!(
+                        "timberfs: {fname}: nothing to rotate before the cutoff \
+                         (fail-on-empty requested)"
+                    );
+                    reply.error(libc::ENODATA);
+                    return;
+                }
+                if let (Some(t), true) = (req.target.as_deref(), was_new) {
+                    // Rotating nothing into a new target still creates
+                    // it: present-but-empty and missing are opposite
+                    // signals to whoever ships or ingests the segment.
+                    if let Err(e) = store.create(t) {
+                        eprintln!("timberfs: {t}: creating empty rotation target: {e}");
+                    }
+                }
+            }
+            (res, dir, was_new)
+        };
         match res {
             Ok(stats) => {
                 if let Some(t) = &req.target {
                     self.assign_ino(t);
+                    if target_was_new {
+                        // rotation-created segment: a derived store with
+                        // lineage (rotate holds the source's writer locks,
+                        // so minting the source's identity is safe)
+                        let derived =
+                            crate::bark::ensure_identified(&dir, &fname).and_then(|src| {
+                                crate::bark::save(
+                                    &dir,
+                                    t,
+                                    &crate::bark::derived_map(Some(&src), "rotate"),
+                                )
+                            });
+                        if let Err(e) = derived {
+                            eprintln!("timberfs: {t}: writing derived manifest failed: {e}");
+                        }
+                    }
                 }
                 eprintln!(
                     "timberfs: {fname}: rotated {} chunk(s) ({} compressed bytes) {}",

@@ -122,6 +122,7 @@ pub fn cmd_rotate(
     cutoff: &str,
     delete: bool,
     dry_run: bool,
+    fail_on_empty: bool,
 ) -> anyhow::Result<()> {
     let cutoff_ms = parse_time(cutoff)?;
     if crate::query::is_bundle(source) {
@@ -192,8 +193,37 @@ pub fn cmd_rotate(
                 files: BTreeMap::new(),
             };
             st.create(&src_name)?;
+            let target_was_new = target_name
+                .as_deref()
+                .is_some_and(|t| !format::rings_path(&dir, t).exists());
             let stats = st.rotate_head(&src_name, target_name.as_deref(), cutoff_ms)?;
+            if stats.chunks_moved == 0 && fail_on_empty {
+                bail!("nothing to rotate: no chunks written entirely before the cutoff (--fail-on-empty)");
+            }
+            if let (Some(t), true) = (target_name.as_deref(), target_was_new) {
+                if stats.chunks_moved == 0 {
+                    // Rotating nothing into a new target still creates it:
+                    // present-but-empty ("this window was rotated, nothing
+                    // was there") and missing ("don't ingest past the gap")
+                    // are opposite signals to whoever ships or ingests it.
+                    st.create(t)?;
+                }
+                // A rotation-created segment is a derived store: rotate
+                // holds the source's writer locks, so it may mint the
+                // source's identity for a complete lineage chain.
+                let src_bark = crate::bark::ensure_identified(&dir, &src_name)?;
+                crate::bark::save(
+                    &dir,
+                    t,
+                    &crate::bark::derived_map(Some(&src_bark), "rotate"),
+                )?;
+            }
             report(&stats, target_name.as_deref());
+            if stats.chunks_moved == 0 && target_was_new {
+                if let Some(t) = target_name.as_deref() {
+                    println!("  created {t} empty — an attested empty result (--fail-on-empty to error instead)");
+                }
+            }
         }
         None => {
             let Some(mp) = store::read_lock_mountpoint(&dir) else {
@@ -205,20 +235,31 @@ pub fn cmd_rotate(
                      stop it and retry"
                 );
             };
-            let value = match &target_name {
+            let mut value = match &target_name {
                 Some(t) => format!("cutoff={cutoff_ms};target={t}"),
                 None => format!("cutoff={cutoff_ms};delete"),
             };
+            if fail_on_empty {
+                value.push_str(";fail-on-empty");
+            }
             setxattr(
                 &mp.join(&src_name),
                 "user.timberfs.rotate",
                 value.as_bytes(),
             )
-            .with_context(|| {
-                format!(
-                    "rotate request via live mount {} failed (see the timberfs daemon's stderr)",
-                    mp.display()
-                )
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ENODATA) {
+                    anyhow::anyhow!(
+                        "nothing to rotate: no chunks written entirely before the cutoff \
+                         (--fail-on-empty)"
+                    )
+                } else {
+                    anyhow::Error::new(e).context(format!(
+                        "rotate request via live mount {} failed (see the timberfs daemon's \
+                         stderr)",
+                        mp.display()
+                    ))
+                }
             })?;
             println!("rotated through the live mount on {}", mp.display());
             let after = format::read_index(&rings)?;

@@ -82,6 +82,27 @@ pub fn resolve_backing(input: &Path) -> anyhow::Result<(PathBuf, String)> {
     Ok((dir, base.to_string()))
 }
 
+/// Write destinations are never read, so a destination that exists as a
+/// plain file is always a mistake — most likely a forgotten destination
+/// argument after a shell glob (`import /logs/*` makes the last match the
+/// destination). A legitimate existing target is a pair, whose logical
+/// name is not a file; its .trunk/.rings paths are allowed.
+pub fn ensure_dest_is_not_plain_file(dest: &Path, verb: &str) -> anyhow::Result<()> {
+    let artifact = matches!(
+        dest.extension().and_then(|e| e.to_str()),
+        Some(format::TRUNK_EXT) | Some(format::RINGS_EXT)
+    );
+    if dest.is_file() && !artifact {
+        bail!(
+            "destination {} is an existing file — did you forget the destination argument? \
+             (a glob makes its last match the destination; {verb} writes <dest>.trunk/.rings \
+             and never reads the destination itself)",
+            dest.display()
+        );
+    }
+    Ok(())
+}
+
 /// True when the path names a `.timber` transfer bundle.
 pub fn is_bundle(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("timber")
@@ -95,6 +116,7 @@ pub fn is_bundle(path: &Path) -> bool {
 pub struct SourceHandle {
     pub records: Vec<ChunkRecord>,
     pub file: File,
+    pub bark: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
@@ -103,6 +125,7 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
         let mut archive = tar::Archive::new(&file);
         let mut rings_bytes: Option<Vec<u8>> = None;
         let mut trunk_pos: Option<(u64, u64)> = None;
+        let mut bark: Option<serde_json::Map<String, serde_json::Value>> = None;
         for entry in archive.entries()? {
             let mut entry = entry?;
             let member = entry.path()?.to_string_lossy().to_string();
@@ -112,6 +135,12 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
                 rings_bytes = Some(v);
             } else if member.ends_with(&format!(".{}", format::TRUNK_EXT)) {
                 trunk_pos = Some((entry.raw_file_position(), entry.header().entry_size()?));
+            } else if member.ends_with(&format!(".{}", format::BARK_EXT)) {
+                let mut v = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut v)?;
+                if let Ok(serde_json::Value::Object(m)) = serde_json::from_slice(&v) {
+                    bark = Some(m);
+                }
             }
         }
         let rings_bytes = rings_bytes.with_context(|| {
@@ -136,7 +165,11 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
         for r in &mut records {
             r.comp_start += trunk_base;
         }
-        return Ok(SourceHandle { records, file });
+        return Ok(SourceHandle {
+            records,
+            file,
+            bark,
+        });
     }
     let (dir, base) = resolve_backing(input)?;
     let rings = format::rings_path(&dir, &base);
@@ -150,7 +183,12 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
     let records =
         format::read_index(&rings).with_context(|| format!("reading index {}", rings.display()))?;
     let file = File::open(format::trunk_path(&dir, &base))?;
-    Ok(SourceHandle { records, file })
+    let bark = crate::bark::load(&dir, &base);
+    Ok(SourceHandle {
+        records,
+        file,
+        bark,
+    })
 }
 
 /// Window + --has chunk selection, shared by query and grep: an

@@ -272,11 +272,8 @@ fn classify_source(path: &Path, extractor: &Extractor) -> anyhow::Result<(u64, S
         // A bundle reads in place: open_source already shifted the record
         // offsets to the trunk member's position within the tar.
         let records = crate::query::open_source(path)?.records;
-        if records.is_empty() {
-            bail!("timberfs bundle {} is empty", path.display());
-        }
         return Ok((
-            records[0].first_write_ms,
+            records.first().map(|r| r.first_write_ms).unwrap_or(0),
             Source::Timber {
                 trunk: path.to_path_buf(),
                 records,
@@ -288,6 +285,11 @@ fn classify_source(path: &Path, extractor: &Extractor) -> anyhow::Result<(u64, S
         Some(crate::format::TRUNK_EXT) | Some(crate::format::RINGS_EXT)
     );
     if !pair_path && path.is_file() {
+        // A zero-byte plain file has no timestamp to sniff — it is an
+        // empty source (a quiet day in a rotated set), not an error.
+        if fs::metadata(path)?.len() == 0 {
+            return Ok((0, Source::Plain(path.to_path_buf())));
+        }
         return Ok((
             first_stamp(path, extractor)?,
             Source::Plain(path.to_path_buf()),
@@ -302,11 +304,8 @@ fn classify_source(path: &Path, extractor: &Extractor) -> anyhow::Result<(u64, S
         );
     }
     let records = crate::format::read_index(&rings)?;
-    if records.is_empty() {
-        bail!("timberfs source {} is empty", path.display());
-    }
     Ok((
-        records[0].first_write_ms,
+        records.first().map(|r| r.first_write_ms).unwrap_or(0),
         Source::Timber {
             trunk: crate::format::trunk_path(&sdir, &sname),
             records,
@@ -323,6 +322,7 @@ pub fn cmd_import(
     custom_format: Option<&str>,
     utc: bool,
     quick: bool,
+    index: bool,
 ) -> anyhow::Result<()> {
     let extractor = Extractor::new(custom_regex, custom_format, utc)?;
     if crate::query::is_bundle(dest) {
@@ -333,18 +333,33 @@ pub fn cmd_import(
             dest.display()
         );
     }
+    crate::query::ensure_dest_is_not_plain_file(dest, "import")?;
     let (dir, name) = resolve_backing(dest)?;
     fs::create_dir_all(&dir)?;
-    let multi = sources_in.len() > 1;
 
     // Multiple sources are one logical stream: order them chronologically
     // by their own first timestamp (rotation numbering and glob order are
-    // unreliable) and show the stitch plan.
+    // unreliable) and show the stitch plan. Empty sources carry no data
+    // but are still valid ("covered, nothing there" — e.g. a quiet day's
+    // shipped segment): they are skipped, never errors.
     let mut sources: Vec<(u64, Source)> = Vec::new();
     for p in sources_in {
-        sources.push(classify_source(p, &extractor)?);
+        let (ts, s) = classify_source(p, &extractor)?;
+        let empty = match &s {
+            Source::Timber { records, .. } => records.is_empty(),
+            Source::Plain(p) => fs::metadata(p).map(|m| m.len()).unwrap_or(1) == 0,
+        };
+        if empty {
+            eprintln!(
+                "timberfs: {} is empty — nothing to append from it",
+                s.display()
+            );
+            continue;
+        }
+        sources.push((ts, s));
     }
     sources.sort_by_key(|(ts, _)| *ts);
+    let multi = sources.len() > 1;
     let any_plain = sources.iter().any(|(_, s)| matches!(s, Source::Plain(_)));
     if multi {
         for w in sources.windows(2) {
@@ -397,7 +412,29 @@ pub fn cmd_import(
         cfg,
         files: std::collections::BTreeMap::new(),
     };
+    let dest_existed = crate::format::rings_path(&dir, &name).exists();
     st.create(&name)?;
+
+    if sources.is_empty() {
+        // Every source was empty. The import still succeeds — and still
+        // materializes the destination: an empty store that EXISTS is the
+        // attestation a shipping pipeline needs to keep ingesting.
+        if index {
+            crate::bark::declare_index(&dir, &name)?;
+        }
+        if index || crate::bark::index_declared(&dir, &name) {
+            crate::grain::extend_grain(&dir, &name)?;
+        }
+        eprintln!(
+            "timberfs: all sources are empty; {name} {}",
+            if dest_existed {
+                "unchanged"
+            } else {
+                "created empty"
+            }
+        );
+        return Ok(());
+    }
 
     // A non-empty target: for a single plain source, verify the imported
     // prefix and resume; timberfs sources append behind the ordering guard
@@ -560,6 +597,17 @@ pub fn cmd_import(
     }
 
     st.flush_all();
+    // The index is a property of the LOG, declared in its .bark manifest
+    // (like a database index): --index persists the declaration, and any
+    // import into a declared log maintains the grain — extended
+    // incrementally for new chunks, rebuilt if missing (e.g. after
+    // rotation/retention dropped it). The writer locks are already held.
+    if index {
+        crate::bark::declare_index(&dir, &name)?;
+    }
+    if index || crate::bark::index_declared(&dir, &name) {
+        crate::grain::extend_grain(&dir, &name)?;
+    }
     let f = st.files.get(&name).unwrap();
     let (first, last) = (f.first_write_ms(), f.last_write_ms());
     if lines == 0 && merged_segments == 0 && (resume_from > 0 || skipped_segments > 0) {

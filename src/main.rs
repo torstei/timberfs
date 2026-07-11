@@ -1,4 +1,5 @@
 mod append;
+mod bark;
 mod export;
 mod format;
 mod fs;
@@ -49,6 +50,21 @@ enum Command {
         #[arg(long)]
         allow_other: bool,
     },
+    /// Create an empty timberfs log with its properties declared up
+    /// front in a .bark manifest — database-style: `create --index` is
+    /// CREATE INDEX, and every later import maintains the .grain
+    /// automatically
+    Create {
+        /// Backing file to create: logical name, .trunk or .rings path
+        dest: PathBuf,
+        /// Declare the token index for this log
+        #[arg(long)]
+        index: bool,
+        /// Set a manifest property (key=value, e.g. host=foo.bar.com);
+        /// repeatable, free-form
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        sets: Vec<String>,
+    },
     /// Append stdin to a log in a backing directory, without FUSE
     /// (svlogd-style): `myapp 2>&1 | timberfs append backing/app.log`.
     /// One writer per file; appenders for different files share a
@@ -82,9 +98,15 @@ enum Command {
     /// first timestamps. Re-importing a grown single source appends only
     /// the growth, after verifying the already-imported data.
     Import {
-        /// Source log file(s), then the destination backing file LAST
-        #[arg(required = true, num_args = 2..)]
-        files: Vec<PathBuf>,
+        /// Source log file(s): plain logs (stitched chronologically by
+        /// their first timestamps when several), timberfs logs, or
+        /// .timber bundles
+        #[arg(required = true, num_args = 1..)]
+        sources: Vec<PathBuf>,
+        /// Destination backing file: logical name, .trunk or .rings path
+        /// (a named flag on purpose — a glob can never eat it)
+        #[arg(long = "into", value_name = "DEST")]
+        dest: PathBuf,
         /// Uncompressed chunk size threshold in bytes
         #[arg(long, default_value_t = 256 * 1024)]
         chunk_size: usize,
@@ -105,6 +127,11 @@ enum Command {
         /// chunks against the source instead of all of them
         #[arg(long)]
         quick: bool,
+        /// Declare and build the .grain token index for this log
+        /// (persisted in the .bark manifest — needed once; every later
+        /// import maintains the index automatically)
+        #[arg(long)]
+        index: bool,
     },
     /// Export a time window (or everything) from a timberfs log into a NEW
     /// timberfs log, chunks copied verbatim — no recompression. A DEST
@@ -121,6 +148,11 @@ enum Command {
         /// End of the window; default: end
         #[arg(long)]
         to: Option<String>,
+        /// Error instead of writing an empty artifact when nothing matches
+        /// (default: an empty result is a result — present-but-empty tells
+        /// a consumer "covered, nothing there", unlike a missing file)
+        #[arg(long)]
+        fail_on_empty: bool,
     },
     /// Print the bytes written between --from and --to, reading the backing
     /// files directly (works with or without an active mount)
@@ -222,6 +254,10 @@ enum Command {
         /// Preview what would move without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Error when nothing rotates (default: rotating nothing into a
+        /// new DEST still creates it empty — an attested empty result)
+        #[arg(long)]
+        fail_on_empty: bool,
     },
 }
 
@@ -258,6 +294,9 @@ fn main() -> anyhow::Result<()> {
             );
             fs::mount(s, &mountpoint, allow_other)?;
         }
+        Command::Create { dest, index, sets } => {
+            bark::cmd_create(&dest, index, &sets)?;
+        }
         Command::Append {
             file,
             chunk_size,
@@ -274,28 +313,30 @@ fn main() -> anyhow::Result<()> {
             append::cmd_append(&file, cfg, retain.as_deref(), retain_size.as_deref())?;
         }
         Command::Import {
-            files,
+            sources,
+            dest,
             chunk_size,
             level,
             timestamp_regex,
             timestamp_format,
             utc,
             quick,
+            index,
         } => {
             let cfg = store::Config {
                 chunk_size: chunk_size.max(1),
                 level,
                 flush_age_ms: u64::MAX, // no age flushing during import
             };
-            let (dest, sources) = files.split_last().expect("clap enforces >= 2 args");
             import::cmd_import(
-                sources,
-                dest,
+                &sources,
+                &dest,
                 cfg,
                 timestamp_regex.as_deref(),
                 timestamp_format.as_deref(),
                 utc,
                 quick,
+                index,
             )?;
         }
         Command::Export {
@@ -303,8 +344,15 @@ fn main() -> anyhow::Result<()> {
             dest,
             from,
             to,
+            fail_on_empty,
         } => {
-            export::cmd_export(&source, &dest, from.as_deref(), to.as_deref())?;
+            export::cmd_export(
+                &source,
+                &dest,
+                from.as_deref(),
+                to.as_deref(),
+                fail_on_empty,
+            )?;
         }
         Command::Query {
             files,
@@ -356,8 +404,16 @@ fn main() -> anyhow::Result<()> {
             cutoff,
             delete,
             dry_run,
+            fail_on_empty,
         } => {
-            rotate::cmd_rotate(&source, dest.as_deref(), &cutoff, delete, dry_run)?;
+            rotate::cmd_rotate(
+                &source,
+                dest.as_deref(),
+                &cutoff,
+                delete,
+                dry_run,
+                fail_on_empty,
+            )?;
         }
     }
     Ok(())

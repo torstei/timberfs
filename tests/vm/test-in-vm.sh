@@ -102,6 +102,19 @@ rotate_split_correct() {
         && ! grep -q "batch-one" "$MNT/app.log"
 }
 
+mounted_empty_rotation() {
+    # rotating nothing into a NEW target through the live daemon still
+    # creates it — present-but-empty and missing are different signals —
+    # with lineage; and --fail-on-empty is relayed (refused with ENODATA)
+    timberfs rotate "$BACKING/app.log" quiet.log --cutoff "2000-01-01 00:00" \
+        && [ -e "$BACKING/quiet.log.rings" ] \
+        && [ "$(stat -c %s "$MNT/quiet.log")" = 0 ] \
+        && grep -q '"derived_op": "rotate"' "$BACKING/quiet.log.bark" \
+        && ! timberfs rotate "$BACKING/app.log" quiet2.log \
+             --cutoff "2000-01-01 00:00" --fail-on-empty 2>/dev/null \
+        && [ ! -e "$BACKING/quiet2.log.rings" ]
+}
+
 retention_delete() {
     # unix-seconds cutoff in the future: drop everything in archive.log
     timberfs rotate "$BACKING/archive.log" --delete --cutoff "$(($(date +%s) + 3600))" \
@@ -206,7 +219,7 @@ with open('/tmp/old.log', 'w') as f:
         f.write(f'{ts.isoformat()} INFO event number {i}\n')
 "
     # small chunks so the 83-minute file spans many windows, not one
-    timberfs import /tmp/old.log "$PIPE_BACKING/imported.log" --chunk-size 4096 \
+    timberfs import /tmp/old.log --into "$PIPE_BACKING/imported.log" --chunk-size 4096 \
         && zstd -dc "$PIPE_BACKING/imported.log.trunk" | cmp - /tmp/old.log \
         && timberfs query "$PIPE_BACKING/imported.log" \
                --from "2026-06-03 14:30:00" --to "2026-06-03 14:31:00" \
@@ -218,11 +231,11 @@ with open('/tmp/old.log', 'w') as f:
 
 import_resume_grown() {
     # identical re-import: verified no-op
-    timberfs import /tmp/old.log "$PIPE_BACKING/imported.log" 2>&1 \
+    timberfs import /tmp/old.log --into "$PIPE_BACKING/imported.log" 2>&1 \
         | grep -q "already up to date" || return 1
     # grown source: only the delta is appended, byte-exact
     echo "2026-06-03T15:30:00 INFO late event" >> /tmp/old.log
-    timberfs import /tmp/old.log "$PIPE_BACKING/imported.log" 2>&1 \
+    timberfs import /tmp/old.log --into "$PIPE_BACKING/imported.log" 2>&1 \
         | grep -q "imported 1 lines" || return 1
     zstd -dc "$PIPE_BACKING/imported.log.trunk" | cmp - /tmp/old.log
 }
@@ -260,6 +273,7 @@ run_test "time query: --from cut finds only batch-two" query_after_cut
 run_test "time query: --to cut finds only batch-one" query_before_cut
 run_test "online rotation through live mount" online_rotate
 run_test "rotation split is correct" rotate_split_correct
+run_test "mounted empty rotation attests; --fail-on-empty relays" mounted_empty_rotation
 run_test "retention --delete empties file" retention_delete
 run_test "100k-line integrity + stock-zstd recovery" big_file_integrity
 run_test "compressed on disk (>5x)" compression_on_disk
@@ -276,9 +290,9 @@ import_segment_merge() {
     # ship a rotated segment into an archive: verbatim merge, idempotent
     timberfs rotate "$PIPE_BACKING/imported.log" seg-old.log \
         --cutoff "2026-06-03 14:40:00" > /dev/null
-    timberfs import "$PIPE_BACKING/seg-old.log" "$PIPE_BACKING/archive.log" 2>&1 \
+    timberfs import "$PIPE_BACKING/seg-old.log" --into "$PIPE_BACKING/archive.log" 2>&1 \
         | grep -q "merged verbatim" || return 1
-    timberfs import "$PIPE_BACKING/seg-old.log" "$PIPE_BACKING/archive.log" 2>&1 \
+    timberfs import "$PIPE_BACKING/seg-old.log" --into "$PIPE_BACKING/archive.log" 2>&1 \
         | grep -q "already up to date" || return 1
     timberfs query "$PIPE_BACKING/archive.log" --to "2026-06-03 14:10:00" \
         | grep -q "event number 100"
@@ -289,7 +303,7 @@ import_leading_backfill() {
     # are backfilled with the first timestamp found
     printf '    at Frame.one\n    at Frame.two\n2026-06-02T08:00:00 INFO head test\n' \
         > /tmp/headless.log
-    timberfs import /tmp/headless.log "$PIPE_BACKING/headless.log" 2>&1 \
+    timberfs import /tmp/headless.log --into "$PIPE_BACKING/headless.log" 2>&1 \
         | grep -q "(1 stamped, 2 inherited)" \
         && timberfs query "$PIPE_BACKING/headless.log" --to "2026-06-02 08:00:00" \
            | grep -q "Frame.one"
@@ -305,7 +319,7 @@ export_bundle_roundtrip() {
     timberfs export "$PIPE_BACKING/archive.log" /tmp/win.timber \
         --from "2026-06-03 14:30:00" --to "2026-06-03 14:35:00" \
         && timberfs query /tmp/win.timber | grep -q "event number 1900" \
-        && timberfs import /tmp/win.timber "$PIPE_BACKING/from-bundle.log" 2>&1 \
+        && timberfs import /tmp/win.timber --into "$PIPE_BACKING/from-bundle.log" 2>&1 \
            | grep -q "merged verbatim" \
         && timberfs query "$PIPE_BACKING/from-bundle.log" | grep -q "event number 1900" \
         && tar tf /tmp/win.timber | head -1 | grep -q ".rings"
@@ -324,9 +338,9 @@ with open('/tmp/haystack.log', 'w') as f:
         else:
             f.write(f'{ts} INFO routine work {i}\n')
 "
-    timberfs import /tmp/haystack.log "$PIPE_BACKING/haystack.log" --chunk-size 4096 \
-        && timberfs reindex "$PIPE_BACKING/haystack.log" \
+    timberfs import /tmp/haystack.log --into "$PIPE_BACKING/haystack.log" --chunk-size 4096 --index \
         && [ -s "$PIPE_BACKING/haystack.log.grain" ] \
+        && timberfs reindex "$PIPE_BACKING/haystack.log" \
         && timberfs query "$PIPE_BACKING/haystack.log" --has NEEDLE77AB31CD99 2>/tmp/sel.txt \
            | grep -q "NEEDLE77AB31CD99" \
         && SEL=$(grep -oE '^timberfs: [0-9]+' /tmp/sel.txt | grep -oE '[0-9]+') \
@@ -347,8 +361,8 @@ run_test "grain: reindex + --has finds a needle, skipping chunks" grain_needle_s
 multi_file_fleet_view() {
     printf '2026-06-06T10:00:00 INFO alpha one\n2026-06-06T10:00:02 INFO alpha two\n' > /tmp/hA.log
     printf '2026-06-06T10:00:01 INFO beta one\n2026-06-06T10:00:03 ERROR beta boom\n' > /tmp/hB.log
-    timberfs import /tmp/hA.log "$PIPE_BACKING/hA.log" --chunk-size 1 2>/dev/null
-    timberfs import /tmp/hB.log "$PIPE_BACKING/hB.log" --chunk-size 1 2>/dev/null
+    timberfs import /tmp/hA.log --into "$PIPE_BACKING/hA.log" --chunk-size 1 2>/dev/null
+    timberfs import /tmp/hB.log --into "$PIPE_BACKING/hB.log" --chunk-size 1 2>/dev/null
     # interleaved and attributed
     OUT=$(timberfs query "$PIPE_BACKING/hA.log" "$PIPE_BACKING/hB.log" 2>/dev/null)
     [ "$(echo "$OUT" | head -2 | grep -c 'one')" = 2 ] \
@@ -359,7 +373,53 @@ multi_file_fleet_view() {
 }
 
 run_test "grep: entry-aware matching, stdin and grain-accelerated source" grep_entry_aware
+forgotten_destination_refused() {
+    # `import /logs/*` with no --into: a hard argument error, no matter
+    # what the glob expanded to; and a plain-file --into is refused too
+    printf '2026-06-07T08:00:00 a\n' > /tmp/fg1.log
+    printf '2026-06-07T08:00:01 b\n' > /tmp/fg2.log
+    if timberfs import /tmp/fg1.log /tmp/fg2.log 2>/tmp/fg.err; then
+        return 1
+    fi
+    grep -q "\-\-into" /tmp/fg.err \
+        && [ ! -e /tmp/fg2.log.trunk ] \
+        && ! timberfs import /tmp/fg1.log --into /tmp/fg2.log 2>/dev/null \
+        && ! echo x | timberfs append /tmp/fg1.log 2>/dev/null
+}
+
 run_test "multi-file: interleaved attributed query, per-file grep counts" multi_file_fleet_view
+sticky_declared_index() {
+    # create --index declares; imports maintain the grain with no flag
+    printf '2026-06-08T09:00:00 INFO alpha STICKYNEEDLE42
+' > /tmp/s1.log
+    printf '2026-06-08T09:00:01 INFO beta
+' > /tmp/s2.log
+    timberfs create "$PIPE_BACKING/sticky.log" --index --set host=vm.test 2>/dev/null \
+        && grep -q '"index": true' "$PIPE_BACKING/sticky.log.bark" \
+        && grep -qE '"id": "[0-9a-f-]{36}"' "$PIPE_BACKING/sticky.log.bark" \
+        && timberfs import /tmp/s1.log --into "$PIPE_BACKING/sticky.log" 2>/dev/null \
+        && [ -s "$PIPE_BACKING/sticky.log.grain" ] \
+        && timberfs query "$PIPE_BACKING/sticky.log" --has STICKYNEEDLE42 \
+           | grep -q STICKYNEEDLE42
+}
+
+empty_results_are_results() {
+    # a quiet day: the empty export still ships (bark records the asked
+    # window), imports as a clean no-op, and --fail-on-empty restores
+    # the error
+    timberfs export "$PIPE_BACKING/sticky.log" /tmp/quietday.timber \
+        --from "2031-01-01 00:00" --to "2031-01-02 00:00" 2>/dev/null \
+        && tar xOf /tmp/quietday.timber quietday.bark | grep -q '"window_to"' \
+        && timberfs import /tmp/quietday.timber --into "$PIPE_BACKING/sticky.log" 2>/tmp/qd.err \
+        && grep -q "is empty" /tmp/qd.err \
+        && ! timberfs export "$PIPE_BACKING/sticky.log" /tmp/nope.timber \
+             --from "2031-01-01 00:00" --to "2031-01-02 00:00" --fail-on-empty 2>/dev/null \
+        && [ ! -e /tmp/nope.timber ]
+}
+
+run_test "write guards: forgotten destination after a glob is refused" forgotten_destination_refused
+run_test "bark: create --index makes imports maintain the grain" sticky_declared_index
+run_test "empty results are results: export ships, import no-ops" empty_results_are_results
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 
