@@ -540,6 +540,28 @@ timberfs grep 'tenantId=FOO' backing/app.log \-\-from 13:00 \-\-to 14:10 \-\-int
 timberfs query case.timber | less        # attach case.timber to the ticket
 .RE
 .fi
+.SS info
+.B timberfs info
+.I FILE
+shows a store's vital signs on one screen: identity and creation time,
+lineage (what it derives from, by which operation, over which requested
+window, and \(em for
+.B grep
+artifacts \(em the command line that produced it, labelled
+.BR question ),
+declared provenance, logical size vs on-disk size and compression
+ratio, the time span covered and its duration, index sizes with grain
+.B coverage
+(a grain lagging its log \(em appender writes, partial extends \(em
+covers fewer chunks than the rings; the gap is scanned), and the writer
+state (none / active appender or import / mounted, probed from the
+actual flocks, never from stale lock-file contents). Works identically
+on backing pairs and read-only
+.B .timber
+bundles.
+.B \-\-json
+prints the same facts as one JSON object for scripting. Read-only and
+safe against live writers.
 .SS index
 .B timberfs index
 .I FILE

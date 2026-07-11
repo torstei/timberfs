@@ -111,6 +111,13 @@ pub struct Grain {
 }
 
 impl Grain {
+    /// How many chunks this grain has entries for (an index lagging its
+    /// log — appender writes, partial extends — covers fewer than the
+    /// rings; the gap is scanned, per the contract).
+    pub fn chunk_count(&self) -> usize {
+        self.filters.len()
+    }
+
     /// May chunk `idx` contain ALL the tokens? A chunk beyond the grain's
     /// coverage answers yes — missing means scan, per the contract.
     pub fn may_contain_all(&self, idx: usize, tokens: &[Vec<u8>]) -> bool {

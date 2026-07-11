@@ -26,7 +26,7 @@ use crate::format;
 use crate::query::{fmt_ms, resolve_backing};
 use crate::store::{self, Config, RotateStats, Store};
 
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
     let mut u = 0;
