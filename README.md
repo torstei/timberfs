@@ -15,6 +15,126 @@ storing them chunked + zstd-compressed, with a per-chunk **write-time index**
 so a time-range query is a binary search + a few frame decompressions —
 independent of file size.
 
+## Getting started: you have a pile of logs
+
+You probably found this because you have large logfiles *right now*. You
+don't need the filesystem part to get value — start by importing what you
+have. It's as easy as gzipping the logs, and considerably more useful.
+
+Install (see [Install](#install) for details and verification):
+
+```sh
+sudo apt install ./timberfs_amd64.deb   # from the latest GitHub release
+cargo install timberfs                  # or, with a Rust toolchain
+```
+
+### 1. Create a store, import your logs
+
+```sh
+timberfs create --index --set host=$(hostname) backing/app.log
+timberfs import /var/log/myapp/app.log* --into backing/app.log
+```
+
+That's it — and note what you did *not* have to do: figure out which
+rotated file covers which period. The glob imports in any order (files are
+stitched chronologically by their own first timestamps — rotation
+numbering lies), and the result is **one continuous timeline**: the
+question that used to span `app.log.2.gz`, `app.log.1` and `app.log` is
+now just a query. Timestamps are auto-detected from the lines (ISO/RFC3339
+variants, Apache/CLF, epochs; `--timestamp-regex`/`--timestamp-format` for
+exotic formats), and `--index` declares a token index that every future
+import maintains automatically. Tomorrow, the same command imports the
+next day's file: placement is automatic — after the store's end it
+appends, overlaps are deduplicated line by line, and re-running an import
+is a no-op.
+
+Compared to `gzip -9` + `zgrep`, roughly:
+
+|                      | gzip                     | timberfs                             |
+| -------------------- | ------------------------ | ------------------------------------ |
+| size                 | ~20x                     | ~15–65x (zstd, measured on real logs)|
+| "13:42 to 13:43?"    | decompress everything    | indexed: milliseconds, any file size |
+| "who logged req-8f3a"| zgrep = full decompress  | Bloom-indexed: skips ~99% of chunks  |
+| around a rotation?   | zcat + cat, in the right order | one timeline, no seams         |
+| worst case           | zcat still works         | `zstd -dc *.trunk` still works       |
+
+### 2. Ask it things
+
+```sh
+timberfs info backing/app.log                  # vital signs: size, ratio, time covered
+timberfs query backing/app.log --from "2026-07-10 13:40" --to "2026-07-10 14:10"
+timberfs grep ERROR backing/app.log --from 2026-07-10        # word-match, index-fast
+timberfs grep req-8f3a backing/app.log                       # request id, no time bound
+timberfs query backing/app.log --from 13:40 --to 14:10 | grep -c 'tenantId=FOO'
+```
+
+The intended workflow is coarse seek by time (cheap, indexed), then exact
+trimming with `timberfs grep` (entry-aware — stack traces stay glued to
+their entry) or plain `grep`/`awk` on the extract. When an investigation
+is done, ship it — with its provenance — as a single file:
+
+```sh
+timberfs grep 'tenantId=FOO' backing/app.log --from 13:40 --to 14:10 --into case.timber
+# case.timber is queryable in place, and records WHERE it came from and
+# WHAT question produced it (timberfs info case.timber). Attach to ticket.
+```
+
+### 3. Make it *the* logger (when you're ready)
+
+Live ingestion also retires rotation's other job. Plain-file logging
+rotates for two reasons: to make room, and to ship archives off-box. In
+timberfs, **making room needs no rotation at all** — retention drops the
+oldest data continuously from the same store, with no rotate-and-delete
+dance and no seams in the timeline. And it's a property of the *log*,
+not of whoever writes it: declared in the manifest (`create --retain-size
+50G`, or `timberfs set backing/app.log retain=90d` — live, no restart)
+and enforced by every writer: the appender, the mount daemon, even a
+cron-driven import. Rotation still exists
+(`timberfs rotate`), but for what it should be for: carving off segments
+to ship somewhere else.
+
+Three ways in, in increasing order of commitment:
+
+**a) Keep importing on a timer** — zero changes to your logging. Re-import
+verifies what's already stored and appends only the growth, so a cron or
+logrotate hook is cheap even on huge files:
+
+```sh
+# cron, or logrotate postrotate:
+timberfs import --quiet /var/log/myapp/app.log --into backing/app.log --quick
+```
+
+**b) Pipe it** — if the producer can write to a pipe, cut the plain file
+out entirely (svlogd-style, retention built in):
+
+```sh
+timberfs set backing/app.log retain_size=50G     # once (or at create time)
+myapp 2>&1 | timberfs append backing/app.log
+# (flags work too and persist the declaration: --retain-size 50G)
+
+# apache2: piped logs are a first-class Apache feature
+CustomLog "|/usr/bin/timberfs append --quiet /var/log/apache2-backing/access.log" combined
+ErrorLog  "|/usr/bin/timberfs append --quiet /var/log/apache2-backing/error.log"
+
+# journald-only software:
+journalctl -u myapp -f -o short-iso | timberfs append backing/myapp.log --retain 90d
+```
+
+**c) Mount it** — if the software insists on writing to a real file path,
+give it one; compression, indexing and retention happen transparently
+underneath:
+
+```sh
+timberfs mount /var/log/myapp-backing /var/log/myapp
+# the app writes /var/log/myapp/app.log as always; tail/less/grep work
+```
+
+One nuance worth knowing: `import` stamps chunks with timestamps **parsed
+from the log lines** (right for historical data), while `append`/`mount`
+stamp with the **write-time wall clock** (right for live ingestion, where
+they coincide). Either way, `query --from/--to` asks about the time the
+log talks about.
+
 ## Why FUSE (and not overlayfs / a kernel module)
 
 - **overlayfs** layers *namespaces* (upper/lower directories, as used by
@@ -73,6 +193,8 @@ human-editable JSON object — the label on the timber:
   "created": "2026-07-11T09:14:02Z", //   constant across renames, moves and hosts
   "host": "imap03.example.com",   // provenance: free-form, yours (--set k=v)
   "index": true,                  // settings: CREATE INDEX — imports maintain the grain
+  "retain": "90d",                //   keep at least this long — enforced by EVERY writer
+  "retain_size": "50G",           //   compressed-size budget, oldest dropped first
   "derived_from": "41d0…",        // lineage: source store's id
   "derived_op": "export",         // …and how: export (copy) or rotate (move)
   "window_from": "2026-07-04T22:00:00.000Z", // the REQUESTED window (operation

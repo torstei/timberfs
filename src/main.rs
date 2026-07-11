@@ -6,6 +6,7 @@ mod fs;
 mod grain;
 mod grep;
 mod import;
+mod note;
 mod query;
 mod rotate;
 mod store;
@@ -21,6 +22,10 @@ use clap::{Parser, Subcommand};
     about = "Append-only, transparently compressed, write-time-indexed filesystem for log files"
 )]
 struct Cli {
+    /// Suppress informational notes on stderr (scan reports, progress,
+    /// summaries); errors and warnings still print
+    #[arg(long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -60,10 +65,33 @@ enum Command {
         /// Declare the token index for this log
         #[arg(long)]
         index: bool,
+        /// Declare retention: continuously drop data older than this
+        /// (e.g. 90d, 12h) — enforced by every writer
+        #[arg(long)]
+        retain: Option<String>,
+        /// Declare a compressed-size budget (e.g. 50G, 512M); oldest
+        /// data drops first — enforced by every writer
+        #[arg(long)]
+        retain_size: Option<String>,
         /// Set a manifest property (key=value, e.g. host=foo.bar.com);
         /// repeatable, free-form
         #[arg(long = "set", value_name = "KEY=VALUE")]
         sets: Vec<String>,
+    },
+    /// Declare or change a store's properties in its .bark manifest —
+    /// validated and atomic, unlike hand-editing. Live writers re-read
+    /// the manifest within a second, so changes need no restart:
+    /// `timberfs set backing/app.log retain=30d`
+    Set {
+        /// Backing file: logical name, .trunk or .rings path
+        store: PathBuf,
+        /// KEY=VALUE to set: retain=90d, retain_size=50G,
+        /// index=true|false, or any free-form provenance key
+        #[arg(value_name = "KEY=VALUE")]
+        sets: Vec<String>,
+        /// Remove a key (repeatable): --unset retain
+        #[arg(long = "unset", value_name = "KEY")]
+        unsets: Vec<String>,
     },
     /// Append stdin to a log in a backing directory, without FUSE
     /// (svlogd-style): `myapp 2>&1 | timberfs append backing/app.log`.
@@ -305,6 +333,7 @@ fn main() -> anyhow::Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
+    note::set_quiet(cli.quiet);
     match cli.command {
         Command::Mount {
             backing,
@@ -331,8 +360,27 @@ fn main() -> anyhow::Result<()> {
             );
             fs::mount(s, &mountpoint, allow_other)?;
         }
-        Command::Create { dest, index, sets } => {
-            bark::cmd_create(&dest, index, &sets)?;
+        Command::Create {
+            dest,
+            index,
+            retain,
+            retain_size,
+            sets,
+        } => {
+            bark::cmd_create(
+                &dest,
+                index,
+                retain.as_deref(),
+                retain_size.as_deref(),
+                &sets,
+            )?;
+        }
+        Command::Set {
+            store,
+            sets,
+            unsets,
+        } => {
+            bark::cmd_set(&store, &sets, &unsets)?;
         }
         Command::Append {
             file,

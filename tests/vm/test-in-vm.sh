@@ -115,6 +115,19 @@ mounted_empty_rotation() {
         && [ ! -e "$BACKING/quiet2.log.rings" ]
 }
 
+mounted_retention() {
+    # declared retention (bark) is enforced by the mount daemon, live: a
+    # `timberfs set` while mounted takes effect on the next tick, and
+    # O_APPEND writers survive the shrink (kernel attrs invalidated).
+    # Own file: retention on a shared fixture breaks downstream tests.
+    for i in $(seq 1 20); do seq 1 20000 >> "$MNT/ret.log"; done \
+        && timberfs set "$BACKING/ret.log" retain_size=64K > /dev/null \
+        && sleep 3 \
+        && [ "$(stat -c %s "$BACKING/ret.log.trunk")" -le 262144 ] \
+        && echo RETAINED-BUT-ALIVE >> "$MNT/ret.log" \
+        && tail -1 "$MNT/ret.log" | grep -q RETAINED-BUT-ALIVE
+}
+
 retention_delete() {
     # unix-seconds cutoff in the future: drop everything in archive.log
     timberfs rotate "$BACKING/archive.log" --delete --cutoff "$(($(date +%s) + 3600))" \
@@ -276,6 +289,7 @@ run_test "rotation split is correct" rotate_split_correct
 run_test "mounted empty rotation attests; --fail-on-empty relays" mounted_empty_rotation
 run_test "retention --delete empties file" retention_delete
 run_test "100k-line integrity + stock-zstd recovery" big_file_integrity
+run_test "mounted retention: declared in bark, enforced live" mounted_retention
 run_test "compressed on disk (>5x)" compression_on_disk
 run_test "systemctl stop timberfs@test" stop_unit
 run_test "unmounted and not failed after stop" stopped_cleanly

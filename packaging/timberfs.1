@@ -162,6 +162,32 @@ derived
 bark survives head-drops, travels on rename, and ships inside
 .B .timber
 bundles.
+.SS set
+.B timberfs set
+.I FILE KEY=VALUE\|.\|.\|.
+declares or changes a store's properties in its
+.B .bark
+manifest \(em validated and atomic, which hand-editing the JSON is
+neither. Known settings are parse-checked
+.RB ( retain =90d,
+.BR retain_size =50G,
+.BR index =true|false);
+anything else is free-form provenance
+.RB ( host =...).
+.B \-\-unset
+.I KEY
+removes a key. Identity and lineage
+.RB ( id ,
+.BR created ,
+.BR derived_* )
+are facts, not settings, and are refused. Works on LIVE stores: writers
+re-read the manifest on their once-a-second retention tick, so
+.B timberfs set backing/app.log retain=30d
+takes effect within a second with no restart \(em restarting a writer
+means restarting whatever pipes into it. A manifest that stops parsing
+mid-flight (a bad hand-edit) keeps the writer alive on its last good
+policy, with one warning: never silently unbounded, never a dead
+producer.
 .SS append
 .B timberfs append
 .I FILE
@@ -618,6 +644,41 @@ Show what would move without changing anything.
 .TP
 .B \-\-fail\-on\-empty
 Error when nothing rotates instead of attesting the empty result.
+.SH RETENTION
+Retention is a property of the LOG, declared in its manifest
+.RB ( retain
+= keep at least this long,
+.B retain_size
+= compressed-size budget, oldest dropped first, whichever bites first)
+and enforced by
+.B every
+writer while it holds the writer locks: the appender and the mount
+daemon on their once-a-second tick, and
+.B import
+after each run \(em so timer-mode (cron import) stores and mounted
+stores get retention too, with no appender running. Declare it at
+.BR create ,
+with
+.BR set ,
+or via the appender's
+.BR \-\-retain / \-\-retain\-size
+flags (which persist the declaration \(em all roads converge, and a
+restarted writer can no longer silently lose its policy). Absent keys
+mean no limits: an artifact carved by
+.B grep \-\-into
+has no business expiring, which is also why retention, like all
+settings, is never inherited by derived stores.
+.B timberfs info
+shows the declared policy and calls out a store that is over budget
+with no writer running to enforce it.
+.SH GLOBAL OPTIONS
+.TP
+.B \-\-quiet
+Suppress informational notes on standard error \(em scan reports,
+progress, stitch plans, summaries. Errors and warnings still print.
+Accepted by every subcommand. (Long-only on purpose:
+.B \-q
+keeps its grep(1) meaning available.)
 .SH TIME FORMATS
 .I TIME
 arguments accept RFC 3339
