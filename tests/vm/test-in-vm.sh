@@ -417,9 +417,23 @@ empty_results_are_results() {
         && [ ! -e /tmp/nope.timber ]
 }
 
+daily_bulk_load() {
+    # day 2 into a non-empty store appends; an overlapping capture is
+    # deduplicated line by line; a re-run is a no-op
+    printf '2026-06-09T08:00:00 d1 a\n2026-06-09T08:00:01 d1 b\n' > /tmp/bl1.log
+    printf '2026-06-09T08:00:01 d1 b\n2026-06-10T08:00:00 d2 c\n' > /tmp/bl2.log
+    timberfs import /tmp/bl1.log --into /tmp/blstore/app.log 2>/dev/null \
+        && timberfs import /tmp/bl2.log --into /tmp/blstore/app.log 2>/tmp/bl.err \
+        && grep -q "1 duplicate line(s) skipped" /tmp/bl.err \
+        && [ "$(timberfs query /tmp/blstore/app.log 2>/dev/null | wc -l)" = 3 ] \
+        && timberfs import /tmp/bl2.log --into /tmp/blstore/app.log 2>/dev/null \
+        && [ "$(timberfs query /tmp/blstore/app.log 2>/dev/null | wc -l)" = 3 ]
+}
+
 run_test "write guards: forgotten destination after a glob is refused" forgotten_destination_refused
 run_test "bark: create --index makes imports maintain the grain" sticky_declared_index
 run_test "empty results are results: export ships, import no-ops" empty_results_are_results
+run_test "daily bulk-load: day-2 appends, overlap dedups, re-run no-ops" daily_bulk_load
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 

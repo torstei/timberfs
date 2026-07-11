@@ -205,7 +205,22 @@ timberfs import /var/log/old-app.log.* /var/log/old-app.log --into logs-backing/
 # is detected automatically and merged VERBATIM — no decompression, no
 # parsing, index included; re-shipping the same segment is a no-op
 timberfs import /shipped/app-2026-07-09.log --into central-backing/hostA-app.log
+
+# the daily bulk-load: each day's file just appends to the archive
+timberfs import imap-2026-07-10.log --into backing/imap.log   # day 2
+timberfs import imap-2026-07-11.log --into backing/imap.log   # day 3, and so on
 ```
+
+Imports into a **non-empty store** are placed by each source's *first
+timestamp*: after the store's end → append (the daily load above);
+*inside* the store's window (day files cut with slack, a re-run) → the
+overlap is deduplicated **line by line** — duplicates skip, genuinely
+new lines in the covered window land with a warning, and re-importing an
+already-covered file is a clean no-op; *before* everything in the store
+→ refused. A source starting exactly where the store starts is the same
+file regrown: its already-imported prefix is byte-verified and only the
+growth is appended (truncated/rewritten files are refused before a byte
+is written).
 
 And `timberfs export` is the read-side twin: carve any time window (or a
 whole log) out of an archive as a fresh timberfs log — or as a
