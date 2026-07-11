@@ -23,7 +23,7 @@ use std::path::Path;
 use anyhow::{bail, Context};
 
 use crate::format;
-use crate::query::{fmt_ms, parse_time, resolve_backing};
+use crate::query::{fmt_ms, resolve_backing};
 use crate::store::{self, Config, RotateStats, Store};
 
 fn human_bytes(n: u64) -> String {
@@ -119,12 +119,11 @@ fn report(stats: &RotateStats, target: Option<&str>) {
 pub fn cmd_rotate(
     source: &Path,
     dest: Option<&str>,
-    cutoff: &str,
+    cutoff_ms: u64,
     delete: bool,
     dry_run: bool,
     fail_on_empty: bool,
 ) -> anyhow::Result<()> {
-    let cutoff_ms = parse_time(cutoff)?;
     if crate::query::is_bundle(source) {
         bail!(
             "{} is a .timber transfer bundle — bundles are read-only \

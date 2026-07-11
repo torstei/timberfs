@@ -601,9 +601,14 @@ Error when nothing rotates instead of attesting the empty result.
 arguments accept RFC 3339
 .RB ( 2026\-07\-10T13:42:00+02:00 ),
 .BR "YYYY\-MM\-DD HH:MM" [ :SS ]
-(local time, a
+(local time; a
 .B T
-separator also works),
+separator also works, and dots as date separators \(em paste straight
+from logback-style logs), a bare
+.B YYYY\-MM\-DD
+(midnight local time, so
+.B \-\-from 2026\-07\-10 \-\-to 2026\-07\-11
+selects exactly that day),
 .BR HH:MM [ :SS ]
 (today, local time), and unix epoch seconds or milliseconds.
 .SH ON-DISK FORMAT

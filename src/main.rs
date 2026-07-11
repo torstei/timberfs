@@ -143,11 +143,11 @@ enum Command {
         /// Destination: new backing file, or a *.timber bundle
         dest: PathBuf,
         /// Start of the window (same formats as query); default: beginning
-        #[arg(long)]
-        from: Option<String>,
+        #[arg(long, value_parser = query::parse_time)]
+        from: Option<u64>,
         /// End of the window; default: end
-        #[arg(long)]
-        to: Option<String>,
+        #[arg(long, value_parser = query::parse_time)]
+        to: Option<u64>,
         /// Error instead of writing an empty artifact when nothing matches
         /// (default: an empty result is a result — present-but-empty tells
         /// a consumer "covered, nothing there", unlike a missing file)
@@ -161,13 +161,14 @@ enum Command {
         /// by chunk time-windows with grep-style "path:" line prefixes
         #[arg(required = true, num_args = 1..)]
         files: Vec<PathBuf>,
-        /// Start of the time window (RFC3339, 'YYYY-MM-DD HH:MM:SS',
+        /// Start of the time window (RFC3339, 'YYYY-MM-DD [HH:MM[:SS]]'
+        /// — a bare date is midnight, dotted dates work too,
         /// 'HH:MM[:SS]' = today, or unix seconds); default: beginning
-        #[arg(long)]
-        from: Option<String>,
+        #[arg(long, value_parser = query::parse_time)]
+        from: Option<u64>,
         /// End of the time window (same formats); default: end
-        #[arg(long)]
-        to: Option<String>,
+        #[arg(long, value_parser = query::parse_time)]
+        to: Option<u64>,
         /// Only chunks that (probably) contain this token, via the .grain
         /// Bloom index (build with `timberfs reindex`); repeatable = AND;
         /// an argument with separators must match all its tokens
@@ -206,12 +207,13 @@ enum Command {
         /// Print only the number of matching entries
         #[arg(short = 'c', long)]
         count: bool,
-        /// Start of the time window (timberfs sources only)
-        #[arg(long)]
-        from: Option<String>,
+        /// Start of the time window (timberfs sources only; same
+        /// formats as query)
+        #[arg(long, value_parser = query::parse_time)]
+        from: Option<u64>,
         /// End of the time window (timberfs sources only)
-        #[arg(long)]
-        to: Option<String>,
+        #[arg(long, value_parser = query::parse_time)]
+        to: Option<u64>,
         /// .grain chunk pre-filter (timberfs sources only); repeatable
         #[arg(long)]
         has: Vec<String>,
@@ -269,9 +271,10 @@ enum Command {
         /// exists); omit when using --delete
         dest: Option<String>,
         /// Rotate data written before this time (RFC3339,
-        /// 'YYYY-MM-DD HH:MM[:SS]', 'HH:MM[:SS]' = today, unix seconds)
-        #[arg(long)]
-        cutoff: String,
+        /// 'YYYY-MM-DD [HH:MM[:SS]]' — a bare date is midnight,
+        /// 'HH:MM[:SS]' = today, unix seconds)
+        #[arg(long, value_parser = query::parse_time)]
+        cutoff: u64,
         /// Drop the rotated chunks instead of moving them (retention)
         #[arg(long, conflicts_with = "dest")]
         delete: bool,
@@ -370,13 +373,7 @@ fn main() -> anyhow::Result<()> {
             to,
             fail_on_empty,
         } => {
-            export::cmd_export(
-                &source,
-                &dest,
-                from.as_deref(),
-                to.as_deref(),
-                fail_on_empty,
-            )?;
+            export::cmd_export(&source, &dest, from, to, fail_on_empty)?;
         }
         Command::Query {
             files,
@@ -385,7 +382,7 @@ fn main() -> anyhow::Result<()> {
             has,
             no_filename,
         } => {
-            query::cmd_query(&files, from.as_deref(), to.as_deref(), &has, no_filename)?;
+            query::cmd_query(&files, from, to, &has, no_filename)?;
         }
         Command::Grep {
             pattern,
@@ -408,8 +405,8 @@ fn main() -> anyhow::Result<()> {
             grep::cmd_grep(
                 &pattern,
                 &files,
-                from.as_deref(),
-                to.as_deref(),
+                from,
+                to,
                 &has,
                 ignore_case,
                 invert,
@@ -441,7 +438,7 @@ fn main() -> anyhow::Result<()> {
             rotate::cmd_rotate(
                 &source,
                 dest.as_deref(),
-                &cutoff,
+                cutoff,
                 delete,
                 dry_run,
                 fail_on_empty,

@@ -51,7 +51,7 @@ use serde_json::Value;
 
 use crate::format::ChunkRecord;
 use crate::import::Extractor;
-use crate::query::{fmt_ms, is_bundle, open_source, parse_time, resolve_backing, select_chunks};
+use crate::query::{fmt_ms, is_bundle, open_source, resolve_backing, select_chunks};
 use crate::store;
 
 /// A timestamp-less flood can't balloon memory: entries are split here.
@@ -299,8 +299,8 @@ fn grep_into(
     p: &Path,
     res: &[Regex],
     extractor: Extractor,
-    from: Option<&str>,
-    to: Option<&str>,
+    from: Option<u64>,
+    to: Option<u64>,
     has: &[String],
     auto_has: &[String],
     scan_reason: Option<&str>,
@@ -310,8 +310,8 @@ fn grep_into(
     fail_on_empty: bool,
 ) -> anyhow::Result<()> {
     let source = open_source(p)?;
-    let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
-    let to_ms = to.map(parse_time).transpose()?.unwrap_or(u64::MAX);
+    let from_ms = from.unwrap_or(0);
+    let to_ms = to.unwrap_or(u64::MAX);
     if from_ms > to_ms {
         bail!("--from is after --to");
     }
@@ -537,8 +537,8 @@ fn grep_one(
     p: &Path,
     res: &[Regex],
     extractor: Extractor,
-    from: Option<&str>,
-    to: Option<&str>,
+    from: Option<u64>,
+    to: Option<u64>,
     has: &[String],
     auto_has: &[String],
     scan_reason: Option<&str>,
@@ -577,8 +577,8 @@ fn grep_one(
         );
     }
     let source = open_source(p)?;
-    let from_ms = from.map(parse_time).transpose()?.unwrap_or(0);
-    let to_ms = to.map(parse_time).transpose()?.unwrap_or(u64::MAX);
+    let from_ms = from.unwrap_or(0);
+    let to_ms = to.unwrap_or(u64::MAX);
     if from_ms > to_ms {
         bail!("--from is after --to");
     }
@@ -609,8 +609,8 @@ fn grep_one(
 pub fn cmd_grep(
     pattern: &str,
     files: &[std::path::PathBuf],
-    from: Option<&str>,
-    to: Option<&str>,
+    from: Option<u64>,
+    to: Option<u64>,
     has: &[String],
     ignore_case: bool,
     invert: bool,
