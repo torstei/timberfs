@@ -197,7 +197,7 @@ pub fn cmd_records_sink(
     );
     let selection: Vec<String> = start_fields
         .iter()
-        .filter(|(k, _)| k == "from" || k == "to" || k == "has")
+        .filter(|(k, _)| k == "from" || k == "to" || k == "has" || k == "any")
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     if !selection.is_empty() {

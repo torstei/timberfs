@@ -223,6 +223,10 @@ enum Command {
         /// an argument with separators must match all its tokens
         #[arg(long)]
         has: Vec<String>,
+        /// Chunks where at least ONE of these matches (repeat = OR; the
+        /// union of exact branches, still exact); composes with --has
+        #[arg(long, value_name = "TEXT")]
+        any: Vec<String>,
         /// Never prefix output lines with the file name
         #[arg(long)]
         no_filename: bool,
@@ -578,6 +582,7 @@ fn main() -> anyhow::Result<()> {
             from,
             to,
             has,
+            any,
             no_filename,
             show_write_time,
             by_write_time,
@@ -589,6 +594,7 @@ fn main() -> anyhow::Result<()> {
                 from,
                 to,
                 &has,
+                &any,
                 no_filename,
                 show_write_time,
                 by_write_time,

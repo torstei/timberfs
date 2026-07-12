@@ -90,9 +90,12 @@ regex's own business:
 At least one must hold; repeat to OR.
 .TP
 .BI \-\-any " TEXT"
-Word-anchored phrase. A single exact
+Word-anchored phrase. Exact
 .B \-\-any
-rides the token index; alternatives read the selection honestly.
+alternatives ride the token index together (pushed down as
+.B query \-\-any
+\(em the union of exact branches is exact); a caseless alternative in
+the mix reads the selection honestly instead.
 .TP
 .BI \-\-any\-caseless " TEXT"
 As
@@ -139,9 +142,9 @@ index \(em every
 .B \-\-has
 whole, every
 .B \-\-substring
-on its interior words, a single
+on its interior words, all-exact
 .B \-\-any
-whole. Caseless variants cannot (the index is exact-case); excludes
+alternatives as their union. Caseless variants cannot (the index is exact-case); excludes
 cannot (absence is unprovable); a single-word
 .B \-\-substring
 proves nothing at all (filtering for IMPORTANT must still find

@@ -294,6 +294,7 @@ pub fn cmd_query(
     from: Option<u64>,
     to: Option<u64>,
     has: &[String],
+    any: &[String],
     no_filename: bool,
     show_write_time: bool,
     by_write_time: bool,
@@ -317,6 +318,7 @@ pub fn cmd_query(
             to_ms,
             windowed,
             has,
+            any,
             no_filename,
             show_write_time,
             null_sep,
@@ -324,9 +326,9 @@ pub fn cmd_query(
         );
     }
     if files.len() == 1 {
-        return query_single(&files[0], from_ms, to_ms, has);
+        return query_single(&files[0], from_ms, to_ms, has, any);
     }
-    query_multi(files, from_ms, to_ms, has, no_filename)
+    query_multi(files, from_ms, to_ms, has, any, no_filename)
 }
 
 /// The default read path: select chunks by the write-time rings (widened
@@ -341,6 +343,7 @@ fn query_entries(
     to_ms: u64,
     windowed: bool,
     has: &[String],
+    any: &[String],
     no_filename: bool,
     show_write_time: bool,
     null_sep: bool,
@@ -373,7 +376,7 @@ fn query_entries(
             from_ms.saturating_sub(WIDEN_MS),
             to_ms.saturating_add(WIDEN_MS),
             has,
-            &[],
+            any,
         )?;
         let filterable = windowed
             && match selected.first() {
@@ -395,7 +398,7 @@ fn query_entries(
         // Unfilterable + windowed: fall back to the UNWIDENED selection —
         // never both looser and unexplained.
         let selected = if window.is_none() && windowed {
-            select_chunks(f, &source.records, from_ms, to_ms, has, &[])?.0
+            select_chunks(f, &source.records, from_ms, to_ms, has, any)?.0
         } else {
             selected
         };
@@ -441,6 +444,9 @@ fn query_entries(
         }
         for h in has {
             write!(out, "\x1fhas={h}")?;
+        }
+        for a in any {
+            write!(out, "\x1fany={a}")?;
         }
         write!(out, "\x1fsources={}", files.len())?;
         out.write_all(b"\0")?;
@@ -509,10 +515,16 @@ fn query_entries(
     Ok(())
 }
 
-fn query_single(file: &Path, from_ms: u64, to_ms: u64, has: &[String]) -> anyhow::Result<()> {
+fn query_single(
+    file: &Path,
+    from_ms: u64,
+    to_ms: u64,
+    has: &[String],
+    any: &[String],
+) -> anyhow::Result<()> {
     let source = open_source(file)?;
     let chunks = source.records;
-    let (selected, in_window) = select_chunks(file, &chunks, from_ms, to_ms, has, &[])?;
+    let (selected, in_window) = select_chunks(file, &chunks, from_ms, to_ms, has, any)?;
 
     let trunk = source.file;
     let stdout = io::stdout();
@@ -552,6 +564,7 @@ fn query_multi(
     from_ms: u64,
     to_ms: u64,
     has: &[String],
+    any: &[String],
     no_filename: bool,
 ) -> anyhow::Result<()> {
     struct Src {
@@ -566,7 +579,7 @@ fn query_multi(
     let mut total_selected = 0usize;
     for f in files {
         let source = open_source(f)?;
-        let (selected, _) = select_chunks(f, &source.records, from_ms, to_ms, has, &[])?;
+        let (selected, _) = select_chunks(f, &source.records, from_ms, to_ms, has, any)?;
         eprintln!(
             "timberfs: {}: {} of {} chunk(s)",
             f.display(),
