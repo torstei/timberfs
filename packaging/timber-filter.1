@@ -1,0 +1,191 @@
+.TH TIMBER\-FILTER 1 "2026-07-12" "timberfs" "User Commands"
+.SH NAME
+timber\-filter \- pass log entries matching named predicates, from timberfs stores, record streams and raw logs
+.SH SYNOPSIS
+.B timber\-filter
+.RI [ predicates ]
+.RI [ options ]
+.RI [ FILE ...]
+.br
+.B timberfs query \-\-records
+.I ...
+.B | timber\-filter
+.RI [ predicates ]
+.SH DESCRIPTION
+.B timber\-filter
+passes whole log ENTRIES \(em a stamped line plus its continuation
+lines, so a stack trace stays attached to the line that raised it \(em
+that satisfy its predicates. Nothing shape-shifts and no flag modifies
+another: positionals are always files, and every predicate flag
+carries its kind, its polarity and its case rule in its own name.
+.PP
+The algebra is one sentence:
+.B Select
+predicates
+.RB ( \-\-has ,
+.BR \-\-substring ,
+.BR \-\-regex )
+AND on repetition \(em every one must hold;
+.B \-\-any
+alternatives OR \(em at least one must hold;
+.B \-\-not\-*
+excludes \(em none may hold; a
+.B \-caseless
+suffix compares that one predicate caselessly. \(lqA and not B\(rq is
+.BR "\-\-substring A \-\-not\-substring B" .
+With no predicates at all, every entry passes: a filter with an empty
+program is
+.BR cat (1),
+here entry-aware, which makes predicate-less
+.B timber\-filter
+the record-stream-to-text converter (\fB\-c\fR alone counts entries;
+.B \-0
+alone re-frames them NUL-terminated).
+.PP
+Selection is not its job. A
+.I FILE
+naming a timberfs store is searched through the selection layer \(em
+.B timber\-filter
+runs its sibling
+.B timberfs query \-\-records
+with
+.BR \-\-from / \-\-to / \-\-has
+passed through, and filters the resulting stream \(em so the fused and
+piped spellings are the same search, byte for byte. Raw log files, raw
+text on standard input, or a
+.BR timberfs\-records (5)
+stream on standard input (recognized automatically) are filtered as
+they come. A truncated record stream \(em one that ends without its
+.B stream\-end
+marker \(em is an error, never a silently short result.
+.SH SELECT
+Every one must hold; repeat to AND.
+.TP
+.BI \-\-has " TEXT"
+Word-anchored phrase the entry must contain (an argument with
+separators is a contiguous phrase, each word matching whole). Rides
+the token index on stores.
+.TP
+.BI \-\-has\-caseless " TEXT"
+As
+.BR \-\-has ,
+compared caselessly (the exact-case index sits out).
+.TP
+.BI \-\-substring " TEXT"
+Literal the entry must contain, anywhere \(em even inside longer
+words (partial ids). A multi-word literal rides the index on its
+INTERIOR words: a substring match requires them whole; edge words
+prove nothing.
+.TP
+.BI \-\-substring\-caseless " TEXT"
+As
+.BR \-\-substring ,
+compared caselessly.
+.TP
+.BI \-\-regex " PATTERN"
+Regular expression the entry must match. Case-insensitivity is the
+regex's own business:
+.BR (?i)... .
+.SH ALTERNATIVES
+At least one must hold; repeat to OR.
+.TP
+.BI \-\-any " TEXT"
+Word-anchored phrase. A single exact
+.B \-\-any
+rides the token index; alternatives read the selection honestly.
+.TP
+.BI \-\-any\-caseless " TEXT"
+As
+.BR \-\-any ,
+compared caselessly.
+.PP
+(There is no
+.BR \-\-not\-any :
+\(lqnot (A or B)\(rq is two excludes \(em De Morgan closes the
+algebra.)
+.SH EXCLUDE
+None may hold. Excludes never ride the index \(em structurally: a
+Bloom filter cannot prove absence.
+.TP
+.BI \-\-not\-has " TEXT"
+Word-anchored phrase the entry must NOT contain.
+.TP
+.BI \-\-not\-has\-caseless " TEXT"
+As
+.BR \-\-not\-has ,
+compared caselessly.
+.TP
+.BI \-\-not\-substring " TEXT"
+Literal the entry must NOT contain anywhere.
+.TP
+.BI \-\-not\-substring\-caseless " TEXT"
+As
+.BR \-\-not\-substring ,
+compared caselessly.
+.TP
+.BI \-\-not\-regex " PATTERN"
+Regular expression the entry must NOT match.
+.SH TIME WINDOW
+Handed to the query layer for store arguments; refused for streams
+(they are already selected).
+.TP
+.BI \-\-from " TIME" ", \-\-to " TIME
+The time window (formats as
+.BR "timberfs query" ).
+Stores only.
+.SH ACCELERATION
+Uniform by SHAPE, not by rule: exact-case positives ride the token
+index \(em every
+.B \-\-has
+whole, every
+.B \-\-substring
+on its interior words, a single
+.B \-\-any
+whole. Caseless variants cannot (the index is exact-case); excludes
+cannot (absence is unprovable); a single-word
+.B \-\-substring
+proves nothing at all (filtering for IMPORTANT must still find
+SUPERIMPORTANT). When nothing narrows a store search, a note says so
+\(em slow but correct is a choice, not a surprise.
+.SH OUTPUT
+.TP
+.BR \-c ", " \-\-count
+Print only the number of matching entries.
+.TP
+.BR \-0 ", " \-\-null
+NUL-terminated entry records (multiline entries stay one record).
+.TP
+.B \-\-records
+Emit the typed record stream (see
+.BR timberfs\-records (5))
+instead of text, for the next timber-aware stage: entry metadata
+passes through verbatim (the payload is unmodified, so every
+.B len
+stays true), stream-end counts are updated, and this stage appends its
+own command line to the stream-start lineage
+.RB ( stage= ...)
+\(em an artifact built at the end of the pipe records every stage that
+shaped it. Raw text input is framed and stamped on the way through.
+.TP
+.B \-\-no\-filename
+Never prefix output lines with the source name (multi-source searches
+prefix by default).
+.TP
+.B \-\-quiet
+Suppress informational notes on standard error; errors still print.
+.SH EXAMPLES
+.nf
+.RS
+timber\-filter \-\-regex 'tenant=[0-9]+' \-\-from 13:00 \-\-to 14:00 app.log
+timber\-filter \-\-has ERROR \-\-has req\-8f3a \-c app.log
+timber\-filter \-\-any ERROR \-\-any FATAL \-\-not\-has HealthCheck app.log
+timber\-filter \-\-has FOO \-\-substring\-caseless 'connection reset' app.log
+timberfs query \-\-records \-\-from 13:00 app.log | timber\-filter \-\-not\-has DEBUG
+timber\-filter \-\-records \-\-has ERROR app.log | timber\-filter \-\-substring 'tenant=7' \-c
+timber\-filter \-\-records old.log \-\-quiet | timber\-filter \-\-quiet   # cat: text=records=text
+.RE
+.fi
+.SH SEE ALSO
+.BR timberfs (1),
+.BR timberfs\-records (5),
+.BR grep (1)
