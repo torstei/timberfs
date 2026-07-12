@@ -464,7 +464,12 @@ substrings do not match. An argument containing separators
 .RB ( req\-8f3a )
 must match all its tokens in the same chunk; repeat
 .B \-\-has
-for chunk-level AND. About 1% of non-matching chunks pass anyway (Bloom
+for chunk-level AND;
+.BI \-\-any " TEXT"
+(repeatable) keeps chunks where at least ONE alternative matches \(em
+the union of exact branches, still exact \(em and composes with
+.BR \-\-has .
+About 1% of non-matching chunks pass anyway (Bloom
 false positives) \(em the exact, entry-level filtering belongs in
 .B timberfs grep
 downstream. The killer use: finding a unique identifier with NO time

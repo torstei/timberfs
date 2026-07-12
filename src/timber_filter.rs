@@ -266,11 +266,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 pushdown.extend(toks);
             }
         }
-        if cli.any.len() == 1 && cli.any_caseless.is_empty() {
-            let w = &cli.any[0];
-            note!("timber-filter: --any {w} rides the token index (as --has)");
-            pushdown.push(w.clone());
-        }
+    }
+    // --any alternatives push down as query --any (the union of exact
+    // branches is exact) — but only when ALL alternatives are exact:
+    // one caseless branch could live in a chunk the index would skip.
+    let mut any_pushdown: Vec<String> = Vec::new();
+    if !stores.is_empty() && !cli.any.is_empty() && cli.any_caseless.is_empty() {
+        note!(
+            "timber-filter: --any alternative{} ride{} the token index (union of exact branches)",
+            if cli.any.len() == 1 { "" } else { "s" },
+            if cli.any.len() == 1 { "s" } else { "" }
+        );
+        any_pushdown = cli.any.clone();
     }
 
     let mut sink = Sink {
@@ -302,12 +309,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         for h in has.iter().chain(&pushdown) {
             cmd.args(["--has", h]);
         }
+        for a in &any_pushdown {
+            cmd.args(["--any", a]);
+        }
         cmd.args(&files).stdout(Stdio::piped());
         let mut child = cmd
             .spawn()
             .context("spawning timberfs (is it installed next to timber-filter?)")?;
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        let note_unselected = has.is_empty() && pushdown.is_empty() && !windowed;
+        let note_unselected =
+            has.is_empty() && pushdown.is_empty() && any_pushdown.is_empty() && !windowed;
         grep_records(stdout, &preds, note_unselected, &mut sink)?;
         let status = child.wait()?;
         if !status.success() {
