@@ -217,6 +217,7 @@ pub fn select_chunks(
     from_ms: u64,
     to_ms: u64,
     has: &[String],
+    any_of: &[String],
 ) -> anyhow::Result<(Vec<(usize, ChunkRecord)>, usize)> {
     let mut selected: Vec<(usize, ChunkRecord)> = chunks
         .iter()
@@ -226,7 +227,7 @@ pub fn select_chunks(
         .collect();
     let in_window = selected.len();
 
-    if !has.is_empty() {
+    if !has.is_empty() || !any_of.is_empty() {
         let mut tokens: Vec<Vec<u8>> = Vec::new();
         for h in has {
             let t = crate::grain::tokenize_query(h);
@@ -238,15 +239,31 @@ pub fn select_chunks(
             }
             tokens.extend(t);
         }
+        // Repeated arguments/tokens are a set: checking a Bloom filter
+        // for the same token twice buys nothing.
+        tokens.sort();
+        tokens.dedup();
         let grain = if is_bundle(file) {
             None
         } else {
             let (dir, base) = resolve_backing(file)?;
             crate::grain::load(&crate::format::grain_path(&dir, &base)).ok()
         };
+        // OR-of-ANDs: a chunk survives when the AND tokens are all
+        // present AND (no alternatives, or at least one alternative's
+        // tokens are all present) — each branch exact, so the union is.
+        let groups: Vec<Vec<Vec<u8>>> = any_of
+            .iter()
+            .map(|a| crate::grain::tokenize_query(a))
+            .filter(|g| !g.is_empty())
+            .collect();
         match grain {
             Some(g) => {
-                selected.retain(|(i, _)| g.may_contain_all(*i, &tokens));
+                selected.retain(|(i, _)| {
+                    g.may_contain_all(*i, &tokens)
+                        && (groups.is_empty()
+                            || groups.iter().any(|grp| g.may_contain_all(*i, grp)))
+                });
             }
             None => {
                 eprintln!(
@@ -265,17 +282,44 @@ pub fn select_chunks(
 /// (A scan, not a binary search: imported files carry logged timestamps
 /// whose windows are only mostly sorted. The index is 48 bytes per chunk,
 /// so scanning it is negligible next to decompressing one chunk.)
+/// How much the write-time selection is widened when the logline filter
+/// can verify entries exactly: catches lines written slightly before or
+/// after the stamps they carry (buffered producers), while the filter
+/// keeps the OUTPUT exactly inside the asked window.
+pub(crate) const WIDEN_MS: u64 = 60_000;
+
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_query(
     files: &[std::path::PathBuf],
     from: Option<u64>,
     to: Option<u64>,
     has: &[String],
     no_filename: bool,
+    show_write_time: bool,
+    by_write_time: bool,
+    null_sep: bool,
 ) -> anyhow::Result<()> {
     let from_ms = from.unwrap_or(0);
     let to_ms = to.unwrap_or(u64::MAX);
     if from_ms > to_ms {
         bail!("--from is after --to");
+    }
+    let windowed = from.is_some() || to.is_some();
+    // The entry pipeline engages when there is something to verify
+    // (a window: the DEFAULT is that every printed entry's own timestamp
+    // is inside it) or when the framing needs entries (-0, annotation).
+    // --by-write-time is the raw escape hatch: chunk dump, no parsing.
+    if !by_write_time && (windowed || null_sep || show_write_time) {
+        return query_entries(
+            files,
+            from_ms,
+            to_ms,
+            windowed,
+            has,
+            no_filename,
+            show_write_time,
+            null_sep,
+        );
     }
     if files.len() == 1 {
         return query_single(&files[0], from_ms, to_ms, has);
@@ -283,10 +327,151 @@ pub fn cmd_query(
     query_multi(files, from_ms, to_ms, has, no_filename)
 }
 
+/// The default read path: select chunks by the write-time rings (widened
+/// when the logline filter can verify), then emit whole ENTRIES whose own
+/// timestamps fall inside the asked window. Unfilterable stores (no
+/// parseable line timestamps) fall back to the unwidened raw window with
+/// a note — never both looser AND unexplained.
+#[allow(clippy::too_many_arguments)]
+fn query_entries(
+    files: &[std::path::PathBuf],
+    from_ms: u64,
+    to_ms: u64,
+    windowed: bool,
+    has: &[String],
+    no_filename: bool,
+    show_write_time: bool,
+    null_sep: bool,
+) -> anyhow::Result<()> {
+    struct Src {
+        file: File,
+        chunks: Vec<(usize, ChunkRecord)>,
+        total_chunks: usize,
+        pos: usize,
+        sink: crate::entry::EntrySink,
+    }
+    let decomp = |file: &File, c: &ChunkRecord| -> anyhow::Result<Vec<u8>> {
+        let mut comp = vec![0u8; c.comp_len as usize];
+        file.read_exact_at(&mut comp, c.comp_start)?;
+        Ok(zstd::stream::decode_all(&comp[..])?)
+    };
+    let multi = files.len() > 1 && !no_filename;
+    let mut srcs: Vec<Src> = Vec::new();
+    for f in files {
+        let source = open_source(f)?;
+        let tf = crate::bark::time_format(source.bark.as_ref());
+        let extractor =
+            crate::import::Extractor::new(tf.regex.as_deref(), tf.format.as_deref(), tf.utc)?;
+        // Widened selection, then a probe: can this store's lines be
+        // parsed at all? If not, no filter — and no widening either.
+        let (selected, _) = select_chunks(
+            f,
+            &source.records,
+            from_ms.saturating_sub(WIDEN_MS),
+            to_ms.saturating_add(WIDEN_MS),
+            has,
+            &[],
+        )?;
+        let filterable = windowed
+            && match selected.first() {
+                Some((_, c)) => crate::entry::probe_stamps(&extractor, &decomp(&source.file, c)?),
+                None => false,
+            };
+        let window = if filterable {
+            Some((from_ms, to_ms))
+        } else {
+            if windowed && !selected.is_empty() {
+                crate::note!(
+                    "timberfs: {}: no parseable line timestamps — showing the write-time \
+                     window as-is (declare a format with `timberfs set` to filter exactly)",
+                    f.display()
+                );
+            }
+            None
+        };
+        // Unfilterable + windowed: fall back to the UNWIDENED selection —
+        // never both looser and unexplained.
+        let selected = if window.is_none() && windowed {
+            select_chunks(f, &source.records, from_ms, to_ms, has, &[])?.0
+        } else {
+            selected
+        };
+        let framing = crate::entry::Framing {
+            null_sep,
+            show_write: show_write_time,
+            label: if multi {
+                Some(f.display().to_string().into_bytes())
+            } else {
+                None
+            },
+        };
+        srcs.push(Src {
+            file: source.file,
+            total_chunks: source.records.len(),
+            chunks: selected,
+            pos: 0,
+            sink: crate::entry::EntrySink::new(
+                extractor,
+                window,
+                framing,
+                &f.display().to_string(),
+            ),
+        });
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    // K-way interleave by chunk write windows across files (within-file
+    // order preserved), same as the raw fleet view.
+    loop {
+        let mut best: Option<usize> = None;
+        for (i, s) in srcs.iter().enumerate() {
+            if s.pos < s.chunks.len() {
+                let key = s.chunks[s.pos].1.first_write_ms;
+                if best.is_none_or(|b: usize| key < srcs[b].chunks[srcs[b].pos].1.first_write_ms) {
+                    best = Some(i);
+                }
+            }
+        }
+        let Some(i) = best else { break };
+        let s = &mut srcs[i];
+        let c = s.chunks[s.pos].1;
+        s.pos += 1;
+        let data = decomp(&s.file, &c)?;
+        s.sink
+            .push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?;
+    }
+    let (mut emitted, mut dropped) = (0u64, 0u64);
+    let (mut read, mut total) = (0usize, 0usize);
+    for s in &mut srcs {
+        s.sink.finish(&mut out)?;
+        emitted += s.sink.emitted;
+        dropped += s.sink.filtered_out;
+        read += s.chunks.len();
+        total += s.total_chunks;
+    }
+    out.flush()?;
+    if windowed {
+        crate::note!(
+            "timberfs: {emitted} entr{} in the window; {read} of {total} chunk(s) read{}",
+            if emitted == 1 { "y" } else { "ies" },
+            if dropped > 0 {
+                format!(
+                    " ({dropped} nearby verified outside it — --show-write-time explains, \
+                     --by-write-time shows raw chunks)"
+                )
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(())
+}
+
 fn query_single(file: &Path, from_ms: u64, to_ms: u64, has: &[String]) -> anyhow::Result<()> {
     let source = open_source(file)?;
     let chunks = source.records;
-    let (selected, in_window) = select_chunks(file, &chunks, from_ms, to_ms, has)?;
+    let (selected, in_window) = select_chunks(file, &chunks, from_ms, to_ms, has, &[])?;
 
     let trunk = source.file;
     let stdout = io::stdout();
@@ -340,7 +525,7 @@ fn query_multi(
     let mut total_selected = 0usize;
     for f in files {
         let source = open_source(f)?;
-        let (selected, _) = select_chunks(f, &source.records, from_ms, to_ms, has)?;
+        let (selected, _) = select_chunks(f, &source.records, from_ms, to_ms, has, &[])?;
         eprintln!(
             "timberfs: {}: {} of {} chunk(s)",
             f.display(),

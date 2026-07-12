@@ -1,19 +1,26 @@
 # timberfs
 
-Experiment: a Linux filesystem purpose-built for log files.
+Experiment: a purpose-built home for log files — stored compressed,
+searchable in milliseconds.
 
-Log files have a very particular access pattern that general-purpose
-filesystems don't exploit:
+`timberfs` keeps logs zstd-compressed (15–65x measured on real logs) and
+still answers *"what happened between 13:42 and 13:43?"* or *"who logged
+req-8f3a?"* in milliseconds, on files of any size, without decompressing
+them. Start by importing the logs you already have — as easy as gzipping
+them, and considerably more useful — and later, if you want, let it BE
+the logger: a pipe target for anything that can write to a pipe, or a
+FUSE filesystem your software writes to unmodified.
+
+It can be this fast and this small because log files have a very
+particular access pattern that general-purpose storage doesn't exploit:
 
 - **append-only writes** — nothing ever rewrites the middle of a log
 - **highly compressible content** — typically 10–20x with zstd
-- **time-correlated reads** — "what happened between 13:42 and 13:43?" is
-  *the* question, but answering it on a plain file means scanning gigabytes
+- **time-correlated reads** — "what happened around 13:42?" is *the*
+  question, but answering it on a plain file means scanning gigabytes
 
-`timberfs` is a FUSE filesystem that presents ordinary-looking log files while
-storing them chunked + zstd-compressed, with a per-chunk **write-time index**
-so a time-range query is a binary search + a few frame decompressions —
-independent of file size.
+Everything else — the on-disk format, the FUSE layer, the indexes — is
+design detail, documented in [How it works](#how-it-works) below.
 
 ## Getting started: you have a pile of logs
 
@@ -68,9 +75,22 @@ timberfs grep req-8f3a backing/app.log                       # request id, no ti
 timberfs query backing/app.log --from 13:40 --to 14:10 | grep -c 'tenantId=FOO'
 ```
 
-The intended workflow is coarse seek by time (cheap, indexed), then exact
-trimming with `timberfs grep` (entry-aware — stack traces stay glued to
-their entry) or plain `grep`/`awk` on the extract. When an investigation
+Queries answer **in the timestamps you can see**: chunks are selected by
+the write-time index (widened a little), then every entry is verified
+against `--from/--to` by the timestamp its own line carries — so asking
+for 13:37–13:38 never shows a 13:42 line. `--show-write-time` reveals the
+invisible second field (arrival time + divergence), `--by-write-time` is
+the raw chunk-level escape hatch, and `-0` emits NUL-terminated entry
+records — a stack trace stays ONE record:
+
+```sh
+# top 3 recurring exceptions, as whole stack traces
+timberfs grep -0 Exception backing/app.log --from 2026-07-10 \
+  | sort -z | uniq -zc | sort -znr | head -z -n 3 | tr '\0' '\n'
+```
+
+For further trimming, `timberfs grep` (entry-aware) or plain `grep`/`awk`
+on the extract compose as always. When an investigation
 is done, ship it — with its provenance — as a single file:
 
 ```sh
@@ -120,6 +140,11 @@ ErrorLog  "|/usr/bin/timberfs append --quiet /var/log/apache2-backing/error.log"
 journalctl -u myapp -f -o short-iso | timberfs append backing/myapp.log --retain 90d
 ```
 
+One rule: **don't backfill history through the pipe** — `append` indexes
+by write time, so old data lands under today's timestamps. Historical
+files go through `import`, which parses their own timestamps (and is
+resumable, deduplicating and idempotent).
+
 **c) Mount it** — if the software insists on writing to a real file path,
 give it one; compression, indexing and retention happen transparently
 underneath:
@@ -135,121 +160,10 @@ stamp with the **write-time wall clock** (right for live ingestion, where
 they coincide). Either way, `query --from/--to` asks about the time the
 log talks about.
 
-## Why FUSE (and not overlayfs / a kernel module)
+## The toolbox
 
-- **overlayfs** layers *namespaces* (upper/lower directories, as used by
-  container images). It has no hook for transforming *content*, so it can't
-  compress on write or maintain an index. Wrong tool.
-- **A native kernel filesystem in Rust** is where Rust-for-Linux is heading,
-  but the filesystem bindings are still experimental. Not a good vehicle for
-  iterating on a design.
-- **FUSE** gives us the full VFS interface in userspace: loggers append
-  through the mount unmodified, `tail -f`/`grep`/`less` all just work, and
-  the implementation is ordinary safe Rust (`fuser` crate, no libfuse
-  dependency — it only needs the `fusermount3` binary at runtime).
-
-The design cleanly splits into a *store* (file format + chunking, no FUSE
-types) and a thin FUSE layer, so the store could later be re-hosted in a
-kernel module, a `LD_PRELOAD` shim, or a log-shipping daemon without change.
-
-## On-disk format
-
-Each logical file `<name>` is backed by two files in the backing directory:
-
-```
-<name>.trunk   concatenated zstd frames, one per chunk, no wrapper bytes
-<name>.rings   8-byte magic "RING0001", then 48-byte records (all u64 LE):
-              uncomp_start | uncomp_len | comp_start | comp_len
-              | first_write_ms | last_write_ms
-```
-
-(The names take the timber metaphor seriously: the data is the trunk, and
-the index is its growth rings — which really are a write-time index;
-dendrochronology dates events by rings exactly the way `timberfs query`
-dates bytes by chunks.)
-
-Because the `.trunk` is a plain zstd frame concatenation, **stock tools can
-always recover the data**: `zstd -dc app.log.trunk` prints the whole
-uncompressed log, no timberfs required. The index is pure acceleration.
-
-Records are appended in write order, so they are sorted both by uncompressed
-offset **and** by wall-clock time — byte reads and time queries are each one
-`partition_point` binary search.
-
-Crash safety: chunks are written data-first, index-second; on open, index
-records pointing past the end of the data are dropped and orphaned data
-bytes are overwritten. `fsync()` through the mount flushes the buffer as a
-chunk and syncs both backing files, so fsync = durable. Unsynced buffered
-data is lost on a crash, bounded by `--flush-age`.
-
-### The .bark manifest
-
-An optional `<name>.bark` holds the log's *declared* facts as one flat,
-human-editable JSON object — the label on the timber:
-
-```json
-{
-  "id": "6f9c2a1e-…",             // identity: random UUID, minted on first write,
-  "created": "2026-07-11T09:14:02Z", //   constant across renames, moves and hosts
-  "host": "imap03.example.com",   // provenance: free-form, yours (--set k=v)
-  "index": true,                  // settings: CREATE INDEX — imports maintain the grain
-  "retain": "90d",                //   keep at least this long — enforced by EVERY writer
-  "retain_size": "50G",           //   compressed-size budget, oldest dropped first
-  "derived_from": "41d0…",        // lineage: source store's id
-  "derived_op": "export",         // …and how: export (copy) or rotate (move)
-  "window_from": "2026-07-04T22:00:00.000Z", // the REQUESTED window (operation
-  "window_to": "2026-07-05T22:00:00.000Z"    //   fact — what was asked)
-}
-```
-
-Artifacts made by `export` and by rotation into a new segment are new
-stores: fresh `id`, `derived_from`/`derived_op` lineage (chains compose
-across re-carves and shipping), provenance inherited, settings and window
-facts not. Content facts — actual spans, sizes — are never recorded (the
-artifact's own rings state them authoritatively); the *requested* window
-is recorded, because content can't state coverage: a file whose last line
-is 17:00 doesn't say whether 17:00–24:00 was covered-but-silent or simply
-not exported.
-
-Which is why **an empty result is a result**: exporting or rotating a
-window that contains nothing still produces the (empty) artifact.
-Present-but-empty ("Saturday was covered, nothing was there — ingest
-Sunday") and missing ("a day is missing — don't ingest past the gap") are
-opposite signals to a consumer; `--fail-on-empty` turns a quiet day back
-into an error for pipelines that want one. `import` skips empty sources
-with a note, never an error. Unlike the derived `.grain`, bark survives
-head-drops, travels on rename, and ships inside `.timber` bundles.
-
-## Semantics
-
-| Operation            | Behaviour                                                        |
-| -------------------- | ---------------------------------------------------------------- |
-| append (write @ EOF) | buffered, compressed into a chunk on size/age/close/fsync        |
-| write elsewhere      | `EPERM` — the filesystem is append-only                          |
-| read anywhere        | chunk located by binary search, decompressed, served             |
-| truncate to 0        | allowed: starts the file over (copytruncate-style rotation)      |
-| truncate elsewhere   | `EPERM`                                                          |
-| rename / unlink      | supported (mv-based log rotation works)                          |
-| `ls -l` size         | logical (uncompressed) size                                      |
-| `du` blocks          | compressed size — `du -h` shows the real disk footprint          |
-| subdirectories       | not yet — flat namespace in v0                                   |
-
-Time-range queries are **chunk-granular** — by design, not as a
-placeholder: every chunk whose write-time window overlaps the requested
-range is returned in full. Chunk windows are bounded by `--flush-age`
-(default 5 s) for slow writers and by `--chunk-size` (default 256 KiB) for
-fast ones, so that's the worst-case slop at the edges of the window.
-
-The intended workflow is: `timberfs query` does the coarse seek into a huge
-file (cheap, no parsing, immune to multiline entries and timestamp-less
-lines), then `timberfs grep` (entry-aware) or ordinary `grep`/`awk` on the
-small extract trims exactly using the timestamps the log lines carry
-anyway. The slop is a feature there:
-buffered loggers write lines slightly after the timestamp they print, so a
-byte-exact write-time cut could miss edge lines that grep-on-content
-catches.
-
-## Usage
+Worked examples of everything, reference-flavored — the getting-started
+guide above covers the happy path; this is the full spread, mount-first:
 
 ```sh
 # mount: logical view on ./logs, compressed store in ./logs-backing
@@ -276,11 +190,15 @@ cat any.log | timberfs grep 'tenantId=FOO' | timberfs grep -v DEBUG
 # entries containing every --has token (or the whole window) match
 timberfs grep --has ERROR -c logs-backing/app.log
 
-# -F = raw substring (partial ids), --regex = full regex: both read
-# EVERYTHING — don't reach for them unless you need them (a note tells
-# you when the index sat idle, and --scan forces the full scan)
-timberfs grep -F 8454XK logs-backing/app.log
-timberfs grep --regex 'ERROR|FATAL' logs-backing/app.log
+# the search algebra — the combinator is readable from the flag's name:
+# --any ORs, --has ANDs (both word-anchored phrases, both indexed);
+# --substring reaches inside words, --regex is a regexp (both full-scan);
+# -v inverts patterns, never --has requirements:
+timberfs grep --any 'INFO TEST' --any 'DEBUG FOO' logs-backing/app.log   # either
+timberfs grep --has 'INFO TEST' --has 'DEBUG FOO' logs-backing/app.log   # both
+timberfs grep --has 'tenantId=FOO' -v DEBUG logs-backing/app.log         # and-not
+timberfs grep --substring 8454XK logs-backing/app.log                    # partial id
+timberfs grep --regex 'ERROR|FATAL' logs-backing/app.log                 # regexp
 
 # the investigation as an artifact: --into writes the matching entries
 # to a NEW store (or .timber bundle to attach to the ticket) whose .bark
@@ -451,6 +369,161 @@ run against a live mount (chunks are immutable, the index is append-only).
 Note they only see flushed chunks — the still-buffered tail (≤ flush-age
 old) is visible through the mount but not yet in the backing files.
 
+## Install
+
+Debian/Ubuntu, from the apt repository (rebuilt by CI from the GitHub
+releases on every release, GPG-signed, `apt upgrade` works):
+
+```sh
+sudo curl -fsSL https://torstei.github.io/timberfs/key.gpg \
+     -o /usr/share/keyrings/timberfs.gpg
+
+sudo tee /etc/apt/sources.list.d/timberfs.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://torstei.github.io/timberfs
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/timberfs.gpg
+EOF
+
+sudo apt update && sudo apt install timberfs
+```
+
+Or grab a single `.deb` from the latest GitHub release (built, VM-tested
+and provenance-attested by CI — verify with
+`gh attestation verify timberfs_amd64.deb --repo torstei/timberfs`):
+
+```sh
+curl -LO https://github.com/torstei/timberfs/releases/latest/download/timberfs_amd64.deb
+sudo apt install ./timberfs_amd64.deb
+```
+
+Or from crates.io with a Rust toolchain: `cargo install timberfs`.
+
+## How it works
+
+Everything below is the design: how the store earns the behavior above.
+You don't need any of it to use timberfs — the curious and the
+contributors start here. The short version: two files per log (data +
+a write-time index), everything else is derived, and stock tools can
+always recover your data.
+
+## Why FUSE (and not overlayfs / a kernel module)
+
+- **overlayfs** layers *namespaces* (upper/lower directories, as used by
+  container images). It has no hook for transforming *content*, so it can't
+  compress on write or maintain an index. Wrong tool.
+- **A native kernel filesystem in Rust** is where Rust-for-Linux is heading,
+  but the filesystem bindings are still experimental. Not a good vehicle for
+  iterating on a design.
+- **FUSE** gives us the full VFS interface in userspace: loggers append
+  through the mount unmodified, `tail -f`/`grep`/`less` all just work, and
+  the implementation is ordinary safe Rust (`fuser` crate, no libfuse
+  dependency — it only needs the `fusermount3` binary at runtime).
+
+The design cleanly splits into a *store* (file format + chunking, no FUSE
+types) and a thin FUSE layer, so the store could later be re-hosted in a
+kernel module, a `LD_PRELOAD` shim, or a log-shipping daemon without change.
+
+## On-disk format
+
+Each logical file `<name>` is backed by two files in the backing directory:
+
+```
+<name>.trunk   concatenated zstd frames, one per chunk, no wrapper bytes
+<name>.rings   8-byte magic "RING0001", then 48-byte records (all u64 LE):
+              uncomp_start | uncomp_len | comp_start | comp_len
+              | first_write_ms | last_write_ms
+```
+
+(The names take the timber metaphor seriously: the data is the trunk, and
+the index is its growth rings — which really are a write-time index;
+dendrochronology dates events by rings exactly the way `timberfs query`
+dates bytes by chunks.)
+
+Because the `.trunk` is a plain zstd frame concatenation, **stock tools can
+always recover the data**: `zstd -dc app.log.trunk` prints the whole
+uncompressed log, no timberfs required. The index is pure acceleration.
+
+Records are appended in write order, so they are sorted both by uncompressed
+offset **and** by wall-clock time — byte reads and time queries are each one
+`partition_point` binary search.
+
+Crash safety: chunks are written data-first, index-second; on open, index
+records pointing past the end of the data are dropped and orphaned data
+bytes are overwritten. `fsync()` through the mount flushes the buffer as a
+chunk and syncs both backing files, so fsync = durable. Unsynced buffered
+data is lost on a crash, bounded by `--flush-age`.
+
+### The .bark manifest
+
+An optional `<name>.bark` holds the log's *declared* facts as one flat,
+human-editable JSON object — the label on the timber:
+
+```json
+{
+  "id": "6f9c2a1e-…",             // identity: random UUID, minted on first write,
+  "created": "2026-07-11T09:14:02Z", //   constant across renames, moves and hosts
+  "host": "imap03.example.com",   // provenance: free-form, yours (--set k=v)
+  "index": true,                  // settings: CREATE INDEX — imports maintain the grain
+  "retain": "90d",                //   keep at least this long — enforced by EVERY writer
+  "retain_size": "50G",           //   compressed-size budget, oldest dropped first
+  "timestamp_regex": "^(...)",    // content: exotic line-timestamp format, declared once
+  "timestamp_format": "%m/%d/%Y %H:%M:%S", //   (import flags persist these; inherits)
+  "derived_from": "41d0…",        // lineage: source store's id
+  "derived_op": "export",         // …and how: export (copy) or rotate (move)
+  "window_from": "2026-07-04T22:00:00.000Z", // the REQUESTED window (operation
+  "window_to": "2026-07-05T22:00:00.000Z"    //   fact — what was asked)
+}
+```
+
+Artifacts made by `export` and by rotation into a new segment are new
+stores: fresh `id`, `derived_from`/`derived_op` lineage (chains compose
+across re-carves and shipping), provenance inherited, settings and window
+facts not. Content facts — actual spans, sizes — are never recorded (the
+artifact's own rings state them authoritatively); the *requested* window
+is recorded, because content can't state coverage: a file whose last line
+is 17:00 doesn't say whether 17:00–24:00 was covered-but-silent or simply
+not exported.
+
+Which is why **an empty result is a result**: exporting or rotating a
+window that contains nothing still produces the (empty) artifact.
+Present-but-empty ("Saturday was covered, nothing was there — ingest
+Sunday") and missing ("a day is missing — don't ingest past the gap") are
+opposite signals to a consumer; `--fail-on-empty` turns a quiet day back
+into an error for pipelines that want one. `import` skips empty sources
+with a note, never an error. Unlike the derived `.grain`, bark survives
+head-drops, travels on rename, and ships inside `.timber` bundles.
+
+## Semantics
+
+| Operation            | Behaviour                                                        |
+| -------------------- | ---------------------------------------------------------------- |
+| append (write @ EOF) | buffered, compressed into a chunk on size/age/close/fsync        |
+| write elsewhere      | `EPERM` — the filesystem is append-only                          |
+| read anywhere        | chunk located by binary search, decompressed, served             |
+| truncate to 0        | allowed: starts the file over (copytruncate-style rotation)      |
+| truncate elsewhere   | `EPERM`                                                          |
+| rename / unlink      | supported (mv-based log rotation works)                          |
+| `ls -l` size         | logical (uncompressed) size                                      |
+| `du` blocks          | compressed size — `du -h` shows the real disk footprint          |
+| subdirectories       | not yet — flat namespace in v0                                   |
+
+Time-range queries are **chunk-granular** — by design, not as a
+placeholder: every chunk whose write-time window overlaps the requested
+range is returned in full. Chunk windows are bounded by `--flush-age`
+(default 5 s) for slow writers and by `--chunk-size` (default 256 KiB) for
+fast ones, so that's the worst-case slop at the edges of the window.
+
+The intended workflow is: `timberfs query` does the coarse seek into a huge
+file (cheap, no parsing, immune to multiline entries and timestamp-less
+lines), then `timberfs grep` (entry-aware) or ordinary `grep`/`awk` on the
+small extract trims exactly using the timestamps the log lines carry
+anyway. The slop is a feature there:
+buffered loggers write lines slightly after the timestamp they print, so a
+byte-exact write-time cut could miss edge lines that grep-on-content
+catches.
+
 ## Custom indexes: the .grain token index
 
 The write-time index generalizes: `.rings` is just a per-chunk summary
@@ -516,37 +589,6 @@ it unnecessary, and the on-disk format stays `RING0001`. (Logged-timestamp
 zone maps, the other planned index family, became largely moot: import
 already writes logged time into the rings.)
 
-## Install
-
-Debian/Ubuntu, from the apt repository (rebuilt by CI from the GitHub
-releases on every release, GPG-signed, `apt upgrade` works):
-
-```sh
-sudo curl -fsSL https://torstei.github.io/timberfs/key.gpg \
-     -o /usr/share/keyrings/timberfs.gpg
-
-sudo tee /etc/apt/sources.list.d/timberfs.sources >/dev/null <<'EOF'
-Types: deb
-URIs: https://torstei.github.io/timberfs
-Suites: stable
-Components: main
-Signed-By: /usr/share/keyrings/timberfs.gpg
-EOF
-
-sudo apt update && sudo apt install timberfs
-```
-
-Or grab a single `.deb` from the latest GitHub release (built, VM-tested
-and provenance-attested by CI — verify with
-`gh attestation verify timberfs_amd64.deb --repo torstei/timberfs`):
-
-```sh
-curl -LO https://github.com/torstei/timberfs/releases/latest/download/timberfs_amd64.deb
-sudo apt install ./timberfs_amd64.deb
-```
-
-Or from crates.io with a Rust toolchain: `cargo install timberfs`.
-
 ## Build
 
 Needs the Rust toolchain and a C compiler (for the vendored zstd), plus
@@ -579,9 +621,14 @@ unit unmounts first, so the daemon flushes everything and exits cleanly.
   auto-seeded provenance on import, bark-aware routing in the future
   sawmill server.
 - **Docs: "why is my grep slow?"**: a short troubleshooting section
-  walking the modes table — word mode + grain = fast; --regex/-F/-i/-v =
+  walking the modes table — word mode + grain = fast; --regex/--substring/-i/-v =
   full scan and why; how to build the index (`create --index`/`reindex`)
   and read the full-scan notes.
+- **Zone-map sidecar (`--written-from/--written-to`)**: per-chunk logline
+  windows as a derived sidecar, making BOTH time axes queryable (arrival
+  for "what came in during the incident", logline for history) and
+  giving the sawmill lag observability. The read path already treats the
+  trunk as its own timestamp index; this would only accelerate it.
 - **`timberfs merge`**: entry-aware N-way merge — split sources (raw logs
   or timberfs) into log entries, merge-sort them by timestamp, emit one
   timberfs store or raw stream. Subsumes "grep a fleet into one artifact"

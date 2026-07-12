@@ -398,7 +398,6 @@ pub fn cmd_import(
     quick: bool,
     index: bool,
 ) -> anyhow::Result<()> {
-    let extractor = Extractor::new(custom_regex, custom_format, utc)?;
     if crate::query::is_bundle(dest) {
         bail!(
             "{} is a .timber transfer bundle — bundles are read-only \
@@ -410,6 +409,15 @@ pub fn cmd_import(
     crate::query::ensure_dest_is_not_plain_file(dest, "import")?;
     let (dir, name) = resolve_backing(dest)?;
     fs::create_dir_all(&dir)?;
+    // Flags override the store's DECLARED format (timestamp_regex /
+    // timestamp_format / timestamp_utc in the manifest) — declare once,
+    // and every later import of an exotic format is flag-free.
+    let declared = crate::bark::time_format(crate::bark::load(&dir, &name).as_ref());
+    let extractor = Extractor::new(
+        custom_regex.or(declared.regex.as_deref()),
+        custom_format.or(declared.format.as_deref()),
+        utc || declared.utc,
+    )?;
 
     // Multiple sources are one logical stream: order them chronologically
     // by their own first timestamp (rotation numbering and glob order are
@@ -777,6 +785,25 @@ pub fn cmd_import(
     // import into a declared log maintains the grain — extended
     // incrementally for new chunks, rebuilt if missing (e.g. after
     // rotation/retention dropped it). The writer locks are already held.
+    if custom_regex.is_some() || utc {
+        // The flags persist, like --index: the format is a property of
+        // the CONTENT, declared in the manifest, and all roads converge.
+        let mut map = crate::bark::load(&dir, &name).unwrap_or_default();
+        if let (Some(r), Some(f)) = (custom_regex, custom_format) {
+            map.insert(
+                "timestamp_regex".to_string(),
+                serde_json::Value::String(r.to_string()),
+            );
+            map.insert(
+                "timestamp_format".to_string(),
+                serde_json::Value::String(f.to_string()),
+            );
+        }
+        if utc {
+            map.insert("timestamp_utc".to_string(), serde_json::Value::Bool(true));
+        }
+        crate::bark::save(&dir, &name, &map)?;
+    }
     if index {
         crate::bark::declare_index(&dir, &name)?;
     }

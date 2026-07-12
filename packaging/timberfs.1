@@ -387,7 +387,7 @@ an all-empty import into a new destination still creates it.
 .SS query
 .B timberfs query
 .I FILE
-prints the bytes stamped inside the given time window to standard output,
+prints the log entries inside the given time window to standard output,
 reading the backing files directly \(em it works with or without an active
 mount, but only sees flushed chunks (the still-buffered tail, at most
 flush-age old, is visible only through the mount).
@@ -483,10 +483,36 @@ whole, so the skip is conservative, never wrong. (For scattered
 word-AND instead of a phrase, use the pattern-less
 .B \-\-has
 form, or pipe greps.)
-.B \-F
-matches a raw substring (reaches inside tokens \(em partial ids) and
-.B \-\-regex
-a full regular expression:
+The mode space is a 2x2 \(em interpretation times boundaries \(em with
+the default in the fast cell: literal + whole words = the bare
+positional (grep legacy),
+.B \-\-any TEXT
+(alternatives \(em OR) or
+.B \-\-has TEXT
+(requirements \(em AND); literal + anywhere
+(inside longer words too, for partial ids) =
+.BR \-\-substring=TEXT ;
+regexp =
+.BR \-\-regex=PATTERN .
+Each flag carries its text (space or
+.B =
+forms are identical), and repeating a flag alternates
+.RB ( \-\-any " ERROR"
+.B \-\-any FATAL
+matches either \(em and stays INDEXED: the union of exact branches is
+exact); the combinator is readable from the name: \-\-any ORs,
+\-\-has ANDs. Different kinds compose by AND, each narrowing the result (a
+multi-word
+.B \-\-substring
+literal still pre-filters on its INTERIOR words \(em a substring match
+requires them whole; only its edge words prove nothing);
+.B \-v
+never inverts a requirement, and
+.B \-i
+never loosens one \(em requirements stay exact-case, like the token
+index they ride.
+.B \-v
+inverts the whole pattern conjunction:
 .B both read every chunk, so don't reach for them unless you need them.
 .B \-i
 (the grain is exact-case) and
@@ -527,14 +553,31 @@ may be left out when
 select instead:
 .B timberfs grep \-\-has ERROR \-c backing/app.log
 counts the entries containing ERROR \(em the first argument, naming an
-existing timberfs log, is taken as the file, and entries containing
-every
+existing file, is taken as the file, and entries containing every
 .B \-\-has
-token match (with a pure
+phrase match (with a pure
 .BR \-\-from / \-\-to
 window, every entry in it). A note on standard error says what was
 matched. (Without this, the file would silently become the PATTERN \(em
 grep's first positional \(em and the resulting errors blamed stdin.)
+.PP
+.B \-\-has
+is the AND side of the algebra: each occurrence is a REQUIREMENT that
+every printed entry must satisfy \(em verified on the entry itself
+(word-anchored; a multi-word argument is a contiguous PHRASE), not only
+at chunk level, so the Bloom skip is an optimization, never a semantics
+change. Requirements are never touched by
+.BR \-v ,
+which inverts the pattern side only \(em so \(lqA and not B\(rq is
+.BR "\-\-has A \-v B" .
+Where pattern flags OR on repetition,
+.B \-\-has
+occurrences always AND. Requirements need no index and no timberfs
+source: on standard input or a plain file they filter entries just the
+same; on an indexed store they also skip chunks. A query of only
+requirements refuses
+.B \-v
+\(em there is no pattern to invert.
 .PP
 .B \-\-into
 .I DEST
@@ -679,6 +722,50 @@ progress, stitch plans, summaries. Errors and warnings still print.
 Accepted by every subcommand. (Long-only on purpose:
 .B \-q
 keeps its grep(1) meaning available.)
+.SH THE TWO CLOCKS
+Every entry effectively has two timestamps: the one its line CARRIES
+(what happened when \(em the one you can see) and the WRITE time it
+arrived in the store (the one the index searches). For imported data
+they are identical; for live data they differ by buffering. By default,
+.B query
+and
+.B grep
+select chunks by the write-time index (widened by about a minute to
+catch buffered stragglers), then verify every entry against
+.BR \-\-from / \-\-to
+by the timestamp its own line carries \(em so the output answers the
+question you asked, in the timestamps you can see. Entries whose
+timestamps cannot be read are always included, never hidden; a store
+with no parseable timestamps at all falls back to the raw, unwidened
+write-time window with a note.
+.B \-\-show\-write\-time
+annotates each entry with the write window it arrived in \(em and, when
+its own stamp falls outside that window, the offset \(em making any
+divergence visible and explainable.
+.B \-\-by\-write\-time
+is the raw escape hatch: chunk output selected by write time only, no
+parsing (the pre-0.7.4 behavior).
+.B \-0
+.RB ( \-\-null )
+emits NUL-terminated entry RECORDS \(em a multiline entry (stack trace)
+stays one record \(em for
+.BR "xargs \-0" ,
+.BR "sort \-z" ,
+.B "uniq \-z"
+pipelines. Persistent whole-hour offsets between the two clocks are
+detected and warned about once (on one host the clocks cancel, so such
+an offset is a timezone or format misconfiguration, not clock skew).
+Declare exotic line formats once in the manifest
+.RB ( timestamp_regex ,
+.BR timestamp_format ,
+.B timestamp_utc
+via
+.B timberfs set
+\(em or import's flags, which persist the declaration); they describe
+the CONTENT, so unlike settings they inherit into derived artifacts.
+Do not backfill historical data through
+.B append
+(its index gets today's write times): import the file instead.
 .SH TIME FORMATS
 .I TIME
 arguments accept RFC 3339

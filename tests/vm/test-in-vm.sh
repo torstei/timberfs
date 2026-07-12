@@ -465,7 +465,24 @@ info_vital_signs() {
     OUT=$(timberfs info "$PIPE_BACKING/sticky.log")         && echo "$OUT" | grep -qE 'identity  [0-9a-f-]{36}'         && echo "$OUT" | grep -qE 'data      .* chunk\(s\)'         && echo "$OUT" | grep -q 'covers    '         && echo "$OUT" | grep -q 'writer    none'         && timberfs info "$PIPE_BACKING/sticky.log" --json | grep -q '"kind": "pair"'
 }
 
+time_story() {
+    # queries answer in the timestamps you can SEE: entries verified
+    # against the window by their own stamps; -0 frames whole entries
+    python3 -c "
+import datetime
+d = datetime.datetime(2026, 6, 12, 9, 0, 0)
+with open('/tmp/ts.log', 'w') as f:
+    for i in range(5000):
+        ts = d + datetime.timedelta(seconds=i)
+        if i == 2500:
+            f.write(f'{ts.isoformat()} ERROR kaboom\n  at deep.Stack\n')
+        else:
+            f.write(f'{ts.isoformat()} INFO ok {i}\n')
+"         && timberfs import /tmp/ts.log --into "$PIPE_BACKING/ts.log" --chunk-size 4096 --quiet         && [ "$(timberfs query "$PIPE_BACKING/ts.log" --from '2026-06-12 09:10:00' --to '2026-06-12 09:10:04' 2>/dev/null | wc -l)" = 5 ]         && [ "$(timberfs query "$PIPE_BACKING/ts.log" --from '2026-06-12 09:10:00' --to '2026-06-12 09:10:04' --by-write-time 2>/dev/null | wc -l)" -gt 5 ]         && timberfs query "$PIPE_BACKING/ts.log" --from '2026-06-12 09:41:40' --to '2026-06-12 09:41:40' -0 2>/dev/null            | head -zn1 | grep -q "deep.Stack"         && timberfs query "$PIPE_BACKING/ts.log" --from '2026-06-12 09:10:00' --to '2026-06-12 09:10:00' --show-write-time 2>/dev/null            | grep -q '^\[w 2026-06-12'
+}
+
 run_test "grep --into: the investigation as an artifact" grep_into_artifact
+run_test "time story: exact windows, raw escape, -0 records, annotation" time_story
 run_test "info: a store's vital signs on one screen" info_vital_signs
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct

@@ -23,12 +23,30 @@
 //! contains the anchored phrase" at entry level — an entry matching the
 //! phrase must contain every token whole, so the skip can only be
 //! conservative, never wrong. (Scattered word-AND instead of a phrase:
-//! the pattern-less --has form, or piped greps.) -F (raw substring —
-//! reaches inside tokens, for partial ids) and --regex (full regex) read
-//! every chunk, as must -i (the grain is exact-case) and -v (non-matches
-//! must be READ to be printed; the index proving "no matches here" means
-//! print the whole chunk, not skip it). When a grain exists but cannot
-//! be used, a one-line note says why — the cost is never a mystery.
+//! the pattern-less --has form, or piped greps.) The mode space is a
+//! 2x2 — interpretation x boundaries — with the default in the fast
+//! cell:
+//!
+//!            | whole words                | anywhere (inside words too)
+//!   literal  | (default / --any / --has)  | --substring
+//!   regexp   |            —               | --regex
+//!
+//! --substring reaches inside tokens (partial ids) and --regex is a full
+//! regex; both read every chunk (a multi-word --substring still
+//! pre-filters on its INTERIOR words), as must -i (the grain is
+//! exact-case) and -v (non-matches must be READ to be printed). When a
+//! grain exists but cannot be used, a one-line note says why.
+//!
+//! Predicates compose in two vocabularies, and the combinator is
+//! readable from the flag's name. PATTERN flags (--any, --regex,
+//! --substring): repeating one ORs within it (--any A --any B matches
+//! either, and stays INDEXED — the union of exact branches is exact),
+//! different kinds AND, and -v inverts the whole pattern conjunction.
+//! REQUIREMENTS (--has): every --has must hold — the AND side;
+//! multi-word arguments are contiguous word-anchored PHRASES (same
+//! matching as --any; only the combinator differs, and the names say
+//! which). "A AND NOT B" is `--has A -v B`. The bare positional is grep
+//! legacy — tolerated, one word-anchored phrase on the pattern side.
 //!
 //! `--into DEST` writes the matching entries into a NEW timberfs log (or
 //! .timber bundle) instead of printing them — an investigation shipped as
@@ -136,27 +154,63 @@ fn is_match(res: &[Regex], entry: &[u8]) -> bool {
     res.iter().all(|re| re.is_match(entry))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run<R: BufRead>(
     mut entries: Entries<R>,
     res: &[Regex],
+    required: &[Regex],
     invert: bool,
     count: bool,
     prefix: Option<&[u8]>,
+    window: Option<(u64, u64)>,
+    null_sep: bool,
 ) -> anyhow::Result<u64> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut matched: u64 = 0;
+    let mut last_ts: Option<u64> = None;
     while let Some(entry) = entries.next_entry()? {
+        // --has is verified on every ENTRY, not just at chunk level: the
+        // Bloom skip is an optimization, never a semantics change. (-v
+        // inverts the PATTERN only; the --has requirement always holds.)
+        if !required.is_empty() && !is_match(required, &entry) {
+            continue;
+        }
+        // The DEFAULT verifies entries against --from/--to by the
+        // timestamps the lines themselves carry; entries we cannot place
+        // in time are included, never hidden.
+        if let Some((from, to)) = window {
+            let head = String::from_utf8_lossy(&entry[..entry.len().min(256)]);
+            let ts = entries.extractor.extract(&head);
+            if let Some(t) = ts {
+                last_ts = Some(t);
+            }
+            if let Some(t) = ts.or(last_ts) {
+                if t < from || t > to {
+                    continue;
+                }
+            }
+        }
         if is_match(res, &entry) != invert {
             matched += 1;
             if !count {
-                match prefix {
-                    None => out.write_all(&entry)?,
-                    Some(label) => {
-                        for line in entry.split_inclusive(|&b| b == b'\n') {
-                            out.write_all(label)?;
-                            out.write_all(b":")?;
-                            out.write_all(line)?;
+                if null_sep {
+                    if let Some(label) = prefix {
+                        out.write_all(label)?;
+                        out.write_all(b":")?;
+                    }
+                    let body = entry.strip_suffix(b"\n").unwrap_or(&entry);
+                    out.write_all(body)?;
+                    out.write_all(b"\0")?;
+                } else {
+                    match prefix {
+                        None => out.write_all(&entry)?,
+                        Some(label) => {
+                            for line in entry.split_inclusive(|&b| b == b'\n') {
+                                out.write_all(label)?;
+                                out.write_all(b":")?;
+                                out.write_all(line)?;
+                            }
                         }
                     }
                 }
@@ -177,8 +231,9 @@ fn padded_chunks(
     from_ms: u64,
     to_ms: u64,
     has: &[String],
+    any_of: &[String],
 ) -> anyhow::Result<(Vec<ChunkRecord>, usize, usize)> {
-    let (selected, in_window) = select_chunks(p, records, from_ms, to_ms, has)?;
+    let (selected, in_window) = select_chunks(p, records, from_ms, to_ms, has, any_of)?;
     let kept = selected.len();
     let mut padded = std::collections::BTreeSet::new();
     for (i, _) in &selected {
@@ -207,6 +262,7 @@ fn report_scan(
     windowed: bool,
     has: &[String],
     auto: bool,
+    idle: Option<&str>,
     scanning: usize,
     in_window: usize,
     kept: usize,
@@ -253,10 +309,14 @@ fn report_scan(
         ""
     };
     crate::note!(
-        "timberfs: {}: scanning {scanning} of {} chunk(s) ({}{padding}){}",
+        "timberfs: {}: scanning {scanning} of {} chunk(s) ({}{padding}){}{}",
         p.display(),
         records.len(),
         parts.join(", "),
+        match idle {
+            Some(r) if windowed => format!("; token index idle — {r}"),
+            _ => String::new(),
+        },
         if auto {
             "; --scan reads everything"
         } else {
@@ -280,58 +340,115 @@ fn names_timberfs_source(s: &str) -> bool {
     }
 }
 
+/// Tokens a SUBSTRING match provably requires whole in any matching
+/// entry: the alphanumeric runs strictly INSIDE the literal, bounded by
+/// non-alphanumerics on both sides within it. Edge runs may extend in
+/// the entry ("needle" can be "needles", "this" can be "Xthis") and
+/// prove nothing — but "this is the needle" requires the word "the".
+fn interior_tokens(lit: &str) -> Vec<String> {
+    let b = lit.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphanumeric() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            let bounded = start > 0 && i < b.len();
+            if bounded && (3..=64).contains(&(i - start)) {
+                out.push(lit[start..i].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// A literal matched at token boundaries — the default mode. "ERROR"
 /// matches the WORD ERROR ([ERROR], "ERROR:"), not ERRORS or
 /// PROTOCOLERROR: the same whole-token semantics as the .grain, which is
 /// exactly what makes the index pre-filter exact rather than
 /// approximate. (?-u): entries are raw bytes, boundaries are ASCII.
-fn word_regex(lit: &str, ignore_case: bool) -> anyhow::Result<Regex> {
-    let pat = format!(
+fn word_pattern(lit: &str) -> String {
+    format!(
         r"(?:\A|(?-u:[^0-9A-Za-z])){}(?:(?-u:[^0-9A-Za-z])|\z)",
         regex::escape(lit)
-    );
-    RegexBuilder::new(&pat)
+    )
+}
+
+fn word_regex(lit: &str, ignore_case: bool) -> anyhow::Result<Regex> {
+    RegexBuilder::new(&word_pattern(lit))
         .case_insensitive(ignore_case)
         .build()
         .with_context(|| format!("bad pattern {lit:?}"))
 }
 
-/// Engage the automatic token pre-filter: when no explicit --has was
-/// given, the pattern is a plain literal, and THIS source has a .grain,
-/// the pattern's tokens select chunks exactly as --has would (any entry
-/// matching a literal must contain all its tokens). Silent no-op when
+/// Engage the automatic token pre-filter: when the pattern is a plain
+/// literal and THIS source has a .grain, the pattern's tokens select
+/// chunks exactly as --has would (any entry matching a literal must
+/// contain all its tokens) — JOINING any explicit --has requirements,
+/// since both are entry-level ANDs and so compose as a chunk-level AND. Silent no-op when
 /// there is no grain — nothing to accelerate with, and the full scan is
 /// the answer, not a warning.
 fn engage_auto_has(
     p: &Path,
     has: &[String],
     auto_has: &[String],
+    any_of: &[String],
     scan_reason: Option<&str>,
+    windowed: bool,
     records: &[ChunkRecord],
-) -> anyhow::Result<Vec<String>> {
-    if !has.is_empty() || is_bundle(p) {
-        return Ok(has.to_vec());
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    if is_bundle(p) {
+        return Ok((has.to_vec(), Vec::new()));
     }
     let Ok((dir, base)) = resolve_backing(p) else {
-        return Ok(Vec::new());
+        return Ok((has.to_vec(), Vec::new()));
     };
     if !crate::format::grain_path(&dir, &base).exists() {
-        return Ok(Vec::new());
+        // select_chunks warns about an explicit --has with no grain.
+        return Ok((has.to_vec(), Vec::new()));
+    }
+    if auto_has.is_empty() && any_of.is_empty() && !has.is_empty() {
+        // Only the explicit requirements filter chunks.
+        return Ok((has.to_vec(), Vec::new()));
+    }
+    if auto_has.is_empty() && !any_of.is_empty() {
+        // OR'd word alternatives: the union of exact branches.
+        crate::note!(
+            "timberfs: {}: pre-filtering on word alternatives ({})",
+            p.display(),
+            any_of.join(" | ")
+        );
+        return Ok((has.to_vec(), any_of.to_vec()));
     }
     if auto_has.is_empty() {
         // There IS an index here, and we are about to ignore it — say why
         // once, so the cost is never a mystery.
         if let Some(reason) = scan_reason {
-            crate::note!(
-                "timberfs: {}: full scan of {} chunk(s): {reason} cannot use the .grain \
-                 token index",
-                p.display(),
-                records.len()
-            );
+            // With a time window in play this is NOT a full scan (the
+            // window still narrows); the reason then rides on the scan
+            // report line instead.
+            if !windowed {
+                crate::note!(
+                    "timberfs: {}: full scan of {} chunk(s): {reason} cannot use the .grain \
+                     token index",
+                    p.display(),
+                    records.len()
+                );
+            }
         }
-        return Ok(Vec::new());
+        return Ok((has.to_vec(), Vec::new()));
     }
-    Ok(auto_has.to_vec())
+    // Pattern tokens JOIN the explicit requirements (AND at chunk level,
+    // exactly as the predicates AND at entry level).
+    let mut merged = has.to_vec();
+    merged.extend(auto_has.iter().cloned());
+    Ok((merged, any_of.to_vec()))
 }
 
 /// The invocation as the user typed it (argv, shell-quoted, argv[0]
@@ -362,11 +479,13 @@ fn command_line() -> String {
 fn grep_into(
     p: &Path,
     res: &[Regex],
+    required: &[Regex],
     extractor: Extractor,
     from: Option<u64>,
     to: Option<u64>,
     has: &[String],
     auto_has: &[String],
+    any_of: &[String],
     scan_reason: Option<&str>,
     invert: bool,
     pattern: &str,
@@ -380,14 +499,36 @@ fn grep_into(
         bail!("--from is after --to");
     }
     let auto = has.is_empty() && !auto_has.is_empty();
-    let has = engage_auto_has(p, has, auto_has, scan_reason, &source.records)?;
-    let (chunks, in_window, kept) = padded_chunks(p, &source.records, from_ms, to_ms, &has)?;
+    let (has, any_of) = engage_auto_has(
+        p,
+        has,
+        auto_has,
+        any_of,
+        scan_reason,
+        from.is_some() || to.is_some(),
+        &source.records,
+    )?;
+    let window = if from.is_none() && to.is_none() {
+        None
+    } else {
+        Some((from_ms, to_ms))
+    };
+    let (sel_from, sel_to) = match window {
+        Some(_) => (
+            from_ms.saturating_sub(crate::query::WIDEN_MS),
+            to_ms.saturating_add(crate::query::WIDEN_MS),
+        ),
+        None => (from_ms, to_ms),
+    };
+    let (chunks, in_window, kept) =
+        padded_chunks(p, &source.records, sel_from, sel_to, &has, &any_of)?;
     report_scan(
         p,
         &source.records,
         from.is_some() || to.is_some(),
         &has,
         auto && !has.is_empty(),
+        scan_reason,
         chunks.len(),
         in_window,
         kept,
@@ -481,7 +622,14 @@ fn grep_into(
         seen += 1;
         let head = String::from_utf8_lossy(&entry[..entry.len().min(256)]);
         let ts = entries.extractor.extract(&head);
-        if is_match(res, &entry) != invert {
+        // Same default as printing: the artifact holds only entries whose
+        // own timestamps fall inside the asked window (unknowable stays).
+        let in_time = match (window, ts.or(last_ts)) {
+            (Some((f, t)), Some(e)) => e >= f && e <= t,
+            _ => true,
+        };
+        let has_ok = required.is_empty() || is_match(required, &entry);
+        if in_time && has_ok && is_match(res, &entry) != invert {
             matched += 1;
             match ts.or(last_ts) {
                 Some(t) => {
@@ -611,15 +759,19 @@ fn assemble_bundle(
 fn grep_one(
     p: &Path,
     res: &[Regex],
+    required: &[Regex],
     extractor: Extractor,
     from: Option<u64>,
     to: Option<u64>,
     has: &[String],
     auto_has: &[String],
+    any_of: &[String],
     scan_reason: Option<&str>,
     invert: bool,
     count: bool,
     prefix: Option<&[u8]>,
+    null_sep: bool,
+    by_write_time: bool,
 ) -> anyhow::Result<u64> {
     let is_timberfs_source = is_bundle(p)
         || matches!(
@@ -630,9 +782,9 @@ fn grep_one(
 
     if !is_timberfs_source {
         // a plain log file at the exact path
-        if from.is_some() || to.is_some() || !has.is_empty() {
+        if from.is_some() || to.is_some() {
             bail!(
-                "--from/--to/--has need a timberfs log or bundle; {} is a plain file",
+                "--from/--to need a timberfs log or bundle; {} is a plain file",
                 p.display()
             );
         }
@@ -646,9 +798,12 @@ fn grep_one(
                 warned_cap: false,
             },
             res,
+            required,
             invert,
             count,
             prefix,
+            None,
+            null_sep,
         );
     }
     let source = open_source(p)?;
@@ -658,14 +813,39 @@ fn grep_one(
         bail!("--from is after --to");
     }
     let auto = has.is_empty() && !auto_has.is_empty();
-    let has = engage_auto_has(p, has, auto_has, scan_reason, &source.records)?;
-    let (chunks, in_window, kept) = padded_chunks(p, &source.records, from_ms, to_ms, &has)?;
+    let (has, any_of) = engage_auto_has(
+        p,
+        has,
+        auto_has,
+        any_of,
+        scan_reason,
+        from.is_some() || to.is_some(),
+        &source.records,
+    )?;
+    // The default verifies entries against the window by their own
+    // timestamps, so the SELECTION widens to catch buffered stragglers;
+    // --by-write-time keeps the raw chunk-window behavior.
+    let window = if by_write_time || (from.is_none() && to.is_none()) {
+        None
+    } else {
+        Some((from_ms, to_ms))
+    };
+    let (sel_from, sel_to) = match window {
+        Some(_) => (
+            from_ms.saturating_sub(crate::query::WIDEN_MS),
+            to_ms.saturating_add(crate::query::WIDEN_MS),
+        ),
+        None => (from_ms, to_ms),
+    };
+    let (chunks, in_window, kept) =
+        padded_chunks(p, &source.records, sel_from, sel_to, &has, &any_of)?;
     report_scan(
         p,
         &source.records,
         from.is_some() || to.is_some(),
         &has,
         auto && !has.is_empty(),
+        scan_reason,
         chunks.len(),
         in_window,
         kept,
@@ -685,22 +865,37 @@ fn grep_one(
             warned_cap: false,
         },
         res,
+        required,
         invert,
         count,
         prefix,
+        window,
+        null_sep,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The pattern side of a grep invocation: an optional positional pattern
+/// (word mode unless a bare --regex/--substring flags it) plus any number of
+/// attached predicates. The composition rule, stated once: repeating a
+/// flag ORs, different kinds AND, --has always ANDs, and -v inverts the
+/// whole pattern conjunction.
+pub struct MatchSpec {
+    pub positional: Option<String>,
+    pub word_alts: Vec<String>,
+    pub regex_alts: Vec<String>,
+    pub substring_alts: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_grep(
-    pattern: &str,
+    spec: MatchSpec,
     files: &[std::path::PathBuf],
     from: Option<u64>,
     to: Option<u64>,
     has: &[String],
     ignore_case: bool,
     invert: bool,
-    fixed: bool,
     count: bool,
     no_filename: bool,
     ts_regex: Option<&str>,
@@ -708,107 +903,245 @@ pub fn cmd_grep(
     into: Option<&Path>,
     fail_on_empty: bool,
     scan: bool,
-    regex_mode: bool,
+    null_sep: bool,
+    by_write_time: bool,
 ) -> anyhow::Result<()> {
-    // A forgotten PATTERN puts the file first — the first positional
-    // silently becomes the pattern, and the resulting "not stdin" error
-    // lies to a user who plainly passed a file. When the "pattern" names
-    // an existing timberfs source AND selection flags are given (today a
-    // guaranteed error or a nonsense match), the intent is unambiguous:
-    // it IS the file, and the selection matches instead — entries
-    // containing every --has token, or every entry in a pure window.
     let mut files: Vec<std::path::PathBuf> = files.to_vec();
-    let mut pattern = pattern.to_string();
+    // Repeated --has arguments are a set, not a list: dedup up front so
+    // matchers, notes and the chunk filter all agree (exact-case,
+    // first-occurrence order).
+    let has: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        has.iter()
+            .filter(|h| seen.insert(h.as_str()))
+            .cloned()
+            .collect()
+    };
+    let has: &[String] = &has;
     let selection_given = from.is_some() || to.is_some() || !has.is_empty();
-    let pattern_is_matchless = if selection_given && names_timberfs_source(&pattern) {
-        files.insert(0, std::path::PathBuf::from(&pattern));
-        if has.is_empty() {
-            crate::note!("timberfs: no PATTERN given; every entry in the window matches");
-            pattern = String::new();
-        } else {
+    let has_alts = !spec.word_alts.is_empty()
+        || !spec.regex_alts.is_empty()
+        || !spec.substring_alts.is_empty()
+        || !has.is_empty();
+    let mut positional = spec.positional;
+
+    // Positional disambiguation. With attached predicates in play, a
+    // positional that names an existing store is a FILE
+    // (--regex='a|b' file.log); otherwise it is a word-mode predicate
+    // (needle --substring='exact' file.log).
+    if has_alts {
+        if let Some(p) = &positional {
+            // ...an existing store OR plain file (grep reads both).
+            if names_timberfs_source(p) || std::path::Path::new(p).is_file() {
+                files.insert(0, std::path::PathBuf::from(p));
+                positional = None;
+            }
+        }
+    }
+    // The forgotten-PATTERN shift: no predicates at all, the "pattern"
+    // names a store, and selection flags are given — it IS the file, and
+    // the selection matches instead.
+    if !has_alts {
+        if let Some(p) = positional.clone() {
+            if selection_given && names_timberfs_source(&p) {
+                files.insert(0, std::path::PathBuf::from(&p));
+                positional = None;
+            } else if files.is_empty() && !selection_given && names_timberfs_source(&p) {
+                use std::io::IsTerminal;
+                if io::stdin().is_terminal() {
+                    bail!(
+                        "{p} names a timberfs log, but it was read as the PATTERN \
+                         (which comes first: timberfs grep PATTERN {p}); to select \
+                         without a pattern, give --has/--from/--to"
+                    );
+                }
+            }
+        }
+    }
+
+    // Assemble the AND-list of predicates.
+    let mut res: Vec<Regex> = Vec::new();
+    let mut desc: Vec<String> = Vec::new();
+    {
+        if let Some(pat) = &positional {
+            // the bare positional is grep legacy: always word mode
+            res.push(word_regex(pat, ignore_case)?);
+            desc.push(pat.clone());
+        }
+        if !spec.word_alts.is_empty() {
+            let joined = spec
+                .word_alts
+                .iter()
+                .map(|w| format!("(?:{})", word_pattern(w)))
+                .collect::<Vec<_>>()
+                .join("|");
+            res.push(
+                RegexBuilder::new(&joined)
+                    .case_insensitive(ignore_case)
+                    .build()
+                    .with_context(|| "bad --any text".to_string())?,
+            );
+            desc.push(format!("({})", spec.word_alts.join("|")));
+        }
+        if !spec.regex_alts.is_empty() {
+            let joined = spec
+                .regex_alts
+                .iter()
+                .map(|p| format!("(?:{p})"))
+                .collect::<Vec<_>>()
+                .join("|");
+            res.push(
+                RegexBuilder::new(&joined)
+                    .case_insensitive(ignore_case)
+                    .multi_line(true)
+                    .build()
+                    .with_context(|| format!("bad --regex pattern {joined:?}"))?,
+            );
+            desc.push(format!("({})", spec.regex_alts.join("|")));
+        }
+        if !spec.substring_alts.is_empty() {
+            let joined = spec
+                .substring_alts
+                .iter()
+                .map(|p| format!("(?:{})", regex::escape(p)))
+                .collect::<Vec<_>>()
+                .join("|");
+            res.push(
+                RegexBuilder::new(&joined)
+                    .case_insensitive(ignore_case)
+                    .build()
+                    .with_context(|| "bad --substring text".to_string())?,
+            );
+            desc.push(format!("({})", spec.substring_alts.join("|")));
+        }
+    }
+    // No patterns at all: the requirements (or the window) select instead
+    // — on ANY source; the chunk skip is just the timberfs acceleration.
+    let matchless = res.is_empty();
+    if matchless {
+        if invert {
+            bail!(
+                "-v inverts patterns, and none were given (--has requirements are \
+                 never inverted); \"A and not B\" is --has A -v B"
+            );
+        }
+        if !has.is_empty() {
             crate::note!(
                 "timberfs: no PATTERN given; matching entries that contain: {}",
                 has.join(", ")
             );
-            pattern = has.join(" AND ");
-        }
-        true
-    } else {
-        false
-    };
-    if files.is_empty() && !selection_given && names_timberfs_source(&pattern) {
-        use std::io::IsTerminal;
-        if io::stdin().is_terminal() {
+        } else if selection_given {
+            crate::note!("timberfs: no PATTERN given; every entry in the window matches");
+        } else {
             bail!(
-                "{pattern} names a timberfs log, but it was read as the PATTERN \
-                 (which comes first: timberfs grep PATTERN {pattern}); to select \
-                 without a pattern, give --has/--from/--to"
+                "PATTERN required (positionally, or as --any TEXT / --regex PATTERN / \
+                 --substring TEXT); or select with --has/--from/--to"
             );
         }
     }
-
-    let res: Vec<Regex> = if pattern_is_matchless {
-        // --has tokens, ANDed, word-anchored like everything else
-        // (empty = match everything, the pure-window case).
-        has.iter()
-            .map(|t| word_regex(t, ignore_case))
-            .collect::<anyhow::Result<_>>()?
-    } else if regex_mode {
-        vec![RegexBuilder::new(&pattern)
-            .case_insensitive(ignore_case)
-            .multi_line(true)
-            .build()
-            .with_context(|| format!("bad pattern {pattern:?}"))?]
-    } else if fixed {
-        // raw substring — matches INSIDE tokens (partial ids), so the
-        // token index cannot help; full scan
-        vec![RegexBuilder::new(&regex::escape(&pattern))
-            .case_insensitive(ignore_case)
-            .build()
-            .with_context(|| format!("bad pattern {pattern:?}"))?]
+    let pattern_desc = if desc.is_empty() {
+        has.join(" AND ")
     } else {
-        // the default: a literal phrase at token boundaries
-        vec![word_regex(&pattern, ignore_case)?]
+        desc.join(" AND ")
     };
 
-    // The default word mode is EXACTLY what the .grain answers: an entry
-    // word-matching a literal must contain all its tokens whole, so the
-    // pre-filter cannot change the answer — a store with a grain gets the
-    // chunk skip for free. Off when the semantics genuinely need every
-    // chunk: --regex/-F (substrings reach inside tokens), -i (the grain
-    // is exact-case), -v (non-matches must be READ to be printed — the
-    // index can only prove absence of matches, which for -v means "print
-    // the whole chunk"), an explicit --has (the user's selection wins),
-    // and --scan.
-    let auto_has: Vec<String> = if !scan
-        && !invert
-        && !ignore_case
-        && !regex_mode
-        && !fixed
-        && !pattern_is_matchless
-        && has.is_empty()
-        && !crate::grain::tokenize_query(&pattern).is_empty()
+    // --has is verified on every entry, always — EXACT-case, like the
+    // index it rides on (-i loosens patterns, not requirements: a looser
+    // entry check than the chunk skip would miss).
+    let required: Vec<Regex> = if !has.is_empty() {
+        has.iter()
+            .map(|t| word_regex(t, false))
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        Vec::new()
+    };
+    if ignore_case && !has.is_empty() {
+        crate::note!(
+            "timberfs: -i applies to patterns; --has requirements stay \
+             exact-case (they ride the exact-case token index)"
+        );
+    }
+
+    // Index acceleration: a WORD-mode positional's tokens are required in
+    // any matching entry, and extra AND-predicates only narrow the result
+    // — so the chunk skip stays exact even in mixed queries, and the
+    // tokens simply join any explicit --has requirements. Off for -i
+    // (the grain is exact-case), -v (non-matches must be read to be
+    // printed), --scan.
+    let word_pat: Option<&String> = positional.as_ref();
+    // A single SUBSTRING literal contributes its interior tokens the
+    // same way (a substring match requires them whole); OR'd substring
+    // alternatives contribute nothing (each branch may lack them).
+    let substring_lit: Option<&String> = if spec.substring_alts.len() == 1 {
+        spec.substring_alts.first()
+    } else {
+        None
+    };
+    let mut accel: Vec<String> = Vec::new();
+    if let Some(p) = word_pat {
+        if !crate::grain::tokenize_query(p).is_empty() {
+            accel.push(p.clone());
+        }
+    }
+    if spec.word_alts.len() == 1 && !crate::grain::tokenize_query(&spec.word_alts[0]).is_empty() {
+        accel.push(spec.word_alts[0].clone());
+    }
+    if let Some(l) = substring_lit {
+        accel.extend(interior_tokens(l));
+    }
+    // Explicit --has does NOT disable pattern-token acceleration: chunk
+    // requirements compose by AND exactly like the entry predicates do.
+    let gates_open = !scan && !invert && !ignore_case;
+    // OR'd words stay indexed: a chunk survives if ANY alternative's
+    // tokens are all present — each branch is exact, so the union is.
+    let any_of: Vec<String> = if gates_open
+        && spec.word_alts.len() > 1
+        && spec
+            .word_alts
+            .iter()
+            .all(|w| !crate::grain::tokenize_query(w).is_empty())
     {
-        vec![pattern.clone()]
+        spec.word_alts.clone()
+    } else {
+        Vec::new()
+    };
+    let auto_has: Vec<String> = if gates_open && !accel.is_empty() {
+        accel
     } else {
         Vec::new()
     };
     // Why a grain-ful store will still be fully scanned (for the hint).
-    let scan_reason: Option<&str> = if auto_has.is_empty() && has.is_empty() && !scan {
-        if regex_mode {
-            Some("--regex")
-        } else if fixed {
-            Some("-F (raw substring)")
-        } else if ignore_case {
-            Some("-i (the index is exact-case)")
+    let scan_reason: Option<String> = if auto_has.is_empty() && has.is_empty() && !scan {
+        if ignore_case {
+            Some("-i (the index is exact-case)".into())
         } else if invert {
-            Some("-v (non-matches must be read to be printed)")
+            Some("-v (non-matches must be read to be printed)".into())
+        } else if word_pat.is_none() && spec.word_alts.is_empty() && !spec.regex_alts.is_empty() {
+            Some("--regex".into())
+        } else if word_pat.is_none() && spec.word_alts.is_empty() && !spec.substring_alts.is_empty()
+        {
+            // A one-word literal deserves the real lesson: without
+            // --substring, this exact search is index-accelerated; --substring
+            // only adds matches INSIDE longer tokens.
+            match substring_lit {
+                Some(l)
+                    if l.bytes().all(|b| b.is_ascii_alphanumeric())
+                        && (3..=64).contains(&l.len()) =>
+                {
+                    Some(format!(
+                        "--substring ({l:?} is one whole word — as --any {l} this is an \
+                         indexed search; --substring adds only matches inside longer tokens)"
+                    ))
+                }
+                _ => Some("--substring (raw text with no interior words to pre-filter on)".into()),
+            }
         } else {
             None
         }
     } else {
         None
     };
+    let scan_reason: Option<&str> = scan_reason.as_deref();
 
     if let Some(dest) = into {
         // The artifact derives from ONE timberfs source: lineage stays
@@ -842,23 +1175,25 @@ pub fn cmd_grep(
         return grep_into(
             p,
             &res,
+            &required,
             extractor,
             from,
             to,
             has,
             &auto_has,
+            &any_of,
             scan_reason,
             invert,
-            &pattern,
+            &pattern_desc,
             dest,
             fail_on_empty,
         );
     }
 
     if files.is_empty() {
-        if selection_given {
+        if from.is_some() || to.is_some() {
             bail!(
-                "--from/--to/--has need a timberfs log or bundle, not stdin \
+                "--from/--to need a timberfs log or bundle, not stdin \
                  (PATTERN comes first: timberfs grep PATTERN FILE)"
             );
         }
@@ -872,9 +1207,12 @@ pub fn cmd_grep(
                 warned_cap: false,
             },
             &res,
+            &required,
             invert,
             count,
             None,
+            None,
+            null_sep,
         )?;
         if count {
             println!("{matched}");
@@ -887,20 +1225,34 @@ pub fn cmd_grep(
     let multi = files.len() > 1 && !no_filename;
     let mut total: u64 = 0;
     for p in &files {
+        // A "file" that is neither a plain file nor a timberfs store is
+        // usually a stray pattern (the pattern comes FIRST, or rides in
+        // --regex PATTERN) — say so instead of blaming a missing .rings.
+        if !p.is_file() && !names_timberfs_source(&p.display().to_string()) {
+            bail!(
+                "{} is neither a file nor a timberfs log — if it was meant as a \
+                 pattern, the pattern comes first (or use --regex PATTERN)",
+                p.display()
+            );
+        }
         let extractor = Extractor::new(ts_regex, ts_format, false)?;
         let label = p.display().to_string().into_bytes();
         let matched = grep_one(
             p,
             &res,
+            &required,
             extractor,
             from,
             to,
             has,
             &auto_has,
+            &any_of,
             scan_reason,
             invert,
             count,
             if multi { Some(&label) } else { None },
+            null_sep,
+            by_write_time,
         )?;
         total += matched;
         if count && multi {
