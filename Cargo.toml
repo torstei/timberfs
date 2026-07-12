@@ -10,6 +10,14 @@ repository = "https://github.com/torstei/timberfs"
 name = "timberfs"
 path = "src/main.rs"
 
+[lib]
+name = "timberfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "timber-filter"
+path = "src/timber_filter.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = "0.4"
@@ -48,7 +56,9 @@ Ships a systemd template unit (timberfs@.service) for mounting instances \
 at boot."""
 assets = [
     ["target/release/timberfs", "usr/bin/", "755"],
+    ["target/release/timber-filter", "usr/bin/", "755"],
     ["packaging/timberfs.1", "usr/share/man/man1/", "644"],
+    ["packaging/timber-filter.1", "usr/share/man/man1/", "644"],
     ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
     ["README.md", "usr/share/doc/timberfs/README.md", "644"],
     ["packaging/timberfs@.service", "lib/systemd/system/timberfs@.service", "644"],

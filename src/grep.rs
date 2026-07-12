@@ -104,15 +104,15 @@ impl Read for ChunkStream {
     }
 }
 
-struct Entries<R: BufRead> {
-    reader: R,
-    extractor: Extractor,
-    pending: Option<Vec<u8>>,
-    warned_cap: bool,
+pub struct Entries<R: BufRead> {
+    pub reader: R,
+    pub extractor: Extractor,
+    pub pending: Option<Vec<u8>>,
+    pub warned_cap: bool,
 }
 
 impl<R: BufRead> Entries<R> {
-    fn next_entry(&mut self) -> io::Result<Option<Vec<u8>>> {
+    pub fn next_entry(&mut self) -> io::Result<Option<Vec<u8>>> {
         let mut entry = match self.pending.take() {
             Some(line) => line,
             None => {
@@ -329,7 +329,7 @@ fn report_scan(
 /// any of its names, or a bundle file)? Used to catch the forgotten-
 /// PATTERN footgun: grep's first positional is the pattern, so a missing
 /// pattern silently promotes the file into it.
-fn names_timberfs_source(s: &str) -> bool {
+pub fn names_timberfs_source(s: &str) -> bool {
     let p = Path::new(s);
     if is_bundle(p) {
         return p.is_file();
@@ -345,7 +345,7 @@ fn names_timberfs_source(s: &str) -> bool {
 /// non-alphanumerics on both sides within it. Edge runs may extend in
 /// the entry ("needle" can be "needles", "this" can be "Xthis") and
 /// prove nothing — but "this is the needle" requires the word "the".
-fn interior_tokens(lit: &str) -> Vec<String> {
+pub fn interior_tokens(lit: &str) -> Vec<String> {
     let b = lit.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -373,7 +373,7 @@ fn interior_tokens(lit: &str) -> Vec<String> {
 /// PROTOCOLERROR: the same whole-token semantics as the .grain, which is
 /// exactly what makes the index pre-filter exact rather than
 /// approximate. (?-u): entries are raw bytes, boundaries are ASCII.
-fn word_pattern(lit: &str) -> String {
+pub fn word_pattern(lit: &str) -> String {
     format!(
         r"(?:\A|(?-u:[^0-9A-Za-z])){}(?:(?-u:[^0-9A-Za-z])|\z)",
         regex::escape(lit)

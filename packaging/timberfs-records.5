@@ -57,8 +57,12 @@ unbounded),
 .B has
 (repeated; the chunk-level token requirements of the selection),
 .B sources
-(number of inputs). The selection echo lets a downstream tool record
-the provenance of what it consumed.
+(number of inputs),
+.B stage
+(repeated; each pipeline stage that transformed the stream appends its
+own command line \(em provenance accumulates across the pipe). The
+selection echo and the stage list let a downstream tool record the
+full lineage of what it consumed.
 .TP
 .B source
 One per input, in argument order, before any entries. Fields:
@@ -69,6 +73,8 @@ One per input, in argument order, before any entries. Fields:
 .B total
 (chunks selected vs present \(em what the index did for this stream;
 a consumer can warn \(lqthis will be slow\(rq before reading further).
+Fields are present when known; a stream that did not originate in a
+store has no chunk statistics.
 .TP
 .B entry
 Announces the next record: its verbatim payload. Fields:
@@ -81,7 +87,8 @@ carries no parseable stamp),
 /
 .B wl
 (first/last write time of the chunk the entry started in \(em the
-write-time window),
+write-time window; present when known \(em a stream converted from raw
+text has none),
 .B src
 (source path; present only in multi-source streams \(em single-source
 streams name their source once, in
@@ -96,7 +103,8 @@ Last record of every complete stream. Fields:
 .B chunks_read
 /
 .B chunks_total
-(work done vs store size). Its PRESENCE is the completeness marker:
+(work done vs store size; present when known). Its PRESENCE is the
+completeness marker:
 a consumer that reaches end-of-input without seeing
 .B stream-end
 must treat the stream as truncated (the producer died, or the pipe

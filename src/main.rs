@@ -1,16 +1,4 @@
-mod append;
-mod bark;
-mod entry;
-mod export;
-mod format;
-mod fs;
-mod grain;
-mod grep;
-mod import;
-mod note;
-mod query;
-mod rotate;
-mod store;
+use timberfs::{append, bark, export, fs, grain, grep, import, note, query, rotate, store};
 
 use std::path::PathBuf;
 
