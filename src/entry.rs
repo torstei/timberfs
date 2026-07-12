@@ -19,6 +19,14 @@ pub struct Framing {
     /// NUL-terminated records instead of newline text (-0): the entry's
     /// trailing newline is stripped, internal newlines kept.
     pub null_sep: bool,
+    /// Typed record stream (--records): each entry is preceded by a
+    /// metadata record (RS-marked, US-separated k=v) carrying len, the
+    /// entry's own timestamp when it has one, its chunk write window,
+    /// and the source label in multi-source streams. Payload bytes are
+    /// VERBATIM (trailing newline kept); len is authoritative and the
+    /// closing NUL is a resync marker, so even NUL bytes in an entry
+    /// are representable. See timberfs-records(5).
+    pub records: bool,
     /// Annotate each record with the write time it arrived at and, when
     /// the entry carries its own stamp, the offset between the two — the
     /// invisible second field, made visible.
@@ -181,6 +189,23 @@ impl EntrySink {
             None
         };
 
+        if self.framing.records {
+            out.write_all(b"\x1eentry")?;
+            write!(out, "\x1flen={}", entry.len())?;
+            if let Some(t) = ts {
+                write!(out, "\x1fts={t}")?;
+            }
+            let (wf, wl) = self.entry_write_win;
+            write!(out, "\x1fwf={wf}\x1fwl={wl}")?;
+            if let Some(label) = &self.framing.label {
+                out.write_all(b"\x1fsrc=")?;
+                out.write_all(label)?;
+            }
+            out.write_all(b"\0")?;
+            out.write_all(&entry)?;
+            out.write_all(b"\0")?;
+            return Ok(());
+        }
         if self.framing.null_sep {
             if let Some(label) = &self.framing.label {
                 out.write_all(label)?;

@@ -1,0 +1,116 @@
+.TH TIMBERFS-RECORDS 5 "2026-07-12" "timberfs" "File Formats"
+.SH NAME
+timberfs-records \- typed, NUL-framed log-entry record stream
+.SH SYNOPSIS
+.B timberfs query \-\-records
+.I ...
+| consumer
+.SH DESCRIPTION
+The record stream is the pipe interface between timberfs selection
+(\fBtimberfs query\fR) and entry-aware consumers. It carries whole log
+ENTRIES (a stamped line plus its continuation lines) as verbatim bytes,
+interleaved with typed metadata records. It is a byte stream, not a
+text format: read it with a parser, not with line-oriented tools (for
+those, use
+.B \-0
+\(em bare NUL-terminated entries \(em or plain text).
+.SH GRAMMAR
+.nf
+.RS
+stream  := record*
+record  := body NUL
+body    := RS kind (US key=value)*    metadata record
+         | payload                    entry payload, verbatim bytes
+.RE
+.fi
+.PP
+.B RS
+is byte 0x1E (ASCII record separator),
+.B US
+is 0x1F (unit separator),
+.B NUL
+is 0x00. A record whose first byte is RS is metadata; every other
+record is the verbatim payload of the entry announced by the
+immediately preceding
+.B entry
+metadata record. Keys never contain \(lq=\(rq; the first \(lq=\(rq
+splits key from value. Values never contain NUL or US (timberfs
+refuses to emit such a stream). Payload bytes are arbitrary \(em
+including NUL: the
+.B len
+field of the
+.B entry
+record is authoritative, and the payload's closing NUL is a
+consistency and resynchronization marker, not the framing.
+.SH RECORD KINDS
+.TP
+.B stream-start
+First record of every stream. Fields:
+.B v
+(format version, this document describes
+.BR v=1 ),
+.B from
+/
+.B to
+(the selection window in Unix milliseconds; omitted edges are
+unbounded),
+.B has
+(repeated; the chunk-level token requirements of the selection),
+.B sources
+(number of inputs). The selection echo lets a downstream tool record
+the provenance of what it consumed.
+.TP
+.B source
+One per input, in argument order, before any entries. Fields:
+.B path
+(the source as given),
+.B kept
+/
+.B total
+(chunks selected vs present \(em what the index did for this stream;
+a consumer can warn \(lqthis will be slow\(rq before reading further).
+.TP
+.B entry
+Announces the next record: its verbatim payload. Fields:
+.B len
+(payload length in bytes, authoritative),
+.B ts
+(the entry's own timestamp, Unix milliseconds; absent when the entry
+carries no parseable stamp),
+.B wf
+/
+.B wl
+(first/last write time of the chunk the entry started in \(em the
+write-time window),
+.B src
+(source path; present only in multi-source streams \(em single-source
+streams name their source once, in
+.BR stream-start / source ).
+.TP
+.B stream-end
+Last record of every complete stream. Fields:
+.B entries
+(payloads emitted),
+.B dropped
+(entries verified outside the window),
+.B chunks_read
+/
+.B chunks_total
+(work done vs store size). Its PRESENCE is the completeness marker:
+a consumer that reaches end-of-input without seeing
+.B stream-end
+must treat the stream as truncated (the producer died, or the pipe
+broke) and must not present the result as complete.
+.SH VERSIONING
+The stream is versioned by the
+.B v
+field of
+.BR stream-start .
+Consumers MUST ignore unknown keys and unknown record kinds \(em new
+fields and kinds may appear within
+.B v=1
+and are always additive. A consumer seeing a
+.B v
+it does not know should refuse rather than guess.
+.SH SEE ALSO
+.BR timberfs (1)

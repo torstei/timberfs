@@ -49,6 +49,7 @@ at boot."""
 assets = [
     ["target/release/timberfs", "usr/bin/", "755"],
     ["packaging/timberfs.1", "usr/share/man/man1/", "644"],
+    ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
     ["README.md", "usr/share/doc/timberfs/README.md", "644"],
     ["packaging/timberfs@.service", "lib/systemd/system/timberfs@.service", "644"],
     ["packaging/timberfs.conf.example", "usr/share/doc/timberfs/examples/timberfs.conf.example", "644"],

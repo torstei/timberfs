@@ -752,7 +752,17 @@ stays one record \(em for
 .BR "xargs \-0" ,
 .BR "sort \-z" ,
 .B "uniq \-z"
-pipelines. Persistent whole-hour offsets between the two clocks are
+pipelines.
+.B \-\-records
+emits the typed record stream for timber-aware consumers: the same
+NUL-framed entries interleaved with metadata records carrying the
+format version, an echo of the selection, per-source index statistics,
+each entry's length, own timestamp and write window, and end-of-stream
+totals whose presence proves the stream arrived complete \(em see
+.BR timberfs\-records (5)
+for the grammar. Plain
+.B \-0
+stays the choice for ordinary Unix tools. Persistent whole-hour offsets between the two clocks are
 detected and warned about once (on one host the clocks cancel, so such
 an offset is a timezone or format misconfiguration, not clock skew).
 Declare exotic line formats once in the manifest
@@ -887,6 +897,8 @@ zstd \-dc logs\-backing/app.log.trunk > app.log.recovered
 .SH EXIT STATUS
 0 on success, non-zero on any error (2 for command-line usage errors).
 .SH SEE ALSO
+.BR timberfs-records (5)
+.br
 .BR fusermount3 (1),
 .BR zstd (1),
 .BR getfattr (1),

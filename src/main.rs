@@ -225,6 +225,18 @@ enum Command {
         /// record — pipe to xargs -0, sort -z, uniq -z ...)
         #[arg(short = '0', long = "null", conflicts_with = "by_write_time")]
         null_sep: bool,
+        /// Typed record stream for timber-aware tools: NUL-terminated
+        /// records where metadata records (stream-start with the format
+        /// version and selection echo, one per source with its stats, a
+        /// row header with len/ts/write-window before every entry, and
+        /// stream-end with totals — its absence means truncation) are
+        /// marked by a leading RS byte. Entry payloads are verbatim
+        /// bytes. See timberfs-records(5)
+        #[arg(
+            long,
+            conflicts_with_all = ["null_sep", "show_write_time", "by_write_time", "no_filename"]
+        )]
+        records: bool,
     },
     /// Entry-aware grep: matches whole log entries (a timestamped line
     /// plus its continuation lines — stack traces stay attached to their
@@ -478,6 +490,7 @@ fn main() -> anyhow::Result<()> {
             show_write_time,
             by_write_time,
             null_sep,
+            records,
         } => {
             query::cmd_query(
                 &files,
@@ -488,6 +501,7 @@ fn main() -> anyhow::Result<()> {
                 show_write_time,
                 by_write_time,
                 null_sep,
+                records,
             )?;
         }
         Command::Grep {

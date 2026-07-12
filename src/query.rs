@@ -298,6 +298,7 @@ pub fn cmd_query(
     show_write_time: bool,
     by_write_time: bool,
     null_sep: bool,
+    records: bool,
 ) -> anyhow::Result<()> {
     let from_ms = from.unwrap_or(0);
     let to_ms = to.unwrap_or(u64::MAX);
@@ -309,7 +310,7 @@ pub fn cmd_query(
     // (a window: the DEFAULT is that every printed entry's own timestamp
     // is inside it) or when the framing needs entries (-0, annotation).
     // --by-write-time is the raw escape hatch: chunk dump, no parsing.
-    if !by_write_time && (windowed || null_sep || show_write_time) {
+    if !by_write_time && (windowed || null_sep || show_write_time || records) {
         return query_entries(
             files,
             from_ms,
@@ -319,6 +320,7 @@ pub fn cmd_query(
             no_filename,
             show_write_time,
             null_sep,
+            records,
         );
     }
     if files.len() == 1 {
@@ -342,6 +344,7 @@ fn query_entries(
     no_filename: bool,
     show_write_time: bool,
     null_sep: bool,
+    records: bool,
 ) -> anyhow::Result<()> {
     struct Src {
         file: File,
@@ -399,6 +402,7 @@ fn query_entries(
         let framing = crate::entry::Framing {
             null_sep,
             show_write: show_write_time,
+            records,
             label: if multi {
                 Some(f.display().to_string().into_bytes())
             } else {
@@ -421,6 +425,36 @@ fn query_entries(
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
+    // --records brackets the stream with typed metadata: stream-start
+    // carries the format version and an echo of the selection (canonical
+    // ms values — downstream tools can record lineage), one source record
+    // per input carries its selection stats, and stream-end (below)
+    // carries totals — its PRESENCE is the completeness marker: a
+    // consumer hitting EOF without it knows the stream was truncated.
+    if records {
+        write!(out, "\x1estream-start\x1fv=1")?;
+        if from_ms > 0 {
+            write!(out, "\x1ffrom={from_ms}")?;
+        }
+        if to_ms < u64::MAX {
+            write!(out, "\x1fto={to_ms}")?;
+        }
+        for h in has {
+            write!(out, "\x1fhas={h}")?;
+        }
+        write!(out, "\x1fsources={}", files.len())?;
+        out.write_all(b"\0")?;
+        for (f, s) in files.iter().zip(&srcs) {
+            write!(
+                out,
+                "\x1esource\x1fpath={}\x1fkept={}\x1ftotal={}",
+                f.display(),
+                s.chunks.len(),
+                s.total_chunks
+            )?;
+            out.write_all(b"\0")?;
+        }
+    }
     // K-way interleave by chunk write windows across files (within-file
     // order preserved), same as the raw fleet view.
     loop {
@@ -449,6 +483,13 @@ fn query_entries(
         dropped += s.sink.filtered_out;
         read += s.chunks.len();
         total += s.total_chunks;
+    }
+    if records {
+        write!(
+            out,
+            "\x1estream-end\x1fentries={emitted}\x1fdropped={dropped}\x1fchunks_read={read}\x1fchunks_total={total}"
+        )?;
+        out.write_all(b"\0")?;
     }
     out.flush()?;
     if windowed {
