@@ -141,6 +141,32 @@ pub fn retention_from_map(map: &Map<String, Value>) -> anyhow::Result<Retention>
     })
 }
 
+/// Declared line-timestamp format — a CONTENT description (unlike
+/// settings it inherits through derivation: an exported slice contains
+/// the same lines in the same format). Consumed by the read path's
+/// entry filtering and by import (flag-free exotic formats).
+#[derive(Clone, Default)]
+pub struct TimeFormat {
+    pub regex: Option<String>,
+    pub format: Option<String>,
+    pub utc: bool,
+}
+
+pub fn time_format(map: Option<&Map<String, Value>>) -> TimeFormat {
+    let Some(map) = map else {
+        return TimeFormat::default();
+    };
+    let get = |k: &str| map.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    TimeFormat {
+        regex: get("timestamp_regex"),
+        format: get("timestamp_format"),
+        utc: map
+            .get("timestamp_utc")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
+}
+
 /// The store's declared retention. Err = a manifest exists but cannot be
 /// read/parsed (the caller decides: warn + last-good, never unbounded).
 pub fn declared_retention(dir: &Path, name: &str) -> anyhow::Result<Retention> {
@@ -356,11 +382,27 @@ pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Resu
                 crate::append::parse_size_bytes(&v)?;
                 Value::String(v)
             }
-            "index" => match v.as_str() {
+            "index" | "timestamp_utc" => match v.as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
-                _ => bail!("\"index\" is true or false"),
+                _ => bail!("\"{k}\" is true or false"),
             },
+            "timestamp_regex" => {
+                let re = regex::Regex::new(&v)
+                    .with_context(|| "\"timestamp_regex\" does not compile".to_string())?;
+                if re.captures_len() < 2 {
+                    bail!("\"timestamp_regex\" needs one capture group around the timestamp");
+                }
+                Value::String(v)
+            }
+            "timestamp_format" => {
+                if chrono::format::StrftimeItems::new(&v)
+                    .any(|i| matches!(i, chrono::format::Item::Error))
+                {
+                    bail!("\"timestamp_format\" is not a valid chrono format string");
+                }
+                Value::String(v)
+            }
             _ => Value::String(v),
         };
         map.insert(k.to_string(), value);
@@ -371,6 +413,10 @@ pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Resu
             bail!("\"{k}\" is identity/lineage — a fact, not a setting");
         }
         map.remove(k);
+    }
+
+    if map.contains_key("timestamp_regex") != map.contains_key("timestamp_format") {
+        bail!("timestamp_regex and timestamp_format go together (set both, or unset both)");
     }
 
     save(&dir, &name, &map)?;
