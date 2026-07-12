@@ -15,5 +15,7 @@ pub mod grep;
 pub mod import;
 pub mod note;
 pub mod query;
+pub mod records;
 pub mod rotate;
+pub mod sink;
 pub mod store;

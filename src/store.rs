@@ -59,9 +59,20 @@ pub struct Config {
     pub flush_age_ms: u64,
 }
 
+struct StageBaseline {
+    chunks: usize,
+    comp_size: u64,
+    buffer_start: u64,
+}
+
 pub struct FileStore {
     trunk: File,
     rings: File,
+    /// Atomic-sink staging: baseline to commit from or roll back to.
+    /// While staged, flushed chunks write trunk frames but hold their
+    /// ring records in memory — readers see the store unchanged until
+    /// commit_stage, and abort_stage truncates the trunk back.
+    staged: Option<StageBaseline>,
     pub chunks: Vec<ChunkRecord>,
     /// Total bytes of indexed (compressed) data in the .trunk.
     pub comp_size: u64,
@@ -124,6 +135,7 @@ impl FileStore {
             buffer_first_ms: None,
             buffer_last_ms: 0,
             cache: None,
+            staged: None,
         })
     }
 
@@ -141,17 +153,70 @@ impl FileStore {
     /// min/max of the stamps it saw, so mildly out-of-order input simply
     /// widens windows — it never loses data.
     pub fn append_stamped(&mut self, data: &[u8], ts_ms: u64, cfg: &Config) -> io::Result<()> {
+        self.append_windowed(data, ts_ms, ts_ms, cfg)
+    }
+
+    /// Append with an explicit write WINDOW (the records sink: an entry
+    /// arriving with its original wf/wl keeps its write history). The
+    /// chunk window is the min/max over everything buffered.
+    pub fn append_windowed(
+        &mut self,
+        data: &[u8],
+        first_ms: u64,
+        last_ms: u64,
+        cfg: &Config,
+    ) -> io::Result<()> {
         if self.buffer.is_empty() {
-            self.buffer_first_ms = Some(ts_ms);
-            self.buffer_last_ms = ts_ms;
+            self.buffer_first_ms = Some(first_ms);
+            self.buffer_last_ms = last_ms;
         } else {
-            self.buffer_first_ms = Some(self.buffer_first_ms.unwrap_or(ts_ms).min(ts_ms));
-            self.buffer_last_ms = self.buffer_last_ms.max(ts_ms);
+            self.buffer_first_ms = Some(self.buffer_first_ms.unwrap_or(first_ms).min(first_ms));
+            self.buffer_last_ms = self.buffer_last_ms.max(last_ms);
         }
         self.buffer.extend_from_slice(data);
         if self.buffer.len() >= cfg.chunk_size {
             self.flush_chunk(cfg)?;
         }
+        Ok(())
+    }
+
+    /// Begin atomic staging (see the `staged` field).
+    pub fn stage(&mut self) {
+        self.staged = Some(StageBaseline {
+            chunks: self.chunks.len(),
+            comp_size: self.comp_size,
+            buffer_start: self.buffer_start,
+        });
+    }
+
+    /// Make everything appended since stage() visible: write the held
+    /// ring records (data-first ordering, as ever), then sync both files.
+    pub fn commit_stage(&mut self, cfg: &Config) -> io::Result<()> {
+        self.flush_chunk(cfg)?;
+        let Some(b) = self.staged.take() else {
+            return Ok(());
+        };
+        for (i, rec) in self.chunks[b.chunks..].iter().enumerate() {
+            let rec_off = RINGS_HEADER_LEN + ((b.chunks + i) * RECORD_LEN) as u64;
+            self.rings.write_all_at(&rec.to_bytes(), rec_off)?;
+        }
+        self.trunk.sync_all()?;
+        self.rings.sync_all()?;
+        Ok(())
+    }
+
+    /// Roll back to the stage() baseline: truncate the trunk, forget the
+    /// held records. Readers never saw any of it.
+    pub fn abort_stage(&mut self) -> io::Result<()> {
+        let Some(b) = self.staged.take() else {
+            return Ok(());
+        };
+        self.trunk.set_len(b.comp_size)?;
+        self.comp_size = b.comp_size;
+        self.buffer_start = b.buffer_start;
+        self.chunks.truncate(b.chunks);
+        self.buffer.clear();
+        self.buffer_first_ms = None;
         Ok(())
     }
 
@@ -172,8 +237,10 @@ impl FileStore {
             first_write_ms: self.buffer_first_ms.unwrap_or(self.buffer_last_ms),
             last_write_ms: self.buffer_last_ms,
         };
-        let rec_off = RINGS_HEADER_LEN + (self.chunks.len() * RECORD_LEN) as u64;
-        self.rings.write_all_at(&rec.to_bytes(), rec_off)?;
+        if self.staged.is_none() {
+            let rec_off = RINGS_HEADER_LEN + (self.chunks.len() * RECORD_LEN) as u64;
+            self.rings.write_all_at(&rec.to_bytes(), rec_off)?;
+        }
         self.comp_size += comp.len() as u64;
         self.buffer_start += self.buffer.len() as u64;
         self.buffer.clear();

@@ -15,7 +15,8 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .br
 .B timberfs append
 .RI [ options ]
-.I FILE
+.B \-\-into
+.I DEST
 .br
 .B timberfs import
 .RI [ options ]
@@ -24,6 +25,9 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .IR SOURCE .\|.\|.
 .br
 .B timberfs export
+.I SOURCE
+.B \-\-into
+.I DEST
 .RB [ \-\-from
 .IR TIME ]
 .RB [ \-\-to
@@ -189,18 +193,35 @@ mid-flight (a bad hand-edit) keeps the writer alive on its last good
 policy, with one warning: never silently unbounded, never a dead
 producer.
 .SS append
-.B timberfs append
-.I FILE
+.B timberfs append \-\-into
+.I DEST
 reads standard input and appends it to a log in the backing store directly,
 with no FUSE mount involved \(em the
 .BR svlogd (8)/s6-log
-pattern:
+pattern (destinations are always named
+.BR \-\-into ,
+here as everywhere):
 .PP
 .nf
 .RS
-myapp 2>&1 | timberfs append logs\-backing/app.log
+myapp 2>&1 | timberfs append \-\-into logs\-backing/app.log
 .RE
 .fi
+.PP
+With
+.B \-\-records
+standard input is a
+.BR timberfs\-records (5)
+stream instead of raw text: entries arrive pre-framed, and an entry
+carrying its original write window
+.RB ( wf / wl )
+keeps it \(em write history survives the pipe. Without a carried
+window, append stamps now, as always \(em the stream's word is law,
+silence falls back to the command's own clock. Delivery is streaming:
+data lands as it arrives, and a truncated stream keeps what came and
+fails the exit code (at-least-once \(em re-running may duplicate; use
+.B import \-\-records
+for all-or-nothing).
 .PP
 Each log has exactly one writer (an exclusive per-file lock), but
 appenders for different files happily share a backing directory; a
@@ -251,7 +272,31 @@ retained data.
 .IR SOURCE .\|.\|.
 converts existing plain log files into a timberfs log. The destination is
 a named flag on purpose: a shell glob among the sources can never
-swallow it. Several sources \(em a rotated set \(em may be given
+swallow it. With
+.B \-\-records
+the single source (a file, or standard input when none is given) is a
+.BR timberfs\-records (5)
+stream: entries arrive pre-framed, an entry carrying its original
+write window
+.RB ( wf / wl )
+keeps it \(em replicating a store preserves its write history \(em
+and one without falls back to import's own clock, the entry's parsed
+timestamp (the backfill doctrine). Delivery is ATOMIC: nothing is
+visible until the stream's
+.B stream\-end
+arrives, and a truncated stream leaves the store byte-for-byte
+unchanged. The upstream selection echo and every pipeline
+.B stage=
+land in the destination's manifest \(em an artifact remembers the
+pipe that filled it:
+.PP
+.nf
+.RS
+timber\-filter \-\-records \-\-has ERROR \-\-from 13:00 app.log |
+    timberfs import \-\-records \-\-into case.timber.d/case.log
+timberfs query \-\-records app.log | ssh host timberfs import \-\-records \-\-into mirror/app.log
+.RE
+.fi Several sources \(em a rotated set \(em may be given
 in any order: each file's first parsed timestamp determines the stitch
 order (rotation numbering and glob order lie), and the plan is printed
 before anything is written. Two sources starting at the same timestamp
@@ -341,7 +386,9 @@ is a no-op, and a source that shrank or changed is refused before
 anything is written (rotated files should be imported to a new target).
 .SS export
 .B timberfs export
-.I SOURCE DEST
+.I SOURCE
+.B \-\-into
+.I DEST
 copies the chunks overlapping the given window (default: everything) into
 a NEW timberfs log \(em verbatim, no recompression, cost proportional to
 the compressed size of the window. The source needs no lock and may be
@@ -864,7 +911,7 @@ Or skip FUSE entirely and pipe:
 .PP
 .nf
 .RS
-myapp 2>&1 | timberfs append logs\-backing/app.log
+myapp 2>&1 | timberfs append \-\-into logs\-backing/app.log
 .RE
 .fi
 .PP

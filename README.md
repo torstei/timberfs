@@ -129,7 +129,7 @@ out entirely (svlogd-style, retention built in):
 
 ```sh
 timberfs set backing/app.log retain_size=50G     # once (or at create time)
-myapp 2>&1 | timberfs append backing/app.log
+myapp 2>&1 | timberfs append --into backing/app.log
 # (flags work too and persist the declaration: --retain-size 50G)
 
 # apache2: piped logs are a first-class Apache feature
@@ -137,7 +137,7 @@ CustomLog "|/usr/bin/timberfs append --quiet /var/log/apache2-backing/access.log
 ErrorLog  "|/usr/bin/timberfs append --quiet /var/log/apache2-backing/error.log"
 
 # journald-only software:
-journalctl -u myapp -f -o short-iso | timberfs append backing/myapp.log --retain 90d
+journalctl -u myapp -f -o short-iso | timberfs append --into backing/myapp.log --retain 90d
 ```
 
 One rule: **don't backfill history through the pipe** — `append` indexes
@@ -236,7 +236,7 @@ from a pipe — the daemontools/runit/s6 log-processor pattern (`multilog`,
 where FUSE is unwelcome (no `/dev/fuse`, no root, no mount):
 
 ```sh
-myapp 2>&1 | timberfs append logs-backing/app.log
+myapp 2>&1 | timberfs append --into logs-backing/app.log
 timberfs query logs-backing/app.log --from 13:42 --to 13:43
 ```
 
@@ -291,7 +291,7 @@ single-file **`.timber` bundle** for shipping (a plain uncompressed tar,
 hand-tarred pair is a valid bundle):
 
 ```sh
-timberfs export backing/archive.log incident.timber --from 13:40 --to 14:10
+timberfs export backing/archive.log --into incident.timber --from 13:40 --to 14:10
 timberfs query incident.timber --from 13:52 --to 13:53 | grep ERROR
 timberfs import incident.timber --into elsewhere/incident.log
 ```
