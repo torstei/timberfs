@@ -454,7 +454,7 @@ fn engage_auto_has(
 /// The invocation as the user typed it (argv, shell-quoted, argv[0]
 /// normalized to "timberfs") — the most informative operation fact an
 /// investigation artifact can carry: what question produced it.
-fn command_line() -> String {
+pub fn command_line() -> String {
     fn quote(a: &str) -> String {
         let plain = !a.is_empty()
             && a.bytes()

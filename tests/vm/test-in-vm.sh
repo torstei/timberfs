@@ -171,13 +171,13 @@ restart_persists() {
 PIPE_BACKING=/var/log/timberfs-backing/pipe
 
 appender_roundtrip() {
-    seq 1 50000 | timberfs append "$PIPE_BACKING/piped.log" \
+    seq 1 50000 | timberfs append --into "$PIPE_BACKING/piped.log" \
         && seq 1 50000 | cmp - <(timberfs query "$PIPE_BACKING/piped.log")
 }
 
 appender_lock_blocks_rotate() {
     mkfifo /tmp/live.fifo
-    timberfs append "$PIPE_BACKING/live.log" --flush-age 60 < /tmp/live.fifo &
+    timberfs append --into "$PIPE_BACKING/live.log" --flush-age 60 < /tmp/live.fifo &
     LIVE_PID=$!
     exec 9>/tmp/live.fifo
     echo "live line" >&9
@@ -200,9 +200,9 @@ appender_sigterm_flushes() {
 
 appenders_share_directory() {
     mkfifo /tmp/sh1.fifo /tmp/sh2.fifo
-    timberfs append "$PIPE_BACKING/share-one.log" < /tmp/sh1.fifo &
+    timberfs append --into "$PIPE_BACKING/share-one.log" < /tmp/sh1.fifo &
     SH1_PID=$!
-    timberfs append "$PIPE_BACKING/share-two.log" < /tmp/sh2.fifo &
+    timberfs append --into "$PIPE_BACKING/share-two.log" < /tmp/sh2.fifo &
     SH2_PID=$!
     exec 7>/tmp/sh1.fifo 8>/tmp/sh2.fifo
     echo "one" >&7
@@ -217,7 +217,7 @@ appenders_share_directory() {
 }
 
 retain_size_budget() {
-    seq 1 100000 | timberfs append "$PIPE_BACKING/cap.log" --chunk-size 8192 --retain-size 16K
+    seq 1 100000 | timberfs append --into "$PIPE_BACKING/cap.log" --chunk-size 8192 --retain-size 16K
     [ "$(stat -c %s "$PIPE_BACKING/cap.log.trunk")" -le 16384 ] \
         && timberfs query "$PIPE_BACKING/cap.log" | tail -1 | grep -qx 100000
 }
@@ -330,7 +330,7 @@ export_bundle_roundtrip() {
     # export a window as a .timber bundle, query it in place, import it
     # elsewhere, compare (archive.log holds the pre-14:40 chunks, which
     # the segment-merge test rotated out of imported.log)
-    timberfs export "$PIPE_BACKING/archive.log" /tmp/win.timber \
+    timberfs export "$PIPE_BACKING/archive.log" --into /tmp/win.timber \
         --from "2026-06-03 14:30:00" --to "2026-06-03 14:35:00" \
         && timberfs query /tmp/win.timber | grep -q "event number 1900" \
         && timberfs import /tmp/win.timber --into "$PIPE_BACKING/from-bundle.log" 2>&1 \
@@ -398,7 +398,7 @@ forgotten_destination_refused() {
     grep -q "\-\-into" /tmp/fg.err \
         && [ ! -e /tmp/fg2.log.trunk ] \
         && ! timberfs import /tmp/fg1.log --into /tmp/fg2.log 2>/dev/null \
-        && ! echo x | timberfs append /tmp/fg1.log 2>/dev/null
+        && ! echo x | timberfs append --into /tmp/fg1.log 2>/dev/null
 }
 
 run_test "multi-file: interleaved attributed query, per-file grep counts" multi_file_fleet_view
@@ -421,12 +421,12 @@ empty_results_are_results() {
     # a quiet day: the empty export still ships (bark records the asked
     # window), imports as a clean no-op, and --fail-on-empty restores
     # the error
-    timberfs export "$PIPE_BACKING/sticky.log" /tmp/quietday.timber \
+    timberfs export "$PIPE_BACKING/sticky.log" --into /tmp/quietday.timber \
         --from "2031-01-01 00:00" --to "2031-01-02 00:00" 2>/dev/null \
         && tar xOf /tmp/quietday.timber quietday.bark | grep -q '"window_to"' \
         && timberfs import /tmp/quietday.timber --into "$PIPE_BACKING/sticky.log" 2>/tmp/qd.err \
         && grep -q "is empty" /tmp/qd.err \
-        && ! timberfs export "$PIPE_BACKING/sticky.log" /tmp/nope.timber \
+        && ! timberfs export "$PIPE_BACKING/sticky.log" --into /tmp/nope.timber \
              --from "2031-01-01 00:00" --to "2031-01-02 00:00" --fail-on-empty 2>/dev/null \
         && [ ! -e /tmp/nope.timber ]
 }

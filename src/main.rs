@@ -1,4 +1,4 @@
-use timberfs::{append, bark, export, fs, grain, grep, import, note, query, rotate, store};
+use timberfs::{append, bark, export, fs, grain, grep, import, note, query, rotate, sink, store};
 
 use std::path::PathBuf;
 
@@ -93,8 +93,21 @@ enum Command {
     /// One writer per file; appenders for different files share a
     /// directory. EOF, SIGTERM or SIGINT flush and sync before exit.
     Append {
-        /// Backing file: logical name, .trunk or .rings path
-        file: PathBuf,
+        /// Destination backing file: logical name, .trunk or .rings
+        /// path (destinations are always named --into; positionals are
+        /// sources)
+        #[arg(long = "into", value_name = "DEST")]
+        into: Option<PathBuf>,
+        /// stdin is a timberfs-records(5) stream, not raw text: entries
+        /// arrive pre-framed, and ones carrying their original write
+        /// window (wf/wl) keep it — write history survives the pipe.
+        /// Without wf/wl, append stamps now, as always. Streaming
+        /// delivery: data lands as it arrives; a truncated stream keeps
+        /// what arrived and fails the exit code
+        #[arg(long)]
+        records: bool,
+        #[arg(hide = true)]
+        legacy: Vec<String>,
         /// Uncompressed chunk size threshold in bytes
         #[arg(long, default_value_t = 256 * 1024)]
         chunk_size: usize,
@@ -123,9 +136,18 @@ enum Command {
     Import {
         /// Source log file(s): plain logs (stitched chronologically by
         /// their first timestamps when several), timberfs logs, or
-        /// .timber bundles
-        #[arg(required = true, num_args = 1..)]
+        /// .timber bundles; with --records, one records file or stdin
+        #[arg(num_args = 0..)]
         sources: Vec<PathBuf>,
+        /// The source is a timberfs-records(5) stream (a file, or stdin
+        /// when no source is given): entries arrive pre-framed, and
+        /// ones carrying their original write window (wf/wl) keep it.
+        /// Without wf/wl, import derives write time from the entry's
+        /// own timestamp, as always. Atomic delivery: nothing is
+        /// visible until stream-end; a truncated stream leaves the
+        /// store unchanged
+        #[arg(long)]
+        records: bool,
         /// Destination backing file: logical name, .trunk or .rings path
         /// (a named flag on purpose — a glob can never eat it)
         #[arg(long = "into", value_name = "DEST")]
@@ -164,7 +186,11 @@ enum Command {
         /// Source backing file: logical name, .trunk or .rings path
         source: PathBuf,
         /// Destination: new backing file, or a *.timber bundle
-        dest: PathBuf,
+        /// (destinations are always named --into)
+        #[arg(long = "into", value_name = "DEST")]
+        dest: Option<PathBuf>,
+        #[arg(hide = true)]
+        legacy: Vec<String>,
         /// Start of the window (same formats as query); default: beginning
         #[arg(long, value_parser = query::parse_time)]
         from: Option<u64>,
@@ -419,23 +445,54 @@ fn main() -> anyhow::Result<()> {
             bark::cmd_set(&store, &sets, &unsets)?;
         }
         Command::Append {
-            file,
+            into,
+            records,
+            legacy,
             chunk_size,
             level,
             flush_age,
             retain,
             retain_size,
         } => {
+            let Some(into) = into else {
+                if let Some(l) = legacy.first() {
+                    anyhow::bail!(
+                        "append writes --into DEST (destinations are always named; \
+                         positionals are sources): timberfs append --into {l}"
+                    );
+                }
+                anyhow::bail!("append needs a destination: --into DEST");
+            };
+            if let Some(l) = legacy.first() {
+                anyhow::bail!(
+                    "unexpected positional {l:?} (append reads stdin and writes \
+                     --into DEST; positionals are sources, and append has none)"
+                );
+            }
             let cfg = store::Config {
                 chunk_size: chunk_size.max(1),
                 level,
                 flush_age_ms: (flush_age * 1000.0).max(0.0) as u64,
             };
-            append::cmd_append(&file, cfg, retain.as_deref(), retain_size.as_deref())?;
+            if records {
+                sink::cmd_records_sink(
+                    None,
+                    &into,
+                    cfg,
+                    sink::Delivery::Streaming,
+                    sink::Clock::Now,
+                    retain.as_deref(),
+                    retain_size.as_deref(),
+                    "append",
+                )?;
+            } else {
+                append::cmd_append(&into, cfg, retain.as_deref(), retain_size.as_deref())?;
+            }
         }
         Command::Import {
             sources,
             dest,
+            records,
             chunk_size,
             level,
             timestamp_regex,
@@ -449,24 +506,71 @@ fn main() -> anyhow::Result<()> {
                 level,
                 flush_age_ms: u64::MAX, // no age flushing during import
             };
-            import::cmd_import(
-                &sources,
-                &dest,
-                cfg,
-                timestamp_regex.as_deref(),
-                timestamp_format.as_deref(),
-                utc,
-                quick,
-                index,
-            )?;
+            if records {
+                if sources.len() > 1 {
+                    anyhow::bail!(
+                        "--records takes ONE stream (a records file, or stdin \
+                         when no source is given) — merge upstream, or import \
+                         streams one at a time"
+                    );
+                }
+                if index {
+                    let (d, n) = query::resolve_backing(&dest)?;
+                    std::fs::create_dir_all(&d)?;
+                    bark::declare_index(&d, &n)?;
+                }
+                sink::cmd_records_sink(
+                    sources.first().map(|p| p.as_path()),
+                    &dest,
+                    cfg,
+                    sink::Delivery::Atomic,
+                    sink::Clock::FromStamps,
+                    None,
+                    None,
+                    "import",
+                )?;
+            } else {
+                if sources.is_empty() {
+                    anyhow::bail!(
+                        "at least one source log is required (or --records for a stream)"
+                    );
+                }
+                import::cmd_import(
+                    &sources,
+                    &dest,
+                    cfg,
+                    timestamp_regex.as_deref(),
+                    timestamp_format.as_deref(),
+                    utc,
+                    quick,
+                    index,
+                )?;
+            }
         }
         Command::Export {
             source,
             dest,
+            legacy,
             from,
             to,
             fail_on_empty,
         } => {
+            let Some(dest) = dest else {
+                if let Some(l) = legacy.first() {
+                    anyhow::bail!(
+                        "export writes --into DEST (destinations are always named; \
+                         positionals are sources): timberfs export {} --into {l}",
+                        source.display()
+                    );
+                }
+                anyhow::bail!("export needs a destination: --into DEST");
+            };
+            if let Some(l) = legacy.first() {
+                anyhow::bail!(
+                    "unexpected positional {l:?} (export reads SOURCE and writes \
+                     --into DEST)"
+                );
+            }
             export::cmd_export(&source, &dest, from, to, fail_on_empty)?;
         }
         Command::Query {
