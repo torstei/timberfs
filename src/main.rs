@@ -1,4 +1,4 @@
-use timberfs::{append, bark, export, fs, grain, grep, import, note, query, rotate, sink, store};
+use timberfs::{append, bark, export, fs, grain, import, note, query, rotate, sink, store};
 
 use std::path::PathBuf;
 
@@ -18,12 +18,6 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
-
-const HEAD_PATTERNS: &str = "Patterns (repeat to OR — any one may match; kinds AND; -v inverts)";
-const HEAD_REQUIREMENTS: &str =
-    "Requirements (repeat to AND — every one must hold; never inverted)";
-const HEAD_WINDOW: &str = "Time window";
-const HEAD_OUTPUT: &str = "Output";
 
 #[derive(Subcommand)]
 enum Command {
@@ -255,90 +249,6 @@ enum Command {
             conflicts_with_all = ["null_sep", "show_write_time", "by_write_time", "no_filename"]
         )]
         records: bool,
-    },
-    /// Entry-aware grep: matches whole log entries (a timestamped line
-    /// plus its continuation lines — stack traces stay attached to their
-    /// entry). Reads raw log from stdin or a plain file, or a timberfs
-    /// log/bundle, where the time window and the words of the query
-    /// pre-select chunks first. Patterns OR within a kind and AND across
-    /// kinds; --has requirements always AND
-    Grep {
-        /// One literal phrase matched at word boundaries — grep legacy,
-        /// index-accelerated (ERROR finds the word ERROR, not ERRORS).
-        /// For SEVERAL patterns, repeat --any (either may match) or
-        /// --has (all must hold). Optional when flags select instead:
-        /// the first argument is then the file
-        pattern: Option<String>,
-        /// Raw log file(s), timberfs backing file(s), or .timber
-        /// bundle(s), processed in order with "path:" prefixes when
-        /// several (default: raw log on stdin)
-        files: Vec<PathBuf>,
-        /// Literal word-anchored phrase; repeat to OR: --any ERROR
-        /// --any FATAL matches either. Index-accelerated
-        #[arg(long, value_name = "TEXT", help_heading = HEAD_PATTERNS)]
-        any: Vec<String>,
-        /// Regular expression; repeat to OR, as in grep -e
-        /// (--regex='a|b' works too). Reads every chunk
-        #[arg(long, value_name = "PATTERN", help_heading = HEAD_PATTERNS)]
-        regex: Vec<String>,
-        /// Literal matched ANYWHERE, even inside longer words (partial
-        /// ids); repeat to OR. Reads every chunk unless multi-word
-        #[arg(long, value_name = "TEXT", help_heading = HEAD_PATTERNS)]
-        substring: Vec<String>,
-        /// Print entries the patterns do NOT match (requirements still
-        /// hold)
-        #[arg(short = 'v', long, help_heading = HEAD_PATTERNS)]
-        invert: bool,
-        /// Case-insensitive patterns (requirements stay exact-case)
-        #[arg(short = 'i', long, help_heading = HEAD_PATTERNS)]
-        ignore_case: bool,
-        /// Literal word-anchored phrase that MUST appear; repeat to AND:
-        /// --has A --has B keeps entries containing both. Exact-case,
-        /// index-accelerated. "A and not B" is --has A -v B
-        #[arg(long, value_name = "TEXT", help_heading = HEAD_REQUIREMENTS)]
-        has: Vec<String>,
-        /// Start of the time window (timberfs sources only; same
-        /// formats as query)
-        #[arg(long, value_parser = query::parse_time, help_heading = HEAD_WINDOW)]
-        from: Option<u64>,
-        /// End of the time window (timberfs sources only)
-        #[arg(long, value_parser = query::parse_time, help_heading = HEAD_WINDOW)]
-        to: Option<u64>,
-        /// Select and emit by write-time windows only; do not verify
-        /// entries against --from/--to by their own timestamps
-        #[arg(long, help_heading = HEAD_WINDOW)]
-        by_write_time: bool,
-        /// Print only the number of matching entries
-        #[arg(short = 'c', long, help_heading = HEAD_OUTPUT)]
-        count: bool,
-        /// Never prefix output lines with the file name
-        #[arg(long, help_heading = HEAD_OUTPUT)]
-        no_filename: bool,
-        /// NUL-terminated entry records (multiline entries stay one
-        /// record — pipe to xargs -0, sort -z, uniq -z ...)
-        #[arg(short = '0', long = "null", help_heading = HEAD_OUTPUT)]
-        null_sep: bool,
-        /// Write matching entries into a NEW timberfs log or .timber
-        /// bundle instead of printing — the investigation as an artifact:
-        /// its manifest records the command line, pattern, window and
-        /// lineage. Takes exactly one timberfs source
-        #[arg(long = "into", value_name = "DEST", conflicts_with_all = ["count", "no_filename"], help_heading = HEAD_OUTPUT)]
-        into: Option<PathBuf>,
-        /// With --into: error instead of writing an empty artifact when
-        /// nothing matches
-        #[arg(long, requires = "into", help_heading = HEAD_OUTPUT)]
-        fail_on_empty: bool,
-        /// Full scan: never pre-filter chunks via the .grain (word
-        /// patterns and --has otherwise use it automatically when one
-        /// exists)
-        #[arg(long)]
-        scan: bool,
-        /// Custom entry-boundary timestamp: regex with one capture group
-        #[arg(long, requires = "timestamp_format")]
-        timestamp_regex: Option<String>,
-        /// chrono format string for the captured timestamp
-        #[arg(long, requires = "timestamp_regex")]
-        timestamp_format: Option<String>,
     },
     /// Show a store's vital signs on one screen: identity, lineage,
     /// data and compression, time covered, index sizes and coverage,
@@ -600,58 +510,6 @@ fn main() -> anyhow::Result<()> {
                 by_write_time,
                 null_sep,
                 records,
-            )?;
-        }
-        Command::Grep {
-            pattern,
-            files,
-            ignore_case,
-            invert,
-            any,
-            substring,
-            count,
-            from,
-            to,
-            has,
-            no_filename,
-            timestamp_regex,
-            timestamp_format,
-            into,
-            fail_on_empty,
-            scan,
-            null_sep,
-            by_write_time,
-            regex,
-        } => {
-            // The predicate model: repeating a flag ORs, different kinds
-            // AND, --has always ANDs, -v inverts the pattern conjunction.
-            // Each flag carries its text (space or = both work); the bare
-            // positional is grep legacy and always means word mode. A
-            // positional given alongside flag predicates is a FILE when
-            // it names an existing store, else one more word predicate.
-            let spec = grep::MatchSpec {
-                positional: pattern,
-                word_alts: any,
-                regex_alts: regex,
-                substring_alts: substring,
-            };
-            grep::cmd_grep(
-                spec,
-                &files,
-                from,
-                to,
-                &has,
-                ignore_case,
-                invert,
-                count,
-                no_filename,
-                timestamp_regex.as_deref(),
-                timestamp_format.as_deref(),
-                into.as_deref(),
-                fail_on_empty,
-                scan,
-                null_sep,
-                by_write_time,
             )?;
         }
         Command::Info { file, json } => {

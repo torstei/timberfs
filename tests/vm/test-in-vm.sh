@@ -365,10 +365,10 @@ run_test "export: window to .timber bundle, import round trip" export_bundle_rou
 grep_entry_aware() {
     printf '2026-06-05T08:00:00 ERROR boom\n    at Frame.one\nCaused by: NEEDFRAME\n2026-06-05T08:00:01 INFO fine\n' > /tmp/entries.log
     # stdin: matching a continuation line prints the whole 3-line entry
-    [ "$(timberfs grep NEEDFRAME < /tmp/entries.log | wc -l)" = 3 ] \
-        && [ "$(timberfs grep -c -v ERROR < /tmp/entries.log)" = 1 ] \
-        && timberfs grep NEEDLE77AB31CD99 "$PIPE_BACKING/haystack.log" \
-               --has NEEDLE77AB31CD99 | grep -q "NEEDLE77AB31CD99"
+    [ "$(timber-filter --has NEEDFRAME < /tmp/entries.log | wc -l)" = 3 ] \
+        && [ "$(timber-filter -c --not-has ERROR < /tmp/entries.log)" = 1 ] \
+        && timber-filter --has NEEDLE77AB31CD99 "$PIPE_BACKING/haystack.log" \
+           | grep -q "NEEDLE77AB31CD99"
 }
 
 run_test "grain: reindex + --has finds a needle, skipping chunks" grain_needle_search
@@ -382,11 +382,10 @@ multi_file_fleet_view() {
     [ "$(echo "$OUT" | head -2 | grep -c 'one')" = 2 ] \
         && echo "$OUT" | head -1 | grep -q "hA.log:" \
         && echo "$OUT" | sed -n 2p | grep -q "hB.log:" \
-        && timberfs grep -c ERROR "$PIPE_BACKING/hA.log" "$PIPE_BACKING/hB.log" \
-           | grep -q "hB.log:1"
+        && [ "$(timber-filter --has ERROR -c "$PIPE_BACKING/hA.log" "$PIPE_BACKING/hB.log" 2>/dev/null)" = 1 ]
 }
 
-run_test "grep: entry-aware matching, stdin and grain-accelerated source" grep_entry_aware
+run_test "timber-filter: entry-aware matching, stdin and grain-accelerated source" grep_entry_aware
 forgotten_destination_refused() {
     # `import /logs/*` with no --into: a hard argument error, no matter
     # what the glob expanded to; and a plain-file --into is refused too
@@ -445,15 +444,17 @@ daily_bulk_load() {
 }
 
 grep_into_artifact() {
-    # the investigation as an artifact: matching entries + a bark that
-    # says what question produced it; readable in place as a bundle
+    # the investigation as an artifact: filter | import --records builds
+    # a store whose bark records the whole pipe; export bundles it
     printf '2026-06-11T10:00:00 ERROR tenant=FOO boom\n  at deep.Stack\n2026-06-11T10:00:01 INFO tenant=BAR fine\n' > /tmp/gi.log
     timberfs import /tmp/gi.log --into /tmp/gistore/app.log 2>/dev/null \
-        && timberfs grep 'tenant=FOO' /tmp/gistore/app.log --into /tmp/gicase.timber 2>/dev/null \
+        && timber-filter --records --has 'tenant=FOO' /tmp/gistore/app.log --quiet \
+           | timberfs import --records --into /tmp/gistore/case.log 2>/dev/null \
+        && timberfs export /tmp/gistore/case.log --into /tmp/gicase.timber 2>/dev/null \
         && [ "$(timberfs query /tmp/gicase.timber 2>/dev/null | wc -l)" = 2 ] \
         && timberfs query /tmp/gicase.timber 2>/dev/null | grep -q "deep.Stack" \
-        && tar xOf /tmp/gicase.timber gicase.bark | grep -q '"derived_op": "grep"' \
-        && tar xOf /tmp/gicase.timber gicase.bark | grep -q '"command": "timberfs grep '
+        && grep -q '"command": "timberfs import --records' /tmp/gistore/case.log.bark \
+        && grep -q '"stream_stages": "timber-filter .*tenant=FOO' /tmp/gistore/case.log.bark
 }
 
 run_test "write guards: forgotten destination after a glob is refused" forgotten_destination_refused
@@ -481,7 +482,7 @@ with open('/tmp/ts.log', 'w') as f:
 "         && timberfs import /tmp/ts.log --into "$PIPE_BACKING/ts.log" --chunk-size 4096 --quiet         && [ "$(timberfs query "$PIPE_BACKING/ts.log" --from '2026-06-12 09:10:00' --to '2026-06-12 09:10:04' 2>/dev/null | wc -l)" = 5 ]         && [ "$(timberfs query "$PIPE_BACKING/ts.log" --from '2026-06-12 09:10:00' --to '2026-06-12 09:10:04' --by-write-time 2>/dev/null | wc -l)" -gt 5 ]         && timberfs query "$PIPE_BACKING/ts.log" --from '2026-06-12 09:41:40' --to '2026-06-12 09:41:40' -0 2>/dev/null            | head -zn1 | grep -q "deep.Stack"         && timberfs query "$PIPE_BACKING/ts.log" --from '2026-06-12 09:10:00' --to '2026-06-12 09:10:00' --show-write-time 2>/dev/null            | grep -q '^\[w 2026-06-12'
 }
 
-run_test "grep --into: the investigation as an artifact" grep_into_artifact
+run_test "filter | import --records: the investigation as an artifact" grep_into_artifact
 run_test "time story: exact windows, raw escape, -0 records, annotation" time_story
 run_test "info: a store's vital signs on one screen" info_vital_signs
 run_test "apt-get purge removes package" purge_package

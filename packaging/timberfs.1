@@ -42,11 +42,6 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .IR TIME ]
 .IR FILE .\|.\|.
 .br
-.B timberfs grep
-.RI [ options ]
-.I PATTERN
-.RI [ FILE .\|.\|.]
-.br
 .B timberfs index
 .I FILE
 .br
@@ -471,7 +466,7 @@ the union of exact branches, still exact \(em and composes with
 .BR \-\-has .
 About 1% of non-matching chunks pass anyway (Bloom
 false positives) \(em the exact, entry-level filtering belongs in
-.B timberfs grep
+.BR timber\-filter (1)
 downstream. The killer use: finding a unique identifier with NO time
 bound.
 .PP
@@ -494,171 +489,32 @@ range is emitted in full, so the result carries at most flush-age worth of
 slop at each edge. The intended workflow is to let
 .B query
 do the coarse seek into a huge file, then trim exactly with
-.BR grep (1)
+.BR timber\-filter (1)
 on the timestamps the log lines carry anyway.
-.SS grep
-.B timberfs grep
-.I PATTERN
-.RI [ FILE ]
-is an entry-aware grep: a log ENTRY is a line carrying a timestamp plus
-all its continuation lines (stack traces, wrapped output), detected with
-the same timestamp auto-detection as
-.B import
-(and the same
-.BR \-\-timestamp\-regex / \-\-timestamp\-format
-escape hatch). The pattern is matched against the whole entry, and
-matching entries print whole; pipe several
-.B grep
-invocations for entry-level AND. Flags:
-.B \-i
-(case-insensitive),
-.B \-v
-(print non-matching entries),
-.B \-c
-(count matching entries).
-.PP
-The default matching mode is a
-.B literal at token boundaries
-(\(lqword mode\(rq: ERROR finds the word ERROR \(em [ERROR], \(lqERROR:\(rq
-\(em not ERRORS or PROTOCOLERROR). That is the
-.BR .grain 's
-own whole-token semantics, so on an indexed log the pattern's tokens
-pre-filter chunks
-.B automatically and exactly
-\(em
-.B grep 'FOO BAR ERROR'
-is
-.B \-\-has FOO \-\-has BAR \-\-has ERROR
-at chunk level, then \(lqthe entry contains the anchored phrase\(rq at
-entry level; an entry matching the phrase must contain every token
-whole, so the skip is conservative, never wrong. (For scattered
-word-AND instead of a phrase, use the pattern-less
-.B \-\-has
-form, or pipe greps.)
-The mode space is a 2x2 \(em interpretation times boundaries \(em with
-the default in the fast cell: literal + whole words = the bare
-positional (grep legacy),
-.B \-\-any TEXT
-(alternatives \(em OR) or
-.B \-\-has TEXT
-(requirements \(em AND); literal + anywhere
-(inside longer words too, for partial ids) =
-.BR \-\-substring=TEXT ;
-regexp =
-.BR \-\-regex=PATTERN .
-Each flag carries its text (space or
-.B =
-forms are identical), and repeating a flag alternates
-.RB ( \-\-any " ERROR"
-.B \-\-any FATAL
-matches either \(em and stays INDEXED: the union of exact branches is
-exact); the combinator is readable from the name: \-\-any ORs,
-\-\-has ANDs. Different kinds compose by AND, each narrowing the result (a
-multi-word
-.B \-\-substring
-literal still pre-filters on its INTERIOR words \(em a substring match
-requires them whole; only its edge words prove nothing);
-.B \-v
-never inverts a requirement, and
-.B \-i
-never loosens one \(em requirements stay exact-case, like the token
-index they ride.
-.B \-v
-inverts the whole pattern conjunction:
-.B both read every chunk, so don't reach for them unless you need them.
-.B \-i
-(the grain is exact-case) and
-.B \-v
-(non-matches must be read to be printed \(em an index proving \(lqno
-matches here\(rq means print the whole chunk, not skip it) also scan.
-Whenever a grain exists but cannot be used, a one-line note on standard
-error says why;
-.B \-\-scan
-forces the full scan.
-.PP
-Input is a raw log on standard input, a plain log file, or a timberfs
-log/bundle \(em in the timberfs case
-.BR \-\-from / \-\-to / \-\-has
-pre-select chunks first (time index and .grain Bloom filters), the
-selection is padded one chunk each way so entries straddling a boundary
-arrive whole, and the pattern then matches exactly:
+.SS searching
+Matching lives in its own tool:
+.BR timber\-filter (1),
+the entry-aware pipeline filter. A store argument is searched through
+the selection layer (it runs
+.B timberfs query \-\-records
+itself), so the fused and piped spellings are the same search:
 .PP
 .nf
 .RS
-timberfs grep req\-8f3a backing/app.log \-\-has req\-8f3a
-cat any.log | timberfs grep 'tenantId=FOO' | timberfs grep \-v DEBUG
-timberfs grep req\-8f3a collector/*.log \-\-has req\-8f3a
+timber\-filter \-\-has ERROR \-\-from 13:00 backing/app.log
+timberfs query \-\-records \-\-from 13:00 backing/app.log | timber\-filter \-\-has ERROR
 .RE
 .fi
 .PP
-Several files process in argument order with grep-style
-.RB \(lq path: \(rq
-line prefixes
-.RB ( \-\-no\-filename
-to suppress) and per-file counts under
-.BR \-c .
-.PP
-The
-.I PATTERN
-may be left out when
-.BR \-\-has / \-\-from / \-\-to
-select instead:
-.B timberfs grep \-\-has ERROR \-c backing/app.log
-counts the entries containing ERROR \(em the first argument, naming an
-existing file, is taken as the file, and entries containing every
-.B \-\-has
-phrase match (with a pure
-.BR \-\-from / \-\-to
-window, every entry in it). A note on standard error says what was
-matched. (Without this, the file would silently become the PATTERN \(em
-grep's first positional \(em and the resulting errors blamed stdin.)
-.PP
-.B \-\-has
-is the AND side of the algebra: each occurrence is a REQUIREMENT that
-every printed entry must satisfy \(em verified on the entry itself
-(word-anchored; a multi-word argument is a contiguous PHRASE), not only
-at chunk level, so the Bloom skip is an optimization, never a semantics
-change. Requirements are never touched by
-.BR \-v ,
-which inverts the pattern side only \(em so \(lqA and not B\(rq is
-.BR "\-\-has A \-v B" .
-Where pattern flags OR on repetition,
-.B \-\-has
-occurrences always AND. Requirements need no index and no timberfs
-source: on standard input or a plain file they filter entries just the
-same; on an indexed store they also skip chunks. A query of only
-requirements refuses
-.B \-v
-\(em there is no pattern to invert.
-.PP
-.B \-\-into
-.I DEST
-writes the matching entries into a NEW timberfs log (or
-.B .timber
-bundle) instead of printing them \(em the investigation shipped as an
-artifact, the third derivation after
-.B export
-and rotation. It takes exactly one timberfs source (lineage stays
-unambiguous); the artifact's bark records
-.B derived_from
-plus the operation, fully told:
-.B command
-(the invocation as typed \(em what question produced this),
-.B pattern
-and the requested window. Multiline entries stay glued, chunk windows
-come from the entries' own timestamps, and the result is a normal store:
-queryable, indexable, exportable, importable. Unlike
-.B export
-(verbatim chunk copies), entries are decompressed, matched and
-recompressed \(em cost follows the uncompressed window. A pattern that
-matches nothing yields an (empty) artifact attesting exactly that;
-.B \-\-fail\-on\-empty
-errors instead.
+The investigation-as-artifact workflow is a pipe into the records sink
+\(em the destination's manifest records the selection and every stage
+that shaped the data:
 .PP
 .nf
 .RS
-timberfs grep 'tenantId=FOO' backing/app.log \-\-from 13:00 \-\-to 14:10 \-\-into case.timber
-timberfs query case.timber | less        # attach case.timber to the ticket
+timber\-filter \-\-records \-\-has 'tenantId=FOO' \-\-from 13:00 backing/app.log |
+    timberfs import \-\-records \-\-into case/case.log
+timberfs export case/case.log \-\-into case.timber   # attach to the ticket
 .RE
 .fi
 .SS info
@@ -666,8 +522,7 @@ timberfs query case.timber | less        # attach case.timber to the ticket
 .I FILE
 shows a store's vital signs on one screen: identity and creation time,
 lineage (what it derives from, by which operation, over which requested
-window, and \(em for
-.B grep
+window, and \(em for records-sink
 artifacts \(em the command line that produced it, labelled
 .BR question ),
 declared provenance, logical size vs on-disk size and compression

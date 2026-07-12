@@ -70,8 +70,8 @@ Compared to `gzip -9` + `zgrep`, roughly:
 ```sh
 timberfs info backing/app.log                  # vital signs: size, ratio, time covered
 timberfs query backing/app.log --from "2026-07-10 13:40" --to "2026-07-10 14:10"
-timberfs grep ERROR backing/app.log --from 2026-07-10        # word-match, index-fast
-timberfs grep req-8f3a backing/app.log                       # request id, no time bound
+timber-filter --has ERROR backing/app.log --from 2026-07-10  # word-match, index-fast
+timber-filter --has req-8f3a backing/app.log                  # request id, no time bound
 timberfs query backing/app.log --from 13:40 --to 14:10 | grep -c 'tenantId=FOO'
 ```
 
@@ -85,18 +85,20 @@ records — a stack trace stays ONE record:
 
 ```sh
 # top 3 recurring exceptions, as whole stack traces
-timberfs grep -0 Exception backing/app.log --from 2026-07-10 \
+timber-filter -0 --substring Exception backing/app.log --from 2026-07-10 \
   | sort -z | uniq -zc | sort -znr | head -z -n 3 | tr '\0' '\n'
 ```
 
-For further trimming, `timberfs grep` (entry-aware) or plain `grep`/`awk`
+For further trimming, `timber-filter` (entry-aware) or plain `grep`/`awk`
 on the extract compose as always. When an investigation
 is done, ship it — with its provenance — as a single file:
 
 ```sh
-timberfs grep 'tenantId=FOO' backing/app.log --from 13:40 --to 14:10 --into case.timber
+timber-filter --records --has 'tenantId=FOO' backing/app.log --from 13:40 --to 14:10 \
+  | timberfs import --records --into case/case.log
+timberfs export case/case.log --into case.timber
 # case.timber is queryable in place, and records WHERE it came from and
-# WHAT question produced it (timberfs info case.timber). Attach to ticket.
+# WHAT pipeline produced it (timberfs info case/case.log). Attach to ticket.
 ```
 
 ### 3. Make it *the* logger (when you're ready)
@@ -179,37 +181,32 @@ grep ERROR logs/app.log
 timberfs query logs-backing/app.log --from 13:42 --to 13:43
 timberfs query logs-backing/app.log --from "2026-07-09 13:42:00" --to "2026-07-09 13:43:00"
 
-# entry-aware grep: matches whole log ENTRIES (a timestamped line plus
-# its continuations — stack traces stay attached); pipe for AND.
-# The default is WORD matching (ERROR, not ERRORS) — the .grain's own
-# semantics, so indexed logs skip chunks automatically and exactly
-timberfs grep ERROR logs-backing/app.log --from 13:42 --to 13:43
-cat any.log | timberfs grep 'tenantId=FOO' | timberfs grep -v DEBUG
+# entry-aware filtering lives in its own tool: timber-filter passes
+# whole log ENTRIES (a timestamped line plus its continuations — stack
+# traces stay attached) matching named predicates. Every flag carries
+# its kind, polarity and case rule in its name; nothing shape-shifts:
+#   Select (--has word / --substring / --regex) AND on repetition;
+#   --any alternatives OR; --not-* excludes; -caseless per predicate
+timber-filter --has ERROR logs-backing/app.log --from 13:42 --to 13:43
+timber-filter --any ERROR --any FATAL --not-has HealthCheck logs-backing/app.log
+timber-filter --has 'tenantId=FOO' --not-has DEBUG logs-backing/app.log  # and-not
+timber-filter --substring 8454XK logs-backing/app.log                    # partial id
+timber-filter --has FOO --substring-caseless 'connection reset' app.log  # mixed case rules
+timber-filter --has ERROR --has 1294737704 -c logs-backing/app.log       # requirements alone
 
-# the pattern may be left out when --has/--from/--to select instead:
-# entries containing every --has token (or the whole window) match
-timberfs grep --has ERROR -c logs-backing/app.log
+# exact word predicates ride the token index on stores — automatically,
+# and only where provably exact; a note says when a search runs unnarrowed
 
-# the search algebra — the combinator is readable from the flag's name:
-# --any ORs, --has ANDs (both word-anchored phrases, both indexed);
-# --substring reaches inside words, --regex is a regexp (both full-scan);
-# -v inverts patterns, never --has requirements:
-timberfs grep --any 'INFO TEST' --any 'DEBUG FOO' logs-backing/app.log   # either
-timberfs grep --has 'INFO TEST' --has 'DEBUG FOO' logs-backing/app.log   # both
-timberfs grep --has 'tenantId=FOO' -v DEBUG logs-backing/app.log         # and-not
-timberfs grep --substring 8454XK logs-backing/app.log                    # partial id
-timberfs grep --regex 'ERROR|FATAL' logs-backing/app.log                 # regexp
-
-# the investigation as an artifact: --into writes the matching entries
-# to a NEW store (or .timber bundle to attach to the ticket) whose .bark
-# records the command line, pattern, window and lineage — it says what
-# question produced it; an empty result is an (empty) artifact too
-timberfs grep 'tenantId=FOO' logs-backing/app.log --from 13:00 --into case.timber
+# the investigation as an artifact: pipe the filtered RECORD STREAM into
+# the sink — the new store's .bark records the selection and every
+# pipeline stage that shaped the data (an empty result is an artifact too)
+timber-filter --records --has 'tenantId=FOO' --from 13:00 logs-backing/app.log \
+  | timberfs import --records --into case/case.log
 
 # the fleet view: store one log per host/app, merge at READ time —
 # chunks interleave by time across files, lines carry "path:" prefixes
 timberfs query --from 13:42 --to 13:43 collector/host*-app.log
-timberfs grep req-8f3a collector/*.log --has req-8f3a   # which hosts saw it?
+timber-filter --has req-8f3a collector/*.log        # which hosts saw it?
 
 # the store's vital signs: identity, lineage, size/compression, time
 # covered, index coverage, writer state (--json for scripting)
@@ -517,7 +514,7 @@ fast ones, so that's the worst-case slop at the edges of the window.
 
 The intended workflow is: `timberfs query` does the coarse seek into a huge
 file (cheap, no parsing, immune to multiline entries and timestamp-less
-lines), then `timberfs grep` (entry-aware) or ordinary `grep`/`awk` on the
+lines), then `timber-filter` (entry-aware) or ordinary `grep`/`awk` on the
 small extract trims exactly using the timestamps the log lines carry
 anyway. The slop is a feature there:
 buffered loggers write lines slightly after the timestamp they print, so a
@@ -548,7 +545,7 @@ timberfs import huge.log --into logs-backing/app.log --index  # or declare+build
 timberfs reindex logs-backing/app.log          # or later: 2.7 GB indexed in ~6 s
 timberfs query logs-backing/app.log --has F454567068093ZHGZCL   # no time bound!
 timberfs query logs-backing/app.log --from 13:00 --to 14:00 --has ERROR \
-    | timberfs grep 'tenantId=FOO'
+    | timber-filter --has 'tenantId=FOO'
 ```
 
 Tokens are ASCII-alphanumeric runs of 3–64 characters, exact case,
@@ -558,7 +555,7 @@ chunk, ubiquitous ones skip nothing and cost only the test. `--has` is a
 separators (`req-8f3a`) must match all its tokens in the same chunk, AND
 across repeated `--has` flags is also chunk-level, and substrings of
 tokens do not match; exact, entry-level filtering stays downstream in
-`timberfs grep`. A false positive costs one needless chunk
+`timber-filter`. A false positive costs one needless chunk
 decompression. The design contract that made this a sidecar:
 
 **Custom indexes are sidecars**: one file per index next to the `.trunk`/`.rings` pair (the
