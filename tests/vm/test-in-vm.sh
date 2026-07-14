@@ -296,10 +296,31 @@ run_test "unmounted and not failed after stop" stopped_cleanly
 run_test "offline query after stop" offline_query_after_stop
 run_test "restart: data persisted" restart_persists
 run_test "appender: pipe 50k lines, query round-trip" appender_roundtrip
+records_sink_age_flush() {
+    # A records producer trickling below the chunk threshold, with the
+    # FIFO held open so `append --records` never sees EOF (the socket
+    # intake case): the age timer must make it durable mid-stream, not
+    # only when a chunk fills or at EOF.
+    mkfifo /tmp/rec.fifo
+    timberfs append --records --into "$PIPE_BACKING/rec.log" --flush-age 1 \
+        < /tmp/rec.fifo &
+    REC_PID=$!
+    exec 6>/tmp/rec.fifo
+    printf '2026-06-05T09:00:00 INFO trickle one\n' \
+        | timber-filter --records --quiet >&6
+    sleep 3
+    # queryable while the sink is STILL running (before we close the FIFO)
+    timberfs query "$PIPE_BACKING/rec.log" | grep -q "trickle one" || return 1
+    exec 6>&-
+    wait "$REC_PID" || return 1
+    rm -f /tmp/rec.fifo
+}
+
 run_test "appender: file lock blocks rotate while live" appender_lock_blocks_rotate
 run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
+run_test "records sink flushes by age, before EOF" records_sink_age_flush
 import_segment_merge() {
     # ship a rotated segment into an archive: verbatim merge, idempotent
     timberfs rotate "$PIPE_BACKING/imported.log" seg-old.log \

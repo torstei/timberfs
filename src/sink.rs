@@ -21,6 +21,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use serde_json::Value;
@@ -106,12 +110,12 @@ pub fn cmd_records_sink(
         crate::bark::save(&dir, &name, &map)?;
     }
 
-    let mut st = Store {
+    let st = Arc::new(Mutex::new(Store {
         dir: dir.clone(),
         cfg,
         files: BTreeMap::new(),
-    };
-    st.create(&name)?;
+    }));
+    st.lock().unwrap().create(&name)?;
 
     let reader: Box<dyn BufRead> = match source {
         Some(p) => Box::new(BufReader::new(
@@ -121,10 +125,49 @@ pub fn cmd_records_sink(
     };
     let mut rec_reader = Reader::new(reader);
 
-    let f = st.files.get_mut(&name).unwrap();
-    if matches!(delivery, Delivery::Atomic) {
-        f.stage();
+    let streaming = matches!(delivery, Delivery::Streaming);
+    if !streaming {
+        // Atomic (import): stage — nothing is visible until the commit.
+        st.lock().unwrap().files.get_mut(&name).unwrap().stage();
     }
+
+    // Streaming maintenance, exactly as `timberfs append`: once a second,
+    // flush any chunk older than flush_age_ms and enforce declared
+    // retention. A FIFO-fed streaming sink may never see EOF, so
+    // end-of-stream maintenance would otherwise never run — a quiet
+    // producer's data would sit unflushed (and undurable) until a chunk
+    // filled. NOT for atomic: staged data must not surface before commit,
+    // and an import is a bounded batch that maintains once at the end.
+    let stop = Arc::new(AtomicBool::new(false));
+    let maint = if streaming {
+        let st = Arc::clone(&st);
+        let stop = Arc::clone(&stop);
+        let dir = dir.clone();
+        let name = name.clone();
+        Some(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1000));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                st.lock().unwrap().flush_aged();
+                match crate::bark::declared_retention(&dir, &name) {
+                    Ok(policy) if policy.is_some() => {
+                        if let Err(e) = st.lock().unwrap().enforce_retention(
+                            &name,
+                            policy.max_age_ms,
+                            policy.max_comp_bytes,
+                        ) {
+                            eprintln!("timberfs: {name}: background retention failed: {e}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     let mut entries: u64 = 0;
     let mut carried: u64 = 0;
@@ -155,7 +198,18 @@ pub fn cmd_records_sink(
                         }
                     },
                 };
-                f.append_windowed(&e.payload, wf, wl, &st.cfg)?;
+                // Locked per record so the maintenance thread can flush
+                // while this thread blocks reading the next one.
+                let mut s = st.lock().unwrap();
+                let cfg = s.cfg;
+                if let Err(e) = s
+                    .files
+                    .get_mut(&name)
+                    .unwrap()
+                    .append_windowed(&e.payload, wf, wl, &cfg)
+                {
+                    break Err(anyhow::Error::from(e));
+                }
                 entries += 1;
             }
             Ok(Some(Rec::End(_))) => {}
@@ -164,24 +218,38 @@ pub fn cmd_records_sink(
         }
     };
 
-    match (&result, &delivery) {
-        (Ok(()), Delivery::Atomic) => f.commit_stage(&st.cfg)?,
-        (Ok(()), Delivery::Streaming) => {
-            f.flush_chunk(&st.cfg)?;
-            f.sync(&st.cfg)?;
-        }
-        (Err(_), Delivery::Atomic) => {
-            f.abort_stage()?;
-            return result.context("nothing imported — the store is unchanged (atomic sink)");
-        }
-        (Err(_), Delivery::Streaming) => {
-            f.flush_chunk(&st.cfg)?;
-            f.sync(&st.cfg)?;
-            return result.context(format!(
-                "{entries} entr{} received before the break are appended \
-                 (streaming sink; re-running may duplicate)",
-                if entries == 1 { "y" } else { "ies" }
-            ));
+    // Stop and join maintenance before the final flush/commit so it can't
+    // race the closing write.
+    stop.store(true, Ordering::Relaxed);
+    if let Some(h) = maint {
+        let _ = h.join();
+    }
+
+    {
+        let mut s = st.lock().unwrap();
+        let cfg = s.cfg;
+        let f = s.files.get_mut(&name).unwrap();
+        match (&result, &delivery) {
+            (Ok(()), Delivery::Atomic) => f.commit_stage(&cfg)?,
+            (Ok(()), Delivery::Streaming) => {
+                f.flush_chunk(&cfg)?;
+                f.sync(&cfg)?;
+            }
+            (Err(_), Delivery::Atomic) => {
+                f.abort_stage()?;
+                drop(s);
+                return result.context("nothing imported — the store is unchanged (atomic sink)");
+            }
+            (Err(_), Delivery::Streaming) => {
+                f.flush_chunk(&cfg)?;
+                f.sync(&cfg)?;
+                drop(s);
+                return result.context(format!(
+                    "{entries} entr{} received before the break are appended \
+                     (streaming sink; re-running may duplicate)",
+                    if entries == 1 { "y" } else { "ies" }
+                ));
+            }
         }
     }
 
@@ -220,12 +288,16 @@ pub fn cmd_records_sink(
     let map = crate::bark::with_identity(map)?;
     crate::bark::save(&dir, &name, &map)?;
 
-    // Declared retention and declared index, like every writer.
+    // Declared retention and declared index, like every writer. (For a
+    // streaming sink the maintenance thread already enforced retention
+    // as it ran; this is the final pass, and the only one for an import.)
     match crate::bark::declared_retention(&dir, &name) {
         Ok(policy) if policy.is_some() => {
-            if let Some(stats) =
-                st.enforce_retention(&name, policy.max_age_ms, policy.max_comp_bytes)?
-            {
+            if let Some(stats) = st.lock().unwrap().enforce_retention(
+                &name,
+                policy.max_age_ms,
+                policy.max_comp_bytes,
+            )? {
                 crate::note!(
                     "timberfs: {name}: retention dropped {} chunk(s), {} compressed bytes",
                     stats.chunks_moved,
@@ -240,16 +312,19 @@ pub fn cmd_records_sink(
         crate::grain::extend_grain(&dir, &name)?;
     }
 
-    let f = st.files.get(&name).unwrap();
-    let span = match (f.first_write_ms(), f.last_write_ms()) {
+    let (chunk_count, first, last) = {
+        let s = st.lock().unwrap();
+        let f = s.files.get(&name).unwrap();
+        (f.chunks.len(), f.first_write_ms(), f.last_write_ms())
+    };
+    let span = match (first, last) {
         (Some(a), Some(b)) => format!(", spanning {} .. {}", fmt_ms(a), fmt_ms(b)),
         _ => String::new(),
     };
     crate::note!(
         "timberfs: {name}: {entries} entr{} from the record stream \
-         ({carried} with their original write windows); now {} chunk(s){span}",
+         ({carried} with their original write windows); now {chunk_count} chunk(s){span}",
         if entries == 1 { "y" } else { "ies" },
-        f.chunks.len()
     );
     Ok(())
 }
