@@ -138,15 +138,45 @@ pub fn cmd_records_sink(
     // producer's data would sit unflushed (and undurable) until a chunk
     // filled. NOT for atomic: staged data must not surface before commit,
     // and an import is a bounded batch that maintains once at the end.
+    // SIGTERM/SIGINT (systemctl stop/restart, upgrades, Ctrl-C) must flush
+    // the buffer before the process dies — otherwise every restart of a
+    // socket-fed streaming sink loses whatever was buffered since the last
+    // age flush. The maintenance thread below performs that final flush and
+    // exits. Handlers are installed only for streaming: a killed atomic
+    // import must leave its staged data uncommitted (store unchanged).
+    if streaming {
+        crate::append::install_signal_handlers();
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let maint = if streaming {
         let st = Arc::clone(&st);
         let stop = Arc::clone(&stop);
         let dir = dir.clone();
         let name = name.clone();
+        let op = op.to_string();
         Some(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(1000));
+                // A graceful-stop signal: flush + sync everything, make sure
+                // the store carries its identity, and exit durably. The main
+                // thread is abandoned mid-read (the process is going away).
+                if crate::append::stopping() {
+                    let mut s = st.lock().unwrap();
+                    let cfg = s.cfg;
+                    let f = s.files.get_mut(&name).unwrap();
+                    let _ = f.flush_chunk(&cfg);
+                    let _ = f.sync(&cfg);
+                    drop(s);
+                    if crate::bark::load(&dir, &name).is_none() {
+                        if let Ok(m) =
+                            crate::bark::with_identity(crate::bark::derived_map(None, &op))
+                        {
+                            let _ = crate::bark::save(&dir, &name, &m);
+                        }
+                    }
+                    std::process::exit(0);
+                }
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }

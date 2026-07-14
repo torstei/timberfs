@@ -34,9 +34,16 @@ extern "C" fn on_signal(_sig: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// True once SIGTERM/SIGINT has been received — a graceful-stop request.
+/// The records sink (a long-lived streaming appender) polls this from its
+/// maintenance thread to flush before the process goes.
+pub fn stopping() -> bool {
+    STOP.load(Ordering::Relaxed)
+}
+
 /// SIGTERM/SIGINT set the stop flag; installed WITHOUT SA_RESTART so a
 /// blocking stdin read returns EINTR and the main loop notices promptly.
-fn install_signal_handlers() {
+pub fn install_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;

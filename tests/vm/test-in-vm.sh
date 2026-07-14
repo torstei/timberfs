@@ -321,6 +321,91 @@ run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
 run_test "records sink flushes by age, before EOF" records_sink_age_flush
+
+# The socket-activated log-intake units (timberfs-log@.socket/.service):
+# exercise the real thing — socket activation, records intake, the
+# drop-in override, and the robustness that is the whole point (a
+# service restart is invisible to the producer because systemd holds
+# the FIFO open O_RDWR).
+LOGINST=vmtest
+LOGSTORE=/var/log/timberfs/$LOGINST.log
+LOGPIPE=/run/timberfs/$LOGINST.pipe
+
+# Frame raw stamped lines as a timberfs-records(5) stream (what the
+# --records service expects on the FIFO).
+records() { timber-filter --records --quiet; }
+
+# Poll the store (up to ~15s) for a line — the intake is async: socket
+# activation starts the service, then the age timer flushes.
+store_has() {
+    local needle=$1 i=0
+    while [ "$i" -lt 15 ]; do
+        if timberfs query "$LOGSTORE" 2>/dev/null | grep -q "$needle"; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+socket_intake_setup() {
+    # /run/timberfs comes from the shipped tmpfiles.d at boot; the package
+    # was installed after boot here, so apply it now (the documented
+    # before-a-reboot step).
+    systemd-tmpfiles --create
+    test -d /run/timberfs || return 1
+    # An instance drop-in (also exercising the override path the docs lean
+    # on): keep the --records default, just flush fast so the test is quick.
+    mkdir -p "/etc/systemd/system/timberfs-log@$LOGINST.service.d"
+    cat > "/etc/systemd/system/timberfs-log@$LOGINST.service.d/override.conf" << 'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/timberfs append --records --into /var/log/timberfs/%i.log --flush-age 1
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "timberfs-log@$LOGINST.socket"
+    test -p "$LOGPIPE"
+}
+
+socket_intake_receives() {
+    printf '2026-06-05T09:00:00 INFO socket alpha\n2026-06-05T09:00:01 INFO socket beta\n' \
+        | records > "$LOGPIPE"
+    # first write socket-activates the service; the age timer makes it durable
+    store_has "socket alpha" || return 1
+    timberfs query "$LOGSTORE" | grep -q "socket beta" || return 1
+    systemctl --quiet is-active "timberfs-log@$LOGINST.service"
+}
+
+socket_intake_survives_restart() {
+    # A long-lived producer holds the FIFO open; bounce the service under
+    # it. systemd keeps the read end (O_RDWR), so the write straddling the
+    # restart must NOT get EPIPE, and both entries must land.
+    exec 8>"$LOGPIPE"
+    if ! printf '2026-06-05T09:02:00 INFO before restart\n' | records >&8; then
+        exec 8>&-
+        return 1
+    fi
+    systemctl restart "timberfs-log@$LOGINST.service"
+    if ! printf '2026-06-05T09:02:01 INFO after restart\n' | records >&8; then
+        exec 8>&-
+        return 1
+    fi
+    exec 8>&-
+    store_has "after restart" || return 1
+    timberfs query "$LOGSTORE" | grep -q "before restart"
+}
+
+socket_intake_stop_removes_fifo() {
+    systemctl stop "timberfs-log@$LOGINST.socket"
+    # RemoveOnStop=yes drops the FIFO node from /run
+    test ! -e "$LOGPIPE"
+}
+
+run_test "socket intake: tmpfiles + drop-in, socket enabled, FIFO created" socket_intake_setup
+run_test "socket intake: records stream lands in the store" socket_intake_receives
+run_test "socket intake: producer survives a service restart" socket_intake_survives_restart
+run_test "socket intake: stop removes the FIFO" socket_intake_stop_removes_fifo
 import_segment_merge() {
     # ship a rotated segment into an archive: verbatim merge, idempotent
     timberfs rotate "$PIPE_BACKING/imported.log" seg-old.log \
