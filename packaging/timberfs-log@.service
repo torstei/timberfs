@@ -1,0 +1,37 @@
+# Systemd template for a supervised timberfs log intake (see timberfs-log@.socket).
+#
+# Drains the instance's FIFO (passed as stdin by the socket unit) into a store
+# at /var/log/timberfs/<instance>.log. Override the store path or add retention
+# with a drop-in:
+#
+#   systemctl edit timberfs-log@applogs.service
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/bin/timberfs append --records --into /srv/logs/applogs.log --retain 30d
+#
+# This is socket-activated: enable the .socket, not this unit. The first write
+# starts it and Restart=always keeps it up; a restart or upgrade is invisible to
+# the producer because the socket holds the FIFO open across it.
+
+[Unit]
+Description=timberfs log intake (%i)
+Documentation=https://github.com/torstei/timberfs
+Requires=timberfs-log@%i.socket
+After=timberfs-log@%i.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/timberfs append --records --into /var/log/timberfs/%i.log
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+
+# Creates and owns /var/log/timberfs (0755) — where the .trunk/.rings/.bark live.
+LogsDirectory=timberfs
+
+# A crash or upgrade of this unit is invisible to the producer (the socket holds
+# the FIFO open): come back and keep draining.
+Restart=always
+RestartSec=1
+
+# No [Install] section: this is socket-activated. Enable the .socket.

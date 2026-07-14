@@ -611,6 +611,21 @@ a config in `/etc/timberfs/<instance>.conf` (see
 `systemctl enable --now timberfs@<instance>` to mount at boot. Stopping the
 unit unmounts first, so the daemon flushes everything and exits cleanly.
 
+It also installs a socket-activated **log-intake** pair,
+`timberfs-log@.socket` + `timberfs-log@.service`, for the pipe pattern without
+a mount: the socket creates `/run/timberfs/<instance>.pipe` and holds it open
+`O_RDWR`, so a producer writing the FIFO is undisturbed while the appender
+(`timberfs append --records --into /var/log/timberfs/<instance>.log`) restarts
+or upgrades under it — writes just buffer in the pipe and drain when it returns.
+
+```sh
+systemctl enable --now timberfs-log@applogs.socket   # then write /run/timberfs/applogs.pipe
+```
+
+Override the store path or add retention with `systemctl edit
+timberfs-log@<instance>.service`. (For an immediate first use before a reboot,
+`systemd-tmpfiles --create` creates `/run/timberfs`.)
+
 ## Ideas / future work
 
 - **More `.bark`**: an `annotate` command for existing logs, attribution

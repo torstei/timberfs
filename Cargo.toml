@@ -52,8 +52,9 @@ write-time index, so "give me what was written between 13:42 and 13:43" \
 is a binary search plus a few frame decompressions regardless of file \
 size. Includes time-based rotation and retention that relocate compressed \
 frames verbatim, and the data files remain recoverable with stock zstd. \
-Ships a systemd template unit (timberfs@.service) for mounting instances \
-at boot."""
+Ships systemd template units: timberfs@.service for mounting instances at \
+boot, and a socket-activated timberfs-log@.socket/.service pair for streaming \
+a producer's logs into a store over a FIFO."""
 assets = [
     ["target/release/timberfs", "usr/bin/", "755"],
     ["target/release/timber-filter", "usr/bin/", "755"],
@@ -62,6 +63,9 @@ assets = [
     ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
     ["README.md", "usr/share/doc/timberfs/README.md", "644"],
     ["packaging/timberfs@.service", "lib/systemd/system/timberfs@.service", "644"],
+    ["packaging/timberfs-log@.socket", "lib/systemd/system/timberfs-log@.socket", "644"],
+    ["packaging/timberfs-log@.service", "lib/systemd/system/timberfs-log@.service", "644"],
+    ["packaging/timberfs-tmpfiles.conf", "usr/lib/tmpfiles.d/timberfs.conf", "644"],
     ["packaging/timberfs.conf.example", "usr/share/doc/timberfs/examples/timberfs.conf.example", "644"],
     ["packaging/etc-README", "etc/timberfs/README", "644"],
 ]

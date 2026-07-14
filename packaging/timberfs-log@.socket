@@ -1,0 +1,32 @@
+# Systemd socket template for a supervised timberfs log intake.
+#
+# Pairs with timberfs-log@.service to drain a FIFO into a store — the
+# svlogd/s6-log pattern, but with a supervisor that survives restarts on BOTH
+# sides. systemd creates the FIFO and opens it O_RDWR, holding a read end for as
+# long as this socket is up, so the consumer service can crash, upgrade or
+# restart without the producer (whatever writes the FIFO) ever seeing EOF or
+# EPIPE: writes buffer in the kernel pipe and drain when it returns.
+#
+#   # /run/timberfs must exist first — the shipped tmpfiles.d handles it at boot;
+#   # for an immediate first use before a reboot: systemd-tmpfiles --create
+#   systemctl enable --now timberfs-log@applogs.socket
+#
+# Then point a producer at /run/timberfs/applogs.pipe (an app that speaks the
+# records format, or e.g.  mydaemon 2>&1 > /run/timberfs/applogs.pipe).
+
+[Unit]
+Description=timberfs log intake FIFO (%i)
+Documentation=https://github.com/torstei/timberfs
+
+[Socket]
+ListenFIFO=/run/timberfs/%i.pipe
+SocketMode=0660
+# The producer must be able to write the FIFO; override the group to match the
+# user your producer runs as:  systemctl edit timberfs-log@%i.socket
+#SocketGroup=
+
+# Drop the FIFO node from /run when the socket is stopped.
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
