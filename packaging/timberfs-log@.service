@@ -1,8 +1,10 @@
 # Systemd template for a supervised timberfs log intake (see timberfs-log@.socket).
 #
 # Drains the instance's FIFO (passed as stdin by the socket unit) into a store
-# at /var/log/timberfs/<instance>.log. Override the store path or add retention
-# with a drop-in:
+# at /var/log/timberfs/<instance>.log. The producer must write a
+# timberfs-records(5) stream (that is what --records means); to archive a
+# plain-text source instead, drop --records from ExecStart. Override the store
+# path, add retention, or change the format with a drop-in:
 #
 #   systemctl edit timberfs-log@applogs.service
 #     [Service]

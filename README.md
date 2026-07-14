@@ -612,19 +612,32 @@ a config in `/etc/timberfs/<instance>.conf` (see
 unit unmounts first, so the daemon flushes everything and exits cleanly.
 
 It also installs a socket-activated **log-intake** pair,
-`timberfs-log@.socket` + `timberfs-log@.service`, for the pipe pattern without
-a mount: the socket creates `/run/timberfs/<instance>.pipe` and holds it open
-`O_RDWR`, so a producer writing the FIFO is undisturbed while the appender
+`timberfs-log@.socket` + `timberfs-log@.service`, for streaming into a store
+without a mount: the socket creates `/run/timberfs/<instance>.pipe` and holds it
+open `O_RDWR`, so a producer is undisturbed while the appender
 (`timberfs append --records --into /var/log/timberfs/<instance>.log`) restarts
 or upgrades under it — writes just buffer in the pipe and drain when it returns.
 
+The service drains the FIFO with `append --records`, so the producer writes a
+[timberfs-records(5)](packaging/timberfs-records.5) stream, not raw text — the
+intended fit for a records-format logging writer that frames its own events and
+timestamps. (To archive a plain-text source, drop `--records` via the drop-in
+below.)
+
 ```sh
-systemctl enable --now timberfs-log@applogs.socket   # then write /run/timberfs/applogs.pipe
+systemctl enable --now timberfs-log@applogs.socket   # then a records producer writes /run/timberfs/applogs.pipe
 ```
 
-Override the store path or add retention with `systemctl edit
-timberfs-log@<instance>.service`. (For an immediate first use before a reboot,
-`systemd-tmpfiles --create` creates `/run/timberfs`.)
+The FIFO is created `root:root` mode 0660, so a **non-root producer needs the
+group set** — there's no universal default, so do it per instance:
+
+```sh
+systemctl edit timberfs-log@applogs.socket     # [Socket] / SocketGroup=myapp
+```
+
+Override the store path or add retention (or drop `--records` for a plain-text
+source) with `systemctl edit timberfs-log@<instance>.service`. (For an immediate
+first use before a reboot, `systemd-tmpfiles --create` creates `/run/timberfs`.)
 
 ## Ideas / future work
 
