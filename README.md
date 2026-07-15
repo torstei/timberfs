@@ -615,8 +615,10 @@ It also installs a socket-activated **log-intake** pair,
 `timberfs-log@.socket` + `timberfs-log@.service`, for streaming into a store
 without a mount: the socket creates `/run/timberfs/<instance>.pipe` and holds it
 open `O_RDWR`, so a producer is undisturbed while the appender
-(`timberfs append --records --into /var/log/timberfs/<instance>.log`) restarts
-or upgrades under it — writes just buffer in the pipe and drain when it returns.
+(`timberfs append --records --into /var/log/timberfs/<instance>/<instance>.log`)
+restarts or upgrades under it — writes just buffer in the pipe and drain when it
+returns. Each instance gets its own directory, so instances can be owned and
+managed independently.
 
 The service drains the FIFO with `append --records`, so the producer writes a
 [timberfs-records(5)](packaging/timberfs-records.5) stream, not raw text — the
