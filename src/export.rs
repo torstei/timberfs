@@ -77,7 +77,8 @@ fn write_pair(
     selected: &[ChunkRecord],
 ) -> anyhow::Result<()> {
     let (ddir, dname) = resolve_backing(dest)?;
-    fs::create_dir_all(&ddir)?;
+    fs::create_dir_all(&ddir)
+        .with_context(|| format!("creating destination directory {}", ddir.display()))?;
     let _dir_lock = store::lock_backing_shared(&ddir)?.with_context(|| {
         format!(
             "destination directory {} is served by a timberfs mount",
@@ -270,7 +271,8 @@ pub fn cmd_export(
     } else {
         write_pair(dest, &rings_bytes, &src_trunk, &selected)?;
         let (ddir, dname) = resolve_backing(dest)?;
-        fs::write(format::bark_path(&ddir, &dname), bark_text)?;
+        fs::write(format::bark_path(&ddir, &dname), bark_text)
+            .with_context(|| format!("writing manifest for {dname}"))?;
     }
     match (selected.first(), selected.last()) {
         (Some(first), Some(last)) => crate::note!(

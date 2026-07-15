@@ -167,7 +167,8 @@ fn verify_prefix(
     quick: bool,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::FileExt;
-    let trunk = File::open(trunk_path)?;
+    let trunk =
+        File::open(trunk_path).with_context(|| format!("opening {}", trunk_path.display()))?;
     let picks: Vec<usize> = if quick && chunks.len() > 3 {
         vec![0, chunks.len() / 2, chunks.len() - 1]
     } else {
@@ -177,7 +178,8 @@ fn verify_prefix(
         let c = chunks[i];
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
-        let imported = zstd::stream::decode_all(&comp[..])?;
+        let imported = zstd::stream::decode_all(&comp[..])
+            .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
         let mut current = vec![0u8; c.uncomp_len as usize];
         src.read_exact_at(&mut current, c.uncomp_start)
             .context("reading the source range matching already-imported data")?;
@@ -218,7 +220,8 @@ fn overlap_line_counts(
     t0: u64,
 ) -> anyhow::Result<HashMap<u128, u32>> {
     use std::os::unix::fs::FileExt;
-    let trunk = File::open(trunk_path)?;
+    let trunk =
+        File::open(trunk_path).with_context(|| format!("opening {}", trunk_path.display()))?;
     let decomp = |c: &crate::format::ChunkRecord| -> anyhow::Result<Vec<u8>> {
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
@@ -408,7 +411,8 @@ pub fn cmd_import(
     }
     crate::query::ensure_dest_is_not_plain_file(dest, "import")?;
     let (dir, name) = resolve_backing(dest)?;
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("creating backing directory {}", dir.display()))?;
     // Flags override the store's DECLARED format (timestamp_regex /
     // timestamp_format / timestamp_utc in the manifest) — declare once,
     // and every later import of an exotic format is flag-free.
@@ -540,7 +544,8 @@ pub fn cmd_import(
                              already imported — rotated or truncated file? import it to a new target"
                         );
                     }
-                    let src = File::open(src_path)?;
+                    let src = File::open(src_path)
+                        .with_context(|| format!("opening source {}", src_path.display()))?;
                     verify_prefix(
                         &f.chunks,
                         &crate::format::trunk_path(&dir, &name),

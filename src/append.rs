@@ -202,7 +202,8 @@ pub fn cmd_append(
     }
     crate::query::ensure_dest_is_not_plain_file(target, "append")?;
     let (dir, name) = resolve_backing(target)?;
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("creating backing directory {}", dir.display()))?;
 
     let _dir_lock = match store::lock_backing_shared(&dir)? {
         Some(f) => f,

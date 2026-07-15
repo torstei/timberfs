@@ -129,7 +129,7 @@ impl Grain {
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Grain> {
-    let buf = fs::read(path)?;
+    let buf = fs::read(path).with_context(|| format!("reading grain index {}", path.display()))?;
     if buf.len() < HEADER_LEN || &buf[..8] != GRAIN_MAGIC {
         bail!("{} is not a grain index (bad magic)", path.display());
     }
@@ -208,7 +208,8 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     if covered == records.len() {
         return Ok(());
     }
-    let trunk = File::open(format::trunk_path(dir, name))?;
+    let trunk = File::open(format::trunk_path(dir, name))
+        .with_context(|| format!("opening {}", format::trunk_path(dir, name).display()))?;
     let out = OpenOptions::new().write(true).open(&gpath)?;
     out.set_len(off as u64)?;
     let mut woff = off as u64;
@@ -216,7 +217,8 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     for c in &records[covered..] {
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
-        let data = zstd::stream::decode_all(&comp[..])?;
+        let data = zstd::stream::decode_all(&comp[..])
+            .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
         let tokens = tokenize(&data);
         total_tokens += tokens.len() as u64;
         let filter = build_filter(&tokens);
@@ -239,7 +241,8 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
 pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     let rings_p = format::rings_path(dir, name);
     let records = format::read_index(&rings_p)?;
-    let trunk = File::open(format::trunk_path(dir, name))?;
+    let trunk = File::open(format::trunk_path(dir, name))
+        .with_context(|| format!("opening {}", format::trunk_path(dir, name).display()))?;
     let tmp = dir.join(format!("{name}.{}.tmp", format::GRAIN_EXT));
     let out = OpenOptions::new()
         .write(true)
@@ -260,7 +263,8 @@ pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     for (i, c) in records.iter().enumerate() {
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
-        let data = zstd::stream::decode_all(&comp[..])?;
+        let data = zstd::stream::decode_all(&comp[..])
+            .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
         let tokens = tokenize(&data);
         total_tokens += tokens.len() as u64;
         let filter = build_filter(&tokens);
@@ -279,7 +283,12 @@ pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         }
     }
     out.sync_all()?;
-    fs::rename(&tmp, format::grain_path(dir, name))?;
+    fs::rename(&tmp, format::grain_path(dir, name)).with_context(|| {
+        format!(
+            "installing grain index {}",
+            format::grain_path(dir, name).display()
+        )
+    })?;
     crate::note!(
         "timberfs: indexed {} chunk(s), {} distinct tokens ({} avg/chunk), grain is {} bytes \
          ({} bytes/chunk avg)",

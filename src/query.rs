@@ -198,7 +198,8 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
     }
     let records =
         format::read_index(&rings).with_context(|| format!("reading index {}", rings.display()))?;
-    let file = File::open(format::trunk_path(&dir, &base))?;
+    let file = File::open(format::trunk_path(&dir, &base))
+        .with_context(|| format!("opening {}", format::trunk_path(&dir, &base).display()))?;
     let bark = crate::bark::load(&dir, &base);
     Ok(SourceHandle {
         records,
@@ -533,7 +534,8 @@ fn query_single(
     for (_, c) in &selected {
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
-        let data = zstd::stream::decode_all(&comp[..])?;
+        let data = zstd::stream::decode_all(&comp[..])
+            .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
         out.write_all(&data)?;
         uncomp_total += c.uncomp_len;
     }
@@ -612,7 +614,8 @@ fn query_multi(
         s.pos += 1;
         let mut comp = vec![0u8; c.comp_len as usize];
         s.file.read_exact_at(&mut comp, c.comp_start)?;
-        let data = zstd::stream::decode_all(&comp[..])?;
+        let data = zstd::stream::decode_all(&comp[..])
+            .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
         if no_filename {
             out.write_all(&data)?;
         } else {
