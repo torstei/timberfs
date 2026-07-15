@@ -168,17 +168,20 @@ pub fn cmd_records_sink(
                 // identity, and exit durably. The main thread is abandoned
                 // mid-read (the process is going away).
                 if crate::append::stopping() {
-                    let mut s = st.lock().unwrap();
-                    let cfg = s.cfg;
-                    let f = s.files.get_mut(&name).unwrap();
-                    let _ = f.flush_chunk(&cfg);
-                    let _ = f.sync(&cfg);
-                    // Grain last, with the lock still held so the (abandoned)
-                    // main thread can't append underneath it.
+                    {
+                        let mut s = st.lock().unwrap();
+                        let cfg = s.cfg;
+                        let f = s.files.get_mut(&name).unwrap();
+                        let _ = f.flush_chunk(&cfg);
+                        let _ = f.sync(&cfg);
+                    }
+                    // Grain after releasing the lock: extend_grain only reads
+                    // committed chunks and owns the grain, so it needn't (and
+                    // shouldn't) hold the lock — a full rebuild here would
+                    // otherwise delay shutdown past systemd's stop timeout.
                     if crate::bark::index_declared(&dir, &name) {
                         let _ = crate::grain::extend_grain(&dir, &name);
                     }
-                    drop(s);
                     if crate::bark::load(&dir, &name).is_none() {
                         if let Ok(m) =
                             crate::bark::with_identity(crate::bark::derived_map(None, &op))
@@ -207,8 +210,13 @@ pub fn cmd_records_sink(
                 // Keep the declared index current while streaming: extend the
                 // grain whenever the flushed-chunk set changed (a flush added
                 // chunks, or retention dropped some and deleted the grain).
-                // The lock is held across the extend so the reader can't
-                // append into files it is scanning.
+                // Deliberately NOT holding the store lock: extend_grain reads
+                // only committed, immutable chunks and is the sole writer of
+                // the grain, so it can't race the append thread (which only
+                // appends new chunks and never touches the grain). This
+                // matters — a missing grain triggers a full rebuild, and
+                // holding the lock through that would stall ingestion for as
+                // long as the rebuild takes.
                 let cur = st
                     .lock()
                     .unwrap()
@@ -217,7 +225,6 @@ pub fn cmd_records_sink(
                     .map(|f| f.chunks.len())
                     .unwrap_or(0);
                 if cur != indexed_chunks && crate::bark::index_declared(&dir, &name) {
-                    let _guard = st.lock().unwrap();
                     match crate::grain::extend_grain(&dir, &name) {
                         Ok(()) => indexed_chunks = cur,
                         Err(e) => {
