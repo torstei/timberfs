@@ -6,10 +6,17 @@
 //! nothing here is persisted; chunks are selected by the write-time rings
 //! and entries are verified against the asked window on the fly.
 
+use std::cell::Cell;
 use std::io::{self, Write};
+use std::rc::Rc;
 
 use crate::import::Extractor;
 use crate::query::fmt_ms;
+
+/// A shared entry cap: (running count across all sinks that share it, max).
+/// Once the count reaches max, sinks stop emitting — a total --max across
+/// interleaved sources.
+pub type EntryLimit = (Rc<Cell<u64>>, u64);
 
 /// A timestamp-less flood can't balloon memory (same cap as grep).
 const ENTRY_CAP: usize = 16 << 20;
@@ -43,6 +50,8 @@ pub struct EntrySink {
     /// Logline window to verify entries against; None = framing only.
     window: Option<(u64, u64)>,
     framing: Framing,
+    /// Optional total-entries cap (--max), shared across sibling sinks.
+    limit: Option<EntryLimit>,
     display: String,
 
     line: Vec<u8>,
@@ -63,12 +72,14 @@ impl EntrySink {
         extractor: Extractor,
         window: Option<(u64, u64)>,
         framing: Framing,
+        limit: Option<EntryLimit>,
         display: &str,
     ) -> EntrySink {
         EntrySink {
             extractor,
             window,
             framing,
+            limit,
             display: display.to_string(),
             line: Vec::new(),
             entry: Vec::new(),
@@ -157,6 +168,15 @@ impl EntrySink {
         if !keep {
             self.filtered_out += 1;
             return Ok(());
+        }
+        // --max: once the shared count hits the cap, drop silently (the
+        // read loop stops feeding chunks, but a chunk in flight can still
+        // hold entries past the limit).
+        if let Some((count, max)) = &self.limit {
+            if count.get() >= *max {
+                return Ok(());
+            }
+            count.set(count.get() + 1);
         }
         self.emitted += 1;
 

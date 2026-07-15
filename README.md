@@ -75,6 +75,19 @@ timber-filter --has req-8f3a backing/app.log                  # request id, no t
 timberfs query backing/app.log --from 13:40 --to 14:10 | grep -c 'tenantId=FOO'
 ```
 
+To watch a store fill live — the socket-intake case, where nothing is mounted —
+`-f`/`--follow` streams new entries as they're committed, `--tail N` shows the
+last N entries first, and `--max N` caps the output (a hard `head`-style limit,
+also on `timber-filter`). A follow is only as live as the writer's `--flush-age`
+(it sees flushed chunks, not the still-buffered tail), and plain-text follow
+streams raw for a true `tail -f` feel:
+
+```sh
+timberfs query /var/log/timberfs/nginx/nginx.log --tail 20 -f   # last 20, then follow
+timberfs query backing/app.log --from 13:40 --max 100           # first 100 in the window
+timber-filter --has ERROR backing/app.log --max 50              # first 50 matches, then stop
+```
+
 Queries answer **in the timestamps you can see**: chunks are selected by
 the write-time index (widened a little), then every entry is verified
 against `--from/--to` by the timestamp its own line carries — so asking

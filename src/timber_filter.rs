@@ -104,6 +104,9 @@ struct Cli {
     /// Print only the number of matching entries
     #[arg(short = 'c', long, help_heading = HEAD_OUTPUT)]
     count: bool,
+    /// Stop after at most N matching entries (a hard cap, like head -n)
+    #[arg(long, value_name = "N", help_heading = HEAD_OUTPUT)]
+    max: Option<u64>,
     /// NUL-terminated entry records (multiline entries stay one record)
     #[arg(short = '0', long = "null", help_heading = HEAD_OUTPUT)]
     null_sep: bool,
@@ -289,6 +292,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         sources: files.len().max(1),
         matched: 0,
         filtered: 0,
+        max: cli.max,
         end_extra: String::new(),
         out: io::BufWriter::new(io::stdout().lock()),
     };
@@ -320,9 +324,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         let note_unselected =
             has.is_empty() && pushdown.is_empty() && any_pushdown.is_empty() && !windowed;
         grep_records(stdout, &preds, note_unselected, &mut sink)?;
-        let status = child.wait()?;
-        if !status.success() {
-            bail!("timberfs query failed");
+        if sink.at_cap() {
+            // --max satisfied: we stopped reading early, so the child sees a
+            // broken pipe and exits non-zero. That's expected, not a failure.
+            let _ = child.kill();
+            let _ = child.wait();
+        } else {
+            let status = child.wait()?;
+            if !status.success() {
+                bail!("timberfs query failed");
+            }
         }
     } else if files.is_empty() {
         // stdin: a record stream or raw text — sniffed by the only
@@ -348,6 +359,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             };
             let extractor = extractor(&cli)?;
             grep_raw(BufReader::new(file), extractor, label, &preds, &mut sink)?;
+            if sink.at_cap() {
+                break;
+            }
         }
     }
 
@@ -385,6 +399,8 @@ struct Sink<W: Write> {
     sources: usize,
     matched: u64,
     filtered: u64,
+    /// --max: stop after this many matching entries (a hard cap).
+    max: Option<u64>,
     /// chunks_read/chunks_total passthrough from an upstream
     /// stream-end, preformatted (leading US), when known.
     end_extra: String,
@@ -413,6 +429,11 @@ fn stage_echo() -> String {
 }
 
 impl<W: Write> Sink<W> {
+    /// --max reached: the caller should stop feeding entries.
+    fn at_cap(&self) -> bool {
+        self.max.is_some_and(|m| self.matched >= m)
+    }
+
     /// Open the outgoing record stream: pass an upstream stream-start's
     /// fields through verbatim (or synthesize v=1 for raw input), then
     /// append this stage's own command line to the lineage.
@@ -582,6 +603,9 @@ fn grep_raw<R: BufRead, W: Write>(
                 None
             };
             sink.emit_meta(&entry, label.as_deref(), None, ts)?;
+            if sink.at_cap() {
+                break;
+            }
         } else {
             sink.filtered += 1;
         }
@@ -670,6 +694,9 @@ fn grep_records<R: BufRead, W: Write>(
                         Some(body),
                         None,
                     )?;
+                    if sink.at_cap() {
+                        break;
+                    }
                 } else {
                     sink.filtered += 1;
                 }
@@ -683,7 +710,9 @@ fn grep_records<R: BufRead, W: Write>(
             _ => {} // forward compatibility: unknown kinds are ignored
         }
     }
-    if !complete {
+    // A missing stream-end normally means truncation — but not when WE
+    // stopped early to satisfy --max; that's a deliberate, complete result.
+    if !complete && !sink.at_cap() {
         bail!(
             "record stream truncated — no stream-end (producer died or pipe \
              broke); the result above is incomplete"

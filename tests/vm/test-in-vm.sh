@@ -346,6 +346,50 @@ run_test "appender: --retain-size 16K budget enforced" retain_size_budget
 run_test "info/query: read-only, work for a non-root reader" info_readonly_nonroot
 run_test "records sink flushes by age, before EOF" records_sink_age_flush
 
+query_max_and_tail() {
+    # --max is an exact hard cap; --tail is chunk-granular last-N entries.
+    # A small chunk size spreads 40 lines over several chunks so --tail
+    # selects a proper suffix, not the whole store.
+    seq 1 40 | sed 's/^/2026-06-08T08:00:00 INFO line /' > /tmp/hl.src
+    timberfs import /tmp/hl.src --into "$PIPE_BACKING/hl.log" --chunk-size 512 --quiet
+    [ "$(timberfs query "$PIPE_BACKING/hl.log" | wc -l)" = 40 ] || return 1
+    # exact cap
+    [ "$(timberfs query "$PIPE_BACKING/hl.log" --max 5 | wc -l)" = 5 ] || return 1
+    [ "$(timber-filter "$PIPE_BACKING/hl.log" --max 7 | wc -l)" = 7 ] || return 1
+    # --tail: at least N, fewer than all (multi-chunk), includes the last entry
+    local n
+    n=$(timberfs query "$PIPE_BACKING/hl.log" --tail 3 | wc -l)
+    [ "$n" -ge 3 ] && [ "$n" -lt 40 ] || return 1
+    timberfs query "$PIPE_BACKING/hl.log" --tail 3 | tail -1 | grep -q "line 40"
+}
+
+query_follow_live() {
+    # A live appender (FIFO held open, fast flush). --follow must pick up
+    # entries written AFTER it starts, and not replay ones from before.
+    mkfifo /tmp/fl.fifo
+    timberfs append --into "$PIPE_BACKING/fl.log" --flush-age 1 < /tmp/fl.fifo &
+    local ap=$!
+    exec 6>/tmp/fl.fifo
+    printf '2026-06-08T08:00:00 INFO seed-line\n' >&6
+    sleep 2
+    timberfs query "$PIPE_BACKING/fl.log" --follow > /tmp/fl.out 2>/dev/null &
+    local fp=$!
+    sleep 1
+    printf '2026-06-08T08:00:01 INFO live-a\n2026-06-08T08:00:02 INFO live-b\n' >&6
+    local got=""
+    for _ in $(seq 1 12); do
+        sleep 1
+        grep -q live-b /tmp/fl.out && { got=yes; break; }
+    done
+    kill "$fp" 2>/dev/null; wait "$fp" 2>/dev/null
+    exec 6>&-; kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null
+    rm -f /tmp/fl.fifo
+    [ "$got" = yes ] && grep -q live-a /tmp/fl.out && ! grep -q seed-line /tmp/fl.out
+}
+
+run_test "query --max caps exactly; --tail is entry-granular" query_max_and_tail
+run_test "query --follow streams new entries live" query_follow_live
+
 # The socket-activated log-intake units (timberfs-log@.socket/.service):
 # exercise the real thing — socket activation, records intake, the
 # drop-in override, and the robustness that is the whole point (a

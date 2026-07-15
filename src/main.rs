@@ -263,6 +263,22 @@ enum Command {
             conflicts_with_all = ["null_sep", "show_write_time", "by_write_time", "no_filename"]
         )]
         records: bool,
+        /// Follow the store: after the selected output, keep emitting entries
+        /// as they are committed, until interrupted (like tail -f). A flushed
+        /// chunk is the unit of visibility, so new data surfaces within the
+        /// writer's --flush-age (default 5s), not instantly.
+        #[arg(short = 'f', long, conflicts_with_all = ["by_write_time", "to"])]
+        follow: bool,
+        /// Start from (about) the last N entries: with --follow, show them
+        /// then follow; without, show them and exit (like tail -n). Rounded
+        /// out to a chunk boundary, so a few extra may show.
+        #[arg(long, value_name = "N", conflicts_with_all = ["by_write_time", "from"])]
+        tail: Option<u64>,
+        /// Stop after at most N log entries (a hard cap, like head -n).
+        /// Composes with --follow to bound it; conflicts with --tail (last-N)
+        /// and --by-write-time (raw chunks have no entry count).
+        #[arg(long, value_name = "N", conflicts_with_all = ["tail", "by_write_time"])]
+        max: Option<u64>,
     },
     /// Show a store's vital signs on one screen: identity, lineage,
     /// data and compression, time covered, index sizes and coverage,
@@ -523,6 +539,9 @@ fn main() -> anyhow::Result<()> {
             by_write_time,
             null_sep,
             records,
+            follow,
+            tail,
+            max,
         } => {
             query::cmd_query(
                 &files,
@@ -535,6 +554,9 @@ fn main() -> anyhow::Result<()> {
                 by_write_time,
                 null_sep,
                 records,
+                follow,
+                tail,
+                max,
             )?;
         }
         Command::Info { file, json } => {
