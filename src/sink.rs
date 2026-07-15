@@ -155,18 +155,28 @@ pub fn cmd_records_sink(
         let dir = dir.clone();
         let name = name.clone();
         let op = op.to_string();
+        // Chunks already folded into the declared grain. Extending re-reads
+        // the whole grain file, so we only do it when the flushed-chunk set
+        // actually changed — not every idle second.
+        let mut indexed_chunks: usize = 0;
         Some(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(1000));
-                // A graceful-stop signal: flush + sync everything, make sure
-                // the store carries its identity, and exit durably. The main
-                // thread is abandoned mid-read (the process is going away).
+                // A graceful-stop signal: flush + sync everything, bring the
+                // declared index current, make sure the store carries its
+                // identity, and exit durably. The main thread is abandoned
+                // mid-read (the process is going away).
                 if crate::append::stopping() {
                     let mut s = st.lock().unwrap();
                     let cfg = s.cfg;
                     let f = s.files.get_mut(&name).unwrap();
                     let _ = f.flush_chunk(&cfg);
                     let _ = f.sync(&cfg);
+                    // Grain last, with the lock still held so the (abandoned)
+                    // main thread can't append underneath it.
+                    if crate::bark::index_declared(&dir, &name) {
+                        let _ = crate::grain::extend_grain(&dir, &name);
+                    }
                     drop(s);
                     if crate::bark::load(&dir, &name).is_none() {
                         if let Ok(m) =
@@ -192,6 +202,27 @@ pub fn cmd_records_sink(
                         }
                     }
                     _ => {}
+                }
+                // Keep the declared index current while streaming: extend the
+                // grain whenever the flushed-chunk set changed (a flush added
+                // chunks, or retention dropped some and deleted the grain).
+                // The lock is held across the extend so the reader can't
+                // append into files it is scanning.
+                let cur = st
+                    .lock()
+                    .unwrap()
+                    .files
+                    .get(&name)
+                    .map(|f| f.chunks.len())
+                    .unwrap_or(0);
+                if cur != indexed_chunks && crate::bark::index_declared(&dir, &name) {
+                    let _guard = st.lock().unwrap();
+                    match crate::grain::extend_grain(&dir, &name) {
+                        Ok(()) => indexed_chunks = cur,
+                        Err(e) => {
+                            eprintln!("timberfs: {name}: background grain extend failed: {e}")
+                        }
+                    }
                 }
             }
         }))
@@ -273,6 +304,13 @@ pub fn cmd_records_sink(
             (Err(_), Delivery::Streaming) => {
                 f.flush_chunk(&cfg)?;
                 f.sync(&cfg)?;
+                // Index what we flushed before returning — this arm is the
+                // main thread's shutdown when its blocked read is interrupted
+                // (a genuine stream error, or the SIGTERM path if it wins the
+                // race with the maintenance thread).
+                if crate::bark::index_declared(&dir, &name) {
+                    let _ = crate::grain::extend_grain(&dir, &name);
+                }
                 drop(s);
                 return result.context(format!(
                     "{entries} entr{} received before the break are appended \
