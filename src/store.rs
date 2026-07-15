@@ -755,6 +755,56 @@ pub fn lock_file_exclusive(dir: &Path, name: &str) -> io::Result<Option<File>> {
     try_flock(open_lock_file(&file_lock_path(dir, name))?, libc::LOCK_EX)
 }
 
+/// The result of a READ-ONLY lock probe. Read-only commands (`info`)
+/// must be able to inspect a store they can only read — a root-owned,
+/// world-readable backing directory must not require write access just
+/// to report who is writing. So the probe OPENS the lock file read-only
+/// and never creates it (flock works fine on an O_RDONLY fd); it is an
+/// observation, not an acquisition.
+pub enum LockProbe {
+    /// The lock file does not exist — no one ever took this lock.
+    Absent,
+    /// We could take the tested lock — no conflicting holder is alive.
+    Free,
+    /// A conflicting holder is alive (an active writer, or a mount).
+    Held,
+    /// The lock file exists but we could not open it (permissions) —
+    /// we cannot tell.
+    Unreadable,
+}
+
+fn probe_lock(path: &Path, op: libc::c_int) -> LockProbe {
+    let f = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return LockProbe::Absent,
+        Err(_) => return LockProbe::Unreadable,
+    };
+    let rc = unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) };
+    if rc == 0 {
+        // Acquired (and released when `f` drops): nobody held it — and
+        // because flock is released on process death, this reflects a
+        // LIVE holder, not stale lock-file contents.
+        LockProbe::Free
+    } else if io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) {
+        LockProbe::Held
+    } else {
+        LockProbe::Unreadable
+    }
+}
+
+/// Read-only probe: is the backing directory held EXCLUSIVELY (by a
+/// mount daemon)? Tested by trying a SHARED lock — failure to get it
+/// means a live exclusive holder. Absent/Free => no mount.
+pub fn probe_backing_exclusive(dir: &Path) -> LockProbe {
+    probe_lock(&dir.join(LOCK_FILE_NAME), libc::LOCK_SH)
+}
+
+/// Read-only probe: is a file's writer lock held — a live appender,
+/// import or rotation?
+pub fn probe_file_writer(dir: &Path, name: &str) -> LockProbe {
+    probe_lock(&file_lock_path(dir, name), libc::LOCK_EX)
+}
+
 /// Names of files in the directory whose per-file writer lock is currently
 /// held (probed non-destructively), for diagnostics in refusal messages.
 pub fn active_file_locks(dir: &Path) -> Vec<String> {

@@ -736,16 +736,23 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             }
         }
         // Who is writing? flock presence is the truth (lock files persist
-        // and their contents go stale); probe without blocking anyone.
-        writer = Some(match crate::store::lock_backing_shared(&dir)? {
-            None => match crate::store::read_lock_mountpoint(&dir) {
+        // and their contents go stale). This is a READ-ONLY probe — an
+        // observation, never an acquisition — so `info` works on a store
+        // it can only read (e.g. a root-owned /var/log/timberfs).
+        use crate::store::LockProbe;
+        writer = Some(match crate::store::probe_backing_exclusive(&dir) {
+            LockProbe::Held => match crate::store::read_lock_mountpoint(&dir) {
                 Some(mp) => format!("mounted at {}", mp.display()),
                 None => "another timberfs process holds the directory".to_string(),
             },
-            Some(_dir_guard) => match crate::store::lock_file_exclusive(&dir, &base)? {
-                None => "active writer (appender, import or rotation)".to_string(),
-                Some(_lock) => "none".to_string(),
-            },
+            LockProbe::Unreadable => "unknown (lock file not readable)".to_string(),
+            LockProbe::Absent | LockProbe::Free => {
+                match crate::store::probe_file_writer(&dir, &base) {
+                    LockProbe::Held => "active writer (appender, import or rotation)".to_string(),
+                    LockProbe::Unreadable => "unknown (lock file not readable)".to_string(),
+                    LockProbe::Absent | LockProbe::Free => "none".to_string(),
+                }
+            }
         });
     }
 
