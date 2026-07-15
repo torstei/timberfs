@@ -62,6 +62,7 @@ assets = [
     ["packaging/timber-filter.1", "usr/share/man/man1/", "644"],
     ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
     ["README.md", "usr/share/doc/timberfs/README.md", "644"],
+    ["docs/deployment.md", "usr/share/doc/timberfs/deployment.md", "644"],
     ["packaging/timberfs@.service", "lib/systemd/system/timberfs@.service", "644"],
     ["packaging/timberfs-log@.socket", "lib/systemd/system/timberfs-log@.socket", "644"],
     ["packaging/timberfs-log@.service", "lib/systemd/system/timberfs-log@.service", "644"],

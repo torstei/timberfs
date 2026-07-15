@@ -641,6 +641,10 @@ Override the store path or add retention (or drop `--records` for a plain-text
 source) with `systemctl edit timberfs-log@<instance>.service`. (For an immediate
 first use before a reboot, `systemd-tmpfiles --create` creates `/run/timberfs`.)
 
+See **[Deploying timberfs](docs/deployment.md)** for the full picture: the
+default directory layout, both systemd unit families, the ownership/permission
+model, and how locking and self-restart-on-upgrade work.
+
 ## Ideas / future work
 
 - **More `.bark`**: an `annotate` command for existing logs, attribution
