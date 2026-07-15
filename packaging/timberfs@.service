@@ -22,10 +22,16 @@ After=local-fs.target
 Type=simple
 EnvironmentFile=/etc/timberfs/%i.conf
 ExecStartPre=/usr/bin/mkdir -p ${BACKING} ${MOUNTPOINT}
-ExecStart=/usr/bin/timberfs mount ${BACKING} ${MOUNTPOINT} $EXTRA_OPTS
+ExecStart=/usr/bin/timberfs mount ${BACKING} ${MOUNTPOINT} --exit-on-upgrade $EXTRA_OPTS
 ExecStop=/usr/bin/fusermount3 -u ${MOUNTPOINT}
 Restart=on-failure
 RestartSec=2
+# --exit-on-upgrade makes the daemon exit 85 when its binary is replaced on
+# disk (a package upgrade); force a restart on that so the mount comes back
+# on the new binary (auto_unmount tears the old one down). SuccessExitStatus
+# keeps it out of the failure log. Runs on `apt upgrade`, attended or not.
+SuccessExitStatus=85
+RestartForceExitStatus=85
 
 [Install]
 WantedBy=multi-user.target

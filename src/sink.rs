@@ -58,6 +58,7 @@ pub fn cmd_records_sink(
     retain: Option<&str>,
     retain_size: Option<&str>,
     op: &str,
+    exit_on_upgrade: bool,
 ) -> anyhow::Result<()> {
     retain.map(crate::append::parse_duration_ms).transpose()?;
     retain_size
@@ -156,6 +157,11 @@ pub fn cmd_records_sink(
         let dir = dir.clone();
         let name = name.clone();
         let op = op.to_string();
+        let watch = if exit_on_upgrade {
+            crate::store::BinaryWatch::current()
+        } else {
+            None
+        };
         // Chunks already folded into the declared grain. Extending re-reads
         // the whole grain file, so we only do it when the flushed-chunk set
         // actually changed — not every idle second.
@@ -163,11 +169,20 @@ pub fn cmd_records_sink(
         Some(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(1000));
-                // A graceful-stop signal: flush + sync everything, bring the
-                // declared index current, make sure the store carries its
-                // identity, and exit durably. The main thread is abandoned
-                // mid-read (the process is going away).
-                if crate::append::stopping() {
+                // Two graceful exits share one clean path: a stop signal
+                // (systemctl stop/restart → exit 0) and our binary being
+                // upgraded on disk (→ EXIT_BINARY_UPGRADED, which the unit
+                // force-restarts on). Both flush + sync everything, bring the
+                // declared index current, ensure the store has its identity,
+                // and exit durably; the main thread is abandoned mid-read.
+                let graceful = if crate::append::stopping() {
+                    Some(0)
+                } else if watch.as_ref().is_some_and(|w| w.changed()) {
+                    Some(crate::store::EXIT_BINARY_UPGRADED)
+                } else {
+                    None
+                };
+                if let Some(code) = graceful {
                     {
                         let mut s = st.lock().unwrap();
                         let cfg = s.cfg;
@@ -189,7 +204,7 @@ pub fn cmd_records_sink(
                             let _ = crate::bark::save(&dir, &name, &m);
                         }
                     }
-                    std::process::exit(0);
+                    std::process::exit(code);
                 }
                 if stop.load(Ordering::Relaxed) {
                     break;

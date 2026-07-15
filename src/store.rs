@@ -16,9 +16,11 @@
 //! the flush age.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,6 +48,72 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Exit code a long-running daemon uses to say "my binary was replaced on
+/// disk — re-exec me on the new one." The systemd units pair it with
+/// SuccessExitStatus + RestartForceExitStatus so the supervisor restarts
+/// on it cleanly, regardless of the unit's normal Restart= policy. Chosen
+/// outside the sysexits.h range (64–78) so it can't be confused with a
+/// real failure.
+pub const EXIT_BINARY_UPGRADED: i32 = 85;
+
+/// Watches the running executable so a supervised daemon can notice its
+/// own package being upgraded (dpkg replaces /usr/bin/timberfs with a new
+/// inode) and exit for a clean re-exec. Only acted on when the operator
+/// opted in (the units pass --exit-on-upgrade); an interactive run keeps
+/// going on the old binary until the user restarts it.
+pub struct BinaryWatch {
+    path: PathBuf,
+    ino: u64,
+}
+
+impl BinaryWatch {
+    /// Capture the running executable's install path and inode. None if
+    /// /proc/self/exe can't be resolved (non-Linux, unusual sandbox) —
+    /// then upgrade-detection is simply disabled.
+    ///
+    /// `metadata` resolves /proc/self/exe to the running inode even after the
+    /// file is unlinked, so `ino` is always the binary we are actually
+    /// executing. `read_link`, though, appends " (deleted)" to the path text
+    /// when the old inode has already been unlinked — which happens if a
+    /// package swap lands during our own startup, before we get here. Left
+    /// intact that bogus path never stats, so `changed()` would return false
+    /// forever and we'd be blind to this upgrade and every one after it.
+    /// Strip the suffix so we watch the real install path.
+    pub fn current() -> Option<BinaryWatch> {
+        let ino = fs::metadata("/proc/self/exe").ok()?.ino();
+        let raw = fs::read_link("/proc/self/exe").ok()?;
+        Some(BinaryWatch {
+            path: strip_deleted(raw),
+            ino,
+        })
+    }
+
+    /// True once a DIFFERENT binary is in place at the original path —
+    /// i.e. the package was upgraded under us and the new file is ready.
+    /// If the path is momentarily absent or unreadable (an upgrade in
+    /// progress, mid-rename), we return false and keep running: never
+    /// exit into a gap where there is no binary to re-exec into — wait
+    /// until the replacement actually lands.
+    pub fn changed(&self) -> bool {
+        match fs::metadata(&self.path) {
+            Ok(m) => m.ino() != self.ino,
+            Err(_) => false,
+        }
+    }
+}
+
+/// A `/proc/self/exe` link target that the kernel has marked with the
+/// trailing " (deleted)" (the original inode was unlinked) points at no
+/// real file. Strip that suffix to recover the install path we should watch;
+/// leave any other path untouched.
+fn strip_deleted(raw: PathBuf) -> PathBuf {
+    const DELETED: &[u8] = b" (deleted)";
+    match raw.as_os_str().as_bytes().strip_suffix(DELETED) {
+        Some(real) => PathBuf::from(OsStr::from_bytes(real)),
+        None => raw,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -866,4 +934,35 @@ pub fn read_lock_mountpoint(dir: &Path) -> Option<PathBuf> {
 /// Raw lock-file content, for describing the current holder in messages.
 pub fn read_lock_raw(dir: &Path) -> Option<String> {
     fs::read_to_string(dir.join(LOCK_FILE_NAME)).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_deleted_recovers_install_path() {
+        // The kernel-marked "(deleted)" target must reduce to the real path,
+        // so BinaryWatch watches /usr/bin/timberfs even when a swap landed
+        // during our startup (else changed() stats a bogus path forever).
+        assert_eq!(
+            strip_deleted(PathBuf::from("/usr/bin/timberfs (deleted)")),
+            PathBuf::from("/usr/bin/timberfs")
+        );
+        // A normal path is untouched...
+        assert_eq!(
+            strip_deleted(PathBuf::from("/usr/bin/timberfs")),
+            PathBuf::from("/usr/bin/timberfs")
+        );
+        // ...including one that merely contains the word deleted, or a path
+        // that legitimately ends in "(deleted)" without the leading space.
+        assert_eq!(
+            strip_deleted(PathBuf::from("/opt/deleted/timberfs")),
+            PathBuf::from("/opt/deleted/timberfs")
+        );
+        assert_eq!(
+            strip_deleted(PathBuf::from("/opt/timberfs(deleted)")),
+            PathBuf::from("/opt/timberfs(deleted)")
+        );
+    }
 }

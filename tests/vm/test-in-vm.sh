@@ -632,6 +632,112 @@ with open('/tmp/ts.log', 'w') as f:
 run_test "filter | import --records: the investigation as an artifact" grep_into_artifact
 run_test "time story: exact windows, raw escape, -0 records, annotation" time_story
 run_test "info: a store's vital signs on one screen" info_vital_signs
+binary_upgrade_restarts_appender() {
+    # Simulate a package upgrade under a live socket intake: replace the
+    # binary with a new inode (dpkg's atomic rename, same filesystem). The
+    # --exit-on-upgrade daemon must notice, exit 85, and systemd must
+    # restart it on the new binary — seamlessly, since the socket holds the
+    # FIFO across the swap.
+    systemd-tmpfiles --create
+    local inst=upgtest
+    systemctl enable --now "timberfs-log@$inst.socket" >/dev/null 2>&1
+    printf '2026-06-09T10:00:00 INFO before-upgrade\n' \
+        | timber-filter --records --quiet > "/run/timberfs/$inst.pipe"
+    for _ in $(seq 1 10); do
+        systemctl --quiet is-active "timberfs-log@$inst.service" && break
+        sleep 1
+    done
+    local pid1
+    pid1=$(systemctl show -p MainPID --value "timberfs-log@$inst.service")
+    [ -n "$pid1" ] && [ "$pid1" != 0 ] || { systemctl stop "timberfs-log@$inst.socket" 2>/dev/null; return 1; }
+    # systemd-executor forks and reports the service active *before* it execs
+    # our binary (LogsDirectory= setup widens that window). Only once MainPID
+    # is genuinely running /usr/bin/timberfs does swapping the file replace a
+    # *running* daemon's binary — swap any earlier and it just starts fresh on
+    # the new inode, with nothing to self-exit for. Capture the inode it runs.
+    local oldino=""
+    for _ in $(seq 1 40); do
+        if [ "$(readlink "/proc/$pid1/exe" 2>/dev/null)" = /usr/bin/timberfs ]; then
+            oldino=$(stat -Lc %i "/proc/$pid1/exe" 2>/dev/null)
+            break
+        fi
+        sleep 0.25
+    done
+    [ -n "$oldino" ] || { systemctl stop "timberfs-log@$inst.socket" 2>/dev/null; return 1; }
+    cp /usr/bin/timberfs /usr/bin/timberfs.upg && mv /usr/bin/timberfs.upg /usr/bin/timberfs
+    local newino
+    newino=$(stat -c %i /usr/bin/timberfs)
+    # Give the running daemon a moment to notice, exit 85, and be restarted;
+    # then re-drive the intake (also re-activates it if systemd returned the
+    # socket to listening). The post-upgrade write must land, and the service
+    # must be back running the NEW inode — checked by running inode, not PID,
+    # so PID reuse can't fool us.
+    sleep 3
+    printf '2026-06-09T10:00:05 INFO after-upgrade\n' \
+        | timber-filter --records --quiet > "/run/timberfs/$inst.pipe"
+    local onnew="" landed=""
+    for _ in $(seq 1 15); do
+        sleep 1
+        local mp
+        mp=$(systemctl show -p MainPID --value "timberfs-log@$inst.service")
+        [ -n "$mp" ] && [ "$mp" != 0 ] \
+            && [ "$(stat -Lc %i "/proc/$mp/exe" 2>/dev/null)" = "$newino" ] && onnew=yes
+        timberfs query "/var/log/timberfs/$inst.log" 2>/dev/null | grep -q after-upgrade && landed=yes
+        [ "$onnew" = yes ] && [ "$landed" = yes ] && break
+    done
+    local before=no
+    timberfs query "/var/log/timberfs/$inst.log" 2>/dev/null | grep -q before-upgrade && before=yes
+    local rc=1
+    [ "$oldino" != "$newino" ] && [ "$onnew" = yes ] && [ "$landed" = yes ] && [ "$before" = yes ] \
+        && ! systemctl --quiet is-failed "timberfs-log@$inst.service" && rc=0
+    systemctl stop "timberfs-log@$inst.socket" 2>/dev/null
+    return $rc
+}
+
+binary_upgrade_restarts_mount() {
+    # Same, for a mount: on the binary swap the daemon exits 85,
+    # auto_unmount tears the FUSE mount down, and systemd remounts on the
+    # new binary (RestartForceExitStatus, despite Restart=on-failure).
+    mkdir -p /etc/timberfs
+    printf 'BACKING=/var/log/timberfs-backing/upmnt\nMOUNTPOINT=/var/log/upmnt\n' \
+        > /etc/timberfs/upmnt.conf
+    systemctl start timberfs@upmnt >/dev/null 2>&1
+    for _ in $(seq 1 20); do mountpoint -q /var/log/upmnt && break; sleep 0.5; done
+    mountpoint -q /var/log/upmnt || { systemctl stop timberfs@upmnt 2>/dev/null; return 1; }
+    echo "upmnt data" > /var/log/upmnt/x.log
+    local pid1
+    pid1=$(systemctl show -p MainPID --value timberfs@upmnt)
+    [ -n "$pid1" ] && [ "$pid1" != 0 ] || { systemctl stop timberfs@upmnt 2>/dev/null; return 1; }
+    # The mount being up already proves the daemon is fully running on the old
+    # binary (no systemd-executor pre-exec window to race), so we can capture
+    # the inode it runs and swap straight away.
+    local oldino
+    oldino=$(stat -Lc %i "/proc/$pid1/exe" 2>/dev/null)
+    cp /usr/bin/timberfs /usr/bin/timberfs.upg2 && mv /usr/bin/timberfs.upg2 /usr/bin/timberfs
+    local newino
+    newino=$(stat -c %i /usr/bin/timberfs)
+    # Comes back running the NEW inode and remounted — verified by running
+    # inode, not PID, so PID reuse can't fool us.
+    local onnew=""
+    for _ in $(seq 1 15); do
+        sleep 1
+        local mp
+        mp=$(systemctl show -p MainPID --value timberfs@upmnt)
+        [ -n "$mp" ] && [ "$mp" != 0 ] \
+            && [ "$(stat -Lc %i "/proc/$mp/exe" 2>/dev/null)" = "$newino" ] \
+            && mountpoint -q /var/log/upmnt && { onnew=yes; break; }
+    done
+    local rc=1
+    [ "$oldino" != "$newino" ] && [ "$onnew" = yes ] \
+        && mountpoint -q /var/log/upmnt \
+        && ! systemctl --quiet is-failed timberfs@upmnt \
+        && grep -q "upmnt data" /var/log/upmnt/x.log && rc=0
+    systemctl stop timberfs@upmnt 2>/dev/null
+    return $rc
+}
+
+run_test "upgrade: appender self-exits, systemd restarts it on the new binary" binary_upgrade_restarts_appender
+run_test "upgrade: mount self-exits, remounts on the new binary" binary_upgrade_restarts_mount
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
 

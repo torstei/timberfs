@@ -188,6 +188,7 @@ pub fn cmd_append(
     cfg: Config,
     retain: Option<&str>,
     retain_size: Option<&str>,
+    exit_on_upgrade: bool,
 ) -> anyhow::Result<()> {
     // Validate the flags up front; they are persisted below.
     retain.map(parse_duration_ms).transpose()?;
@@ -274,8 +275,19 @@ pub fn cmd_append(
         let store = Arc::clone(&store);
         let name = name.clone();
         let policy = Arc::clone(&policy);
+        let watch = if exit_on_upgrade {
+            crate::store::BinaryWatch::current()
+        } else {
+            None
+        };
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(1000));
+            // Binary upgraded on disk: flush and exit for a clean re-exec
+            // (the supervisor restarts us on the new one).
+            if watch.as_ref().is_some_and(|w| w.changed()) {
+                store.lock().unwrap().flush_all();
+                std::process::exit(crate::store::EXIT_BINARY_UPGRADED);
+            }
             store.lock().unwrap().flush_aged();
             let p = policy.lock().unwrap().refresh();
             run_retention(&store, &name, p);
