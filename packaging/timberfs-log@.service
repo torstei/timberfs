@@ -1,10 +1,12 @@
 # Systemd template for a supervised timberfs log intake (see timberfs-log@.socket).
 #
 # Drains the instance's FIFO (passed as stdin by the socket unit) into a store
-# at /var/log/timberfs/<instance>.log. The producer must write a
-# timberfs-records(5) stream (that is what --records means); to archive a
-# plain-text source instead, drop --records from ExecStart. Override the store
-# path, add retention, or change the format with a drop-in:
+# at /var/log/timberfs/<instance>/<instance>.log. Each instance gets its own
+# directory so it can be owned and managed independently (see LogsDirectory
+# below). The producer must write a timberfs-records(5) stream (that is what
+# --records means); to archive a plain-text source instead, drop --records from
+# ExecStart. Override the store path, add retention, or change the format with a
+# drop-in:
 #
 #   systemctl edit timberfs-log@applogs.service
 #     [Service]
@@ -23,13 +25,16 @@ After=timberfs-log@%i.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade --into /var/log/timberfs/%i.log
+ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade --into /var/log/timberfs/%i/%i.log
 StandardInput=socket
 StandardOutput=journal
 StandardError=journal
 
-# Creates and owns /var/log/timberfs (0755) — where the .trunk/.rings/.bark live.
-LogsDirectory=timberfs
+# Creates and owns the per-instance directory /var/log/timberfs/%i (0755) —
+# where this instance's .trunk/.rings/.bark live. A drop-in that sets User=
+# gets that dir owned by that user, so each instance is independently owned
+# and manageable (indexing, rotation) without a directory shared across all.
+LogsDirectory=timberfs/%i
 
 # A crash or upgrade of this unit is invisible to the producer (the socket holds
 # the FIFO open): come back and keep draining.

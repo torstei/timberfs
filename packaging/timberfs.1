@@ -756,6 +756,17 @@ then
 Stopping the unit unmounts first, so the daemon flushes all buffers and
 exits cleanly. An example configuration is installed under
 .IR /usr/share/doc/timberfs/examples/ .
+.PP
+A socket\-activated log\-intake pair,
+.B timberfs\-log@.socket
+and
+.BR timberfs\-log@.service ,
+streams a producer's
+.BR timberfs\-records (5)
+stream into a store over a FIFO.
+The full directory layout, both unit families, the ownership model and
+self\-restart on upgrade are documented in
+.IR /usr/share/doc/timberfs/deployment.md .
 .SH EXAMPLES
 Mount and use:
 .PP

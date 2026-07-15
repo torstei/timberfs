@@ -352,7 +352,7 @@ run_test "records sink flushes by age, before EOF" records_sink_age_flush
 # service restart is invisible to the producer because systemd holds
 # the FIFO open O_RDWR).
 LOGINST=vmtest
-LOGSTORE=/var/log/timberfs/$LOGINST.log
+LOGSTORE=/var/log/timberfs/$LOGINST/$LOGINST.log
 LOGPIPE=/run/timberfs/$LOGINST.pipe
 
 # Frame raw stamped lines as a timberfs-records(5) stream (what the
@@ -385,10 +385,10 @@ socket_intake_setup() {
     cat > "/etc/systemd/system/timberfs-log@$LOGINST.service.d/override.conf" << 'EOF'
 [Service]
 ExecStart=
-ExecStart=/usr/bin/timberfs append --records --into /var/log/timberfs/%i.log --flush-age 1
+ExecStart=/usr/bin/timberfs append --records --into /var/log/timberfs/%i/%i.log --flush-age 1
 EOF
     systemctl daemon-reload
-    # Pre-create the store with a declared index (also makes /var/log/timberfs)
+    # Pre-create the store with a declared index (also makes the instance dir)
     # so the intake exercises grain maintenance on the live/socket path.
     timberfs create --index "$LOGSTORE" >/dev/null
     systemctl enable --now "timberfs-log@$LOGINST.socket"
@@ -682,11 +682,11 @@ binary_upgrade_restarts_appender() {
         mp=$(systemctl show -p MainPID --value "timberfs-log@$inst.service")
         [ -n "$mp" ] && [ "$mp" != 0 ] \
             && [ "$(stat -Lc %i "/proc/$mp/exe" 2>/dev/null)" = "$newino" ] && onnew=yes
-        timberfs query "/var/log/timberfs/$inst.log" 2>/dev/null | grep -q after-upgrade && landed=yes
+        timberfs query "/var/log/timberfs/$inst/$inst.log" 2>/dev/null | grep -q after-upgrade && landed=yes
         [ "$onnew" = yes ] && [ "$landed" = yes ] && break
     done
     local before=no
-    timberfs query "/var/log/timberfs/$inst.log" 2>/dev/null | grep -q before-upgrade && before=yes
+    timberfs query "/var/log/timberfs/$inst/$inst.log" 2>/dev/null | grep -q before-upgrade && before=yes
     local rc=1
     [ "$oldino" != "$newino" ] && [ "$onnew" = yes ] && [ "$landed" = yes ] && [ "$before" = yes ] \
         && ! systemctl --quiet is-failed "timberfs-log@$inst.service" && rc=0

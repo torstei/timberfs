@@ -615,8 +615,10 @@ It also installs a socket-activated **log-intake** pair,
 `timberfs-log@.socket` + `timberfs-log@.service`, for streaming into a store
 without a mount: the socket creates `/run/timberfs/<instance>.pipe` and holds it
 open `O_RDWR`, so a producer is undisturbed while the appender
-(`timberfs append --records --into /var/log/timberfs/<instance>.log`) restarts
-or upgrades under it — writes just buffer in the pipe and drain when it returns.
+(`timberfs append --records --into /var/log/timberfs/<instance>/<instance>.log`)
+restarts or upgrades under it — writes just buffer in the pipe and drain when it
+returns. Each instance gets its own directory, so instances can be owned and
+managed independently.
 
 The service drains the FIFO with `append --records`, so the producer writes a
 [timberfs-records(5)](packaging/timberfs-records.5) stream, not raw text — the
@@ -638,6 +640,10 @@ systemctl edit timberfs-log@applogs.socket     # [Socket] / SocketGroup=myapp
 Override the store path or add retention (or drop `--records` for a plain-text
 source) with `systemctl edit timberfs-log@<instance>.service`. (For an immediate
 first use before a reboot, `systemd-tmpfiles --create` creates `/run/timberfs`.)
+
+See **[Deploying timberfs](docs/deployment.md)** for the full picture: the
+default directory layout, both systemd unit families, the ownership/permission
+model, and how locking and self-restart-on-upgrade work.
 
 ## Ideas / future work
 
