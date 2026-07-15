@@ -155,6 +155,14 @@ SUPERIMPORTANT). When nothing narrows a store search, a note says so
 .BR \-c ", " \-\-count
 Print only the number of matching entries.
 .TP
+.BI \-\-max " N"
+Stop after at most
+.I N
+matching entries (a hard cap, like
+.BR head (1)) \(em
+across all inputs, and without misreporting the early stop as a truncated
+stream.
+.TP
 .BR \-0 ", " \-\-null
 NUL-terminated entry records (multiline entries stay one record).
 .TP

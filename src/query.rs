@@ -4,10 +4,12 @@
 //! mount is safe: chunks are immutable once written and the index is
 //! append-only).
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{bail, Context};
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone};
@@ -301,18 +303,47 @@ pub fn cmd_query(
     by_write_time: bool,
     null_sep: bool,
     records: bool,
+    follow: bool,
+    tail: Option<u64>,
+    max: Option<u64>,
 ) -> anyhow::Result<()> {
     let from_ms = from.unwrap_or(0);
     let to_ms = to.unwrap_or(u64::MAX);
     if from_ms > to_ms {
         bail!("--from is after --to");
     }
+    // Follow / tail is its own read path: a poll loop over newly-committed
+    // chunks rather than the one-shot windowed scan. --has/--any select whole
+    // chunks via the offline .grain index, which neither composes with a live
+    // stream (there is nothing to skip — every new chunk must be read) nor
+    // filters at line granularity; filter a follow with a pipe instead.
+    if follow || tail.is_some() {
+        if !has.is_empty() || !any.is_empty() {
+            bail!(
+                "--has/--any select whole chunks via the offline index and don't compose \
+                 with --follow/--tail; filter the live stream with a pipe (e.g. | grep), \
+                 or run a windowed query for offline chunk-skipping"
+            );
+        }
+        return query_follow(
+            files,
+            from,
+            no_filename,
+            show_write_time,
+            null_sep,
+            records,
+            tail,
+            follow,
+            max,
+        );
+    }
     let windowed = from.is_some() || to.is_some();
     // The entry pipeline engages when there is something to verify
     // (a window: the DEFAULT is that every printed entry's own timestamp
-    // is inside it) or when the framing needs entries (-0, annotation).
+    // is inside it) or when the framing needs entries (-0, annotation), or
+    // a --max cap (counting entries needs entry parsing).
     // --by-write-time is the raw escape hatch: chunk dump, no parsing.
-    if !by_write_time && (windowed || null_sep || show_write_time || records) {
+    if !by_write_time && (windowed || null_sep || show_write_time || records || max.is_some()) {
         return query_entries(
             files,
             from_ms,
@@ -324,6 +355,7 @@ pub fn cmd_query(
             show_write_time,
             null_sep,
             records,
+            max,
         );
     }
     if files.len() == 1 {
@@ -349,6 +381,7 @@ fn query_entries(
     show_write_time: bool,
     null_sep: bool,
     records: bool,
+    max: Option<u64>,
 ) -> anyhow::Result<()> {
     struct Src {
         file: File,
@@ -363,6 +396,8 @@ fn query_entries(
         Ok(zstd::stream::decode_all(&comp[..])?)
     };
     let multi = files.len() > 1 && !no_filename;
+    // --max: a total entry cap shared by every source's sink.
+    let limit = max.map(|m| (Rc::new(Cell::new(0u64)), m));
     let mut srcs: Vec<Src> = Vec::new();
     for f in files {
         let source = open_source(f)?;
@@ -422,6 +457,7 @@ fn query_entries(
                 extractor,
                 window,
                 framing,
+                limit.clone(),
                 &f.display().to_string(),
             ),
         });
@@ -481,6 +517,12 @@ fn query_entries(
         let data = decomp(&s.file, &c)?;
         s.sink
             .push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?;
+        // --max reached: stop decompressing further chunks.
+        if let Some((count, m)) = &limit {
+            if count.get() >= *m {
+                break;
+            }
+        }
     }
     let (mut emitted, mut dropped) = (0u64, 0u64);
     let (mut read, mut total) = (0usize, 0usize);
@@ -513,6 +555,275 @@ fn query_entries(
             }
         );
     }
+    Ok(())
+}
+
+/// Count units in a chunk: entries (a stamped line starts one) normally, or
+/// lines when the store has no parseable timestamps.
+fn count_units(data: &[u8], extractor: &crate::import::Extractor, by_line: bool) -> u64 {
+    let mut n = 0u64;
+    for line in data.split_inclusive(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if by_line {
+            n += 1;
+        } else {
+            let head = String::from_utf8_lossy(&line[..line.len().min(256)]);
+            if extractor.extract(&head).is_some() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The first chunk index such that chunks[start..] hold at least `n` units,
+/// walking back from the end. Chunk-granular: the start chunk is included
+/// whole, so a few extra may precede the Nth-from-last. Exact-N would need a
+/// per-entry offset/length index (a future ".grain"-like log-entry index);
+/// until then the overshoot is bounded by one chunk (--flush-age or 256K).
+fn tail_start(
+    chunks: &[ChunkRecord],
+    file: &File,
+    extractor: &crate::import::Extractor,
+    by_line: bool,
+    n: u64,
+) -> anyhow::Result<usize> {
+    if chunks.is_empty() || n == 0 {
+        return Ok(chunks.len());
+    }
+    let decomp = |c: &ChunkRecord| -> anyhow::Result<Vec<u8>> {
+        let mut comp = vec![0u8; c.comp_len as usize];
+        file.read_exact_at(&mut comp, c.comp_start)?;
+        Ok(zstd::stream::decode_all(&comp[..])?)
+    };
+    let mut count = 0u64;
+    let mut start = chunks.len();
+    for i in (0..chunks.len()).rev() {
+        count += count_units(&decomp(&chunks[i])?, extractor, by_line);
+        start = i;
+        if count >= n {
+            break;
+        }
+    }
+    Ok(start)
+}
+
+/// Follow / tail: emit (about) the last N units, then — with --follow — new
+/// data as chunks are committed, until interrupted. Read-only and lock-free,
+/// so it runs beside a live appender; a flushed chunk is the unit of
+/// visibility, so latency tracks the writer's --flush-age.
+///
+/// Plain text follows RAW chunk bytes (line-oriented, no buffering — the
+/// snappy tail -f). Only the framed modes (-0, --records, --show-write-time)
+/// run the entry pipeline, where the last entry stays buffered until the next
+/// one closes it (a multiline entry can't be known complete any sooner).
+#[allow(clippy::too_many_arguments)]
+fn query_follow(
+    files: &[std::path::PathBuf],
+    from: Option<u64>,
+    no_filename: bool,
+    show_write_time: bool,
+    null_sep: bool,
+    records: bool,
+    tail: Option<u64>,
+    follow: bool,
+    max: Option<u64>,
+) -> anyhow::Result<()> {
+    let decomp = |file: &File, c: &ChunkRecord| -> anyhow::Result<Vec<u8>> {
+        let mut comp = vec![0u8; c.comp_len as usize];
+        file.read_exact_at(&mut comp, c.comp_start)?;
+        Ok(zstd::stream::decode_all(&comp[..])?)
+    };
+    let multi = files.len() > 1 && !no_filename;
+    // Framing needs entries; plain text streams raw bytes (no one-entry lag).
+    // --max caps entries; raw bytes have no entry count, so a cap forces the
+    // entry pipeline (framed) just as it does in the one-shot path.
+    let framed = records || null_sep || show_write_time || max.is_some();
+    // --max: a total entry cap shared across sources; also a stop signal for
+    // the follow loop (bounded follow).
+    let limit = max.map(|m| (Rc::new(Cell::new(0u64)), m));
+    let capped = |limit: &Option<crate::entry::EntryLimit>| {
+        limit.as_ref().is_some_and(|(c, m)| c.get() >= *m)
+    };
+
+    // Raw emit: chunk bytes as-is, or a per-line "path:" prefix across files.
+    fn emit_raw(out: &mut dyn Write, data: &[u8], label: Option<&[u8]>) -> io::Result<()> {
+        match label {
+            None => out.write_all(data),
+            Some(lbl) => {
+                for line in data.split_inclusive(|&b| b == b'\n') {
+                    out.write_all(lbl)?;
+                    out.write_all(b":")?;
+                    out.write_all(line)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    struct FollowSrc {
+        path: std::path::PathBuf,
+        label: Option<Vec<u8>>,
+        sink: Option<crate::entry::EntrySink>,
+        // Last emitted chunk's last_write_ms; new chunks arrive later (the
+        // appender stamps now()), so this is a monotonic follow cursor.
+        cursor_ms: u64,
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    if records {
+        // A followed stream is unbounded: stream-start, then entries, and
+        // deliberately no stream-end — its absence is the honest "still live
+        // (or truncated)" marker. A bounded --tail (no --follow) does close.
+        write!(out, "\x1estream-start\x1fv=1")?;
+        if let Some(fr) = from {
+            write!(out, "\x1ffrom={fr}")?;
+        }
+        if let Some(n) = tail {
+            write!(out, "\x1ftail={n}")?;
+        }
+        write!(
+            out,
+            "\x1ffollow={}\x1fsources={}",
+            u8::from(follow),
+            files.len()
+        )?;
+        out.write_all(b"\0")?;
+    }
+
+    let mut srcs: Vec<FollowSrc> = Vec::new();
+    for f in files {
+        let source = open_source(f)?;
+        let tf = crate::bark::time_format(source.bark.as_ref());
+        let extractor =
+            crate::import::Extractor::new(tf.regex.as_deref(), tf.format.as_deref(), tf.utc)?;
+        let chunks = &source.records;
+        // Where to begin: an entry-count tail, a write-time --from, or (the
+        // default) the current end — following only genuinely new chunks.
+        let start = if let Some(n) = tail {
+            // --tail N counts log ENTRIES (a stamped line and its continuation
+            // lines) the same way in text and framed output, falling back to
+            // lines only when the store has no parseable timestamps. Probe the
+            // first few chunks, not the last: a chunk can split mid-entry, so
+            // the final one is often a bare continuation with no stamp.
+            let mut parseable = false;
+            for c in chunks.iter().take(4) {
+                if crate::entry::probe_stamps(&extractor, &decomp(&source.file, c)?) {
+                    parseable = true;
+                    break;
+                }
+            }
+            let by_line = !parseable;
+            tail_start(chunks, &source.file, &extractor, by_line, n)?
+        } else if let Some(fr) = from {
+            chunks
+                .iter()
+                .position(|c| c.last_write_ms >= fr)
+                .unwrap_or(chunks.len())
+        } else {
+            chunks.len()
+        };
+        let label = if multi {
+            Some(f.display().to_string().into_bytes())
+        } else {
+            None
+        };
+        let mut sink = if framed {
+            Some(crate::entry::EntrySink::new(
+                extractor,
+                None,
+                crate::entry::Framing {
+                    null_sep,
+                    show_write: show_write_time,
+                    records,
+                    label: label.clone(),
+                },
+                limit.clone(),
+                &f.display().to_string(),
+            ))
+        } else {
+            None
+        };
+        let mut cursor_ms = 0u64;
+        for c in &chunks[start..] {
+            let data = decomp(&source.file, c)?;
+            match &mut sink {
+                Some(s) => s.push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?,
+                None => emit_raw(&mut out, &data, label.as_deref())?,
+            }
+            cursor_ms = cursor_ms.max(c.last_write_ms);
+            if capped(&limit) {
+                break;
+            }
+        }
+        // Anchor to the latest committed chunk even when nothing was emitted
+        // (from-now), so only new chunks are followed.
+        if let Some(last) = chunks.last() {
+            cursor_ms = cursor_ms.max(last.last_write_ms);
+        }
+        srcs.push(FollowSrc {
+            path: f.clone(),
+            label,
+            sink,
+            cursor_ms,
+        });
+    }
+    out.flush()?;
+
+    // Nothing to follow (a bounded --tail) or --max already reached during
+    // backfill: skip straight to finalizing.
+    let mut done = !follow || capped(&limit);
+
+    // Poll for newly-committed chunks. Re-open each pass: the ring only grows
+    // (the appender appends), and re-opening picks up a fresh trunk fd too.
+    // Flush every pass so an interrupt never drops already-emitted output.
+    while !done {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for s in &mut srcs {
+            let source = match open_source(&s.path) {
+                Ok(x) => x,
+                Err(_) => continue, // transient (mid-rename by retention): retry
+            };
+            for c in &source.records {
+                if c.first_write_ms > s.cursor_ms {
+                    let data = decomp(&source.file, c)?;
+                    match &mut s.sink {
+                        Some(sink) => {
+                            sink.push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?
+                        }
+                        None => emit_raw(&mut out, &data, s.label.as_deref())?,
+                    }
+                    s.cursor_ms = c.last_write_ms.max(s.cursor_ms);
+                    if capped(&limit) {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        out.flush()?;
+    }
+
+    // Flush any framed sink's last buffered entry and close a record stream —
+    // for a bounded --tail or a --max-capped follow. An unbounded follow never
+    // reaches here (it ends at interrupt), so a live stream has no stream-end,
+    // which is the honest "still going" marker.
+    for s in &mut srcs {
+        if let Some(sink) = &mut s.sink {
+            sink.finish(&mut out)?;
+        }
+    }
+    if records {
+        write!(out, "\x1estream-end")?;
+        out.write_all(b"\0")?;
+    }
+    out.flush()?;
     Ok(())
 }
 

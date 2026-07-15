@@ -469,6 +469,41 @@ false positives) \(em the exact, entry-level filtering belongs in
 .BR timber\-filter (1)
 downstream. The killer use: finding a unique identifier with NO time
 bound.
+.TP
+.BR \-f ", " \-\-follow
+After the selected output, keep emitting entries as chunks are committed,
+until interrupted \(em like
+.BR tail (1)
+.BR \-f .
+A flushed chunk is the unit of visibility, so new data appears within the
+writer's
+.B \-\-flush\-age
+(default 5s), not per line. Read-only and lock-free, so it runs beside a live
+appender; plain text streams raw bytes, while
+.BR \-0 ", " \-\-records ", and " \-\-show\-write\-time
+run the entry pipeline. Filter a live follow with a pipe
+.RB ( "| grep" );
+.B \-\-has
+selects whole chunks offline and does not compose with it.
+.TP
+.BI \-\-tail " N"
+Show (about) the last
+.I N
+log entries \(em a stamped line and its continuation lines are one entry \(em
+then, with
+.BR \-\-follow ,
+keep going. Chunk-granular: rounded out to a whole chunk, so a few extra may
+precede the Nth-from-last. (A store with no parseable timestamps counts lines.)
+.TP
+.BI \-\-max " N"
+Stop after at most
+.I N
+entries (a hard cap, like
+.BR head (1)).
+Composes with
+.B \-\-follow
+to bound it; conflicts with
+.BR \-\-tail .
 .PP
 Several
 .I FILE
