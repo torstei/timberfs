@@ -96,8 +96,10 @@ impl ChunkRecord {
 }
 
 pub fn read_index(path: &Path) -> io::Result<Vec<ChunkRecord>> {
-    let f = File::open(path)?;
+    let f = File::open(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("opening index {}: {e}", path.display())))?;
     read_index_file(&f)
+        .map_err(|e| io::Error::new(e.kind(), format!("reading index {}: {e}", path.display())))
 }
 
 /// Parse a .rings file. A trailing partial record (crash mid-append) is

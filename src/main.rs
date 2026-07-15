@@ -2,6 +2,8 @@ use timberfs::{append, bark, export, fs, grain, import, note, query, rotate, sin
 
 use std::path::PathBuf;
 
+use anyhow::Context;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -430,7 +432,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 if index {
                     let (d, n) = query::resolve_backing(&dest)?;
-                    std::fs::create_dir_all(&d)?;
+                    std::fs::create_dir_all(&d)
+                        .with_context(|| format!("creating backing directory {}", d.display()))?;
                     bark::declare_index(&d, &n)?;
                 }
                 sink::cmd_records_sink(

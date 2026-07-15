@@ -91,18 +91,22 @@ impl FileStore {
     /// Open (or create) the backing pair for a logical file and reconcile
     /// index and data after a possible crash.
     pub fn open(dir: &Path, name: &str) -> io::Result<FileStore> {
+        let trunk_p = format::trunk_path(dir, name);
         let trunk = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(format::trunk_path(dir, name))?;
+            .open(&trunk_p)
+            .map_err(|e| io::Error::new(e.kind(), format!("opening {}: {e}", trunk_p.display())))?;
+        let rings_p = format::rings_path(dir, name);
         let rings = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(format::rings_path(dir, name))?;
+            .open(&rings_p)
+            .map_err(|e| io::Error::new(e.kind(), format!("opening {}: {e}", rings_p.display())))?;
 
         let mut chunks = Vec::new();
         if rings.metadata()?.len() == 0 {
@@ -721,6 +725,15 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "opening lock {} (need write access to the backing directory)",
+                    path.display()
+                ),
+            )
+        })
 }
 
 /// Ok(Some(file)) = lock acquired, keep the File alive to hold it.
