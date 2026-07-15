@@ -222,6 +222,29 @@ retain_size_budget() {
         && timberfs query "$PIPE_BACKING/cap.log" | tail -1 | grep -qx 100000
 }
 
+info_readonly_nonroot() {
+    # info and query are READ-ONLY: a non-root user must be able to
+    # inspect a root-owned, world-readable store (the /var/log/timberfs
+    # case) without any write access to the backing dir. Regression for
+    # the writer-state probe, which used to open the lock O_RDWR|O_CREAT
+    # and fail with EACCES.
+    id timbertest >/dev/null 2>&1 || useradd -M -s /usr/sbin/nologin timbertest
+    local d=/var/log/timberfs-rotest
+    rm -rf "$d"
+    mkdir -p "$d" # root-owned 0755
+    printf '2026-06-08T10:00:00 INFO RONEEDLE hi\n' \
+        | timberfs append --into "$d/app.log" --quiet
+    # as a non-root user: info succeeds with no error, and query reads it
+    runuser -u timbertest -- timberfs info "$d/app.log" > /tmp/ro.out 2>/tmp/ro.err
+    local ex=$?
+    local rows
+    rows=$(runuser -u timbertest -- timberfs query "$d/app.log" 2>/dev/null | grep -c RONEEDLE)
+    rm -rf "$d"
+    [ "$ex" = 0 ] && [ ! -s /tmp/ro.err ] \
+        && grep -q "writer" /tmp/ro.out \
+        && [ "$rows" = 1 ]
+}
+
 import_historical_log() {
     python3 -c "
 import datetime
@@ -320,6 +343,7 @@ run_test "appender: file lock blocks rotate while live" appender_lock_blocks_rot
 run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
+run_test "info/query: read-only, work for a non-root reader" info_readonly_nonroot
 run_test "records sink flushes by age, before EOF" records_sink_age_flush
 
 # The socket-activated log-intake units (timberfs-log@.socket/.service):
