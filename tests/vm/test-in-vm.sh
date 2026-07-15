@@ -364,6 +364,9 @@ ExecStart=
 ExecStart=/usr/bin/timberfs append --records --into /var/log/timberfs/%i.log --flush-age 1
 EOF
     systemctl daemon-reload
+    # Pre-create the store with a declared index (also makes /var/log/timberfs)
+    # so the intake exercises grain maintenance on the live/socket path.
+    timberfs create --index "$LOGSTORE" >/dev/null
     systemctl enable --now "timberfs-log@$LOGINST.socket"
     test -p "$LOGPIPE"
 }
@@ -396,6 +399,19 @@ socket_intake_survives_restart() {
     timberfs query "$LOGSTORE" | grep -q "before restart"
 }
 
+socket_intake_index_maintained() {
+    # The store was created --index; the streaming sink keeps the grain
+    # current while live (not just declared-but-empty), so a --has query
+    # is index-accelerated rather than a full scan.
+    for _ in $(seq 1 10); do
+        [ -f "$LOGSTORE.grain" ] && break
+        sleep 1
+    done
+    [ -f "$LOGSTORE.grain" ] || return 1
+    ! timber-filter --has restart "$LOGSTORE" -c 2>&1 >/dev/null | grep -q "no .grain" \
+        && [ "$(timber-filter --has restart "$LOGSTORE" -c 2>/dev/null)" -ge 1 ]
+}
+
 socket_intake_stop_removes_fifo() {
     systemctl stop "timberfs-log@$LOGINST.socket"
     # RemoveOnStop=yes drops the FIFO node from /run
@@ -405,6 +421,7 @@ socket_intake_stop_removes_fifo() {
 run_test "socket intake: tmpfiles + drop-in, socket enabled, FIFO created" socket_intake_setup
 run_test "socket intake: records stream lands in the store" socket_intake_receives
 run_test "socket intake: producer survives a service restart" socket_intake_survives_restart
+run_test "socket intake: declared index maintained while live" socket_intake_index_maintained
 run_test "socket intake: stop removes the FIFO" socket_intake_stop_removes_fifo
 import_segment_merge() {
     # ship a rotated segment into an archive: verbatim merge, idempotent
