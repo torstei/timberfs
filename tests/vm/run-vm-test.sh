@@ -24,6 +24,18 @@ if [ -z "$DEB" ] || [ ! -f "$DEB" ]; then
     exit 2
 fi
 
+# When we auto-picked the newest .deb, guard against silently testing a stale
+# one: if any packaged source is newer than it, someone forgot to re-run
+# 'cargo deb' and the VM would exercise the wrong binary. Warn loudly rather
+# than quietly mislead. (An explicit path is the caller's own choice.)
+if [ -z "${1:-}" ]; then
+    STALE=$(find src packaging Cargo.toml Cargo.lock -type f -newer "$DEB" -print -quit 2>/dev/null || true)
+    if [ -n "$STALE" ]; then
+        echo "WARNING: $DEB is older than tracked sources (e.g. $STALE)." >&2
+        echo "         It may not reflect your changes — run 'cargo deb' to rebuild." >&2
+    fi
+fi
+
 CACHE=${TIMBERFS_VM_CACHE:-$HOME/.cache/timberfs-vm-tests}
 IMG_URL=https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
 BASE=$CACHE/$(basename "$IMG_URL")

@@ -9,7 +9,7 @@
 #   systemctl edit timberfs-log@applogs.service
 #     [Service]
 #     ExecStart=
-#     ExecStart=/usr/bin/timberfs append --records --into /srv/logs/applogs.log --retain 30d
+#     ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade --into /srv/logs/applogs.log --retain 30d
 #
 # This is socket-activated: enable the .socket, not this unit. The first write
 # starts it and Restart=always keeps it up; a restart or upgrade is invisible to
@@ -23,7 +23,7 @@ After=timberfs-log@%i.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs append --records --into /var/log/timberfs/%i.log
+ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade --into /var/log/timberfs/%i.log
 StandardInput=socket
 StandardOutput=journal
 StandardError=journal
@@ -35,5 +35,11 @@ LogsDirectory=timberfs
 # the FIFO open): come back and keep draining.
 Restart=always
 RestartSec=1
+# --exit-on-upgrade: the daemon exits 85 when its binary is upgraded on disk;
+# force a restart onto the new binary. The socket holds the FIFO open across
+# it, so the producer sees no gap. SuccessExitStatus keeps it out of the
+# failure log. (Keep --exit-on-upgrade in any ExecStart override.)
+SuccessExitStatus=85
+RestartForceExitStatus=85
 
 # No [Install] section: this is socket-activated. Enable the .socket.

@@ -791,7 +791,12 @@ impl Filesystem for TimberFs {
     }
 }
 
-pub fn mount(store: Store, mountpoint: &Path, allow_other: bool) -> anyhow::Result<()> {
+pub fn mount(
+    store: Store,
+    mountpoint: &Path,
+    allow_other: bool,
+    exit_on_upgrade: bool,
+) -> anyhow::Result<()> {
     let mountpoint = std::fs::canonicalize(mountpoint)?;
     let mountpoint = mountpoint.as_path();
     // Claim the backing dir exclusively (a mount owns in-memory state for
@@ -844,6 +849,11 @@ pub fn mount(store: Store, mountpoint: &Path, allow_other: bool) -> anyhow::Resu
         let store = Arc::clone(&store);
         let notifier = Arc::clone(&notifier_slot);
         let inos = Arc::clone(&shared_inos);
+        let watch = if exit_on_upgrade {
+            crate::store::BinaryWatch::current()
+        } else {
+            None
+        };
         thread::spawn(move || {
             type Stamp = Option<(Option<std::time::SystemTime>, u64)>;
             let mut last_good: HashMap<String, crate::bark::Retention> = HashMap::new();
@@ -851,6 +861,14 @@ pub fn mount(store: Store, mountpoint: &Path, allow_other: bool) -> anyhow::Resu
             let mut warned: std::collections::HashSet<String> = std::collections::HashSet::new();
             loop {
                 thread::sleep(Duration::from_millis(1000));
+                // Our binary was replaced on disk (a package upgrade): flush
+                // and exit for a clean re-exec. auto_unmount tears the mount
+                // down (lazily, no busy-hang), and the supervisor restarts us
+                // on the new binary via RestartForceExitStatus.
+                if watch.as_ref().is_some_and(|w| w.changed()) {
+                    store.lock().unwrap().flush_all();
+                    std::process::exit(crate::store::EXIT_BINARY_UPGRADED);
+                }
                 let (dir, names) = {
                     let s = store.lock().unwrap();
                     (s.dir.clone(), s.files.keys().cloned().collect::<Vec<_>>())

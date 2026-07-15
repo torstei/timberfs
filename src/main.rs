@@ -45,6 +45,12 @@ enum Command {
         /// /etc/fuse.conf)
         #[arg(long)]
         allow_other: bool,
+        /// Exit for a clean re-exec when this binary is upgraded on disk
+        /// (dpkg replaces it). Only for supervised runs that will be
+        /// restarted — the systemd units set it and pair it with
+        /// RestartForceExitStatus; leave it off for an interactive mount.
+        #[arg(long)]
+        exit_on_upgrade: bool,
     },
     /// Create an empty timberfs log with its properties declared up
     /// front in a .bark manifest — database-style: `create --index` is
@@ -121,6 +127,12 @@ enum Command {
         /// (e.g. 200G, 512M); oldest data is dropped first
         #[arg(long)]
         retain_size: Option<String>,
+        /// Exit for a clean re-exec when this binary is upgraded on disk.
+        /// Only for supervised runs (the log-intake unit sets it); leave
+        /// it off for an interactive `producer | timberfs append`, which
+        /// must not vanish on an unrelated upgrade.
+        #[arg(long)]
+        exit_on_upgrade: bool,
     },
     /// Import existing plain log files into a timberfs log, stamping
     /// chunks with timestamps parsed from the log lines (auto-detects
@@ -320,6 +332,7 @@ fn main() -> anyhow::Result<()> {
             level,
             flush_age,
             allow_other,
+            exit_on_upgrade,
         } => {
             let cfg = store::Config {
                 chunk_size: chunk_size.max(1),
@@ -336,7 +349,7 @@ fn main() -> anyhow::Result<()> {
                 cfg.level,
                 flush_age
             );
-            fs::mount(s, &mountpoint, allow_other)?;
+            fs::mount(s, &mountpoint, allow_other, exit_on_upgrade)?;
         }
         Command::Create {
             dest,
@@ -369,6 +382,7 @@ fn main() -> anyhow::Result<()> {
             flush_age,
             retain,
             retain_size,
+            exit_on_upgrade,
         } => {
             let Some(into) = into else {
                 if let Some(l) = legacy.first() {
@@ -400,9 +414,16 @@ fn main() -> anyhow::Result<()> {
                     retain.as_deref(),
                     retain_size.as_deref(),
                     "append",
+                    exit_on_upgrade,
                 )?;
             } else {
-                append::cmd_append(&into, cfg, retain.as_deref(), retain_size.as_deref())?;
+                append::cmd_append(
+                    &into,
+                    cfg,
+                    retain.as_deref(),
+                    retain_size.as_deref(),
+                    exit_on_upgrade,
+                )?;
             }
         }
         Command::Import {
@@ -445,6 +466,7 @@ fn main() -> anyhow::Result<()> {
                     None,
                     None,
                     "import",
+                    false,
                 )?;
             } else {
                 if sources.is_empty() {
