@@ -1,4 +1,6 @@
-use timberfs::{append, bark, export, forest, fs, grain, import, note, query, rotate, sink, store};
+use timberfs::{
+    append, bark, export, forest, fs, grain, import, list, note, query, rotate, sink, store,
+};
 
 use std::path::PathBuf;
 
@@ -295,6 +297,23 @@ enum Command {
         /// Backing file: logical name, .trunk or .rings path
         file: PathBuf,
     },
+    /// List every store across the configured forests (or the given
+    /// directories): handle, forest, size, time span, writer state, index
+    /// presence and declared retention — the directory-level complement to
+    /// `info`. Read-only and lock-free, like `info`
+    List {
+        /// Directories to list stores in (ad-hoc; need not be configured
+        /// forests). Default: every configured forest
+        #[arg(num_args = 0..)]
+        dirs: Vec<PathBuf>,
+        /// Bare handles only, one per line, no header or columns (what
+        /// shell completion consumes)
+        #[arg(long, conflicts_with = "json")]
+        names: bool,
+        /// A JSON array of objects instead of the human table
+        #[arg(long)]
+        json: bool,
+    },
     /// Build or rebuild the .grain token index for a log: one Bloom filter
     /// per chunk over every token in it (~1% false positives), letting
     /// `query --has` skip chunks — e.g. find a request id with no known
@@ -572,6 +591,9 @@ fn main() -> anyhow::Result<()> {
         Command::Index { file } => {
             let file = forest::resolve_source(&file)?;
             query::cmd_index(&file)?;
+        }
+        Command::List { dirs, names, json } => {
+            list::cmd_list(&dirs, names, json)?;
         }
         Command::Reindex { file } => {
             let file = forest::resolve_source(&file)?;

@@ -579,6 +579,73 @@ safe against live writers.
 prints the chunk index of a backing file: per chunk the uncompressed
 offset and length, compressed length, compression ratio, and first/last
 write time, plus totals.
+.SS list
+.B timberfs list
+.RI [ DIR " ...]"
+is the directory-level complement to
+.BR info :
+one row per store, sorted by forest then handle, across every configured
+.B forest
+(see
+.B FORESTS
+below), or \(em when one or more
+.I DIR
+arguments are given \(em exactly the stores in those directories
+(ad-hoc; they need not be configured forests). Columns:
+.B HANDLE
+(the forest handle),
+.B FOREST
+(the config filename minus
+.IR .conf ,
+or the directory itself for an ad-hoc/
+.B TIMBERFS_FORESTS
+forest),
+.B SIZE
+(compressed on-disk size),
+.B SPAN
+(earliest \(em latest write time covered, or
+.IR empty ),
+.B WRITER
+.RI ( live
+if a writer currently holds the file's own lock, else
+.IR \- ),
+.B INDEX
+.RI ( grain
+if a
+.B .grain
+token index is present or declared, else
+.IR \- ),
+and
+.B RETAIN
+(declared
+.BR retain / retain_size ,
+else
+.IR \- ).
+The same handle found in two forests shows up as two rows \(em
+.B list
+is how an ambiguity that handle resolution would refuse to guess at
+becomes visible, not something it hides.
+.TP
+.B \-\-names
+Bare handles only, one per line, no header or columns \(em what shell
+completion consumes.
+.TP
+.B \-\-json
+A JSON array of objects
+.RI ( handle ", " forest ", " dir ", " path ", " size_bytes ", "
+.IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
+.IR retain_size )
+instead of the human table.
+.PP
+No forests configured and no
+.I DIR
+given prints a note to stderr and exits 0; a forest or
+.I DIR
+that doesn't exist is skipped (also noted). Read-only and lock-free \(em
+like
+.BR info ,
+it only ever probes a writer lock, never acquires one, so it works for a
+non-root reader on a root-owned forest.
 .SS reindex
 .B timberfs reindex
 .I FILE

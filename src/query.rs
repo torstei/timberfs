@@ -959,6 +959,145 @@ fn query_multi(
     Ok(())
 }
 
+/// The writer state of a backing pair, probed read-only (never acquired):
+/// is it served by a live mount, does an appender/import/rotation hold the
+/// file's own lock, or is nobody home? Shared by `info`'s prose and
+/// `list`'s WRITER column, which only cares about the `Active` case (a
+/// mount holds the directory lock, not the per-file one).
+pub enum WriterState {
+    /// The backing directory is held exclusively by a mount daemon.
+    Mounted(Option<PathBuf>),
+    /// The file's own writer lock is held: an appender, import or rotation.
+    Active,
+    /// A lock file exists but couldn't be opened (permissions) — unknown.
+    Unreadable,
+    /// Nobody holds anything.
+    Idle,
+}
+
+impl WriterState {
+    /// `list`'s WRITER column: is a writer live right now, per the
+    /// per-file lock specifically (a mount holds the directory lock
+    /// instead, so a mounted store reads `false` here).
+    pub fn is_live(&self) -> bool {
+        matches!(self, WriterState::Active)
+    }
+}
+
+/// A store's vital signs, gathered once from its parsed rings index and
+/// manifest — shared by `info`'s detailed print and `list`'s one-line row,
+/// so the two commands report identical facts. `records`/`bark` are handed
+/// in rather than re-read: `info` already has them from `open_source`, and
+/// `list` reads them directly without opening the (unneeded) trunk file.
+pub struct StoreSummary {
+    pub chunks: usize,
+    pub logical_bytes: u64,
+    pub compressed_bytes: u64,
+    pub first_write_ms: Option<u64>,
+    pub last_write_ms: Option<u64>,
+    pub rings_bytes: u64,
+    pub grain: Option<(u64, usize)>, // (bytes, chunks covered)
+    pub index_declared: bool,
+    pub retain: Option<String>,
+    pub retain_size: Option<String>,
+    pub writer: WriterState,
+}
+
+impl StoreSummary {
+    /// `list`'s INDEX column: a `.grain` token index that is present, or
+    /// declared (and due to be rebuilt on the next import if actually
+    /// missing) — either way, `--has` queries are meant to work here.
+    pub fn indexed(&self) -> bool {
+        self.index_declared || self.grain.is_some()
+    }
+}
+
+pub fn summarize_store(
+    dir: &Path,
+    name: &str,
+    records: &[ChunkRecord],
+    bark: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> StoreSummary {
+    let (chunks, logical_bytes, compressed_bytes) = match (records.first(), records.last()) {
+        (Some(f), Some(l)) => (
+            records.len(),
+            l.uncomp_end() - f.uncomp_start,
+            l.comp_end() - f.comp_start,
+        ),
+        _ => (0, 0, 0),
+    };
+    // Mostly-sorted windows: scan for the true extremes (48 B per chunk).
+    let (first_write_ms, last_write_ms) = if records.is_empty() {
+        (None, None)
+    } else {
+        let (mut min_ms, mut max_ms) = (u64::MAX, 0u64);
+        for r in records {
+            min_ms = min_ms.min(r.first_write_ms);
+            max_ms = max_ms.max(r.last_write_ms);
+        }
+        (Some(min_ms), Some(max_ms))
+    };
+    let rings_bytes = std::fs::metadata(format::rings_path(dir, name))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let gpath = format::grain_path(dir, name);
+    let grain = std::fs::metadata(&gpath).ok().and_then(|m| {
+        crate::grain::load(&gpath)
+            .ok()
+            .map(|g| (m.len(), g.chunk_count()))
+    });
+    let get = |k: &str| {
+        bark.and_then(|b| b.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let index_declared = bark
+        .and_then(|b| b.get("index"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Who is writing? flock presence is the truth (lock files persist and
+    // their contents go stale). This is a READ-ONLY probe — an observation,
+    // never an acquisition — so `info`/`list` work on a store they can only
+    // read (e.g. a root-owned /var/log/timberfs).
+    use crate::store::LockProbe;
+    let writer = match crate::store::probe_backing_exclusive(dir) {
+        LockProbe::Held => WriterState::Mounted(crate::store::read_lock_mountpoint(dir)),
+        LockProbe::Unreadable => WriterState::Unreadable,
+        LockProbe::Absent | LockProbe::Free => match crate::store::probe_file_writer(dir, name) {
+            LockProbe::Held => WriterState::Active,
+            LockProbe::Unreadable => WriterState::Unreadable,
+            LockProbe::Absent | LockProbe::Free => WriterState::Idle,
+        },
+    };
+
+    StoreSummary {
+        chunks,
+        logical_bytes,
+        compressed_bytes,
+        first_write_ms,
+        last_write_ms,
+        rings_bytes,
+        grain,
+        index_declared,
+        retain: get("retain"),
+        retain_size: get("retain_size"),
+        writer,
+    }
+}
+
+/// `info`'s prose rendering of a writer state — also what its `--json`
+/// mode prints under `"writer"`.
+fn writer_text(w: &WriterState) -> String {
+    match w {
+        WriterState::Mounted(Some(mp)) => format!("mounted at {}", mp.display()),
+        WriterState::Mounted(None) => "another timberfs process holds the directory".to_string(),
+        WriterState::Active => "active writer (appender, import or rotation)".to_string(),
+        WriterState::Unreadable => "unknown (lock file not readable)".to_string(),
+        WriterState::Idle => "none".to_string(),
+    }
+}
+
 /// Human-readable dump of the write-time index.
 /// `timberfs info`: a store's vital signs on one screen — identity,
 /// lineage, provenance, data/compression, time covered, index sizes and
@@ -968,22 +1107,6 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     let bundled = is_bundle(input);
     let handle = open_source(input)?;
     let records = &handle.records;
-
-    let chunks = records.len();
-    let logical = match (records.first(), records.last()) {
-        (Some(f), Some(l)) => l.uncomp_end() - f.uncomp_start,
-        _ => 0,
-    };
-    let compressed = match (records.first(), records.last()) {
-        (Some(f), Some(l)) => l.comp_end() - f.comp_start,
-        _ => 0,
-    };
-    // Mostly-sorted windows: scan for the true extremes (48 B per chunk).
-    let (mut min_ms, mut max_ms) = (u64::MAX, 0u64);
-    for r in records {
-        min_ms = min_ms.min(r.first_write_ms);
-        max_ms = max_ms.max(r.last_write_ms);
-    }
 
     let bark = handle.bark.clone().unwrap_or_default();
     let get = |k: &str| bark.get(k).and_then(|v| v.as_str()).map(str::to_string);
@@ -1024,51 +1147,47 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         })
         .collect();
 
-    // Pair-only facts: sidecar sizes, grain coverage, writer state.
+    // Pair-only facts: size/span, sidecar sizes, grain coverage, writer
+    // state — computed by the same `summarize_store` that builds a `list`
+    // row, so the two commands agree on what they report.
     let mut name = input
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut location = String::new();
-    let mut rings_bytes: Option<u64> = None;
-    let mut grain: Option<(u64, usize)> = None; // (bytes, chunks covered)
-    let mut writer: Option<String> = None;
     let mut bundle_bytes: Option<u64> = None;
-    if bundled {
+    let (chunks, logical, compressed, min_ms, max_ms, rings_bytes, grain, writer) = if bundled {
         bundle_bytes = std::fs::metadata(input).map(|m| m.len()).ok();
+        let chunks = records.len();
+        let (logical, compressed) = match (records.first(), records.last()) {
+            (Some(f), Some(l)) => (l.uncomp_end() - f.uncomp_start, l.comp_end() - f.comp_start),
+            _ => (0, 0),
+        };
+        // Mostly-sorted windows: scan for the true extremes (48 B per chunk).
+        let (mut min_ms, mut max_ms) = (u64::MAX, 0u64);
+        for r in records {
+            min_ms = min_ms.min(r.first_write_ms);
+            max_ms = max_ms.max(r.last_write_ms);
+        }
+        (
+            chunks, logical, compressed, min_ms, max_ms, None, None, None,
+        )
     } else {
         let (dir, base) = resolve_backing(input)?;
         name = base.clone();
         location = dir.display().to_string();
-        rings_bytes = std::fs::metadata(format::rings_path(&dir, &base))
-            .map(|m| m.len())
-            .ok();
-        let gpath = format::grain_path(&dir, &base);
-        if let Ok(m) = std::fs::metadata(&gpath) {
-            if let Ok(g) = crate::grain::load(&gpath) {
-                grain = Some((m.len(), g.chunk_count()));
-            }
-        }
-        // Who is writing? flock presence is the truth (lock files persist
-        // and their contents go stale). This is a READ-ONLY probe — an
-        // observation, never an acquisition — so `info` works on a store
-        // it can only read (e.g. a root-owned /var/log/timberfs).
-        use crate::store::LockProbe;
-        writer = Some(match crate::store::probe_backing_exclusive(&dir) {
-            LockProbe::Held => match crate::store::read_lock_mountpoint(&dir) {
-                Some(mp) => format!("mounted at {}", mp.display()),
-                None => "another timberfs process holds the directory".to_string(),
-            },
-            LockProbe::Unreadable => "unknown (lock file not readable)".to_string(),
-            LockProbe::Absent | LockProbe::Free => {
-                match crate::store::probe_file_writer(&dir, &base) {
-                    LockProbe::Held => "active writer (appender, import or rotation)".to_string(),
-                    LockProbe::Unreadable => "unknown (lock file not readable)".to_string(),
-                    LockProbe::Absent | LockProbe::Free => "none".to_string(),
-                }
-            }
-        });
-    }
+        let s = summarize_store(&dir, &base, records, handle.bark.as_ref());
+        (
+            s.chunks,
+            s.logical_bytes,
+            s.compressed_bytes,
+            s.first_write_ms.unwrap_or(u64::MAX),
+            s.last_write_ms.unwrap_or(0),
+            Some(s.rings_bytes),
+            s.grain,
+            Some(writer_text(&s.writer)),
+        )
+    };
 
     if json {
         let mut o = serde_json::Map::new();

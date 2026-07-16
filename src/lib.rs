@@ -14,6 +14,7 @@ pub mod fs;
 pub mod grain;
 pub mod grep;
 pub mod import;
+pub mod list;
 pub mod note;
 pub mod query;
 pub mod records;

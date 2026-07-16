@@ -30,9 +30,9 @@ const FORESTS_ENV: &str = "TIMBERFS_FORESTS";
 /// configured under (the config filename minus `.conf`; the directory path
 /// for an env-provided forest). The name is only for diagnostics and
 /// ambiguity messages — qualified handles (`default:nginx`) come later.
-struct Forest {
-    name: String,
-    dir: PathBuf,
+pub(crate) struct Forest {
+    pub(crate) name: String,
+    pub(crate) dir: PathBuf,
 }
 
 /// The handle a store's `.rings` file is reachable by: the file name minus
@@ -139,6 +139,22 @@ fn lookup_handle(handle: &str) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// The forests for `timberfs list`: the given directories as ad-hoc forests
+/// (named by their own path, same as an env-provided forest) when any are
+/// given, otherwise every configured forest.
+pub(crate) fn forests_for_list(dirs: &[PathBuf]) -> Vec<Forest> {
+    if dirs.is_empty() {
+        load_forests()
+    } else {
+        dirs.iter()
+            .map(|dir| Forest {
+                name: dir.display().to_string(),
+                dir: dir.clone(),
+            })
+            .collect()
+    }
+}
+
 /// The configured forests, in search order. TIMBERFS_FORESTS, when set,
 /// replaces the config entirely; otherwise read /etc/timberfs/forests.d/*.conf
 /// in sorted filename order.
@@ -192,7 +208,7 @@ fn parse_forest_file(path: &Path) -> Option<Forest> {
 /// the forest root and its immediate subdirectories for `*.rings` — flat
 /// stores at the root, nested stores one level down. A missing or unreadable
 /// forest yields nothing (skipped silently).
-fn scan_forest(dir: &Path) -> Vec<(String, PathBuf)> {
+pub(crate) fn scan_forest(dir: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
