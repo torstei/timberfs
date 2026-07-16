@@ -28,6 +28,7 @@ use anyhow::{bail, Context};
 use clap::Parser;
 use regex::bytes::{Regex, RegexBuilder};
 
+use timberfs::forest;
 use timberfs::grep::{interior_tokens, names_timberfs_source, word_pattern, Entries};
 use timberfs::import::Extractor;
 use timberfs::note;
@@ -146,7 +147,16 @@ fn main() {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    let files = cli.files.clone();
+    // A bare handle (e.g. `nginx`) names no path of its own, so it must
+    // be resolved to a store before the store-vs-raw classification
+    // below ever sees it — same resolution the `timberfs` commands run,
+    // and an existing path (raw file, full store path, bundle, or a
+    // stdin placeholder that never reaches here) passes through unchanged.
+    let files: Vec<PathBuf> = cli
+        .files
+        .iter()
+        .map(|f| forest::resolve_source(f))
+        .collect::<anyhow::Result<_>>()?;
 
     // Positionals are always files — a name that is neither a store
     // nor an existing file is the one first-contact mistake, so the

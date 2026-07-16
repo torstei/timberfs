@@ -63,6 +63,8 @@ assets = [
     ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
     ["packaging/timberfs-completion.bash", "usr/share/bash-completion/completions/timberfs", "644"],
     ["packaging/timberfs-completion.zsh", "usr/share/zsh/vendor-completions/_timberfs", "644"],
+    ["packaging/timber-filter-completion.bash", "usr/share/bash-completion/completions/timber-filter", "644"],
+    ["packaging/timber-filter-completion.zsh", "usr/share/zsh/vendor-completions/_timber-filter", "644"],
     ["README.md", "usr/share/doc/timberfs/README.md", "644"],
     ["docs/deployment.md", "usr/share/doc/timberfs/deployment.md", "644"],
     ["packaging/timberfs@.service", "lib/systemd/system/timberfs@.service", "644"],

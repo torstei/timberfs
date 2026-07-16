@@ -297,7 +297,9 @@ man_page_installed() {
 
 completion_scripts_installed() {
     test -f /usr/share/bash-completion/completions/timberfs \
-        && test -f /usr/share/zsh/vendor-completions/_timberfs
+        && test -f /usr/share/zsh/vendor-completions/_timberfs \
+        && test -f /usr/share/bash-completion/completions/timber-filter \
+        && test -f /usr/share/zsh/vendor-completions/_timber-filter
 }
 
 run_test "install deb with dependencies" install_package
@@ -626,6 +628,54 @@ run_test "bash completion: timberfs <TAB> lists subcommands" bash_completion_lis
 run_test "bash completion: query <TAB> offers live store handles" bash_completion_offers_live_handles
 run_test "bash completion: no forests falls back to file paths, no error" bash_completion_falls_back_with_no_forests
 run_test "zsh completion: _timberfs compdef parses without error" zsh_completion_parses_cleanly
+
+# P4: timber-filter handle resolution + its own completion. Reuses the
+# `web` store completion_setup left under /var/log/timberfs.
+timber_filter_handle_resolution() {
+    # a bare handle resolves to the store exactly like `timberfs query web`
+    timber-filter web --has "completion fixture" 2>/dev/null \
+        | grep -q "web completion fixture" || return 1
+    # a full store path still works unchanged
+    timber-filter /var/log/timberfs/web/web.log --has "completion fixture" 2>/dev/null \
+        | grep -q "web completion fixture" || return 1
+    # a raw text file (not a store) still filters as plain text, unaffected
+    # — timestamped lines so each is its own entry and --has narrows to one
+    printf '2026-07-16T10:00:00 INFO plain line one\n2026-07-16T10:00:01 INFO plain line two\n' \
+        > /tmp/tf-raw.log
+    [ "$(timber-filter --has "line one" /tmp/tf-raw.log 2>/dev/null)" \
+        = "2026-07-16T10:00:00 INFO plain line one" ] || return 1
+    # an unknown bare token now fails as "no store", not "no such file"
+    timber-filter no-such-handle-here 2>&1 >/dev/null | grep -q "no store" || return 1
+    return 0
+}
+
+timber_filter_bash_completion_offers_handles() {
+    source /usr/share/bash-completion/completions/timber-filter
+    COMP_WORDS=(timber-filter "")
+    COMP_CWORD=1
+    _timber_filter
+    printf '%s\n' "${COMPREPLY[@]}" | grep -qx web \
+        && printf '%s\n' "${COMPREPLY[@]}" | grep -qx db
+}
+
+timber_filter_bash_completion_offers_flags() {
+    source /usr/share/bash-completion/completions/timber-filter
+    COMP_WORDS=(timber-filter "-")
+    COMP_CWORD=1
+    _timber_filter
+    printf '%s\n' "${COMPREPLY[@]}" | grep -qx -- --has \
+        && printf '%s\n' "${COMPREPLY[@]}" | grep -qx -- --records
+}
+
+timber_filter_zsh_completion_parses_cleanly() {
+    command -v zsh >/dev/null 2>&1 || apt-get install -y -qq zsh || return 1
+    zsh -n /usr/share/zsh/vendor-completions/_timber-filter
+}
+
+run_test "timber-filter: bare handle resolves; path/raw-file unaffected; unknown errors" timber_filter_handle_resolution
+run_test "timber-filter bash completion: <TAB> offers store handles" timber_filter_bash_completion_offers_handles
+run_test "timber-filter bash completion: -<TAB> offers flags" timber_filter_bash_completion_offers_flags
+run_test "timber-filter zsh completion: _timber-filter compdef parses without error" timber_filter_zsh_completion_parses_cleanly
 
 import_segment_merge() {
     # ship a rotated segment into an archive: verbatim merge, idempotent
