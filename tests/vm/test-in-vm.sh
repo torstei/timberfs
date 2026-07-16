@@ -295,11 +295,17 @@ man_page_installed() {
     zcat /usr/share/man/man1/timberfs.1.gz | grep -q "^.TH TIMBERFS 1"
 }
 
+completion_scripts_installed() {
+    test -f /usr/share/bash-completion/completions/timberfs \
+        && test -f /usr/share/zsh/vendor-completions/_timberfs
+}
+
 run_test "install deb with dependencies" install_package
 run_test "binary runs (--version)" timberfs --version
 run_test "fuse3 dependency pulled in" command -v fusermount3
 run_test "man page installed and gzipped" man_page_installed
 run_test "package ships /etc/timberfs" test -f /etc/timberfs/README
+run_test "shell completion scripts installed to vendor paths" completion_scripts_installed
 configure_instance
 run_test "systemctl enable --now timberfs@test" start_unit
 run_test "mountpoint appears" wait_mounted
@@ -563,6 +569,63 @@ forest_list_command() {
 }
 
 run_test "list: table/--names/--json/explicit-dir agree; WRITER=live best-effort" forest_list_command
+
+# P3: shell completion. forest_list_command already left `web` and `db`
+# stores under /var/log/timberfs; touch them again (append is safe to
+# repeat) so this section doesn't depend on run order or prior tests.
+completion_setup() {
+    printf '2026-07-16T09:00:00 INFO web completion fixture\n' \
+        | timberfs append --into /var/log/timberfs/web/web.log --quiet \
+        && printf '2026-07-16T09:00:00 INFO db completion fixture\n' \
+        | timberfs append --into /var/log/timberfs/db/db.log --quiet
+}
+
+bash_completion_lists_subcommands() {
+    source /usr/share/bash-completion/completions/timberfs
+    COMP_WORDS=(timberfs "")
+    COMP_CWORD=1
+    _timberfs
+    printf '%s\n' "${COMPREPLY[@]}" | grep -qx query \
+        && printf '%s\n' "${COMPREPLY[@]}" | grep -qx list \
+        && printf '%s\n' "${COMPREPLY[@]}" | grep -qx rotate
+}
+
+bash_completion_offers_live_handles() {
+    source /usr/share/bash-completion/completions/timberfs
+    COMP_WORDS=(timberfs query "")
+    COMP_CWORD=2
+    _timberfs
+    printf '%s\n' "${COMPREPLY[@]}" | grep -qx web \
+        && printf '%s\n' "${COMPREPLY[@]}" | grep -qx db
+}
+
+bash_completion_falls_back_with_no_forests() {
+    # empty TIMBERFS_FORESTS: `list --names` prints nothing (still exit 0),
+    # so completion must not error and must still offer file completion
+    # instead of handles.
+    source /usr/share/bash-completion/completions/timberfs
+    (
+        TIMBERFS_FORESTS=
+        export TIMBERFS_FORESTS
+        cd /tmp || exit 1
+        touch fallback-marker.log
+        COMP_WORDS=(timberfs query "fallback-mark")
+        COMP_CWORD=2
+        _timberfs
+        printf '%s\n' "${COMPREPLY[@]}" | grep -q "^fallback-marker.log$"
+    )
+}
+
+zsh_completion_parses_cleanly() {
+    command -v zsh >/dev/null 2>&1 || apt-get install -y -qq zsh || return 1
+    zsh -n /usr/share/zsh/vendor-completions/_timberfs
+}
+
+run_test "completion setup: touch web/db stores" completion_setup
+run_test "bash completion: timberfs <TAB> lists subcommands" bash_completion_lists_subcommands
+run_test "bash completion: query <TAB> offers live store handles" bash_completion_offers_live_handles
+run_test "bash completion: no forests falls back to file paths, no error" bash_completion_falls_back_with_no_forests
+run_test "zsh completion: _timberfs compdef parses without error" zsh_completion_parses_cleanly
 
 import_segment_merge() {
     # ship a rotated segment into an archive: verbatim merge, idempotent
