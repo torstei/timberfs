@@ -69,4 +69,5 @@ assets = [
     ["packaging/timberfs-tmpfiles.conf", "usr/lib/tmpfiles.d/timberfs.conf", "644"],
     ["packaging/timberfs.conf.example", "usr/share/doc/timberfs/examples/timberfs.conf.example", "644"],
     ["packaging/etc-README", "etc/timberfs/README", "644"],
+    ["packaging/forests-default.conf", "etc/timberfs/forests.d/default.conf", "644"],
 ]

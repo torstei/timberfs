@@ -1,4 +1,4 @@
-use timberfs::{append, bark, export, fs, grain, import, note, query, rotate, sink, store};
+use timberfs::{append, bark, export, forest, fs, grain, import, note, query, rotate, sink, store};
 
 use std::path::PathBuf;
 
@@ -387,6 +387,7 @@ fn main() -> anyhow::Result<()> {
             sets,
             unsets,
         } => {
+            let store = forest::resolve_source(&store)?;
             bark::cmd_set(&store, &sets, &unsets)?;
         }
         Command::Append {
@@ -526,6 +527,7 @@ fn main() -> anyhow::Result<()> {
                      --into DEST)"
                 );
             }
+            let source = forest::resolve_source(&source)?;
             export::cmd_export(&source, &dest, from, to, fail_on_empty)?;
         }
         Command::Query {
@@ -543,6 +545,10 @@ fn main() -> anyhow::Result<()> {
             tail,
             max,
         } => {
+            let files = files
+                .iter()
+                .map(|f| forest::resolve_source(f))
+                .collect::<anyhow::Result<Vec<_>>>()?;
             query::cmd_query(
                 &files,
                 from,
@@ -560,12 +566,15 @@ fn main() -> anyhow::Result<()> {
             )?;
         }
         Command::Info { file, json } => {
+            let file = forest::resolve_source(&file)?;
             query::cmd_info(&file, json)?;
         }
         Command::Index { file } => {
+            let file = forest::resolve_source(&file)?;
             query::cmd_index(&file)?;
         }
         Command::Reindex { file } => {
+            let file = forest::resolve_source(&file)?;
             grain::cmd_reindex(&file)?;
         }
         Command::Rotate {
@@ -576,6 +585,7 @@ fn main() -> anyhow::Result<()> {
             dry_run,
             fail_on_empty,
         } => {
+            let source = forest::resolve_source(&source)?;
             rotate::cmd_rotate(
                 &source,
                 dest.as_deref(),

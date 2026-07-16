@@ -16,6 +16,7 @@ pass its own paths.
 /usr/bin/timber-filter                    the entry-aware records filter
 
 /etc/timberfs/<instance>.conf             config for a mount instance (see below)
+/etc/timberfs/forests.d/*.conf            forests: directories searched by handle (see below)
 
 /run/timberfs/<instance>.pipe             intake FIFO, created by the .socket unit
                                           (the directory is created at boot by tmpfiles.d)
@@ -37,6 +38,22 @@ path:
 timberfs query /var/log/timberfs/nginx/nginx.log --from 13:42 --to 13:43
 timberfs info  /var/log/timberfs/nginx/nginx.log
 ```
+
+Or by **handle**: the package ships `/etc/timberfs/forests.d/default.conf` with
+`DIR=/var/log/timberfs`, and a bare token (no `/`) that names no store on disk
+is looked up as a store under a configured forest — so `nginx` finds
+`/var/log/timberfs/nginx/nginx.log`:
+
+```sh
+timberfs query nginx --from 13:42 --to 13:43
+timberfs info  nginx
+```
+
+The handle is the `.rings` file name minus `.rings` and a single trailing
+`.log`, so both a flat `nginx.rings` and a nested `nginx/nginx.log.rings`
+resolve as `nginx`. Full paths always win and nothing existing changes; edit
+`DIR`, drop in another `*.conf`, or delete the file to disable the lookup (it's
+a conffile, so edits survive upgrades). See `man timberfs` (FORESTS).
 
 ### Why a directory per instance
 
