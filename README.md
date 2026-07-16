@@ -88,6 +88,11 @@ timberfs query backing/app.log --from 13:40 --max 100           # first 100 in t
 timber-filter --has ERROR backing/app.log --max 50              # first 50 matches, then stop
 ```
 
+A store under a configured **forest** (`/var/log/timberfs` by default) can be
+named by a bare **handle** instead of its full path — `timberfs query nginx`
+reads `/var/log/timberfs/nginx/nginx.log`. Full paths always work unchanged;
+see `man timberfs` (FORESTS) or the deployment guide.
+
 Queries answer **in the timestamps you can see**: chunks are selected by
 the write-time index (widened a little), then every entry is verified
 against `--from/--to` by the timestamp its own line carries — so asking

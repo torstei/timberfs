@@ -8,6 +8,7 @@ pub mod append;
 pub mod bark;
 pub mod entry;
 pub mod export;
+pub mod forest;
 pub mod format;
 pub mod fs;
 pub mod grain;

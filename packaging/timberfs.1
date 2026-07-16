@@ -656,6 +656,67 @@ settings, is never inherited by derived stores.
 .B timberfs info
 shows the declared policy and calls out a store that is over budget
 with no writer running to enforce it.
+.SH FORESTS
+A
+.I forest
+is a directory
+.B timberfs
+searches for stores by a short
+.IR handle ,
+so
+.B timberfs query nginx
+finds
+.I /var/log/timberfs/nginx/nginx.log
+without spelling out the path. Handle lookup applies to the source
+argument of
+.BR query ", " info ", " index ", " reindex ", " set ", " rotate " and " export ;
+a full path, a relative path or a
+.B .timber
+bundle is always taken literally, so every existing invocation is
+unchanged \(em a forest is consulted only for a bare token (no
+.BR / )
+that names no store on disk.
+.PP
+Forests are configured by
+.IR /etc/timberfs/forests.d/*.conf ,
+one forest per file, the same
+.B KEY=VALUE
+idiom as an instance
+.IR .conf ,
+read in sorted filename order. The only key is
+.BR DIR ,
+an absolute directory; blank lines,
+.B #
+comments and unknown keys are ignored, and a configured directory that
+does not exist is skipped. The package ships
+.I default.conf
+with
+.BR DIR=/var/log/timberfs ;
+edit it, drop in another
+.IR .conf ,
+or delete it to disable handle lookup (it is a conffile, so edits
+survive upgrades).
+.PP
+A store's handle is its
+.B .rings
+file name minus
+.B .rings
+and a single trailing
+.BR .log ,
+so a flat
+.I nginx.rings
+and a nested
+.I nginx/nginx.log.rings
+both resolve as
+.BR nginx ", while " metrics.jsonl.rings " keeps its " .jsonl .
+Each forest's root and its immediate subdirectories are scanned. A
+handle that matches no store, or more than one, is an error that names
+what was searched and asks for a full path.
+.PP
+The environment variable
+.B TIMBERFS_FORESTS
+(colon-separated absolute directories) replaces the configuration
+entirely \(em for tests and one-off use.
 .SH GLOBAL OPTIONS
 .TP
 .B \-\-quiet

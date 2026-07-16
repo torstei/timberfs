@@ -491,6 +491,29 @@ run_test "socket intake: records stream lands in the store" socket_intake_receiv
 run_test "socket intake: producer survives a service restart" socket_intake_survives_restart
 run_test "socket intake: declared index maintained while live" socket_intake_index_maintained
 run_test "socket intake: stop removes the FIFO" socket_intake_stop_removes_fifo
+
+forest_handle_resolution() {
+    # The package ships /etc/timberfs/forests.d/default.conf with
+    # DIR=/var/log/timberfs, so a bare handle names a store under that tree
+    # without spelling out the path. Create one (append makes the nested
+    # dir), then check handle lookup for query and info, that a full path
+    # still works unchanged, and that an unknown handle fails loudly.
+    grep -q '^DIR=/var/log/timberfs$' /etc/timberfs/forests.d/default.conf || return 1
+    local store=/var/log/timberfs/nginx/nginx.log
+    printf '2026-07-07T08:00:00 INFO forest hello\n' \
+        | timberfs append --into "$store" >/dev/null 2>&1 || return 1
+    # bare handle "nginx" resolves to the nested store nginx/nginx.log
+    timberfs query nginx 2>/dev/null | grep -q "forest hello" || return 1
+    # info takes the same handle
+    timberfs info nginx 2>/dev/null | grep -q "nginx.log" || return 1
+    # a full path behaves exactly as before
+    timberfs query "$store" 2>/dev/null | grep -q "forest hello" || return 1
+    # an unknown handle is an error, not a silent miss
+    ! timberfs query no-such-handle-here >/dev/null 2>&1
+}
+
+run_test "forest: bare handle resolves query/info; full path unchanged; unknown errors" forest_handle_resolution
+
 import_segment_merge() {
     # ship a rotated segment into an archive: verbatim merge, idempotent
     timberfs rotate "$PIPE_BACKING/imported.log" seg-old.log \
