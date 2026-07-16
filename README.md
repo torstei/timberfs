@@ -91,7 +91,10 @@ timber-filter --has ERROR backing/app.log --max 50              # first 50 match
 A store under a configured **forest** (`/var/log/timberfs` by default) can be
 named by a bare **handle** instead of its full path — `timberfs query nginx`
 reads `/var/log/timberfs/nginx/nginx.log`. Full paths always work unchanged;
-see `man timberfs` (FORESTS) or the deployment guide.
+see `man timberfs` (FORESTS) or the deployment guide. `timberfs list` shows
+what's actually there: one row per store (handle, forest, size, time span,
+writer state, index, retention), across every configured forest or a given
+directory — `--names` for bare handles, `--json` for scripting.
 
 Queries answer **in the timestamps you can see**: chunks are selected by
 the write-time index (widened a little), then every entry is verified

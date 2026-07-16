@@ -44,7 +44,7 @@ MNT=/var/log/testlogs
 install_package() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq /opt/timberfs.deb zstd
+    apt-get install -y -qq /opt/timberfs.deb zstd jq
 }
 
 configure_instance() {
@@ -513,6 +513,56 @@ forest_handle_resolution() {
 }
 
 run_test "forest: bare handle resolves query/info; full path unchanged; unknown errors" forest_handle_resolution
+
+forest_list_command() {
+    # `timberfs list`: the directory-level complement to `info`. Clear the
+    # default forest of state left by earlier tests (the socket-intake
+    # instance and forest_handle_resolution's nginx store) so the counts
+    # below are exact, then create two nested stores of our own.
+    rm -rf /var/log/timberfs/vmtest /var/log/timberfs/nginx
+    printf '2026-07-08T09:00:00 INFO web one\n2026-07-08T09:00:01 INFO web two\n' \
+        | timberfs append --into /var/log/timberfs/web/web.log --quiet || return 1
+    printf '2026-07-08T09:05:00 INFO db one\n' \
+        | timberfs append --into /var/log/timberfs/db/db.log --quiet || return 1
+
+    local out names dir_names
+    out=$(timberfs list) || return 1
+    echo "$out" | head -1 | grep -q '^HANDLE' || return 1
+    # a row for each, with a real (non-"empty") SPAN — both stores have data
+    echo "$out" | grep -E '^web[[:space:]]+default[[:space:]]' | grep -q ' \.\. ' || return 1
+    echo "$out" | grep -E '^db[[:space:]]+default[[:space:]]' | grep -q ' \.\. ' || return 1
+
+    names=$(timberfs list --names | sort | tr '\n' ',')
+    [ "$names" = "db,web," ] || return 1
+
+    timberfs list --json > /tmp/list.json || return 1
+    jq -e 'length == 2' /tmp/list.json >/dev/null || return 1
+    jq -e '([.[].handle] | sort) == ["db","web"]' /tmp/list.json >/dev/null || return 1
+    rm -f /tmp/list.json
+
+    # an explicit dir (not necessarily a configured forest) surfaces the
+    # same STORES — its FOREST column is the directory itself, not the
+    # configured forest's name, so compare handles rather than raw text
+    dir_names=$(timberfs list /var/log/timberfs --names | sort | tr '\n' ',')
+    [ "$dir_names" = "$names" ] || return 1
+
+    # nice-to-have: a live appender shows WRITER=live; best-effort, never
+    # fails the test (the lock-holding window is inherently a race)
+    mkfifo /tmp/list-live.fifo
+    timberfs append --into /var/log/timberfs/live/live.log --flush-age 60 < /tmp/list-live.fifo &
+    local live_pid=$!
+    exec 9>/tmp/list-live.fifo
+    sleep 0.5
+    timberfs list --json 2>/dev/null \
+        | jq -e '.[] | select(.handle=="live") | .writer_live == true' >/dev/null 2>&1 \
+        || echo "note: live-writer race missed for WRITER=live (non-fatal)"
+    exec 9>&-
+    wait "$live_pid" 2>/dev/null
+    rm -f /tmp/list-live.fifo
+    return 0
+}
+
+run_test "list: table/--names/--json/explicit-dir agree; WRITER=live best-effort" forest_list_command
 
 import_segment_merge() {
     # ship a rotated segment into an archive: verbatim merge, idempotent
