@@ -784,6 +784,27 @@ The environment variable
 .B TIMBERFS_FORESTS
 (colon-separated absolute directories) replaces the configuration
 entirely \(em for tests and one-off use.
+.SH SHELL COMPLETION
+The package ships completion scripts for
+.B bash
+and
+.BR zsh ,
+installed to the standard vendor locations
+.RI ( /usr/share/bash\-completion/completions/timberfs " and "
+.IR /usr/share/zsh/vendor\-completions/_timberfs )
+so both shells load them automatically, with no per-user setup.
+.B timberfs
+.RB [ TAB ]
+lists the subcommands; the store argument of
+.BR query ", " info ", " index ", " reindex ", " set " and the source of "
+.BR rotate " and " export
+additionally completes bare
+.B FORESTS
+handles, gathered live from
+.B timberfs list \-\-names
+and offered alongside normal file-path completion. With no forests
+configured (or if that call errors), completion silently falls back to
+file paths \(em never an error at the prompt.
 .SH GLOBAL OPTIONS
 .TP
 .B \-\-quiet

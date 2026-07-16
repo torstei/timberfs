@@ -94,7 +94,9 @@ reads `/var/log/timberfs/nginx/nginx.log`. Full paths always work unchanged;
 see `man timberfs` (FORESTS) or the deployment guide. `timberfs list` shows
 what's actually there: one row per store (handle, forest, size, time span,
 writer state, index, retention), across every configured forest or a given
-directory — `--names` for bare handles, `--json` for scripting.
+directory — `--names` for bare handles, `--json` for scripting. The package
+also ships bash/zsh completion, so `timberfs query <TAB>` offers those same
+handles live.
 
 Queries answer **in the timestamps you can see**: chunks are selected by
 the write-time index (widened a little), then every entry is verified
