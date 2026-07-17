@@ -190,6 +190,11 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
         });
     }
     let (dir, base) = resolve_backing(input)?;
+    // Best-effort: a collapse that started but never finished (a writer
+    // crash) leaves a `.trim` marker; reconcile it before reading so we
+    // never see a half-landed cut. A read-only caller without write
+    // access to the directory just leaves it for the next writer.
+    let _ = crate::store::reconcile_trim(&dir, &base);
     let rings = format::rings_path(&dir, &base);
     if !rings.exists() {
         bail!(
@@ -208,6 +213,63 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
         file,
         bark,
     })
+}
+
+/// Identity for the collapse-head seqlock guard (store.rs): `None` for a
+/// `.timber` bundle (its trunk member is written once and never mutated
+/// again, so there's nothing a reader could race), `Some(dir, name)` for
+/// a live backing pair, which a concurrent writer's retention can
+/// collapse out from under a standalone reader in another process.
+fn seq_guard(input: &Path) -> Option<(PathBuf, String)> {
+    if is_bundle(input) {
+        None
+    } else {
+        resolve_backing(input).ok()
+    }
+}
+
+/// Read+decompress chunk `c`, safe against a concurrent `collapse_head`
+/// (store.rs): a standalone reader's `.trunk` pread can land mid-collapse,
+/// at an offset the kernel is actively shifting underneath it. Bracket
+/// the read with the store's seqlock (odd = a collapse is in flight; a
+/// value that changed since we sampled it means one just finished); on
+/// either signal, re-open `input` fresh and re-locate the SAME chunk by
+/// its write-time window and length (offsets shift under a collapse,
+/// write times and lengths don't), then retry. A chunk the race retained
+/// away comes back `None` — a legitimate outcome (the same as if the read
+/// had started a moment later), never stale or garbage bytes.
+fn read_chunk(
+    input: &Path,
+    guard: &Option<(PathBuf, String)>,
+    handle: &mut SourceHandle,
+    mut c: ChunkRecord,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    loop {
+        let before = guard.as_ref().map(|(d, n)| crate::store::read_seq(d, n));
+        let mut comp = vec![0u8; c.comp_len as usize];
+        let read_res = handle.file.read_exact_at(&mut comp, c.comp_start);
+        let raced = if let (Some(before), Some((d, n))) = (before, guard.as_ref()) {
+            let after = crate::store::read_seq(d, n);
+            before % 2 == 1 || after % 2 == 1 || before != after
+        } else {
+            false
+        };
+        if !raced {
+            read_res.context("reading a stored chunk")?;
+            return Ok(Some(zstd::stream::decode_all(&comp[..]).with_context(
+                || "decompressing a stored chunk — the .trunk may be corrupt",
+            )?));
+        }
+        *handle = open_source(input)?;
+        match handle.records.iter().find(|r| {
+            r.first_write_ms == c.first_write_ms
+                && r.last_write_ms == c.last_write_ms
+                && r.uncomp_len == c.uncomp_len
+        }) {
+            Some(r) => c = *r,
+            None => return Ok(None),
+        }
+    }
 }
 
 /// Window + --has chunk selection, shared by query and grep: an
@@ -384,23 +446,21 @@ fn query_entries(
     max: Option<u64>,
 ) -> anyhow::Result<()> {
     struct Src {
-        file: File,
+        path: std::path::PathBuf,
+        guard: Option<(PathBuf, String)>,
+        handle: SourceHandle,
         chunks: Vec<(usize, ChunkRecord)>,
         total_chunks: usize,
         pos: usize,
         sink: crate::entry::EntrySink,
     }
-    let decomp = |file: &File, c: &ChunkRecord| -> anyhow::Result<Vec<u8>> {
-        let mut comp = vec![0u8; c.comp_len as usize];
-        file.read_exact_at(&mut comp, c.comp_start)?;
-        Ok(zstd::stream::decode_all(&comp[..])?)
-    };
     let multi = files.len() > 1 && !no_filename;
     // --max: a total entry cap shared by every source's sink.
     let limit = max.map(|m| (Rc::new(Cell::new(0u64)), m));
     let mut srcs: Vec<Src> = Vec::new();
     for f in files {
-        let source = open_source(f)?;
+        let mut source = open_source(f)?;
+        let guard = seq_guard(f);
         let tf = crate::bark::time_format(source.bark.as_ref());
         let extractor =
             crate::import::Extractor::new(tf.regex.as_deref(), tf.format.as_deref(), tf.utc)?;
@@ -416,7 +476,13 @@ fn query_entries(
         )?;
         let filterable = windowed
             && match selected.first() {
-                Some((_, c)) => crate::entry::probe_stamps(&extractor, &decomp(&source.file, c)?),
+                Some((_, c)) => match read_chunk(f, &guard, &mut source, *c)? {
+                    Some(data) => crate::entry::probe_stamps(&extractor, &data),
+                    // Retained away by a race between selection and probe:
+                    // default to unfilterable (never both looser and
+                    // silent — the note below explains).
+                    None => false,
+                },
                 None => false,
             };
         let window = if filterable {
@@ -449,8 +515,10 @@ fn query_entries(
             },
         };
         srcs.push(Src {
-            file: source.file,
+            path: f.clone(),
+            guard,
             total_chunks: source.records.len(),
+            handle: source,
             chunks: selected,
             pos: 0,
             sink: crate::entry::EntrySink::new(
@@ -514,7 +582,9 @@ fn query_entries(
         let s = &mut srcs[i];
         let c = s.chunks[s.pos].1;
         s.pos += 1;
-        let data = decomp(&s.file, &c)?;
+        let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
+            continue; // retained away by a race between selection and read
+        };
         s.sink
             .push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?;
         // --max reached: stop decompressing further chunks.
@@ -584,8 +654,10 @@ fn count_units(data: &[u8], extractor: &crate::import::Extractor, by_line: bool)
 /// per-entry offset/length index (a future ".grain"-like log-entry index);
 /// until then the overshoot is bounded by one chunk (--flush-age or 256K).
 fn tail_start(
+    input: &Path,
+    guard: &Option<(PathBuf, String)>,
+    handle: &mut SourceHandle,
     chunks: &[ChunkRecord],
-    file: &File,
     extractor: &crate::import::Extractor,
     by_line: bool,
     n: u64,
@@ -593,15 +665,12 @@ fn tail_start(
     if chunks.is_empty() || n == 0 {
         return Ok(chunks.len());
     }
-    let decomp = |c: &ChunkRecord| -> anyhow::Result<Vec<u8>> {
-        let mut comp = vec![0u8; c.comp_len as usize];
-        file.read_exact_at(&mut comp, c.comp_start)?;
-        Ok(zstd::stream::decode_all(&comp[..])?)
-    };
     let mut count = 0u64;
     let mut start = chunks.len();
     for i in (0..chunks.len()).rev() {
-        count += count_units(&decomp(&chunks[i])?, extractor, by_line);
+        if let Some(data) = read_chunk(input, guard, handle, chunks[i])? {
+            count += count_units(&data, extractor, by_line);
+        }
         start = i;
         if count >= n {
             break;
@@ -631,11 +700,6 @@ fn query_follow(
     follow: bool,
     max: Option<u64>,
 ) -> anyhow::Result<()> {
-    let decomp = |file: &File, c: &ChunkRecord| -> anyhow::Result<Vec<u8>> {
-        let mut comp = vec![0u8; c.comp_len as usize];
-        file.read_exact_at(&mut comp, c.comp_start)?;
-        Ok(zstd::stream::decode_all(&comp[..])?)
-    };
     let multi = files.len() > 1 && !no_filename;
     // Framing needs entries; plain text streams raw bytes (no one-entry lag).
     // --max caps entries; raw bytes have no entry count, so a cap forces the
@@ -696,11 +760,15 @@ fn query_follow(
 
     let mut srcs: Vec<FollowSrc> = Vec::new();
     for f in files {
-        let source = open_source(f)?;
+        let mut source = open_source(f)?;
+        let guard = seq_guard(f);
         let tf = crate::bark::time_format(source.bark.as_ref());
         let extractor =
             crate::import::Extractor::new(tf.regex.as_deref(), tf.format.as_deref(), tf.utc)?;
-        let chunks = &source.records;
+        // Owned, not borrowed from `source`: read_chunk needs `&mut
+        // source` on a race, which a live borrow of source.records
+        // would forbid (chunk records are Copy, so cloning is cheap).
+        let chunks = source.records.clone();
         // Where to begin: an entry-count tail, a write-time --from, or (the
         // default) the current end — following only genuinely new chunks.
         let start = if let Some(n) = tail {
@@ -711,13 +779,15 @@ fn query_follow(
             // the final one is often a bare continuation with no stamp.
             let mut parseable = false;
             for c in chunks.iter().take(4) {
-                if crate::entry::probe_stamps(&extractor, &decomp(&source.file, c)?) {
-                    parseable = true;
-                    break;
+                if let Some(data) = read_chunk(f, &guard, &mut source, *c)? {
+                    if crate::entry::probe_stamps(&extractor, &data) {
+                        parseable = true;
+                        break;
+                    }
                 }
             }
             let by_line = !parseable;
-            tail_start(chunks, &source.file, &extractor, by_line, n)?
+            tail_start(f, &guard, &mut source, &chunks, &extractor, by_line, n)?
         } else if let Some(fr) = from {
             chunks
                 .iter()
@@ -749,10 +819,13 @@ fn query_follow(
         };
         let mut cursor_ms = 0u64;
         for c in &chunks[start..] {
-            let data = decomp(&source.file, c)?;
-            match &mut sink {
-                Some(s) => s.push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?,
-                None => emit_raw(&mut out, &data, label.as_deref())?,
+            if let Some(data) = read_chunk(f, &guard, &mut source, *c)? {
+                match &mut sink {
+                    Some(s) => {
+                        s.push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?
+                    }
+                    None => emit_raw(&mut out, &data, label.as_deref())?,
+                }
             }
             cursor_ms = cursor_ms.max(c.last_write_ms);
             if capped(&limit) {
@@ -783,24 +856,32 @@ fn query_follow(
     while !done {
         std::thread::sleep(std::time::Duration::from_millis(1000));
         for s in &mut srcs {
-            let source = match open_source(&s.path) {
+            let mut source = match open_source(&s.path) {
                 Ok(x) => x,
                 Err(_) => continue, // transient (mid-rename by retention): retry
             };
-            for c in &source.records {
-                if c.first_write_ms > s.cursor_ms {
-                    let data = decomp(&source.file, c)?;
+            let guard = seq_guard(&s.path);
+            // Owned: read_chunk needs `&mut source` on a race, which a
+            // live borrow of source.records would forbid.
+            let pending: Vec<ChunkRecord> = source
+                .records
+                .iter()
+                .filter(|c| c.first_write_ms > s.cursor_ms)
+                .copied()
+                .collect();
+            for c in pending {
+                if let Some(data) = read_chunk(&s.path, &guard, &mut source, c)? {
                     match &mut s.sink {
                         Some(sink) => {
                             sink.push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?
                         }
                         None => emit_raw(&mut out, &data, s.label.as_deref())?,
                     }
-                    s.cursor_ms = c.last_write_ms.max(s.cursor_ms);
-                    if capped(&limit) {
-                        done = true;
-                        break;
-                    }
+                }
+                s.cursor_ms = c.last_write_ms.max(s.cursor_ms);
+                if capped(&limit) {
+                    done = true;
+                    break;
                 }
             }
             if done {
@@ -834,27 +915,25 @@ fn query_single(
     has: &[String],
     any: &[String],
 ) -> anyhow::Result<()> {
-    let source = open_source(file)?;
-    let chunks = source.records;
-    let (selected, in_window) = select_chunks(file, &chunks, from_ms, to_ms, has, any)?;
+    let mut source = open_source(file)?;
+    let (selected, in_window) = select_chunks(file, &source.records, from_ms, to_ms, has, any)?;
+    let total_chunks = source.records.len();
+    let guard = seq_guard(file);
 
-    let trunk = source.file;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut uncomp_total = 0u64;
     for (_, c) in &selected {
-        let mut comp = vec![0u8; c.comp_len as usize];
-        trunk.read_exact_at(&mut comp, c.comp_start)?;
-        let data = zstd::stream::decode_all(&comp[..])
-            .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
-        out.write_all(&data)?;
-        uncomp_total += c.uncomp_len;
+        if let Some(data) = read_chunk(file, &guard, &mut source, *c)? {
+            out.write_all(&data)?;
+            uncomp_total += c.uncomp_len;
+        }
     }
     out.flush()?;
     eprintln!(
         "timberfs: {} of {} chunk(s){}, {} bytes (chunk granularity; unflushed tail not included)",
         selected.len(),
-        chunks.len(),
+        total_chunks,
         if has.is_empty() {
             String::new()
         } else {
@@ -881,8 +960,10 @@ fn query_multi(
     no_filename: bool,
 ) -> anyhow::Result<()> {
     struct Src {
+        path: PathBuf,
+        guard: Option<(PathBuf, String)>,
         label: Vec<u8>,
-        file: File,
+        handle: SourceHandle,
         chunks: Vec<ChunkRecord>,
         pos: usize,
         carry: Vec<u8>,
@@ -891,19 +972,21 @@ fn query_multi(
     let mut total_chunks = 0usize;
     let mut total_selected = 0usize;
     for f in files {
-        let source = open_source(f)?;
-        let (selected, _) = select_chunks(f, &source.records, from_ms, to_ms, has, any)?;
+        let handle = open_source(f)?;
+        let (selected, _) = select_chunks(f, &handle.records, from_ms, to_ms, has, any)?;
         eprintln!(
             "timberfs: {}: {} of {} chunk(s)",
             f.display(),
             selected.len(),
-            source.records.len()
+            handle.records.len()
         );
-        total_chunks += source.records.len();
+        total_chunks += handle.records.len();
         total_selected += selected.len();
         srcs.push(Src {
+            path: f.clone(),
+            guard: seq_guard(f),
             label: f.display().to_string().into_bytes(),
-            file: source.file,
+            handle,
             chunks: selected.into_iter().map(|(_, c)| c).collect(),
             pos: 0,
             carry: Vec::new(),
@@ -923,10 +1006,9 @@ fn query_multi(
         let s = &mut srcs[i];
         let c = s.chunks[s.pos];
         s.pos += 1;
-        let mut comp = vec![0u8; c.comp_len as usize];
-        s.file.read_exact_at(&mut comp, c.comp_start)?;
-        let data = zstd::stream::decode_all(&comp[..])
-            .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
+        let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
+            continue; // retained away by a race between selection and read
+        };
         if no_filename {
             out.write_all(&data)?;
         } else {

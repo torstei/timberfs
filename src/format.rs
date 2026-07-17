@@ -26,6 +26,13 @@ pub const TRUNK_EXT: &str = "trunk";
 pub const RINGS_EXT: &str = "rings";
 pub const GRAIN_EXT: &str = "grain";
 pub const BARK_EXT: &str = "bark";
+/// The collapse-head seqlock counter (store.rs): even means idle, odd
+/// means a collapse is in flight. Missing reads as 0 (never collapsed).
+pub const SEQ_EXT: &str = "seq";
+/// The collapse-head crash marker (store.rs): present only mid-collapse,
+/// so `FileStore::open` can tell whether a crashed collapse's
+/// `fallocate(COLLAPSE_RANGE)` landed before reconciling the rings.
+pub const TRIM_EXT: &str = "trim";
 
 pub fn trunk_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{TRUNK_EXT}"))
@@ -41,6 +48,14 @@ pub fn grain_path(dir: &Path, name: &str) -> PathBuf {
 
 pub fn bark_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{BARK_EXT}"))
+}
+
+pub fn seq_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.{SEQ_EXT}"))
+}
+
+pub fn trim_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.{TRIM_EXT}"))
 }
 
 /// One chunk: a contiguous run of appended bytes, compressed as a single

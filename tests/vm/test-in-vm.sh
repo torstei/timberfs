@@ -861,7 +861,167 @@ with open('/tmp/ts.log', 'w') as f:
 
 run_test "filter | import --records: the investigation as an artifact" grep_into_artifact
 run_test "time story: exact windows, raw escape, -0 records, annotation" time_story
-run_test "info: a store's vital signs on one screen" info_vital_signs
+# P5: collapse-range retention. FALLOC_FL_COLLAPSE_RANGE drops the head of
+# a store's .trunk in place (peak disk ~1x) instead of remove_head's
+# rewrite (peak ~2x) -- proven on a filesystem sized BETWEEN 1x and 2x the
+# retain-size cap, where the old rewrite would ENOSPC.
+COLLAPSE_IMG=/root/collapse.img
+COLLAPSE_MNT=/mnt/collapse-test
+COLLAPSE_SRC=/tmp/collapse-src.txt
+
+collapse_space_win_setup() {
+    dd if=/dev/zero of="$COLLAPSE_IMG" bs=1M count=60 status=none \
+        && mkfs.ext4 -q "$COLLAPSE_IMG" \
+        && mkdir -p "$COLLAPSE_MNT" \
+        && mount -o loop "$COLLAPSE_IMG" "$COLLAPSE_MNT"
+}
+
+collapse_space_win() {
+    # High-entropy content barely compresses, so the compressed size tracks
+    # the raw size closely -- comfortably past the 40M cap on this 60M
+    # filesystem: a size the old rewrite (needing ~2x the cap, ~80M) could
+    # never fit, but collapse (~1x, ~40M) does.
+    #
+    # Retention is only checked once a second, so the feed is throttled
+    # (through a FIFO, in small pieces) rather than piped in one instant
+    # burst -- a real producer trickles; an instantaneous firehose would
+    # overshoot the loopback fs before the first check ever ran, which
+    # would ENOSPC regardless of collapse vs. the old rewrite and prove
+    # nothing about either.
+    local backing="$COLLAPSE_MNT/backing"
+    mkdir -p "$backing"
+    head -c $((60 * 1024 * 1024)) /dev/urandom | base64 -w200 > "$COLLAPSE_SRC"
+    mkfifo /tmp/collapse.fifo
+    timberfs append --into "$backing/app.log" --chunk-size 65536 \
+        --retain-size 40M --flush-age 1 < /tmp/collapse.fifo &
+    local pid=$!
+    exec 9>/tmp/collapse.fifo
+    split -b 512k "$COLLAPSE_SRC" /tmp/collapse-part-
+    for part in /tmp/collapse-part-*; do
+        cat "$part" >&9 || break
+        sleep 0.15
+    done
+    exec 9>&-
+    wait "$pid" || return 1
+    rm -f /tmp/collapse.fifo /tmp/collapse-part-*
+    local size
+    size=$(stat -c %s "$backing/app.log.trunk")
+    [ "$size" -le $((40 * 1024 * 1024)) ] || return 1
+    # the tail (most recent data) is intact across the collapse(s)
+    local lastline
+    lastline=$(tail -1 "$COLLAPSE_SRC")
+    timberfs query "$backing/app.log" | tail -1 | grep -qxF "$lastline"
+}
+
+collapse_recovery_survives() {
+    # Stock zstd still recovers the WHOLE surviving trunk after a collapse
+    # (the skippable-frame stamp over the leftover sliver is transparent to
+    # it), and timberfs's own index agrees with it exactly.
+    local backing="$COLLAPSE_MNT/backing"
+    local zcount qcount lastline
+    zcount=$(zstd -dc "$backing/app.log.trunk" | wc -l) || return 1
+    qcount=$(timberfs query "$backing/app.log" 2>/dev/null | wc -l) || return 1
+    lastline=$(tail -1 "$COLLAPSE_SRC")
+    [ "$zcount" -gt 0 ] && [ "$zcount" = "$qcount" ] \
+        && zstd -dc "$backing/app.log.trunk" | tail -1 | grep -qxF "$lastline"
+}
+
+collapse_space_win_teardown() {
+    umount "$COLLAPSE_MNT" 2>/dev/null
+    rm -f "$COLLAPSE_IMG" "$COLLAPSE_SRC"
+    return 0
+}
+
+CONC_BACKING=/var/log/timberfs-backing/conc
+
+concurrent_reader_race() {
+    # A live appender streaming under a tight cap, retaining (and so
+    # collapsing) frequently, while `timberfs query` runs repeatedly in a
+    # SEPARATE process: it must only ever print whole, well-formed entries
+    # -- never garbage, never a non-zero exit or panic -- across however
+    # many collapses land during the run.
+    mkfifo /tmp/conc.fifo
+    timberfs append --into "$CONC_BACKING/live.log" --chunk-size 4096 \
+        --retain-size 32K --flush-age 1 < /tmp/conc.fifo &
+    local conc_pid=$!
+    exec 9>/tmp/conc.fifo
+
+    # Give the appender a moment to create the backing pair before the
+    # query loop starts: a store not existing YET is our own test startup
+    # race, not the collapse race this test targets.
+    for _ in $(seq 1 20); do
+        [ -f "$CONC_BACKING/live.log.rings" ] && break
+        sleep 0.1
+    done
+
+    (
+        n=0
+        while [ "$n" -lt 4000 ]; do
+            n=$((n + 1))
+            printf '2026-07-17T09:00:00 INFO conc line %d %d%d\n' "$n" "$RANDOM" "$RANDOM"
+            # Spread the feed over several seconds (many flush/retention
+            # ticks, so many collapses) instead of finishing instantly.
+            [ $((n % 50)) -eq 0 ] && sleep 0.1
+        done >&9
+    ) &
+    local feeder=$!
+
+    local bad=0 iters=0
+    while kill -0 "$feeder" 2>/dev/null; do
+        iters=$((iters + 1))
+        if ! timberfs query "$CONC_BACKING/live.log" >/tmp/conc.out 2>/tmp/conc.err; then
+            echo "query exited non-zero"
+            cat /tmp/conc.err
+            bad=1
+        fi
+        if [ -s /tmp/conc.out ] \
+            && grep -qvE '^2026-07-17T09:00:00 INFO conc line [0-9]+ [0-9]+$' /tmp/conc.out; then
+            echo "malformed/garbage output:"
+            grep -vE '^2026-07-17T09:00:00 INFO conc line [0-9]+ [0-9]+$' /tmp/conc.out | head -5
+            bad=1
+        fi
+        [ "$bad" = 1 ] && break
+    done
+    wait "$feeder" 2>/dev/null
+    exec 9>&-
+    kill "$conc_pid" 2>/dev/null
+    wait "$conc_pid" 2>/dev/null
+    rm -f /tmp/conc.out /tmp/conc.err /tmp/conc.fifo
+    [ "$bad" = 0 ] && [ "$iters" -gt 0 ]
+}
+
+TMPFS_COLLAPSE=/mnt/tmpfs-collapse
+
+tmpfs_fallback_setup() {
+    mkdir -p "$TMPFS_COLLAPSE" && mount -t tmpfs -o size=200M tmpfs "$TMPFS_COLLAPSE"
+}
+
+tmpfs_fallback_retention() {
+    # tmpfs has no FALLOC_FL_COLLAPSE_RANGE (EOPNOTSUPP): retention must
+    # fall back to remove_head's rewrite and still succeed, given enough
+    # space (200M tmpfs, 256K cap -- ample headroom for the ~2x peak).
+    seq 1 200000 | timberfs append --into "$TMPFS_COLLAPSE/app.log" \
+        --chunk-size 8192 --retain-size 256K || return 1
+    local size
+    size=$(stat -c %s "$TMPFS_COLLAPSE/app.log.trunk")
+    [ "$size" -le $((256 * 1024)) ] || return 1
+    timberfs query "$TMPFS_COLLAPSE/app.log" | tail -1 | grep -qx 200000
+}
+
+tmpfs_fallback_teardown() {
+    umount "$TMPFS_COLLAPSE" 2>/dev/null
+    return 0
+}
+
+run_test "collapse: loopback fs setup (60M ext4, between 1x/2x the cap)" collapse_space_win_setup
+run_test "collapse: retention succeeds where the old rewrite would ENOSPC" collapse_space_win
+run_test "collapse: stock zstd -dc still recovers the whole survivor" collapse_recovery_survives
+run_test "collapse: loopback teardown" collapse_space_win_teardown
+run_test "collapse: concurrent standalone reader never sees garbage" concurrent_reader_race
+run_test "collapse: tmpfs setup (no COLLAPSE_RANGE)" tmpfs_fallback_setup
+run_test "collapse: retention falls back to remove_head on tmpfs" tmpfs_fallback_retention
+run_test "collapse: tmpfs teardown" tmpfs_fallback_teardown
+
 binary_upgrade_restarts_appender() {
     # Simulate a package upgrade under a live socket intake: replace the
     # binary with a new inode (dpkg's atomic rename, same filesystem). The
