@@ -31,6 +31,164 @@ fn invalid_input(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.to_string())
 }
 
+/// zstd skippable-frame magic range is 0x184D2A50..=0x184D2A5F (the low
+/// nibble is a frame-type tag decoders ignore); any value in range works.
+const ZSTD_SKIPPABLE_MAGIC: u32 = 0x184D2A50;
+
+/// Read a store's collapse-head seqlock counter: even means idle, odd
+/// means a collapse is in flight (readers must not trust what they read
+/// while it's odd, or if it changed underneath them). Missing reads as 0
+/// — a store never collapsed has never bumped it.
+pub fn read_seq(dir: &Path, name: &str) -> u64 {
+    match fs::read(format::seq_path(dir, name)) {
+        Ok(b) if b.len() >= 8 => u64::from_le_bytes(b[..8].try_into().unwrap()),
+        _ => 0,
+    }
+}
+
+fn write_seq(dir: &Path, name: &str, v: u64) -> io::Result<()> {
+    let f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(format::seq_path(dir, name))?;
+    f.write_all_at(&v.to_le_bytes(), 0)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+fn fstatvfs_bsize(f: &File) -> io::Result<u64> {
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::fstatvfs(f.as_raw_fd(), &mut st) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(st.f_bsize as u64)
+    }
+}
+
+/// The block-aligned cut point for `FALLOC_FL_COLLAPSE_RANGE`, and the
+/// "sliver" of bytes left before it — the tail of the last dropped frame,
+/// which collapse can't remove (it isn't block-aligned) and which gets
+/// overwritten with a zstd skippable frame instead. `None` when there
+/// isn't even one whole block to cut, so the caller must fall back to
+/// `remove_head`.
+fn collapse_alignment(comp_cut: u64, bsize: u64) -> Option<(u64, u64)> {
+    let aligned = (comp_cut / bsize) * bsize;
+    if aligned == 0 {
+        return None;
+    }
+    let sliver = comp_cut - aligned;
+    if sliver == 0 || sliver >= 8 {
+        return Some((aligned, sliver));
+    }
+    // 0 < sliver < 8: no room for the 8-byte skippable-frame header.
+    // Collapse one block fewer so the sliver grows past it.
+    let aligned = aligned - bsize;
+    if aligned == 0 {
+        return None;
+    }
+    Some((aligned, comp_cut - aligned))
+}
+
+/// Overwrite the leading `sliver` bytes of a post-collapse trunk with a
+/// zstd skippable frame, so `zstd -dc` (and our own chunk_data) can keep
+/// decoding straight through the leftover tail of the dropped frame and
+/// into the real ones that follow. `sliver` must be 0 (nothing to do) or
+/// >= 8 (room for the header) — see `collapse_alignment`.
+fn stamp_skippable_frame(trunk: &File, sliver: u64) -> io::Result<()> {
+    if sliver == 0 {
+        return Ok(());
+    }
+    debug_assert!(sliver >= 8);
+    let mut hdr = [0u8; 8];
+    hdr[0..4].copy_from_slice(&ZSTD_SKIPPABLE_MAGIC.to_le_bytes());
+    hdr[4..8].copy_from_slice(&((sliver - 8) as u32).to_le_bytes());
+    trunk.write_all_at(&hdr, 0)?;
+    Ok(())
+}
+
+fn write_trim_marker(path: &Path, pre_comp_size: u64, aligned: u64, sliver: u64) -> io::Result<()> {
+    let f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    f.write_all_at(
+        format!("{pre_comp_size} {aligned} {sliver}\n").as_bytes(),
+        0,
+    )?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Parse a `.trim` marker's `"pre_comp_size aligned sliver"` text.
+fn parse_trim_marker(text: &str) -> Option<(u64, u64, u64)> {
+    let mut it = text.split_whitespace();
+    let pre_comp_size = it.next()?.parse().ok()?;
+    let aligned = it.next()?.parse().ok()?;
+    let sliver = it.next()?.parse().ok()?;
+    Some((pre_comp_size, aligned, sliver))
+}
+
+/// Reconcile a lingering `<name>.trim` marker before a store is opened —
+/// a collapse that started but never finished (a crash between the
+/// `fallocate` and the final rename, or a standalone reader observing a
+/// writer mid-collapse). Compare the trunk's actual size against the
+/// marker's recorded before/after sizes to tell which side of the
+/// `fallocate` we're on:
+///
+///   - still `pre_comp_size`: the collapse never landed — roll back
+///     (drop the staged rings and the marker; the committed rings are
+///     untouched and already correct).
+///   - `pre_comp_size - aligned`: the collapse landed — roll forward
+///     (re-stamp the skippable frame, idempotent, then promote the
+///     staged rings over the committed ones and drop the sidecar grain,
+///     same as a normal collapse's tail).
+///
+/// Best-effort by design: a read-only caller without write access to the
+/// directory (a non-root `query`/`info`) just leaves the marker for the
+/// next writer to reconcile, rather than erroring out of a read.
+pub fn reconcile_trim(dir: &Path, name: &str) -> io::Result<()> {
+    let trim_p = format::trim_path(dir, name);
+    let text = match fs::read_to_string(&trim_p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let rings_tmp = dir.join(format!("{name}.{}.tmp", format::RINGS_EXT));
+    let Some((pre_comp_size, aligned, sliver)) = parse_trim_marker(&text) else {
+        // Unparseable marker: nothing safe to redo. Drop it and any
+        // staged rings; the last committed rings are untouched.
+        let _ = fs::remove_file(&rings_tmp);
+        let _ = fs::remove_file(&trim_p);
+        return Ok(());
+    };
+    let trunk_len = fs::metadata(format::trunk_path(dir, name))?.len();
+    if trunk_len == pre_comp_size {
+        let _ = fs::remove_file(&rings_tmp);
+        let _ = fs::remove_file(&trim_p);
+    } else if trunk_len == pre_comp_size.saturating_sub(aligned) {
+        if sliver >= 8 {
+            let trunk = OpenOptions::new()
+                .write(true)
+                .open(format::trunk_path(dir, name))?;
+            stamp_skippable_frame(&trunk, sliver)?;
+        }
+        fs::rename(&rings_tmp, format::rings_path(dir, name))?;
+        let _ = fs::remove_file(format::grain_path(dir, name));
+        let _ = fs::remove_file(&trim_p);
+    } else {
+        eprintln!(
+            "timberfs: {name}: .trim marker doesn't match the trunk size \
+             ({trunk_len} bytes; expected {pre_comp_size} or {}) — leaving it \
+             for manual recovery",
+            pre_comp_size.saturating_sub(aligned)
+        );
+    }
+    Ok(())
+}
+
 fn copy_range(from: &File, from_off: u64, len: u64, to: &File, to_off: u64) -> io::Result<()> {
     let mut buf = vec![0u8; 1 << 20];
     let mut copied = 0u64;
@@ -159,6 +317,11 @@ impl FileStore {
     /// Open (or create) the backing pair for a logical file and reconcile
     /// index and data after a possible crash.
     pub fn open(dir: &Path, name: &str) -> io::Result<FileStore> {
+        // A lingering .trim marker means a collapse started but never
+        // finished (crash between the fallocate and the final rename);
+        // reconcile it before anything below reads the trunk/rings, so
+        // neither the truncation check nor a caller sees a half-landed cut.
+        reconcile_trim(dir, name)?;
         let trunk_p = format::trunk_path(dir, name);
         let trunk = OpenOptions::new()
             .read(true)
@@ -488,7 +651,11 @@ impl FileStore {
         let rings_p = format::rings_path(dir, name);
         let trunk_tmp = dir.join(format!("{name}.{}.tmp", format::TRUNK_EXT));
         let rings_tmp = dir.join(format!("{name}.{}.tmp", format::RINGS_EXT));
-        {
+        // Fallible section only builds the temp files; nothing here has
+        // touched the live trunk/rings yet, so an error (ENOSPC, most
+        // likely — exactly when this rewrite is tightest on space) just
+        // needs the partial temps cleaned up, not a rollback.
+        let staged: io::Result<()> = (|| {
             let new_trunk = File::create(&trunk_tmp)?;
             copy_range(
                 &self.trunk,
@@ -513,6 +680,12 @@ impl FileStore {
             let new_rings = File::create(&rings_tmp)?;
             new_rings.write_all_at(&idx, 0)?;
             new_rings.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            let _ = fs::remove_file(&trunk_tmp);
+            let _ = fs::remove_file(&rings_tmp);
+            return Err(e);
         }
         fs::rename(&trunk_tmp, &trunk_p)?;
         fs::rename(&rings_tmp, &rings_p)?;
@@ -530,6 +703,156 @@ impl FileStore {
         self.buffer_start -= uncomp_cut;
         self.cache = None;
         Ok(())
+    }
+
+    /// Cut the first `k` chunks off this file via
+    /// `FALLOC_FL_COLLAPSE_RANGE`: the kernel shifts the surviving
+    /// compressed bytes down IN the existing trunk inode, so peak disk
+    /// usage is ~1x the store rather than `remove_head`'s ~2x (a full
+    /// rewrite briefly coexisting with the original). Returns `Ok(false)`
+    /// when collapse isn't applicable here — too little data to cut a
+    /// whole filesystem block, or the filesystem doesn't support
+    /// `COLLAPSE_RANGE` (tmpfs, btrfs, NFS, older ext4/xfs) — so the
+    /// caller can fall back to `remove_head`; `Ok(true)` once the cut has
+    /// landed and in-memory state is rebased to match.
+    fn collapse_head(&mut self, k: usize, dir: &Path, name: &str) -> io::Result<bool> {
+        if k == 0 {
+            return Ok(true);
+        }
+        let comp_cut = self.chunks[k - 1].comp_end();
+        let uncomp_cut = self.chunks[k - 1].uncomp_end();
+        let bsize = fstatvfs_bsize(&self.trunk)?;
+        let Some((aligned, sliver)) = collapse_alignment(comp_cut, bsize) else {
+            return Ok(false);
+        };
+
+        let rings_p = format::rings_path(dir, name);
+        let rings_tmp = dir.join(format!("{name}.{}.tmp", format::RINGS_EXT));
+        let trim_p = format::trim_path(dir, name);
+        let cleanup_staged = || {
+            let _ = fs::remove_file(&rings_tmp);
+            let _ = fs::remove_file(&trim_p);
+        };
+
+        // Stage the rebased rings under a temp name — not yet the live
+        // index — before touching the trunk at all.
+        let staged: io::Result<()> = (|| {
+            let mut idx = Vec::with_capacity(
+                RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN,
+            );
+            idx.extend_from_slice(format::RINGS_MAGIC);
+            for c in &self.chunks[k..] {
+                let rec = ChunkRecord {
+                    uncomp_start: c.uncomp_start - uncomp_cut,
+                    comp_start: c.comp_start - aligned,
+                    ..*c
+                };
+                idx.extend_from_slice(&rec.to_bytes());
+            }
+            let new_rings = File::create(&rings_tmp)?;
+            new_rings.write_all_at(&idx, 0)?;
+            new_rings.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            cleanup_staged();
+            return Err(e);
+        }
+
+        // The crash marker, written (and fsynced, with the staged rings)
+        // BEFORE the fallocate: if we die before the final rename below,
+        // FileStore::open's reconcile_trim tells landed from not-landed
+        // by comparing the trunk's actual size against these two values,
+        // rather than misreading a shorter trunk as truncated writes.
+        if let Err(e) = write_trim_marker(&trim_p, self.comp_size, aligned, sliver) {
+            cleanup_staged();
+            return Err(e);
+        }
+
+        // Odd = a collapse is in flight: a concurrent standalone reader
+        // (query/info in their own process) must not trust an offset
+        // resolved while this is odd, since the trunk can be mutated out
+        // from under them mid-read. See query.rs's seqlock guard.
+        let seq0 = read_seq(dir, name);
+        if let Err(e) = write_seq(dir, name, seq0 + 1) {
+            cleanup_staged();
+            return Err(e);
+        }
+
+        let rc = unsafe {
+            libc::fallocate(
+                self.trunk.as_raw_fd(),
+                libc::FALLOC_FL_COLLAPSE_RANGE,
+                0,
+                aligned as libc::off_t,
+            )
+        };
+        if rc != 0 {
+            let e = io::Error::last_os_error();
+            cleanup_staged();
+            let _ = write_seq(dir, name, seq0);
+            return match e.raw_os_error() {
+                Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) => Ok(false),
+                _ => Err(e),
+            };
+        }
+
+        // The fallocate has committed the cut to the trunk — there is no
+        // going back. From here the store MUST end consistent, or a still-
+        // running writer would append at a stale offset and corrupt it. The
+        // stamp and the seqlock reset don't touch in-memory offsets (a
+        // missing stamp only degrades `zstd -dc` until the next reindex; an
+        // unreset seqlock only makes readers retry), so those are
+        // best-effort. The index rename and reopen DO define the offset
+        // space, so a failure there is fatal: exit before the maintenance
+        // thread can append onto a divergent store — the .trim marker makes
+        // the next startup reconcile the landed cut (mirrors the
+        // binary-upgrade exit in the same thread).
+        if let Err(e) = stamp_skippable_frame(&self.trunk, sliver) {
+            eprintln!(
+                "timberfs: {name}: skippable-frame stamp failed after collapse ({e}); \
+                 `zstd -dc` recovery needs a `timberfs reindex` until then"
+            );
+        }
+        if let Err(e) = fs::rename(&rings_tmp, &rings_p) {
+            eprintln!(
+                "timberfs: {name}: FATAL: collapse landed but committing the rebased \
+                 index failed ({e}); exiting so no write lands at a stale offset — \
+                 the .trim marker reconciles it on restart"
+            );
+            std::process::exit(1);
+        }
+        // Sidecar contract: a rings rewrite invalidates chunk numbering,
+        // so derived indexes are deleted (rebuild with `timberfs reindex`).
+        let _ = fs::remove_file(format::grain_path(dir, name));
+        let _ = fs::remove_file(&trim_p);
+        if let Err(e) = write_seq(dir, name, seq0 + 2) {
+            eprintln!(
+                "timberfs: {name}: resetting the collapse seqlock failed ({e}); \
+                 readers retry until the next collapse or reconcile"
+            );
+        }
+
+        self.rings = match OpenOptions::new().read(true).write(true).open(&rings_p) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "timberfs: {name}: FATAL: collapse landed but reopening the rebased \
+                     index failed ({e}); exiting so no write lands at a stale offset — \
+                     the .trim marker reconciles it on restart"
+                );
+                std::process::exit(1);
+            }
+        };
+        self.chunks.drain(..k);
+        for c in &mut self.chunks {
+            c.uncomp_start -= uncomp_cut;
+            c.comp_start -= aligned;
+        }
+        self.comp_size -= aligned;
+        self.buffer_start -= uncomp_cut;
+        self.cache = None;
+        Ok(true)
     }
 }
 
@@ -743,9 +1066,19 @@ impl Store {
         if let Some(budget) = max_comp_bytes {
             if f.comp_size > budget {
                 let low_water = budget.saturating_sub(budget / 20);
+                // collapse_head can only cut on a filesystem-block
+                // boundary, rounding the cut DOWN — up to ~2 blocks of the
+                // dropped range's tail survives as an inert skippable
+                // frame (one block from the alignment itself, up to one
+                // more if the sliver was too small for the header and it
+                // backed off a further block). Aim a couple of blocks
+                // further below the low-water mark so that slack still
+                // lands at or under it, never over the hard budget.
+                let margin = fstatvfs_bsize(&f.trunk).unwrap_or(4096) * 2;
+                let target = low_water.saturating_sub(margin);
                 let ks = f
                     .chunks
-                    .partition_point(|c| f.comp_size - c.comp_start > low_water);
+                    .partition_point(|c| f.comp_size - c.comp_start > target);
                 k = k.max(ks);
             }
         }
@@ -761,7 +1094,13 @@ impl Store {
             last_write_ms: f.chunks[k - 1].last_write_ms,
             chunks_remaining: f.chunks.len() - k,
         };
-        f.remove_head(k, &self.dir, name)?;
+        // Prefer the in-place collapse (peak disk ~1x the store) and only
+        // fall back to the rewrite (peak ~2x) when collapse doesn't apply
+        // here (too little to cut a whole block, or the filesystem
+        // doesn't support COLLAPSE_RANGE).
+        if !f.collapse_head(k, &self.dir, name)? {
+            f.remove_head(k, &self.dir, name)?;
+        }
         Ok(Some(stats))
     }
 }
@@ -964,5 +1303,183 @@ mod tests {
             strip_deleted(PathBuf::from("/opt/timberfs(deleted)")),
             PathBuf::from("/opt/timberfs(deleted)")
         );
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A unique scratch directory that removes itself on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("timberfs-store-test-{}-{n}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn collapse_alignment_falls_back_below_one_block() {
+        // comp_cut doesn't even reach one whole block: nothing to collapse.
+        assert_eq!(collapse_alignment(100, 4096), None);
+    }
+
+    #[test]
+    fn collapse_alignment_aligns_down_to_the_block() {
+        assert_eq!(
+            collapse_alignment(4096 * 2 + 50, 4096),
+            Some((4096 * 2, 50))
+        );
+    }
+
+    #[test]
+    fn collapse_alignment_exact_multiple_has_no_sliver() {
+        assert_eq!(collapse_alignment(4096 * 3, 4096), Some((4096 * 3, 0)));
+    }
+
+    #[test]
+    fn collapse_alignment_backs_off_a_block_when_sliver_too_small() {
+        // A 5-byte sliver has no room for the 8-byte skippable-frame
+        // header, so collapse one block fewer — growing the sliver past it.
+        assert_eq!(
+            collapse_alignment(4096 * 2 + 5, 4096),
+            Some((4096, 4096 + 5))
+        );
+    }
+
+    #[test]
+    fn collapse_alignment_gives_up_when_backing_off_hits_zero() {
+        // Only one block is available and its sliver is < 8: backing off
+        // to fit the header leaves nothing left to collapse at all.
+        assert_eq!(collapse_alignment(4096 + 5, 4096), None);
+    }
+
+    #[test]
+    fn stamped_sliver_is_a_valid_skippable_frame() {
+        let dir = TempDir::new();
+        let trunk_path = dir.path().join("t.trunk");
+        let kept = zstd::stream::encode_all(&b"world\n"[..], 3).unwrap();
+        let sliver_len = 20u64;
+        // The leftover tail of the dropped frame: arbitrary bytes, since
+        // the skippable-frame length field is what makes zstd skip them,
+        // not their content.
+        let mut buf = vec![0xABu8; sliver_len as usize];
+        buf.extend_from_slice(&kept);
+        fs::write(&trunk_path, &buf).unwrap();
+
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&trunk_path)
+            .unwrap();
+        stamp_skippable_frame(&f, sliver_len).unwrap();
+        drop(f);
+
+        let all = fs::read(&trunk_path).unwrap();
+        let magic = u32::from_le_bytes(all[0..4].try_into().unwrap());
+        assert!((0x184D2A50..=0x184D2A5F).contains(&magic));
+        let declared_len = u32::from_le_bytes(all[4..8].try_into().unwrap()) as u64;
+        // The frame occupies exactly [0, sliver_len): header + declared
+        // user-data length adds back up to the whole sliver.
+        assert_eq!(8 + declared_len, sliver_len);
+        // zstd -dc skips the stamped frame and decodes straight into the
+        // real one that follows.
+        let decoded = zstd::stream::decode_all(&all[..]).unwrap();
+        assert_eq!(decoded, b"world\n");
+    }
+
+    #[test]
+    fn stamp_skippable_frame_is_a_noop_for_a_zero_sliver() {
+        let dir = TempDir::new();
+        let trunk_path = dir.path().join("t.trunk");
+        let kept = zstd::stream::encode_all(&b"exact\n"[..], 3).unwrap();
+        fs::write(&trunk_path, &kept).unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&trunk_path)
+            .unwrap();
+        stamp_skippable_frame(&f, 0).unwrap();
+        drop(f);
+        assert_eq!(fs::read(&trunk_path).unwrap(), kept);
+    }
+
+    #[test]
+    fn reconcile_trim_rolls_back_when_the_collapse_never_landed() {
+        let dir = TempDir::new();
+        let name = "app";
+        // Trunk is still at its pre-collapse size: the fallocate never
+        // actually happened before the crash.
+        fs::write(format::trunk_path(dir.path(), name), vec![0u8; 100]).unwrap();
+        fs::write(format::rings_path(dir.path(), name), b"old-rings").unwrap();
+        let rings_tmp = dir.path().join(format!("{name}.{}.tmp", format::RINGS_EXT));
+        fs::write(&rings_tmp, b"staged-rings").unwrap();
+        write_trim_marker(&format::trim_path(dir.path(), name), 100, 40, 0).unwrap();
+
+        reconcile_trim(dir.path(), name).unwrap();
+
+        assert!(!format::trim_path(dir.path(), name).exists());
+        assert!(!rings_tmp.exists());
+        assert_eq!(
+            fs::read(format::rings_path(dir.path(), name)).unwrap(),
+            b"old-rings"
+        );
+    }
+
+    #[test]
+    fn reconcile_trim_rolls_forward_when_the_collapse_landed() {
+        let dir = TempDir::new();
+        let name = "app";
+        let sliver = 20u64;
+        let mut trunk_bytes = vec![0xCDu8; sliver as usize];
+        trunk_bytes.extend_from_slice(&zstd::stream::encode_all(&b"kept\n"[..], 3).unwrap());
+        fs::write(format::trunk_path(dir.path(), name), &trunk_bytes).unwrap();
+        fs::write(format::rings_path(dir.path(), name), b"old-rings").unwrap();
+        let rings_tmp = dir.path().join(format!("{name}.{}.tmp", format::RINGS_EXT));
+        fs::write(&rings_tmp, b"staged-rings").unwrap();
+        fs::write(format::grain_path(dir.path(), name), b"stale-grain").unwrap();
+        // aligned = 40: the trunk's actual size is pre_comp_size - aligned,
+        // proving the fallocate landed before the crash.
+        let pre_comp_size = trunk_bytes.len() as u64 + 40;
+        write_trim_marker(
+            &format::trim_path(dir.path(), name),
+            pre_comp_size,
+            40,
+            sliver,
+        )
+        .unwrap();
+
+        reconcile_trim(dir.path(), name).unwrap();
+
+        assert!(!format::trim_path(dir.path(), name).exists());
+        assert!(!rings_tmp.exists());
+        assert!(!format::grain_path(dir.path(), name).exists());
+        assert_eq!(
+            fs::read(format::rings_path(dir.path(), name)).unwrap(),
+            b"staged-rings"
+        );
+        let all = fs::read(format::trunk_path(dir.path(), name)).unwrap();
+        assert_eq!(zstd::stream::decode_all(&all[..]).unwrap(), b"kept\n");
+    }
+
+    #[test]
+    fn reconcile_trim_is_a_noop_with_no_marker() {
+        let dir = TempDir::new();
+        // No .trim file at all: nothing to reconcile, no error.
+        reconcile_trim(dir.path(), "app").unwrap();
     }
 }
