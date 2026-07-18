@@ -89,9 +89,16 @@ fi
 
 echo "booting test VM ($(basename "$DEB"))..."
 set +e
+# -object/-device virtio-rng feeds host entropy to the guest so its kernel
+# CSPRNG (crng) seeds immediately. Without it, cloud-init's early SSH
+# host-key generation can block in getrandom() waiting for entropy and stall
+# the whole boot until the TIMEOUT fires (seen in CI 2026-07-18: repeated
+# 1200s timeouts, serial ending at the ssh-keygen randomart).
 # shellcheck disable=SC2086
 timeout "$TIMEOUT" qemu-system-x86_64 $KVM_ARGS \
     -m 1024 -smp 2 \
+    -object rng-random,filename=/dev/urandom,id=rng0 \
+    -device virtio-rng-pci,rng=rng0 \
     -display none \
     -serial file:"$WORK/serial.log" \
     -drive file="$WORK/disk.qcow2",if=virtio,format=qcow2 \
