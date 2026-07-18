@@ -144,7 +144,19 @@ fn parse_trim_marker(text: &str) -> Option<(u64, u64, u64)> {
 ///   - `pre_comp_size - aligned`: the collapse landed — roll forward
 ///     (re-stamp the skippable frame, idempotent, then promote the
 ///     staged rings over the committed ones and drop the sidecar grain,
-///     same as a normal collapse's tail).
+///     same as a normal collapse's tail). The rename itself must be
+///     idempotent too: a crash can land after the rename already
+///     committed (between it and the `.trim` removal), in which case
+///     `rings.tmp` is already gone and `rings` already holds the rebased
+///     index — that's success, not an error, so a missing `rings.tmp` here
+///     just means "already renamed" and the rename is skipped.
+///
+/// Either finalizing branch also resets the collapse seqlock (store.rs) to
+/// even if it's odd: a writer that died after bumping it but before
+/// resetting it would otherwise leave standalone readers spinning forever
+/// against a store that looks permanently mid-collapse. Best-effort — a
+/// read-only caller without write access can't write it, but the marker
+/// stays gone either way, so the next writer's own `open` clears it.
 ///
 /// Best-effort by design: a read-only caller without write access to the
 /// directory (a non-root `query`/`info`) just leaves the marker for the
@@ -168,6 +180,7 @@ pub fn reconcile_trim(dir: &Path, name: &str) -> io::Result<()> {
     if trunk_len == pre_comp_size {
         let _ = fs::remove_file(&rings_tmp);
         let _ = fs::remove_file(&trim_p);
+        reset_seq_if_odd(dir, name);
     } else if trunk_len == pre_comp_size.saturating_sub(aligned) {
         if sliver >= 8 {
             let trunk = OpenOptions::new()
@@ -175,9 +188,17 @@ pub fn reconcile_trim(dir: &Path, name: &str) -> io::Result<()> {
                 .open(format::trunk_path(dir, name))?;
             stamp_skippable_frame(&trunk, sliver)?;
         }
-        fs::rename(&rings_tmp, format::rings_path(dir, name))?;
+        match fs::rename(&rings_tmp, format::rings_path(dir, name)) {
+            Ok(()) => {}
+            // Already renamed by a prior attempt that crashed between the
+            // rename and the marker removal below: the live rings already
+            // holds the rebased index, nothing left to redo.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         let _ = fs::remove_file(format::grain_path(dir, name));
         let _ = fs::remove_file(&trim_p);
+        reset_seq_if_odd(dir, name);
     } else {
         eprintln!(
             "timberfs: {name}: .trim marker doesn't match the trunk size \
@@ -187,6 +208,21 @@ pub fn reconcile_trim(dir: &Path, name: &str) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Reset the collapse seqlock to even if a crash left it odd (see
+/// `reconcile_trim`). Best-effort: a failed write here just means readers
+/// keep retrying until the next writer's `open` gets a chance.
+fn reset_seq_if_odd(dir: &Path, name: &str) {
+    let seq = read_seq(dir, name);
+    if seq % 2 == 1 {
+        if let Err(e) = write_seq(dir, name, seq + 1) {
+            eprintln!(
+                "timberfs: {name}: resetting the collapse seqlock during \
+                 reconcile failed ({e}); readers retry until the next writer opens it"
+            );
+        }
+    }
 }
 
 fn copy_range(from: &File, from_off: u64, len: u64, to: &File, to_off: u64) -> io::Result<()> {
@@ -822,16 +858,23 @@ impl FileStore {
             );
             std::process::exit(1);
         }
-        // Sidecar contract: a rings rewrite invalidates chunk numbering,
-        // so derived indexes are deleted (rebuild with `timberfs reindex`).
-        let _ = fs::remove_file(format::grain_path(dir, name));
-        let _ = fs::remove_file(&trim_p);
+        // Reset the seqlock to even BEFORE the .trim marker goes away: if
+        // we die between here and the marker removal, the marker is still
+        // there to make the next open's reconcile_trim finalize the
+        // collapse, and a still-odd counter would otherwise wedge every
+        // standalone reader until that happens. A crash before this point
+        // leaves the counter odd with the marker present — reconcile_trim
+        // resets it too, so the next writer open still clears it.
         if let Err(e) = write_seq(dir, name, seq0 + 2) {
             eprintln!(
                 "timberfs: {name}: resetting the collapse seqlock failed ({e}); \
                  readers retry until the next collapse or reconcile"
             );
         }
+        // Sidecar contract: a rings rewrite invalidates chunk numbering,
+        // so derived indexes are deleted (rebuild with `timberfs reindex`).
+        let _ = fs::remove_file(format::grain_path(dir, name));
+        let _ = fs::remove_file(&trim_p);
 
         self.rings = match OpenOptions::new().read(true).write(true).open(&rings_p) {
             Ok(f) => f,
@@ -1429,6 +1472,9 @@ mod tests {
         let rings_tmp = dir.path().join(format!("{name}.{}.tmp", format::RINGS_EXT));
         fs::write(&rings_tmp, b"staged-rings").unwrap();
         write_trim_marker(&format::trim_path(dir.path(), name), 100, 40, 0).unwrap();
+        // Simulate a crash after the writer bumped the seqlock odd but
+        // before the fallocate — bug B: rollback must clear it too.
+        write_seq(dir.path(), name, 7).unwrap();
 
         reconcile_trim(dir.path(), name).unwrap();
 
@@ -1437,6 +1483,11 @@ mod tests {
         assert_eq!(
             fs::read(format::rings_path(dir.path(), name)).unwrap(),
             b"old-rings"
+        );
+        assert_eq!(
+            read_seq(dir.path(), name) % 2,
+            0,
+            "seqlock left odd after rollback"
         );
     }
 
@@ -1462,6 +1513,9 @@ mod tests {
             sliver,
         )
         .unwrap();
+        // Simulate a crash after the fallocate landed but before the
+        // seqlock reset — bug B: roll-forward must clear it too.
+        write_seq(dir.path(), name, 5).unwrap();
 
         reconcile_trim(dir.path(), name).unwrap();
 
@@ -1474,6 +1528,78 @@ mod tests {
         );
         let all = fs::read(format::trunk_path(dir.path(), name)).unwrap();
         assert_eq!(zstd::stream::decode_all(&all[..]).unwrap(), b"kept\n");
+        assert_eq!(
+            read_seq(dir.path(), name) % 2,
+            0,
+            "seqlock left odd after roll-forward"
+        );
+    }
+
+    #[test]
+    fn reconcile_trim_rolls_forward_when_the_rename_already_committed() {
+        // Bug A: a crash between the rename (rings.tmp -> rings) and the
+        // .trim removal leaves rings.tmp already gone and rings already
+        // holding the rebased index. The old code unconditionally
+        // re-ran the rename and errored with NotFound, making the store
+        // unopenable; reconcile_trim must treat this as "already done".
+        let dir = TempDir::new();
+        let name = "app";
+        let sliver = 20u64;
+        let mut trunk_bytes = vec![0xCDu8; sliver as usize];
+        trunk_bytes.extend_from_slice(&zstd::stream::encode_all(&b"kept\n"[..], 3).unwrap());
+        fs::write(format::trunk_path(dir.path(), name), &trunk_bytes).unwrap();
+        // rings already holds the rebased (post-rename) content; no
+        // rings.tmp left behind, no stale grain either (already removed).
+        fs::write(format::rings_path(dir.path(), name), b"rebased-rings").unwrap();
+        let pre_comp_size = trunk_bytes.len() as u64 + 40;
+        write_trim_marker(
+            &format::trim_path(dir.path(), name),
+            pre_comp_size,
+            40,
+            sliver,
+        )
+        .unwrap();
+        write_seq(dir.path(), name, 5).unwrap();
+
+        reconcile_trim(dir.path(), name).unwrap();
+
+        assert!(!format::trim_path(dir.path(), name).exists());
+        assert_eq!(
+            fs::read(format::rings_path(dir.path(), name)).unwrap(),
+            b"rebased-rings"
+        );
+        let all = fs::read(format::trunk_path(dir.path(), name)).unwrap();
+        assert_eq!(zstd::stream::decode_all(&all[..]).unwrap(), b"kept\n");
+        assert_eq!(
+            read_seq(dir.path(), name) % 2,
+            0,
+            "seqlock left odd after reconcile"
+        );
+    }
+
+    #[test]
+    fn reconcile_trim_ignores_an_orphan_staged_rings_with_no_marker() {
+        // Crash window 1: the writer staged rings.tmp but died before
+        // writing the .trim marker — nothing was ever committed, so
+        // there's no marker to reconcile. The orphan rings.tmp is
+        // harmless: a later collapse truncates and reuses it, and
+        // FileStore::open never looks at it.
+        let dir = TempDir::new();
+        let name = "app";
+        fs::write(format::trunk_path(dir.path(), name), vec![0u8; 100]).unwrap();
+        fs::write(format::rings_path(dir.path(), name), b"old-rings").unwrap();
+        let rings_tmp = dir.path().join(format!("{name}.{}.tmp", format::RINGS_EXT));
+        fs::write(&rings_tmp, b"staged-rings").unwrap();
+
+        reconcile_trim(dir.path(), name).unwrap();
+
+        // No marker means reconcile_trim is a no-op: the orphan is left
+        // for the next collapse attempt to overwrite.
+        assert!(rings_tmp.exists());
+        assert_eq!(
+            fs::read(format::rings_path(dir.path(), name)).unwrap(),
+            b"old-rings"
+        );
     }
 
     #[test]

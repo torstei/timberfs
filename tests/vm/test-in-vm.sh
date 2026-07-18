@@ -222,6 +222,81 @@ retain_size_budget() {
         && timberfs query "$PIPE_BACKING/cap.log" | tail -1 | grep -qx 100000
 }
 
+collapse_crash_kill_resilience() {
+    # A `fallocate(COLLAPSE_RANGE)` retention cut interrupted mid-flight
+    # must always be recoverable. Drive a real appender under a tight
+    # --retain-size with a small --chunk-size (so collapses fire often),
+    # kill -9 it repeatedly at randomized moments, and after every kill
+    # require the store to reopen cleanly — exercising a real interrupted
+    # collapse rather than a synthesized crash state.
+    #
+    # The feed is `yes`, which never reaches EOF on its own: a bounded
+    # source (e.g. `seq`) risks the whole append finishing on its own
+    # before the randomized sleep elapses (this VM's disk is fast enough
+    # that it routinely did, in an earlier version of this test, making
+    # every "kill" a no-op). An endless feed guarantees the appender is
+    # still alive — reading, mid-flush, mid-retention-tick, or mid-collapse
+    # — at the instant we send SIGKILL.
+    local d=/var/log/timberfs-collapsetest
+    rm -rf "$d"
+    mkdir -p "$d"
+
+    local iter pid
+    for iter in $(seq 1 8); do
+        yes "COLLAPSE-CRASH-FILLER-LINE-0123456789-abcdefghij-$iter" \
+            | timberfs append --into "$d/churn.log" --chunk-size 4096 \
+                  --retain-size 16K --flush-age 1 --quiet &
+        pid=$!
+        # Randomize the kill point (50-940ms) across the appender's
+        # lifecycle: the startup retention catch-up, the read/flush loop,
+        # and the once-a-second retention tick — sometimes landing right
+        # in the middle of collapse_head.
+        sleep "0.$(printf '%02d' $((RANDOM % 90 + 5)))"
+        kill -9 "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+
+        if ! timberfs info "$d/churn.log" > /tmp/collapse.out 2>/tmp/collapse.err; then
+            echo "iteration $iter: info failed after kill" >&2
+            cat /tmp/collapse.err >&2
+            return 1
+        fi
+        if [ -s /tmp/collapse.err ]; then
+            echo "iteration $iter: info reported an error after kill" >&2
+            cat /tmp/collapse.err >&2
+            return 1
+        fi
+    done
+
+    # After all the kills: the store is queryable, its trunk is still
+    # decodable with STOCK zstd (proving the skippable-frame stamp and
+    # rebased index left valid frames behind, not just an openable
+    # index), and a fresh appender can resume writing to it.
+    if ! timberfs query "$d/churn.log" > /tmp/collapse.final 2>/tmp/collapse.err; then
+        echo "final query failed" >&2
+        cat /tmp/collapse.err >&2
+        return 1
+    fi
+    # query, unlike info, always prints an informational chunk-count
+    # summary to stderr — even on success — so stderr emptiness isn't a
+    # signal here; only the exit code and the actual bytes matter.
+    if [ ! -s /tmp/collapse.final ]; then
+        echo "final query returned no data" >&2
+        return 1
+    fi
+    if ! zstd -dc "$d/churn.log.trunk" > /tmp/collapse.zstd 2>/tmp/collapse.zstderr; then
+        echo "stock zstd -dc failed on the post-kill trunk" >&2
+        cat /tmp/collapse.zstderr >&2
+        return 1
+    fi
+    if ! cmp -s /tmp/collapse.final /tmp/collapse.zstd; then
+        echo "timberfs query output diverges from stock zstd -dc of the trunk" >&2
+        return 1
+    fi
+
+    echo "post-kill-resume-marker" | timberfs append --into "$d/churn.log" --quiet \
+        && timberfs query "$d/churn.log" | tail -1 | grep -qx "post-kill-resume-marker"
+}
+
 info_readonly_nonroot() {
     # info and query are READ-ONLY: a non-root user must be able to
     # inspect a root-owned, world-readable store (the /var/log/timberfs
@@ -351,6 +426,7 @@ run_test "appender: file lock blocks rotate while live" appender_lock_blocks_rot
 run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
+run_test "collapse-head retention survives repeated kill -9" collapse_crash_kill_resilience
 run_test "info/query: read-only, work for a non-root reader" info_readonly_nonroot
 run_test "records sink flushes by age, before EOF" records_sink_age_flush
 
