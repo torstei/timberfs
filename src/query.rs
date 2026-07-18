@@ -244,6 +244,10 @@ fn read_chunk(
     handle: &mut SourceHandle,
     mut c: ChunkRecord,
 ) -> anyhow::Result<Option<Vec<u8>>> {
+    // Bound the retries: a writer that died mid-collapse (before it could
+    // bump the seqlock back to even) would otherwise leave the counter odd
+    // forever and spin this loop — surface a clear error instead.
+    let mut tries = 0usize;
     loop {
         let before = guard.as_ref().map(|(d, n)| crate::store::read_seq(d, n));
         let mut comp = vec![0u8; c.comp_len as usize];
@@ -260,13 +264,35 @@ fn read_chunk(
                 || "decompressing a stored chunk — the .trunk may be corrupt",
             )?));
         }
+        tries += 1;
+        if tries > 64 {
+            anyhow::bail!(
+                "{}: reads keep racing an in-flight collapse (or a writer died \
+                 mid-collapse, leaving the store's seqlock unfinished) — rerun once \
+                 a writer has reconciled it",
+                input.display()
+            );
+        }
         *handle = open_source(input)?;
-        match handle.records.iter().find(|r| {
-            r.first_write_ms == c.first_write_ms
+        // Re-locate the SAME chunk in the fresh index by its stable content
+        // identity — the write-time window and BOTH lengths; offsets shift
+        // under a collapse, these don't. A collapse only ever shifts
+        // survivors DOWN, so on the vanishing chance two survivors share
+        // that identity, take the one whose (shifted) comp_start is nearest
+        // at or below the old one. No match => the race retained it away.
+        let mut best: Option<ChunkRecord> = None;
+        for r in &handle.records {
+            let same = r.first_write_ms == c.first_write_ms
                 && r.last_write_ms == c.last_write_ms
                 && r.uncomp_len == c.uncomp_len
-        }) {
-            Some(r) => c = *r,
+                && r.comp_len == c.comp_len
+                && r.comp_start <= c.comp_start;
+            if same && best.is_none_or(|b| r.comp_start > b.comp_start) {
+                best = Some(*r);
+            }
+        }
+        match best {
+            Some(r) => c = r,
             None => return Ok(None),
         }
     }

@@ -797,15 +797,53 @@ impl FileStore {
             };
         }
 
-        stamp_skippable_frame(&self.trunk, sliver)?;
-        fs::rename(&rings_tmp, &rings_p)?;
+        // The fallocate has committed the cut to the trunk — there is no
+        // going back. From here the store MUST end consistent, or a still-
+        // running writer would append at a stale offset and corrupt it. The
+        // stamp and the seqlock reset don't touch in-memory offsets (a
+        // missing stamp only degrades `zstd -dc` until the next reindex; an
+        // unreset seqlock only makes readers retry), so those are
+        // best-effort. The index rename and reopen DO define the offset
+        // space, so a failure there is fatal: exit before the maintenance
+        // thread can append onto a divergent store — the .trim marker makes
+        // the next startup reconcile the landed cut (mirrors the
+        // binary-upgrade exit in the same thread).
+        if let Err(e) = stamp_skippable_frame(&self.trunk, sliver) {
+            eprintln!(
+                "timberfs: {name}: skippable-frame stamp failed after collapse ({e}); \
+                 `zstd -dc` recovery needs a `timberfs reindex` until then"
+            );
+        }
+        if let Err(e) = fs::rename(&rings_tmp, &rings_p) {
+            eprintln!(
+                "timberfs: {name}: FATAL: collapse landed but committing the rebased \
+                 index failed ({e}); exiting so no write lands at a stale offset — \
+                 the .trim marker reconciles it on restart"
+            );
+            std::process::exit(1);
+        }
         // Sidecar contract: a rings rewrite invalidates chunk numbering,
         // so derived indexes are deleted (rebuild with `timberfs reindex`).
         let _ = fs::remove_file(format::grain_path(dir, name));
         let _ = fs::remove_file(&trim_p);
-        write_seq(dir, name, seq0 + 2)?;
+        if let Err(e) = write_seq(dir, name, seq0 + 2) {
+            eprintln!(
+                "timberfs: {name}: resetting the collapse seqlock failed ({e}); \
+                 readers retry until the next collapse or reconcile"
+            );
+        }
 
-        self.rings = OpenOptions::new().read(true).write(true).open(&rings_p)?;
+        self.rings = match OpenOptions::new().read(true).write(true).open(&rings_p) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "timberfs: {name}: FATAL: collapse landed but reopening the rebased \
+                     index failed ({e}); exiting so no write lands at a stale offset — \
+                     the .trim marker reconciles it on restart"
+                );
+                std::process::exit(1);
+            }
+        };
         self.chunks.drain(..k);
         for c in &mut self.chunks {
             c.uncomp_start -= uncomp_cut;
