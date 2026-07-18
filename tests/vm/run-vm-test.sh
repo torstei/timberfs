@@ -37,7 +37,9 @@ if [ -z "${1:-}" ]; then
 fi
 
 CACHE=${TIMBERFS_VM_CACHE:-$HOME/.cache/timberfs-vm-tests}
-IMG_URL=https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+# Pinned to a dated build (not trixie/latest) so the VM base is stable and
+# reproducible; bump deliberately from https://cloud.debian.org/images/cloud/trixie/ .
+IMG_URL=https://cloud.debian.org/images/cloud/trixie/20260402-2435/debian-13-genericcloud-amd64-20260402-2435.qcow2
 BASE=$CACHE/$(basename "$IMG_URL")
 WORK=target/vm-test
 TIMEOUT=${TIMBERFS_VM_TIMEOUT:-1200}
