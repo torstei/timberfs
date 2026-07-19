@@ -2,9 +2,8 @@
 # Runs INSIDE the disposable test VM (delivered via cloud-init, executed as
 # root by runcmd). Installs the timberfs .deb from /opt, exercises the
 # package + systemd unit end to end, reports one "TEST PASS/FAIL: ..." line
-# per case on the serial console, then powers the VM off. The host-side
-# harness greps the serial log for the final ALL PASSED marker.
-exec > /dev/ttyS0 2>&1
+# per case on a dedicated serial port (ttyS1), then powers the VM off. The
+# host-side harness reads that port for the final ALL PASSED marker.
 set -u
 
 PASS=0
@@ -13,8 +12,9 @@ DONE=0
 CUT=""
 TMPOUT=/tmp/test-output
 
-# Power off no matter how we exit (a set -u abort included), so the host
-# harness never has to wait for its timeout.
+# Power off no matter how we exit (a set -u abort or a failed redirect
+# included), so the host harness never waits for its timeout. Installed
+# BEFORE the redirect below, so poweroff still runs even if that fails.
 on_exit() {
     if [ "$DONE" != 1 ]; then
         echo "TIMBERFS-VM-TESTS: script aborted (PASS=$PASS FAIL=$FAIL so far)"
@@ -25,14 +25,19 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# Results go to ttyS1, a port serial-getty never owns (ttyS0 is the console),
+# so they can't be lost to a getty vhangup race.
+exec > /dev/ttyS1 2>&1
+
 run_test() {
     local name=$1
     shift
+    local start=$SECONDS
     if "$@" >"$TMPOUT" 2>&1; then
-        echo "TEST PASS: $name"
+        echo "TEST PASS: $name ($((SECONDS - start))s)"
         PASS=$((PASS + 1))
     else
-        echo "TEST FAIL: $name"
+        echo "TEST FAIL: $name ($((SECONDS - start))s)"
         sed 's/^/    /' "$TMPOUT"
         FAIL=$((FAIL + 1))
     fi
@@ -267,34 +272,34 @@ collapse_crash_kill_resilience() {
         fi
     done
 
-    # After all the kills: the store is queryable, its trunk is still
-    # decodable with STOCK zstd (proving the skippable-frame stamp and
-    # rebased index left valid frames behind, not just an openable
-    # index), and a fresh appender can resume writing to it.
-    if ! timberfs query "$d/churn.log" > /tmp/collapse.final 2>/tmp/collapse.err; then
+    # After all the kills the store must be intact: queryable, its trunk
+    # still decodable with STOCK zstd (proving the skippable-frame stamp and
+    # rebased index left valid frames behind), and byte-identical between the
+    # two. The `yes` feed is ~1000x compressible, so the store decompresses to
+    # gigabytes — compare STREAMED md5sums, never dumping it to disk (that
+    # overflows a small VM's /tmp/RAM and is what a full-dump comparison hit).
+    local qsum zsum empty
+    empty=$(printf '' | md5sum)
+    qsum=$(set -o pipefail; timberfs query "$d/churn.log" 2>/dev/null | md5sum) || {
         echo "final query failed" >&2
-        cat /tmp/collapse.err >&2
         return 1
-    fi
-    # query, unlike info, always prints an informational chunk-count
-    # summary to stderr — even on success — so stderr emptiness isn't a
-    # signal here; only the exit code and the actual bytes matter.
-    if [ ! -s /tmp/collapse.final ]; then
+    }
+    zsum=$(set -o pipefail; zstd -dc "$d/churn.log.trunk" | md5sum) || {
+        echo "stock zstd -dc failed on the post-kill trunk" >&2
+        return 1
+    }
+    if [ "$qsum" = "$empty" ]; then
         echo "final query returned no data" >&2
         return 1
     fi
-    if ! zstd -dc "$d/churn.log.trunk" > /tmp/collapse.zstd 2>/tmp/collapse.zstderr; then
-        echo "stock zstd -dc failed on the post-kill trunk" >&2
-        cat /tmp/collapse.zstderr >&2
-        return 1
-    fi
-    if ! cmp -s /tmp/collapse.final /tmp/collapse.zstd; then
-        echo "timberfs query output diverges from stock zstd -dc of the trunk" >&2
+    if [ "$qsum" != "$zsum" ]; then
+        echo "query output diverges from stock zstd -dc ($qsum vs $zsum)" >&2
         return 1
     fi
 
+    # A fresh appender resumes; its marker is the last entry.
     echo "post-kill-resume-marker" | timberfs append --into "$d/churn.log" --quiet \
-        && timberfs query "$d/churn.log" | tail -1 | grep -qx "post-kill-resume-marker"
+        && timberfs query "$d/churn.log" 2>/dev/null | tail -1 | grep -qx "post-kill-resume-marker"
 }
 
 info_readonly_nonroot() {
@@ -1206,6 +1211,23 @@ run_test "upgrade: appender self-exits, systemd restarts it on the new binary" b
 run_test "upgrade: mount self-exits, remounts on the new binary" binary_upgrade_restarts_mount
 run_test "apt-get purge removes package" purge_package
 run_test "purge keeps user conf and data, drops package files" purge_correct
+
+# Health checks run LAST: a test that leaks disk turns a clear failure into
+# confusing cascades (a full /tmp made query fail silently, empty-stderr),
+# so assert the filesystems aren't near-full and surface it as its own test.
+health_filesystems_not_full() {
+    local fs pct
+    for fs in / /tmp /var; do
+        pct=$(df --output=pcent "$fs" 2>/dev/null | tail -1 | tr -dc '0-9')
+        [ -n "$pct" ] || continue
+        if [ "$pct" -ge 90 ]; then
+            df -h "$fs"
+            echo "$fs is ${pct}% full — a test leaked disk"
+            return 1
+        fi
+    done
+}
+run_test "health: filesystems not near-full" health_filesystems_not_full
 
 echo "TIMBERFS-VM-TESTS: PASS=$PASS FAIL=$FAIL"
 if [ "$FAIL" -eq 0 ]; then
