@@ -3,30 +3,25 @@
 Experiment: a purpose-built home for log files — stored compressed,
 searchable in milliseconds.
 
-`timberfs` keeps logs zstd-compressed (15–65x measured on real logs) and
-still answers *"what happened between 13:42 and 13:43?"* or *"who logged
-req-8f3a?"* in milliseconds, on files of any size, without decompressing
-them. Start by importing the logs you already have — as easy as gzipping
-them, and considerably more useful — and later, if you want, let it BE
-the logger: a pipe target for anything that can write to a pipe, or a
-FUSE filesystem your software writes to unmodified.
+`timberfs` keeps logs compressed (zstd) as they are written, and still
+answers *"what happened between 13:42 and 13:43?"* or *"who logged req-8f3a?"*
+in milliseconds, on files of any size, without decompressing them.
 
-It can be this fast and this small because log files have a very
-particular access pattern that general-purpose storage doesn't exploit:
+It can be this fast and this small because log files have a particular access
+pattern that general-purpose storage doesn't exploit:
 
 - **append-only writes** — nothing ever rewrites the middle of a log
 - **highly compressible content** — typically 10–20x with zstd
-- **time-correlated reads** — "what happened around 13:42?" is *the*
-  question, but answering it on a plain file means scanning gigabytes
+- **time-correlated reads** — "what happened around 13:42?" is *the* question,
+  but on a plain file it means scanning gigabytes
+- **oldest-first deletion** — logs age out from the front, which a plain file
+  can't do without a rewrite; timberfs drops old data cheaply
 
-Everything else — the on-disk format, the FUSE layer, the indexes — is
-design detail, documented in [How it works](#how-it-works) below.
+The one trade-off: data must arrive in log order (by timestamp). `import`
+stitches historical files into order for you, and live ingestion is in order
+by definition — so in practice it rarely bites.
 
 ## Getting started: you have a pile of logs
-
-You probably found this because you have large logfiles *right now*. You
-don't need the filesystem part to get value — start by importing what you
-have. It's as easy as gzipping the logs, and considerably more useful.
 
 Install (see [Install](#install) for details and verification):
 
@@ -42,29 +37,6 @@ timberfs create --index --set host=$(hostname) backing/app.log
 timberfs import /var/log/myapp/app.log* --into backing/app.log
 ```
 
-That's it — and note what you did *not* have to do: figure out which
-rotated file covers which period. The glob imports in any order (files are
-stitched chronologically by their own first timestamps — rotation
-numbering lies), and the result is **one continuous timeline**: the
-question that used to span `app.log.2.gz`, `app.log.1` and `app.log` is
-now just a query. Timestamps are auto-detected from the lines (ISO/RFC3339
-variants, Apache/CLF, epochs; `--timestamp-regex`/`--timestamp-format` for
-exotic formats), and `--index` declares a token index that every future
-import maintains automatically. Tomorrow, the same command imports the
-next day's file: placement is automatic — after the store's end it
-appends, overlaps are deduplicated line by line, and re-running an import
-is a no-op.
-
-Compared to `gzip -9` + `zgrep`, roughly:
-
-|                      | gzip                     | timberfs                             |
-| -------------------- | ------------------------ | ------------------------------------ |
-| size                 | ~20x                     | ~15–65x (zstd, measured on real logs)|
-| "13:42 to 13:43?"    | decompress everything    | indexed: milliseconds, any file size |
-| "who logged req-8f3a"| zgrep = full decompress  | Bloom-indexed: skips ~99% of chunks  |
-| around a rotation?   | zcat + cat, in the right order | one timeline, no seams         |
-| worst case           | zcat still works         | `zstd -dc *.trunk` still works       |
-
 ### 2. Ask it things
 
 ```sh
@@ -75,68 +47,31 @@ timber-filter --has req-8f3a backing/app.log                  # request id, no t
 timberfs query backing/app.log --from 13:40 --to 14:10 | grep -c 'tenantId=FOO'
 ```
 
-To watch a store fill live — the socket-intake case, where nothing is mounted —
-`-f`/`--follow` streams new entries as they're committed, `--tail N` shows the
-last N entries first, and `--max N` caps the output (a hard `head`-style limit,
-also on `timber-filter`). A follow is only as live as the writer's `--flush-age`
-(it sees flushed chunks, not the still-buffered tail), and plain-text follow
-streams raw for a true `tail -f` feel:
+`query` selects by time — verified against each line's own timestamp, so
+13:37–13:38 never shows a 13:42 line — while `timber-filter` matches whole
+entries (stack traces stay intact) by named predicates, exact word predicates
+riding the token index automatically. `-f`/`--follow`, `--tail N` and `--max N`
+stream or cap. Stores in a **forest** (`/var/log/timberfs`) take a bare handle
+(`timberfs query nginx`), `timberfs list` shows what's there, and the package
+ships shell completion for both tools. Full reference: `man timberfs`,
+`man timber-filter`.
 
-```sh
-timberfs query /var/log/timberfs/nginx/nginx.log --tail 20 -f   # last 20, then follow
-timberfs query backing/app.log --from 13:40 --max 100           # first 100 in the window
-timber-filter --has ERROR backing/app.log --max 50              # first 50 matches, then stop
-```
-
-A store under a configured **forest** (`/var/log/timberfs` by default) can be
-named by a bare **handle** instead of its full path — `timberfs query nginx`
-reads `/var/log/timberfs/nginx/nginx.log`. Full paths always work unchanged;
-see `man timberfs` (FORESTS) or the deployment guide. `timberfs list` shows
-what's actually there: one row per store (handle, forest, size, time span,
-writer state, index, retention), across every configured forest or a given
-directory — `--names` for bare handles, `--json` for scripting. The package
-also ships bash/zsh completion, so `timberfs query <TAB>` offers those same
-handles live.
-
-Queries answer **in the timestamps you can see**: chunks are selected by
-the write-time index (widened a little), then every entry is verified
-against `--from/--to` by the timestamp its own line carries — so asking
-for 13:37–13:38 never shows a 13:42 line. `--show-write-time` reveals the
-invisible second field (arrival time + divergence), `--by-write-time` is
-the raw chunk-level escape hatch, and `-0` emits NUL-terminated entry
-records — a stack trace stays ONE record:
-
-```sh
-# top 3 recurring exceptions, as whole stack traces
-timber-filter -0 --substring Exception backing/app.log --from 2026-07-10 \
-  | sort -z | uniq -zc | sort -znr | head -z -n 3 | tr '\0' '\n'
-```
-
-For further trimming, `timber-filter` (entry-aware) or plain `grep`/`awk`
-on the extract compose as always. When an investigation
-is done, ship it — with its provenance — as a single file:
+Ship an investigation — with its provenance — as one self-describing file:
 
 ```sh
 timber-filter --records --has 'tenantId=FOO' backing/app.log --from 13:40 --to 14:10 \
   | timberfs import --records --into case/case.log
-timberfs export case/case.log --into case.timber
-# case.timber is queryable in place, and records WHERE it came from and
-# WHAT pipeline produced it (timberfs info case/case.log). Attach to ticket.
+timberfs export case/case.log --into case.timber   # queryable in place; records where it
+                                                    # came from and how (timberfs info case.timber)
 ```
 
 ### 3. Make it *the* logger (when you're ready)
 
-Live ingestion also retires rotation's other job. Plain-file logging
-rotates for two reasons: to make room, and to ship archives off-box. In
-timberfs, **making room needs no rotation at all** — retention drops the
-oldest data continuously from the same store, with no rotate-and-delete
-dance and no seams in the timeline. And it's a property of the *log*,
-not of whoever writes it: declared in the manifest (`create --retain-size
-50G`, or `timberfs set backing/app.log retain=90d` — live, no restart)
-and enforced by every writer: the appender, the mount daemon, even a
-cron-driven import. Rotation still exists
-(`timberfs rotate`), but for what it should be for: carving off segments
-to ship somewhere else.
+Live ingestion also retires rotation's "make room" job: **retention** drops the
+oldest data continuously (no rotate-and-delete, no seams), as a property of the
+*log* — declared in the manifest, enforced by every writer: `create
+--retain-size 50G` or `timberfs set backing/app.log retain=90d` (live, no
+restart).
 
 Three ways in, in increasing order of commitment:
 
@@ -185,174 +120,21 @@ stamp with the **write-time wall clock** (right for live ingestion, where
 they coincide). Either way, `query --from/--to` asks about the time the
 log talks about.
 
-## The toolbox
+## Beyond the getting-started path
 
-Worked examples of everything, reference-flavored — the getting-started
-guide above covers the happy path; this is the full spread, mount-first:
+The tour above is the whole core loop. The main thing it leaves out is the
+**fleet view**: keep one log per host/app and merge them at *read* time, so a
+single query spans the fleet — chunks interleave by timestamp across files, and
+each line carries a `path:` prefix showing who logged it.
 
 ```sh
-# mount: logical view on ./logs, compressed store in ./logs-backing
-timberfs mount ./logs-backing ./logs &
-
-# any process just appends normally
-myapp >> logs/app.log
-echo "hello" >> logs/app.log
-tail -f logs/app.log
-grep ERROR logs/app.log
-
-# the killer feature: extract by wall-clock write time, O(log n)
-timberfs query logs-backing/app.log --from 13:42 --to 13:43
-timberfs query logs-backing/app.log --from "2026-07-09 13:42:00" --to "2026-07-09 13:43:00"
-
-# entry-aware filtering lives in its own tool: timber-filter passes
-# whole log ENTRIES (a timestamped line plus its continuations — stack
-# traces stay attached) matching named predicates. Every flag carries
-# its kind, polarity and case rule in its name; nothing shape-shifts:
-#   Select (--has word / --substring / --regex) AND on repetition;
-#   --any alternatives OR; --not-* excludes; -caseless per predicate
-timber-filter --has ERROR logs-backing/app.log --from 13:42 --to 13:43
-timber-filter --any ERROR --any FATAL --not-has HealthCheck logs-backing/app.log
-timber-filter --has 'tenantId=FOO' --not-has DEBUG logs-backing/app.log  # and-not
-timber-filter --substring 8454XK logs-backing/app.log                    # partial id
-timber-filter --has FOO --substring-caseless 'connection reset' app.log  # mixed case rules
-timber-filter --has ERROR --has 1294737704 -c logs-backing/app.log       # requirements alone
-
-# exact word predicates ride the token index on stores — automatically,
-# and only where provably exact; a note says when a search runs unnarrowed
-
-# the investigation as an artifact: pipe the filtered RECORD STREAM into
-# the sink — the new store's .bark records the selection and every
-# pipeline stage that shaped the data (an empty result is an artifact too)
-timber-filter --records --has 'tenantId=FOO' --from 13:00 logs-backing/app.log \
-  | timberfs import --records --into case/case.log
-
-# the fleet view: store one log per host/app, merge at READ time —
-# chunks interleave by time across files, lines carry "path:" prefixes
 timberfs query --from 13:42 --to 13:43 collector/host*-app.log
 timber-filter --has req-8f3a collector/*.log        # which hosts saw it?
-
-# the store's vital signs: identity, lineage, size/compression, time
-# covered, index coverage, writer state (--json for scripting)
-timberfs info logs-backing/app.log
-
-# inspect the chunk index (offsets, compression ratio, time windows)
-timberfs index logs-backing/app.log
-
-# quick metadata via xattrs on the mounted file
-getfattr -d -m 'user.timberfs.' logs/app.log
-
-# escape hatch: recover everything with stock tools, no timberfs needed
-zstd -dc logs-backing/app.log.trunk
-
-# unmount
-fusermount3 -u ./logs
 ```
 
-### Piping without FUSE
-
-The mount is optional: `timberfs append` writes the same store directly
-from a pipe — the daemontools/runit/s6 log-processor pattern (`multilog`,
-`svlogd`, `s6-log`), so it drops into supervision trees and containers
-where FUSE is unwelcome (no `/dev/fuse`, no root, no mount):
-
-```sh
-myapp 2>&1 | timberfs append --into logs-backing/app.log
-timberfs query logs-backing/app.log --from 13:42 --to 13:43
-```
-
-Each log has exactly one writer (a per-file lock), appenders for different
-files share a directory freely, and a directory is either mounted *or*
-appended to — never both (the mount daemon owns in-memory state for the
-whole directory). End of input, `SIGTERM` or `SIGINT` flush and sync
-everything before exit.
-
-**Importing existing logs** works the same way, but with a twist that
-matters: chunk time windows come from timestamps *parsed out of the log
-lines* (auto-detected RFC3339/ISO, Apache/CLF, or leading epochs;
-`--timestamp-regex`/`--timestamp-format` for anything else), because the
-write time of historical data says nothing. Lines without a timestamp —
-stack traces, continuations — inherit the previous line's, and mildly
-out-of-order lines just widen chunk windows (queries select by interval
-overlap, so nothing is lost):
-
-```sh
-timberfs import /var/log/old-app.log --into logs-backing/app.log
-timberfs query logs-backing/app.log --from "2026-06-03 14:00" --to "2026-06-03 15:00"
-
-# a whole rotated set, in any order — files are stitched chronologically
-# by their own first timestamps (rotation numbering and glob order lie)
-timberfs import /var/log/old-app.log.* /var/log/old-app.log --into logs-backing/app.log
-
-# a timberfs source (say, a rotation segment shipped from another box)
-# is detected automatically and merged VERBATIM — no decompression, no
-# parsing, index included; re-shipping the same segment is a no-op
-timberfs import /shipped/app-2026-07-09.log --into central-backing/hostA-app.log
-
-# the daily bulk-load: each day's file just appends to the archive
-timberfs import imap-2026-07-10.log --into backing/imap.log   # day 2
-timberfs import imap-2026-07-11.log --into backing/imap.log   # day 3, and so on
-```
-
-Imports into a **non-empty store** are placed by each source's *first
-timestamp*: after the store's end → append (the daily load above);
-*inside* the store's window (day files cut with slack, a re-run) → the
-overlap is deduplicated **line by line** — duplicates skip, genuinely
-new lines in the covered window land with a warning, and re-importing an
-already-covered file is a clean no-op; *before* everything in the store
-→ refused. A source starting exactly where the store starts is the same
-file regrown: its already-imported prefix is byte-verified and only the
-growth is appended (truncated/rewritten files are refused before a byte
-is written).
-
-And `timberfs export` is the read-side twin: carve any time window (or a
-whole log) out of an archive as a fresh timberfs log — or as a
-single-file **`.timber` bundle** for shipping (a plain uncompressed tar,
-`.rings` member first, so `tar xf` + `zstd -dc` always recovers it and a
-hand-tarred pair is a valid bundle):
-
-```sh
-timberfs export backing/archive.log --into incident.timber --from 13:40 --to 14:10
-timberfs query incident.timber --from 13:52 --to 13:53 | grep ERROR
-timberfs import incident.timber --into elsewhere/incident.log
-```
-
-Note the middle line: bundles are first-class *read-only* logs — `query`,
-`index` and `export` operate on a `.timber` file directly (tar keeps its
-members contiguous and uncompressed, so the trunk member is just a trunk
-at an offset). A directory of `.timber` case files is a queryable cold
-archive; unpacking or importing is only ever needed to append.
-
-Together these close the shipping loop: `rotate` cuts history out of live
-logs, `export` carves arbitrary windows out of anything, `.timber` bundles
-travel as single files, and `import` merges them anywhere, idempotently —
-every step a verbatim copy of compressed chunks. The shipping format *is*
-the storage format.
-
-Re-importing is idempotent: the target is its own checkpoint. Already
-imported bytes are verified against the source (all chunks, or
-first/middle/last with `--quick`), then only the growth is appended —
-an unchanged source is a no-op, a rotated/rewritten one is refused before
-anything is written. So a periodic `timberfs import` of a growing file
-is a safe, cheap catch-up (full verification of a multi-GB target runs
-in well under a second).
-
-The appender is also where **retention** lives, because it already owns
-the file: `--retain 30d` continuously drops data older than 30 days, and
-`--retain-size 200G` keeps the compressed on-disk size under a hard
-budget, oldest first — combine them for "keep the last 30 days, but never
-more than 200G":
-
-```sh
-myapp 2>&1 | timberfs append --retain 30d --retain-size 200G logs-backing/app.log
-```
-
-No dated-file rotation needed: the log is simply a single file that always
-contains the recent past, and `timberfs query` finds things in it by time.
-(Head-dropping currently compacts by rewriting the retained data, so
-enforcement is batched — expired data goes once it's ~10% of the file, size
-overruns trim to 95% of budget — and compaction briefly needs free space
-proportional to what's kept. Hole-punching is the planned fix for very
-large stores.)
+The full command reference — every flag, `import`/`export`/`rotate`, retention,
+forests, `.timber` bundles, and the records stream — is in the man pages:
+`man timberfs`, `man timber-filter`, and `man timberfs-records`.
 
 ## Rotation & retention
 
@@ -367,27 +149,11 @@ timberfs rotate backing/app.log --delete --cutoff "2026-06-01T00:00"   # retenti
 timberfs rotate backing/app.log archive.log --cutoff 12:00 --dry-run   # preview
 ```
 
-Why it's cheap: chunks are immutable zstd frames, so rotation relocates
-**compressed bytes verbatim** — no decompression, no recompression — and
-rebases the index records. Rotating gigabytes of logs costs I/O proportional
-to the compressed size. The destination (same backing directory) is created
-or appended to; appends are refused if they would break the index's time
-ordering. Like queries, the cutoff is chunk-granular: a chunk straddling it
-stays in the live file.
-
-It works against a live mount: the daemon holds an `flock` on
-`<backing>/.timberfs.lock` recording its mountpoint, and `timberfs rotate`
-auto-detects it — offline it rewrites the backing files directly (holding
-the same lock), mounted it routes the request through the daemon as a
-`setxattr` control call (`user.timberfs.rotate`), which rotates atomically
-under the daemon's state lock and then invalidates the kernel's attribute
-cache so writers holding the file open with `O_APPEND` keep working across
-the shrink (their next write re-bases to the new EOF).
-
-`timberfs query`/`timberfs index` read the backing files directly and are safe to
-run against a live mount (chunks are immutable, the index is append-only).
-Note they only see flushed chunks — the still-buffered tail (≤ flush-age
-old) is visible through the mount but not yet in the backing files.
+It's cheap because chunks are immutable zstd frames: rotation relocates
+compressed bytes verbatim (no re/decompression) and rebases the index, so it
+costs I/O proportional to the compressed size. It runs against a live mount
+(auto-detected, routed through the daemon atomically) and is chunk-granular
+like queries. Details: `man timberfs`.
 
 ## Install
 
@@ -422,192 +188,15 @@ Or from crates.io with a Rust toolchain: `cargo install timberfs`.
 
 ## How it works
 
-Everything below is the design: how the store earns the behavior above.
-You don't need any of it to use timberfs — the curious and the
-contributors start here. The short version: two files per log (data +
-a write-time index), everything else is derived, and stock tools can
-always recover your data.
+Two files per log: the data (`<name>.trunk`, concatenated zstd frames) and a
+write-time index (`<name>.rings`). Everything else is derived, and stock tools
+can always recover your data — `zstd -dc <name>.trunk` prints the whole log, no
+timberfs required; the index is pure acceleration.
 
-## Why FUSE (and not overlayfs / a kernel module)
-
-- **overlayfs** layers *namespaces* (upper/lower directories, as used by
-  container images). It has no hook for transforming *content*, so it can't
-  compress on write or maintain an index. Wrong tool.
-- **A native kernel filesystem in Rust** is where Rust-for-Linux is heading,
-  but the filesystem bindings are still experimental. Not a good vehicle for
-  iterating on a design.
-- **FUSE** gives us the full VFS interface in userspace: loggers append
-  through the mount unmodified, `tail -f`/`grep`/`less` all just work, and
-  the implementation is ordinary safe Rust (`fuser` crate, no libfuse
-  dependency — it only needs the `fusermount3` binary at runtime).
-
-The design cleanly splits into a *store* (file format + chunking, no FUSE
-types) and a thin FUSE layer, so the store could later be re-hosted in a
-kernel module, a `LD_PRELOAD` shim, or a log-shipping daemon without change.
-
-## On-disk format
-
-Each logical file `<name>` is backed by two files in the backing directory:
-
-```
-<name>.trunk   concatenated zstd frames, one per chunk, no wrapper bytes
-<name>.rings   8-byte magic "RING0001", then 48-byte records (all u64 LE):
-              uncomp_start | uncomp_len | comp_start | comp_len
-              | first_write_ms | last_write_ms
-```
-
-(The names take the timber metaphor seriously: the data is the trunk, and
-the index is its growth rings — which really are a write-time index;
-dendrochronology dates events by rings exactly the way `timberfs query`
-dates bytes by chunks.)
-
-Because the `.trunk` is a plain zstd frame concatenation, **stock tools can
-always recover the data**: `zstd -dc app.log.trunk` prints the whole
-uncompressed log, no timberfs required. The index is pure acceleration.
-
-Records are appended in write order, so they are sorted both by uncompressed
-offset **and** by wall-clock time — byte reads and time queries are each one
-`partition_point` binary search.
-
-Crash safety: chunks are written data-first, index-second; on open, index
-records pointing past the end of the data are dropped and orphaned data
-bytes are overwritten. `fsync()` through the mount flushes the buffer as a
-chunk and syncs both backing files, so fsync = durable. Unsynced buffered
-data is lost on a crash, bounded by `--flush-age`.
-
-### The .bark manifest
-
-An optional `<name>.bark` holds the log's *declared* facts as one flat,
-human-editable JSON object — the label on the timber:
-
-```json
-{
-  "id": "6f9c2a1e-…",             // identity: random UUID, minted on first write,
-  "created": "2026-07-11T09:14:02Z", //   constant across renames, moves and hosts
-  "host": "imap03.example.com",   // provenance: free-form, yours (--set k=v)
-  "index": true,                  // settings: CREATE INDEX — imports maintain the grain
-  "retain": "90d",                //   keep at least this long — enforced by EVERY writer
-  "retain_size": "50G",           //   compressed-size budget, oldest dropped first
-  "timestamp_regex": "^(...)",    // content: exotic line-timestamp format, declared once
-  "timestamp_format": "%m/%d/%Y %H:%M:%S", //   (import flags persist these; inherits)
-  "derived_from": "41d0…",        // lineage: source store's id
-  "derived_op": "export",         // …and how: export (copy) or rotate (move)
-  "window_from": "2026-07-04T22:00:00.000Z", // the REQUESTED window (operation
-  "window_to": "2026-07-05T22:00:00.000Z"    //   fact — what was asked)
-}
-```
-
-Artifacts made by `export` and by rotation into a new segment are new
-stores: fresh `id`, `derived_from`/`derived_op` lineage (chains compose
-across re-carves and shipping), provenance inherited, settings and window
-facts not. Content facts — actual spans, sizes — are never recorded (the
-artifact's own rings state them authoritatively); the *requested* window
-is recorded, because content can't state coverage: a file whose last line
-is 17:00 doesn't say whether 17:00–24:00 was covered-but-silent or simply
-not exported.
-
-Which is why **an empty result is a result**: exporting or rotating a
-window that contains nothing still produces the (empty) artifact.
-Present-but-empty ("Saturday was covered, nothing was there — ingest
-Sunday") and missing ("a day is missing — don't ingest past the gap") are
-opposite signals to a consumer; `--fail-on-empty` turns a quiet day back
-into an error for pipelines that want one. `import` skips empty sources
-with a note, never an error. Unlike the derived `.grain`, bark survives
-head-drops, travels on rename, and ships inside `.timber` bundles.
-
-## Semantics
-
-| Operation            | Behaviour                                                        |
-| -------------------- | ---------------------------------------------------------------- |
-| append (write @ EOF) | buffered, compressed into a chunk on size/age/close/fsync        |
-| write elsewhere      | `EPERM` — the filesystem is append-only                          |
-| read anywhere        | chunk located by binary search, decompressed, served             |
-| truncate to 0        | allowed: starts the file over (copytruncate-style rotation)      |
-| truncate elsewhere   | `EPERM`                                                          |
-| rename / unlink      | supported (mv-based log rotation works)                          |
-| `ls -l` size         | logical (uncompressed) size                                      |
-| `du` blocks          | compressed size — `du -h` shows the real disk footprint          |
-| subdirectories       | not yet — flat namespace in v0                                   |
-
-Time-range queries are **chunk-granular** — by design, not as a
-placeholder: every chunk whose write-time window overlaps the requested
-range is returned in full. Chunk windows are bounded by `--flush-age`
-(default 5 s) for slow writers and by `--chunk-size` (default 256 KiB) for
-fast ones, so that's the worst-case slop at the edges of the window.
-
-The intended workflow is: `timberfs query` does the coarse seek into a huge
-file (cheap, no parsing, immune to multiline entries and timestamp-less
-lines), then `timber-filter` (entry-aware) or ordinary `grep`/`awk` on the
-small extract trims exactly using the timestamps the log lines carry
-anyway. The slop is a feature there:
-buffered loggers write lines slightly after the timestamp they print, so a
-byte-exact write-time cut could miss edge lines that grep-on-content
-catches.
-
-## Custom indexes: the .grain token index
-
-The write-time index generalizes: `.rings` is just a per-chunk summary
-(byte ranges + a searchable time window), and queries never touch the
-trunk except for the chunks the summary selects. The first content index
-is implemented: **`.grain`**, one Bloom filter per chunk over every token
-in it (~10 bits per distinct token, k=7, ~1% false positives — measured
-0.86% on a 2.7 GB production log). Build it with `timberfs reindex`, use
-it with `query --has`:
-
-The index is a property of the LOG, declared once in its `.bark`
-manifest — after that, every import maintains the grain automatically
-(extended incrementally for new chunks, rebuilt if rotation/retention
-dropped it). There is no per-import flag to forget:
-
-```sh
-timberfs create --index --set host=foo.bar.com logs-backing/app.log
-timberfs import day1/* --into logs-backing/app.log     # grain maintained
-timberfs import day2/* --into logs-backing/app.log     # still maintained
-
-timberfs import huge.log --into logs-backing/app.log --index  # or declare+build in one go
-timberfs reindex logs-backing/app.log          # or later: 2.7 GB indexed in ~6 s
-timberfs query logs-backing/app.log --has F454567068093ZHGZCL   # no time bound!
-timberfs query logs-backing/app.log --from 13:00 --to 14:00 --has ERROR \
-    | timber-filter --has 'tenantId=FOO'
-```
-
-Tokens are ASCII-alphanumeric runs of 3–64 characters, exact case,
-config-free: rare tokens (request keys, message ids) skip nearly every
-chunk, ubiquitous ones skip nothing and cost only the test. `--has` is a
-**chunk-level pre-filter with whole-token matching** — an argument with
-separators (`req-8f3a`) must match all its tokens in the same chunk, AND
-across repeated `--has` flags is also chunk-level, and substrings of
-tokens do not match; exact, entry-level filtering stays downstream in
-`timber-filter`. A false positive costs one needless chunk
-decompression. The design contract that made this a sidecar:
-
-**Custom indexes are sidecars**: one file per index next to the `.trunk`/`.rings` pair (the
-metaphor extends: `.rings` is time, content indexes are *grain*), with a
-self-describing header (index type + extractor description) and one
-append-only entry per chunk. Three rules:
-
-1. **Derived and rebuildable.** A sidecar can always be regenerated by
-   streaming the trunk (`timberfs reindex`), so indexes can be added to
-   existing logs, reconfigured, or deleted at zero risk. The trunk and
-   rings remain the only durable truth.
-2. **Missing means scan.** A chunk without an index entry is "no
-   information — scan it". Partial or lagging indexes degrade to
-   conservative scans, never wrong answers; this is also the crash story.
-3. **Rings rewrites delete sidecars.** Any operation that rewrites the
-   `.rings` (rotation, retention head-drop) deletes the file's custom
-   indexes; `reindex` recreates them. No coordination logic, no corruption
-   class. (Prefix-trimming sidecars in the same pass is a later
-   optimization, since head-drops remove exactly a chunk prefix.)
-
-Consequences worth knowing: chunk size is an index-selectivity knob
-(smaller chunks → sharper lookups, more overhead), the grain lags a live
-appender until the next `reindex` (lagging entries just mean scanning
-those chunks), and `.timber` bundles carry no grain yet. A
-chunk-sequence-number field in the rings header was considered to let
-sidecars survive head-drops without deletion, and rejected: rule 3 makes
-it unnecessary, and the on-disk format stays `RING0001`. (Logged-timestamp
-zone maps, the other planned index family, became largely moot: import
-already writes logged time into the rings.)
+The full design — why FUSE, the on-disk format, the `.bark` manifest, the
+semantics table, and the `.grain` token index — lives in
+**[docs/design.md](docs/design.md)**. You don't need any of it to use timberfs;
+the curious and the contributors start there.
 
 ## Build
 
@@ -628,94 +217,16 @@ cargo deb                                        # target/debian/timberfs_*.deb
 sudo dpkg -i target/debian/timberfs_*.deb
 ```
 
-The package installs `/usr/bin/timberfs` plus a systemd template unit: drop
-a config in `/etc/timberfs/<instance>.conf` (see
-`/usr/share/doc/timberfs/examples/timberfs.conf.example`) and run
-`systemctl enable --now timberfs@<instance>` to mount at boot. Stopping the
-unit unmounts first, so the daemon flushes everything and exits cleanly.
+The package installs `/usr/bin/timberfs` and two systemd template unit
+families: `timberfs@<instance>` to mount a store at boot, and a
+socket-activated `timberfs-log@<instance>` to stream into a store without a
+mount. See **[Deploying timberfs](docs/deployment.md)** for the directory
+layout, both unit families, the ownership/permission model, and
+self-restart-on-upgrade.
 
-It also installs a socket-activated **log-intake** pair,
-`timberfs-log@.socket` + `timberfs-log@.service`, for streaming into a store
-without a mount: the socket creates `/run/timberfs/<instance>.pipe` and holds it
-open `O_RDWR`, so a producer is undisturbed while the appender
-(`timberfs append --records --into /var/log/timberfs/<instance>/<instance>.log`)
-restarts or upgrades under it — writes just buffer in the pipe and drain when it
-returns. Each instance gets its own directory, so instances can be owned and
-managed independently.
+## Roadmap
 
-The service drains the FIFO with `append --records`, so the producer writes a
-[timberfs-records(5)](packaging/timberfs-records.5) stream, not raw text — the
-intended fit for a records-format logging writer that frames its own events and
-timestamps. (To archive a plain-text source, drop `--records` via the drop-in
-below.)
-
-```sh
-systemctl enable --now timberfs-log@applogs.socket   # then a records producer writes /run/timberfs/applogs.pipe
-```
-
-The FIFO is created `root:root` mode 0660, so a **non-root producer needs the
-group set** — there's no universal default, so do it per instance:
-
-```sh
-systemctl edit timberfs-log@applogs.socket     # [Socket] / SocketGroup=myapp
-```
-
-Override the store path or add retention (or drop `--records` for a plain-text
-source) with `systemctl edit timberfs-log@<instance>.service`. (For an immediate
-first use before a reboot, `systemd-tmpfiles --create` creates `/run/timberfs`.)
-
-See **[Deploying timberfs](docs/deployment.md)** for the full picture: the
-default directory layout, both systemd unit families, the ownership/permission
-model, and how locking and self-restart-on-upgrade work.
-
-## Ideas / future work
-
-- **More `.bark`**: an `annotate` command for existing logs, attribution
-  labels from manifest fields in multi-file output (`--label '{host}'`),
-  auto-seeded provenance on import, bark-aware routing in the future
-  sawmill server.
-- **Docs: "why is my grep slow?"**: a short troubleshooting section
-  walking the modes table — word mode + grain = fast; --regex/--substring/-i/-v =
-  full scan and why; how to build the index (`create --index`/`reindex`)
-  and read the full-scan notes.
-- **Zone-map sidecar (`--written-from/--written-to`)**: per-chunk logline
-  windows as a derived sidecar, making BOTH time axes queryable (arrival
-  for "what came in during the incident", logline for history) and
-  giving the sawmill lag observability. The read path already treats the
-  trunk as its own timestamp index; this would only accelerate it.
-- **`timberfs merge`**: entry-aware N-way merge — split sources (raw logs
-  or timberfs) into log entries, merge-sort them by timestamp, emit one
-  timberfs store or raw stream. Subsumes "grep a fleet into one artifact"
-  (merge, then `grep --into`) and gives shipped per-host segments a
-  single-timeline view at write time rather than only at read time.
-- **A timberfs server ("sawmill")**: bundles shipped in over HTTP (PUT +
-  idempotent import = at-least-once ingest for free), routed to per-stream
-  archives by their `.bark` manifests, queried over a thin REST layer
-  wrapping query/grep. Tiering: keep rings+grain LOCAL, ship trunks to
-  object storage — queries plan locally (time windows + blooms) and fetch
-  candidate chunks as single S3 ranged GETs. Principle: the directory
-  stays the database; the server owns no state that is not a plain
-  timberfs file. Path: lib refactor → .bark → read-only serve → ingest →
-  tiering.
-- **zstd seekable format / dictionaries**: adopt the official seekable-zstd
-  framing for ecosystem compat; train a dictionary per file for much better
-  small-chunk ratios; long-range mode for cold recompression.
-- **Cold-chunk recompression**: rewrite old chunks at zstd -19 in the
-  background; the index makes this a local, safe operation.
-- **Scheduled rotation**: a `timberfs rotated`-style timer (or systemd timer
-  recipe) driving `rotate --cutoff`/`--delete` policies per file.
-- **Appender growth toward s6-log**: `SIGHUP`-triggered and scheduled
-  rotation into dated files (for shipping archives off-box), optional line
-  timestamping, `--tee` passthrough, and a `--follow` reader.
-- **Hole-punching retention**: drop the head via `FALLOC_FL_PUNCH_HOLE`
-  instead of compact-rewrite, making `--retain-size` cheap on huge stores.
-- **Expose the index in-band**: a virtual `.idx` twin file or ioctl so tools
-  can query through the mount without knowing the backing dir.
-- **tail(1) fast-path**: negative-offset "time seek" via `llseek` hooks.
-- **Subdirectories, multi-writer O_APPEND atomicity, runtime rescan of the
-  backing dir, real statfs passthrough.**
-- **Kernel port**: the store layer is FUSE-free by design; revisit
-  Rust-for-Linux filesystem bindings when they stabilize.
+Ideas and future work live in [ROADMAP.md](ROADMAP.md).
 
 ## License
 
