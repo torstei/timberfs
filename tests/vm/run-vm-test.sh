@@ -71,9 +71,6 @@ write_files:
     content: $(base64 -w0 tests/vm/test-in-vm.sh)
     permissions: '0755'
 runcmd:
-  # agetty vhangup()s ttyS0 when it starts, killing the test script's
-  # already-open fd on the serial console — keep the port to ourselves
-  - [systemctl, mask, --now, serial-getty@ttyS0.service]
   - [bash, /opt/test-in-vm.sh]
 EOF
 
@@ -89,18 +86,15 @@ fi
 
 echo "booting test VM ($(basename "$DEB"))..."
 set +e
-# -object/-device virtio-rng feeds host entropy to the guest so its kernel
-# CSPRNG (crng) seeds immediately. Without it, cloud-init's early SSH
-# host-key generation can block in getrandom() waiting for entropy and stall
-# the whole boot until the TIMEOUT fires (seen in CI 2026-07-18: repeated
-# 1200s timeouts, serial ending at the ssh-keygen randomart).
+# Two serial ports: ttyS0 (serial.log) is the kernel console + serial-getty;
+# ttyS1 (test.log) is a dedicated channel for the test script's output, which
+# serial-getty never owns — so results can't be lost to a getty vhangup race.
 # shellcheck disable=SC2086
 timeout "$TIMEOUT" qemu-system-x86_64 $KVM_ARGS \
     -m 1024 -smp 2 \
-    -object rng-random,filename=/dev/urandom,id=rng0 \
-    -device virtio-rng-pci,rng=rng0 \
     -display none \
     -serial file:"$WORK/serial.log" \
+    -serial file:"$WORK/test.log" \
     -drive file="$WORK/disk.qcow2",if=virtio,format=qcow2 \
     -drive file="$WORK/seed.iso",if=virtio,format=raw,read-only=on \
     -nic user,model=virtio-net-pci \
@@ -108,31 +102,34 @@ timeout "$TIMEOUT" qemu-system-x86_64 $KVM_ARGS \
 QEMU_RC=$?
 set -e
 
-# Materialize the CR-stripped log ONCE: piping it into an early-exiting
-# consumer (grep -q) under pipefail flips the verdict to FAILED when tr
-# catches EPIPE — a pipe-buffer race that only shows up once the log
-# grows big enough. No pipes in the verdict path.
-CLEAN="$WORK/serial.clean"
-tr -d '\r' < "$WORK/serial.log" > "$CLEAN"
+# Read the verdict from the results port (ttyS1 -> test.log), not the console.
+# Materialize the CR-stripped file ONCE and grep the file: no pipes in the
+# verdict path, since piping into grep -q under pipefail can flip the verdict
+# when tr catches EPIPE on grep's early exit.
+CLEAN="$WORK/test.clean"
+tr -d '\r' < "$WORK/test.log" > "$CLEAN"
 
 if [ "$QEMU_RC" = 124 ]; then
-    echo "=== VM timed out after ${TIMEOUT}s; last serial output: ===" >&2
+    echo "=== VM timed out after ${TIMEOUT}s ===" >&2
+    echo "--- results (ttyS1) ---" >&2
     tail -30 "$CLEAN" >&2
+    echo "--- boot log (ttyS0) ---" >&2
+    tr -d '\r' < "$WORK/serial.log" | tail -30 >&2
     exit 1
 fi
 
 echo "=== test results ==="
 grep -E "^(TEST (PASS|FAIL)|TIMBERFS-VM-TESTS)" "$CLEAN" || {
-    echo "no test output found on serial console; last serial output:" >&2
-    tail -30 "$CLEAN" >&2
+    echo "no test output on the results port (ttyS1); boot log tail:" >&2
+    tr -d '\r' < "$WORK/serial.log" | tail -30 >&2
     exit 1
 }
 
 if grep -q "^TIMBERFS-VM-TESTS: ALL PASSED" "$CLEAN"; then
-    echo "OK (full log: $WORK/serial.log)"
+    echo "OK (logs: $WORK/test.log, $WORK/serial.log)"
     exit 0
 else
-    echo "FAILED — failing test output above; full log: $WORK/serial.log" >&2
+    echo "FAILED — failing test output above; logs: $WORK/test.log, $WORK/serial.log" >&2
     grep -A5 "^TEST FAIL" "$CLEAN" >&2 || true
     exit 1
 fi
