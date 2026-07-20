@@ -23,7 +23,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release
 
-  vm-tests:
+  vm-tests-matrix:
     name: vm-tests (${{ matrix.image }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -72,3 +72,19 @@ jobs:
         env:
           TIMBERFS_VM_IMAGE: ${{ matrix.image }}
         run: tests/vm/run-vm-test.sh target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb
+
+  # Single required status check that stays green iff every matrix leg passed.
+  # Branch protection requires the context `vm-tests`; the matrix legs report as
+  # `vm-tests (trixie)` / `vm-tests (focal)`, so this aggregates them into that
+  # one name without pinning the protection rule to specific matrix values.
+  vm-tests:
+    needs: vm-tests-matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the matrix result
+        run: |
+          if [ "${{ needs.vm-tests-matrix.result }}" != "success" ]; then
+            echo "a vm-tests matrix leg did not succeed: ${{ needs.vm-tests-matrix.result }}" >&2
+            exit 1
+          fi
