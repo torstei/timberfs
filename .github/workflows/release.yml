@@ -70,10 +70,13 @@ jobs:
           tool: cargo-deb,cargo-zigbuild
 
       - name: Install zig (cargo-zigbuild's cross linker)
+        # Extract OUTSIDE the checkout: unpacking into the repo leaves thousands
+        # of untracked files, and `cargo publish` refuses to run on a dirty tree.
         run: |
           curl -fL --retry 3 \
-            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
-          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
 
       # One amd64 package for every supported release. cargo-zigbuild links an
       # old glibc (target .2.31) so it installs from Ubuntu 20.04 (focal) up;
