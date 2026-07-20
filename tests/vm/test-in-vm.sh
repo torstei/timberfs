@@ -297,8 +297,13 @@ collapse_crash_kill_resilience() {
         return 1
     fi
 
-    # A fresh appender resumes; its marker is the last entry.
-    echo "post-kill-resume-marker" | timberfs append --into "$d/churn.log" --quiet \
+    # A fresh appender resumes and its marker is the last entry. Lead it with a
+    # newline: a kill -9 can leave the committed trunk ending mid-line (chunks
+    # are cut on a byte, not a line, boundary), and plain-text append is
+    # byte-faithful — it will NOT insert a separator (that is exactly what keeps
+    # `zstd -dc` an exact recovery). So a resuming logger opens a fresh line
+    # itself, rather than fusing onto the partial line the crash left behind.
+    printf '\npost-kill-resume-marker\n' | timberfs append --into "$d/churn.log" --quiet \
         && timberfs query "$d/churn.log" 2>/dev/null | tail -1 | grep -qx "post-kill-resume-marker"
 }
 

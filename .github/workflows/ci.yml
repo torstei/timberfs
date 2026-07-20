@@ -23,10 +23,17 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release
 
-  vm-tests:
-    name: vm-tests
+  vm-tests-matrix:
+    name: vm-tests (${{ matrix.image }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # We ship one old-glibc .deb for every supported release, so test it on
+        # the OLDEST we claim (focal — Ubuntu 20.04, systemd 245, glibc 2.31)
+        # and a current one (trixie).
+        image: [trixie, focal]
     steps:
       - uses: actions/checkout@v4
       # /dev/kvm exists on GitHub's standard runners but isn't accessible
@@ -43,15 +50,41 @@ jobs:
           sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Cache Debian cloud base image
+      - name: Cache cloud base image
         uses: actions/cache@v4
         with:
           path: ~/.cache/timberfs-vm-tests
-          key: debian-13-genericcloud-amd64
+          key: vm-base-${{ matrix.image }}
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deb
-      - name: Build the .deb
-        run: cargo deb
+          tool: cargo-deb,cargo-zigbuild
+      - name: Install zig (cargo-zigbuild's cross linker)
+        run: |
+          curl -fL --retry 3 \
+            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+      # Build and test exactly what we ship: the old-glibc compat .deb.
+      - name: Build the compat .deb
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
+          cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
       - name: Run the VM package test suite
-        run: tests/vm/run-vm-test.sh
+        env:
+          TIMBERFS_VM_IMAGE: ${{ matrix.image }}
+        run: tests/vm/run-vm-test.sh target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb
+
+  # Single required status check that stays green iff every matrix leg passed.
+  # Branch protection requires the context `vm-tests`; the matrix legs report as
+  # `vm-tests (trixie)` / `vm-tests (focal)`, so this aggregates them into that
+  # one name without pinning the protection rule to specific matrix values.
+  vm-tests:
+    needs: vm-tests-matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the matrix result
+        run: |
+          if [ "${{ needs.vm-tests-matrix.result }}" != "success" ]; then
+            echo "a vm-tests matrix leg did not succeed: ${{ needs.vm-tests-matrix.result }}" >&2
+            exit 1
+          fi
