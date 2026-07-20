@@ -37,7 +37,19 @@ if [ -z "${1:-}" ]; then
 fi
 
 CACHE=${TIMBERFS_VM_CACHE:-$HOME/.cache/timberfs-vm-tests}
-IMG_URL=https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+# Base image: Debian trixie by default. TIMBERFS_VM_IMAGE selects a named
+# preset; TIMBERFS_VM_IMG_URL overrides the URL outright. Focal (Ubuntu 20.04:
+# systemd 245, glibc 2.31) is the oldest release the compat .deb targets — run
+# it to prove the package actually WORKS there (units start, mounts hold), not
+# just that dpkg lets it install.
+case "${TIMBERFS_VM_IMAGE:-trixie}" in
+    trixie) IMG_URL=https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2 ;;
+    focal)  IMG_URL=https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img ;;
+    jammy)  IMG_URL=https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img ;;
+    noble)  IMG_URL=https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img ;;
+    *) echo "unknown TIMBERFS_VM_IMAGE '${TIMBERFS_VM_IMAGE}' (trixie|focal|jammy|noble)" >&2; exit 2 ;;
+esac
+IMG_URL=${TIMBERFS_VM_IMG_URL:-$IMG_URL}
 BASE=$CACHE/$(basename "$IMG_URL")
 WORK=target/vm-test
 TIMEOUT=${TIMBERFS_VM_TIMEOUT:-1200}

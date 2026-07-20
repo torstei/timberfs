@@ -75,3 +75,19 @@ assets = [
     ["packaging/etc-README", "etc/timberfs/README", "644"],
     ["packaging/forests-default.conf", "etc/timberfs/forests.d/default.conf", "644"],
 ]
+
+# The published amd64 package. CI builds it with cargo-zigbuild against an old
+# glibc (target x86_64-unknown-linux-gnu.2.31) so one .deb installs from Ubuntu
+# 20.04 (focal, glibc 2.31) through current — timberfs links no libfuse or
+# libzstd (both are static/exec'd), so glibc is the only floor that matters.
+#
+# The dependency is stated, not `$auto`-derived: built on a modern host,
+# dpkg-shlibdeps miscomputes it. The old-glibc binary links libpthread.so.0 and
+# libdl.so.2 as separate libraries (they merged into libc6 at 2.34), so on a
+# 2.34+ builder it stamps `libc6 (>= 2.34)` and locks out the very releases we
+# target. The binary itself references only <= glibc 2.30 symbols and runs on
+# focal — the focal VM test proves it. zig statically links libgcc, so there is
+# no libgcc-s1 dependency either.
+[package.metadata.deb.variants.compat]
+name = "timberfs"
+depends = "fuse3, libc6 (>= 2.31)"

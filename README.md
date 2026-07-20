@@ -158,7 +158,9 @@ like queries. Details: `man timberfs`.
 ## Install
 
 Debian/Ubuntu, from the apt repository (rebuilt by CI from the GitHub
-releases on every release, GPG-signed, `apt upgrade` works):
+releases on every release, GPG-signed, `apt upgrade` works). One `amd64`
+package is built against an old glibc, so it installs on every current
+release — Ubuntu 20.04+ and Debian 11+:
 
 ```sh
 sudo curl -fsSL https://torstei.github.io/timberfs/key.gpg \

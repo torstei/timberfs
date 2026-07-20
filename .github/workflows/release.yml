@@ -67,21 +67,32 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deb
+          tool: cargo-deb,cargo-zigbuild
 
+      - name: Install zig (cargo-zigbuild's cross linker)
+        run: |
+          curl -fL --retry 3 \
+            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+
+      # One amd64 package for every supported release. cargo-zigbuild links an
+      # old glibc (target .2.31) so it installs from Ubuntu 20.04 (focal) up;
+      # the `compat` variant states the true libc6 floor (see Cargo.toml).
       - name: Build the .deb
-        run: cargo deb
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
+          cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
 
       - name: Test the exact release artifact in a VM
-        run: tests/vm/run-vm-test.sh
+        run: tests/vm/run-vm-test.sh target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb
 
       # Assets are staged OUTSIDE the checkout: cargo publish refuses to
       # run from a dirty working tree, and rightly so.
       - name: Stage release assets
         run: |
           mkdir -p "$RUNNER_TEMP/dist"
-          cp target/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/"
-          cp target/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/timberfs_amd64.deb"
+          cp target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/"
+          cp target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/timberfs_amd64.deb"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
