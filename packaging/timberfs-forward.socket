@@ -1,0 +1,34 @@
+# Systemd socket for the Fluentd Forward protocol intake (see
+# timberfs-forward.service).
+#
+# Unlike the log-intake FIFO pair, this is one TCP listener shared by every
+# tag a sender talks about — Forward multiplexes tags over the connection,
+# not over separate sockets — so there is no per-instance template here.
+#
+# Listens on loopback only by default: Forward v1 has no handshake/auth
+# phase and this receiver adds no TLS (see the module doc comment in
+# src/forward.rs and docs/deployment.md), so anything reachable on the
+# listening address can write to any store under --into-dir. Override the
+# address (e.g. to bind a private/internal interface for a remote Docker
+# host) with a drop-in:
+#
+#   systemctl edit timberfs-forward.socket
+#     [Socket]
+#     ListenStream=
+#     ListenStream=10.0.0.5:24224
+#
+#   systemctl enable --now timberfs-forward.socket
+#
+# Then point a Forward-protocol producer (Docker's fluentd log driver,
+# Fluent Bit, Fluentd, fluent-logger) at this address.
+
+[Unit]
+Description=timberfs Fluentd Forward protocol intake
+Documentation=https://github.com/torstei/timberfs
+
+[Socket]
+ListenStream=127.0.0.1:24224
+Accept=no
+
+[Install]
+WantedBy=sockets.target

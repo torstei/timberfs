@@ -29,6 +29,12 @@ pass its own paths.
     <instance>.log.bark                     JSON manifest: durable identity + retention
     <instance>.log.lock                     the store's writer lock
   .timberfs.lock                            the directory lock (see Locking)
+
+/var/log/timberfs/forward/                one directory shared by every tag the
+                                          Fluentd Forward intake sees (it is a
+                                          single TCP listener, not templated):
+    <tag>.log.trunk / .rings / .grain / .bark / .lock     one store per tag
+  .timberfs.lock                            the directory lock (see Locking)
 ```
 
 The store's **logical name** is `<instance>.log`, so you read it with the full
@@ -112,14 +118,58 @@ logging writer that frames its own events and timestamps. To archive a
 plain-text source instead, drop `--records` from the `ExecStart` (see the
 drop-in below).
 
+### Speaking Fluentd Forward — `timberfs-forward.socket` + `timberfs-forward.service`
+
+Receive the [Fluentd Forward protocol v1](https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1)
+over TCP — the wire protocol Docker's `fluentd` log driver, Fluent Bit,
+Fluentd and the fluent-logger client libraries already speak — with no
+producer-side changes needed. Unlike the FIFO pair above this is **one TCP
+listener for every tag**, not a template: Forward multiplexes tags over a
+single connection, and each tag lands in its own store under
+`/var/log/timberfs/forward/<tag>.log`.
+
+```sh
+systemctl enable --now timberfs-forward.socket
+# then point a Forward-protocol producer at 127.0.0.1:24224
+```
+
+```sh
+docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 \
+    --log-opt tag={{.Name}} --log-opt fluentd-async=true \
+    --log-opt fluentd-request-ack=true --log-opt fluentd-sub-second-precision=true \
+    myimage
+```
+
+`fluentd-async` keeps a receiver outage from blocking the container's stdout;
+`fluentd-request-ack` makes Docker retry a batch until it sees `{"ack": id}`
+back, which this receiver sends only once the batch is flushed and fsynced
+(see **Reliability model** below). The default Docker tag is a 12-char
+container id — a poor store name — hence `tag={{.Name}}`.
+
+**Deliberate limitations**, all downstream of Forward v1 having no
+authentication or negotiation phase and this receiver adding none of its own:
+
+- **No TLS, no handshake** — bind it to loopback or a private network only
+  (override the address with a drop-in, see below); anything that can reach
+  the listening address can write to any store under `--into-dir`.
+- **No `CompressedPackedForward` (gzip)** — refused; the connection is logged
+  and closed rather than silently dropping data.
+- **No UDP heartbeat listener.**
+
+The verb name (`forward-intake`) is provisional. Details, the wire modes
+supported, and the partial-message reassembly are in `man timberfs`.
+
 ## Ownership and permissions
 
-- **The store directory** is created by `LogsDirectory=timberfs/%i`, owned by the
-  service's `User=` (root by default). Set `User=` in a drop-in to own the
-  instance's directory as a specific user.
+- **The store directory** is created by `LogsDirectory=timberfs/%i` (or plain
+  `timberfs/forward` for the Forward intake), owned by the service's `User=`
+  (root by default). Set `User=` in a drop-in to own the directory as a
+  specific user.
 - **The FIFO** is created `root:root 0660`. A non-root producer cannot write it
   until you set the socket's group to one that user belongs to (`SocketGroup=`);
   there is no sane default, because the producer's identity is site-specific.
+  (The Forward intake has no FIFO — it is a TCP listener, gated by the address
+  it binds, not by filesystem permissions.)
 - **Readers vs. writers.** `query` and `info` are read-only — they need only
   read access to the store, not write access to its directory. `append`,
   `index`, `reindex` and `rotate` are writers and *do* need directory write
@@ -144,6 +194,13 @@ ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade \
 SocketGroup=applog
 ```
 
+```ini
+# timberfs-forward.socket — bind a private/internal interface instead of loopback
+[Socket]
+ListenStream=
+ListenStream=10.0.0.5:24224
+```
+
 ## Locking
 
 Two levels, all `flock`-based, so locks die with their process — a crash never
@@ -164,10 +221,27 @@ The units pass `--exit-on-upgrade`. When a package upgrade replaces
 with a dedicated code, `85`; `SuccessExitStatus=85` + `RestartForceExitStatus=85`
 make systemd restart it onto the new binary regardless of `Restart=`.
 
-- **Intake** is seamless: the `.socket` holds the FIFO open across the swap, so
-  the producer sees no gap.
+- **FIFO intake** is seamless: the `.socket` holds the FIFO open across the
+  swap, so the producer sees no gap.
 - **Mount** is clean: `auto_unmount` tears the old FUSE session down, and systemd
   remounts on the new binary.
+- **Forward intake** is *not* seamless: unlike the FIFO, the `.socket` does not
+  hold TCP connections open across a restart, so a swap drops them. This is by
+  design rather than a gap — Forward-protocol senders already reconnect and
+  retry any unacked chunk (that is what the chunk/ack handshake is for), so the
+  cost is the same at-least-once duplication a network blip would cause anyway.
+
+## Reliability model (Forward intake)
+
+- **At-least-once, not exactly-once.** An acked chunk is durable (flushed and
+  fsynced); an unacked one may or may not have landed, so the sender retries
+  it — a retry after a receiver restart or a lost ack can duplicate entries.
+- **Ack timing.** Acks are sent by a maintenance tick (about once a second),
+  not synchronously per message — expect a small delay, not per-event
+  round-trips.
+- **A decode error closes the connection.** A desynced msgpack stream can't be
+  resynchronized, so the connection is dropped and logged; the sender
+  reconnects.
 
 ## See also
 

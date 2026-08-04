@@ -10,6 +10,7 @@ pub mod entry;
 pub mod export;
 pub mod forest;
 pub mod format;
+pub mod forward;
 pub mod fs;
 pub mod grain;
 pub mod grep;

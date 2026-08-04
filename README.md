@@ -73,7 +73,7 @@ oldest data continuously (no rotate-and-delete, no seams), as a property of the
 --retain-size 50G` or `timberfs set backing/app.log retain=90d` (live, no
 restart).
 
-Three ways in, in increasing order of commitment:
+Four ways in, in increasing order of commitment:
 
 **a) Keep importing on a timer** — zero changes to your logging. Re-import
 verifies what's already stored and appends only the growth, so a cron or
@@ -113,6 +113,30 @@ underneath:
 timberfs mount /var/log/myapp-backing /var/log/myapp
 # the app writes /var/log/myapp/app.log as always; tail/less/grep work
 ```
+
+**d) Let it speak Fluentd Forward** — `timberfs forward-intake` is a TCP
+receiver for the Fluentd Forward protocol v1, the wire protocol Docker's
+`fluentd` log driver, Fluent Bit, Fluentd and the fluent-logger client
+libraries already speak — no plain-file or FIFO producer needed. Every tag
+lands in its own store; a `chunk` id is acked only once flushed and fsynced
+(at-least-once, like the socket intake above):
+
+```sh
+timberfs forward-intake --into-dir /var/log/timberfs/forward &
+
+docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 \
+    --log-opt tag={{.Name}} --log-opt fluentd-async=true \
+    --log-opt fluentd-request-ack=true --log-opt fluentd-sub-second-precision=true \
+    myimage
+```
+
+`fluentd-async` keeps a down receiver from blocking the container's stdout;
+`fluentd-request-ack` and `fluentd-sub-second-precision` are opt-in on
+Docker's side. The default tag is a 12-char container id (a bad store
+name), hence `tag={{.Name}}`. Deliberate limitations — no TLS/handshake
+(loopback or a private network only), no gzip-compressed mode, no UDP
+heartbeat — are in `man timberfs` and [docs/deployment.md](docs/deployment.md).
+The verb name is provisional.
 
 One nuance worth knowing: `import` stamps chunks with timestamps **parsed
 from the log lines** (right for historical data), while `append`/`mount`
@@ -219,12 +243,14 @@ cargo deb                                        # target/debian/timberfs_*.deb
 sudo dpkg -i target/debian/timberfs_*.deb
 ```
 
-The package installs `/usr/bin/timberfs` and two systemd template unit
-families: `timberfs@<instance>` to mount a store at boot, and a
-socket-activated `timberfs-log@<instance>` to stream into a store without a
-mount. See **[Deploying timberfs](docs/deployment.md)** for the directory
-layout, both unit families, the ownership/permission model, and
-self-restart-on-upgrade.
+The package installs `/usr/bin/timberfs` and three systemd units:
+`timberfs@<instance>` (a template) to mount a store at boot, a
+socket-activated `timberfs-log@<instance>` (also a template) to stream into
+a store without a mount, and a socket-activated `timberfs-forward` (not
+templated — Forward multiplexes every tag over one connection) for the
+Fluentd Forward intake above. See **[Deploying timberfs](docs/deployment.md)**
+for the directory layout, all three unit families, the ownership/permission
+model, and self-restart-on-upgrade.
 
 ## Roadmap
 

@@ -1,0 +1,53 @@
+# Systemd unit for the Fluentd Forward protocol intake (see
+# timberfs-forward.socket). Not templated — Forward multiplexes every tag
+# over the one connection, so one instance serves every tag it sees, each
+# landing in its own store at /var/log/timberfs/forward/<tag>.log.
+#
+# The producer must speak Forward protocol v1 (Message, Forward or
+# PackedForward — CompressedPackedForward/gzip is refused). Override the
+# store directory, payload key, or add retention with a drop-in:
+#
+#   systemctl edit timberfs-forward.service
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/bin/timberfs forward-intake --exit-on-upgrade \
+#         --into-dir /var/log/timberfs/forward --retain 30d
+#
+# This is socket-activated: enable the .socket, not this unit.
+
+[Unit]
+Description=timberfs Fluentd Forward protocol intake
+Documentation=https://github.com/torstei/timberfs
+Requires=timberfs-forward.socket
+After=timberfs-forward.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs/forward --exit-on-upgrade
+# NOT StandardInput=socket: unlike the FIFO log-intake pair (which reads a
+# single accepted connection straight off stdin), this is a listen socket
+# accepting many connections, handed over the standard LISTEN_FDS/LISTEN_PID
+# protocol at fd 3 (SD_LISTEN_FDS_START) instead.
+StandardOutput=journal
+StandardError=journal
+
+# Owns /var/log/timberfs/forward (0755) — where every tag's .trunk/.rings/
+# .bark live. A drop-in that sets User= gets that directory owned by that
+# user instead.
+LogsDirectory=timberfs/forward
+
+# Unlike the FIFO log-intake pair, the .socket here does NOT hold the
+# client's TCP connections open across a restart of this service — a
+# restart or upgrade drops them. Forward-protocol senders are already built
+# for that: they reconnect and retry any chunk that wasn't acked, which is
+# the whole point of the chunk/ack handshake (at-least-once, not
+# exactly-once — a retried chunk after a restart can duplicate entries).
+Restart=always
+RestartSec=1
+# --exit-on-upgrade: the daemon exits 85 when its binary is upgraded on
+# disk; force a restart onto the new binary. SuccessExitStatus keeps it out
+# of the failure log. (Keep --exit-on-upgrade in any ExecStart override.)
+SuccessExitStatus=85
+RestartForceExitStatus=85
+
+# No [Install] section: this is socket-activated. Enable the .socket.
