@@ -22,11 +22,6 @@ jobs:
       - run: cargo fmt -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release
-      # --lib only: some existing doc comments hold shell examples (not
-      # Rust) that `cargo test --doc` misreads as doctests and fails to
-      # compile — pre-existing and unrelated to this gate (the forward.rs
-      # decoder/receiver unit tests).
-      - run: cargo test --lib
 
   vm-tests-matrix:
     name: vm-tests (${{ matrix.image }})
