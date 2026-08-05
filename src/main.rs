@@ -540,12 +540,16 @@ fn main() -> anyhow::Result<()> {
                     &sources,
                     &dest,
                     cfg,
-                    timestamp_regex.as_deref(),
-                    timestamp_format.as_deref(),
-                    utc,
-                    quick,
-                    index,
-                    wal,
+                    import::ImportOpts {
+                        time: bark::TimeFormat {
+                            regex: timestamp_regex,
+                            format: timestamp_format,
+                            utc,
+                        },
+                        quick,
+                        index,
+                        wal,
+                    },
                 )?;
             }
         }

@@ -390,18 +390,32 @@ fn classify_source(path: &Path, extractor: &Extractor) -> anyhow::Result<(u64, S
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Options for [`cmd_import`], one field per CLI flag.
+pub struct ImportOpts {
+    /// Caller's timestamp interpretation (--timestamp-regex /
+    /// --timestamp-format / --utc); merged with the store's declared
+    /// format before extraction.
+    pub time: crate::bark::TimeFormat,
+    /// Sample-verify re-imports instead of full byte verification.
+    pub quick: bool,
+    /// Declare and maintain the .grain content index.
+    pub index: bool,
+    /// Declare the .sap write-ahead sidecar.
+    pub wal: bool,
+}
+
 pub fn cmd_import(
     sources_in: &[PathBuf],
     dest: &Path,
     cfg: Config,
-    custom_regex: Option<&str>,
-    custom_format: Option<&str>,
-    utc: bool,
-    quick: bool,
-    index: bool,
-    wal: bool,
+    opts: ImportOpts,
 ) -> anyhow::Result<()> {
+    let ImportOpts {
+        time,
+        quick,
+        index,
+        wal,
+    } = opts;
     if crate::query::is_bundle(dest) {
         bail!(
             "{} is a .timber transfer bundle — bundles are read-only \
@@ -419,9 +433,9 @@ pub fn cmd_import(
     // and every later import of an exotic format is flag-free.
     let declared = crate::bark::time_format(crate::bark::load(&dir, &name).as_ref());
     let extractor = Extractor::new(
-        custom_regex.or(declared.regex.as_deref()),
-        custom_format.or(declared.format.as_deref()),
-        utc || declared.utc,
+        time.regex.as_deref().or(declared.regex.as_deref()),
+        time.format.as_deref().or(declared.format.as_deref()),
+        time.utc || declared.utc,
     )?;
 
     // Multiple sources are one logical stream: order them chronologically
@@ -794,11 +808,11 @@ pub fn cmd_import(
     // import into a declared log maintains the grain — extended
     // incrementally for new chunks, rebuilt if missing (e.g. after
     // rotation/retention dropped it). The writer locks are already held.
-    if custom_regex.is_some() || utc {
+    if time.regex.is_some() || time.utc {
         // The flags persist, like --index: the format is a property of
         // the CONTENT, declared in the manifest, and all roads converge.
         let mut map = crate::bark::load(&dir, &name).unwrap_or_default();
-        if let (Some(r), Some(f)) = (custom_regex, custom_format) {
+        if let (Some(r), Some(f)) = (&time.regex, &time.format) {
             map.insert(
                 "timestamp_regex".to_string(),
                 serde_json::Value::String(r.to_string()),
@@ -808,7 +822,7 @@ pub fn cmd_import(
                 serde_json::Value::String(f.to_string()),
             );
         }
-        if utc {
+        if time.utc {
             map.insert("timestamp_utc".to_string(), serde_json::Value::Bool(true));
         }
         crate::bark::save(&dir, &name, &map)?;
