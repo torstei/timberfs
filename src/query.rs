@@ -1106,6 +1106,10 @@ pub struct StoreSummary {
     pub rings_bytes: u64,
     pub grain: Option<(u64, usize)>, // (bytes, chunks covered)
     pub index_declared: bool,
+    pub wal_declared: bool,
+    /// Bytes currently buffered in the `.sap` sidecar (header excluded),
+    /// not yet folded into a chunk — a read-only stat, never replayed.
+    pub sap_pending_bytes: Option<u64>,
     pub retain: Option<String>,
     pub retain_size: Option<String>,
     pub writer: WriterState,
@@ -1163,6 +1167,15 @@ pub fn summarize_store(
         .and_then(|b| b.get("index"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let wal_declared = bark
+        .and_then(|b| b.get("wal"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Read-only: a stat of the live sidecar's size, never opened for
+    // replay (that only ever happens from a writer's FileStore::open).
+    let sap_pending_bytes = std::fs::metadata(format::sap_path(dir, name))
+        .ok()
+        .map(|m| m.len().saturating_sub(crate::sap::HEADER_LEN));
 
     // Who is writing? flock presence is the truth (lock files persist and
     // their contents go stale). This is a READ-ONLY probe — an observation,
@@ -1188,6 +1201,8 @@ pub fn summarize_store(
         rings_bytes,
         grain,
         index_declared,
+        wal_declared,
+        sap_pending_bytes,
         retain: get("retain"),
         retain_size: get("retain_size"),
         writer,
@@ -1264,7 +1279,18 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         .unwrap_or_default();
     let mut location = String::new();
     let mut bundle_bytes: Option<u64> = None;
-    let (chunks, logical, compressed, min_ms, max_ms, rings_bytes, grain, writer) = if bundled {
+    let (
+        chunks,
+        logical,
+        compressed,
+        min_ms,
+        max_ms,
+        rings_bytes,
+        grain,
+        writer,
+        wal_declared,
+        sap_pending,
+    ) = if bundled {
         bundle_bytes = std::fs::metadata(input).map(|m| m.len()).ok();
         let chunks = records.len();
         let (logical, compressed) = match (records.first(), records.last()) {
@@ -1277,8 +1303,10 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             min_ms = min_ms.min(r.first_write_ms);
             max_ms = max_ms.max(r.last_write_ms);
         }
+        // A `.timber` bundle is a snapshot, not a live writer state:
+        // it never carries a sap.
         (
-            chunks, logical, compressed, min_ms, max_ms, None, None, None,
+            chunks, logical, compressed, min_ms, max_ms, None, None, None, false, None,
         )
     } else {
         let (dir, base) = resolve_backing(input)?;
@@ -1294,6 +1322,8 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             Some(s.rings_bytes),
             s.grain,
             Some(writer_text(&s.writer)),
+            s.wal_declared,
+            s.sap_pending_bytes,
         )
     };
 
@@ -1335,6 +1365,10 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             put("retain_size", r.clone().into());
         }
         put("index_declared", index_declared.into());
+        put("wal_declared", wal_declared.into());
+        if let Some(p) = sap_pending {
+            put("sap_pending_bytes", p.into());
+        }
         put(
             "provenance",
             serde_json::Value::Object(
@@ -1444,6 +1478,18 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                  rebuilds it (or run reindex)"
             ),
             None => println!("  index     rings {rings}; no grain (reindex to build one)"),
+        }
+        if wal_declared {
+            match sap_pending {
+                Some(p) => println!(
+                    "  wal       declared; {} buffered in .sap, not yet in a chunk",
+                    crate::rotate::human_bytes(p)
+                ),
+                None => println!(
+                    "  wal       declared but the .sap is MISSING — the next writer \
+                     to open this log recreates it"
+                ),
+            }
         }
         if retain.is_some() || retain_size.is_some() {
             let mut parts: Vec<String> = Vec::new();

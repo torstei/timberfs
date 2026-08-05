@@ -400,6 +400,7 @@ pub fn cmd_import(
     utc: bool,
     quick: bool,
     index: bool,
+    wal: bool,
 ) -> anyhow::Result<()> {
     if crate::query::is_bundle(dest) {
         bail!(
@@ -506,6 +507,9 @@ pub fn cmd_import(
         // attestation a shipping pipeline needs to keep ingesting.
         if index {
             crate::bark::declare_index(&dir, &name)?;
+        }
+        if wal {
+            crate::bark::declare_wal(&dir, &name)?;
         }
         if index || crate::bark::index_declared(&dir, &name) {
             crate::grain::extend_grain(&dir, &name)?;
@@ -811,6 +815,9 @@ pub fn cmd_import(
     }
     if index {
         crate::bark::declare_index(&dir, &name)?;
+    }
+    if wal {
+        crate::bark::declare_wal(&dir, &name)?;
     }
     if index || crate::bark::index_declared(&dir, &name) {
         crate::grain::extend_grain(&dir, &name)?;

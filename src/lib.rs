@@ -19,5 +19,6 @@ pub mod note;
 pub mod query;
 pub mod records;
 pub mod rotate;
+pub mod sap;
 pub mod sink;
 pub mod store;

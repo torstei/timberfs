@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::format::{self, ChunkRecord, RECORD_LEN, RINGS_HEADER_LEN};
+use crate::sap;
 
 fn invalid_input(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.to_string())
@@ -328,6 +329,8 @@ struct StageBaseline {
 }
 
 pub struct FileStore {
+    dir: PathBuf,
+    name: String,
     trunk: File,
     rings: File,
     /// Atomic-sink staging: baseline to commit from or roll back to.
@@ -347,12 +350,33 @@ pub struct FileStore {
     /// Single-entry decompression cache: (chunk index, uncompressed data).
     /// Enough to make sequential scans (cat/grep) decompress each chunk once.
     cache: Option<(usize, Vec<u8>)>,
+    /// The write-ahead sidecar (sap.rs), live only when `"wal": true` is
+    /// declared in `.bark` — `None` costs nothing, the default for every
+    /// store today. Its content always equals `buffer` by construction;
+    /// see `append_windowed` and `flush_chunk`'s seal-and-swap.
+    wal: Option<sap::Sap>,
 }
 
 impl FileStore {
     /// Open (or create) the backing pair for a logical file and reconcile
-    /// index and data after a possible crash.
-    pub fn open(dir: &Path, name: &str) -> io::Result<FileStore> {
+    /// index, data and the write-ahead sidecar after a possible crash.
+    ///
+    /// Sap recovery MUTATES the store (it can rebuild the buffer, or force
+    /// a flush to complete an interrupted one), so it must only run for a
+    /// writer already holding this file's exclusive lock. Verified: every
+    /// read-only path (`query`/`info`/`grep`/`timber-filter`) resolves
+    /// sources through `query::open_source`, which never calls
+    /// `FileStore::open`; every writer (`append`, the records sink,
+    /// `import`, `rotate`, the mount's `create`/`setxattr` handlers) calls
+    /// this only after acquiring the file's exclusive lock, via
+    /// `Store::create`. The one exception is the mount daemon's own
+    /// startup enumeration (`Store::open`, below), which lists every
+    /// `.rings` file in the directory before `fs::mount` acquires the
+    /// directory's exclusive lock — the same pre-existing window
+    /// `reconcile_trim` already runs in unguarded (a narrow, accepted race
+    /// against a directory no other writer should be touching while a
+    /// mount is starting up).
+    pub fn open(dir: &Path, name: &str, cfg: &Config) -> io::Result<FileStore> {
         // A lingering .trim marker means a collapse started but never
         // finished (crash between the fallocate and the final rename);
         // reconcile it before anything below reads the trunk/rings, so
@@ -394,19 +418,118 @@ impl FileStore {
         // Trim dropped/partial trailing records from the index file.
         rings.set_len(RINGS_HEADER_LEN + (chunks.len() * RECORD_LEN) as u64)?;
 
-        let comp_size = chunks.last().map(|c| c.comp_end()).unwrap_or(0);
-        let buffer_start = chunks.last().map(|c| c.uncomp_end()).unwrap_or(0);
+        let mut comp_size = chunks.last().map(|c| c.comp_end()).unwrap_or(0);
+        let mut buffer_start = chunks.last().map(|c| c.uncomp_end()).unwrap_or(0);
+        let mut buffer = Vec::new();
+        let mut buffer_first_ms: Option<u64> = None;
+        let mut buffer_last_ms = 0u64;
+
+        let apply_entries = |entries: Vec<sap::SapEntry>,
+                             buffer: &mut Vec<u8>,
+                             first: &mut Option<u64>,
+                             last: &mut u64| {
+            for e in entries {
+                if buffer.is_empty() {
+                    *first = Some(e.wf);
+                    *last = e.wl;
+                } else {
+                    *first = Some(first.unwrap_or(e.wf).min(e.wf));
+                    *last = (*last).max(e.wl);
+                }
+                buffer.extend_from_slice(&e.payload);
+            }
+        };
+
+        // --- sap reconciliation (see docs/design.md's ".sap" chapter for
+        // the full crash matrix; this mirrors it directly) ---
+        let seal_p = format::sap_seal_path(dir, name);
+        let sap_p = format::sap_path(dir, name);
+        if let Some(seal) = sap::replay(&seal_p)? {
+            if seal.base < comp_size {
+                // The flush landed (its frame is already in the trunk):
+                // the seal is stale debris.
+                let _ = fs::remove_file(&seal_p);
+            } else {
+                if seal.base > comp_size {
+                    eprintln!(
+                        "timberfs: {name}: .sap.seal's base ({}) exceeds the trunk's \
+                         compressed size ({comp_size}) — the trunk shrank underneath an \
+                         interrupted flush; replaying the sealed entries anyway \
+                         (preserving data wins over tidiness)",
+                        seal.base
+                    );
+                }
+                // The flush never landed: replay through the normal append
+                // path and complete it now, exactly where it would have
+                // landed (comp_size is unchanged since the frame was never
+                // written).
+                apply_entries(
+                    seal.entries,
+                    &mut buffer,
+                    &mut buffer_first_ms,
+                    &mut buffer_last_ms,
+                );
+                if !buffer.is_empty() {
+                    let comp = zstd::stream::encode_all(&buffer[..], cfg.level)?;
+                    trunk.write_all_at(&comp, comp_size)?;
+                    let rec = ChunkRecord {
+                        uncomp_start: buffer_start,
+                        uncomp_len: buffer.len() as u64,
+                        comp_start: comp_size,
+                        comp_len: comp.len() as u64,
+                        first_write_ms: buffer_first_ms.unwrap_or(buffer_last_ms),
+                        last_write_ms: buffer_last_ms,
+                    };
+                    let rec_off = RINGS_HEADER_LEN + (chunks.len() * RECORD_LEN) as u64;
+                    rings.write_all_at(&rec.to_bytes(), rec_off)?;
+                    trunk.sync_all()?;
+                    rings.sync_all()?;
+                    comp_size += comp.len() as u64;
+                    buffer_start += buffer.len() as u64;
+                    chunks.push(rec);
+                    buffer.clear();
+                    buffer_first_ms = None;
+                    buffer_last_ms = 0;
+                }
+                let _ = fs::remove_file(&seal_p);
+            }
+        }
+
+        let wal_declared = crate::bark::wal_declared(dir, name);
+        let mut wal: Option<sap::Sap> = None;
+        if let Some(live) = sap::replay(&sap_p)? {
+            apply_entries(
+                live.entries,
+                &mut buffer,
+                &mut buffer_first_ms,
+                &mut buffer_last_ms,
+            );
+            if wal_declared {
+                wal = Some(sap::Sap::resume(&sap_p, live.base, live.valid_len)?);
+            } else {
+                // "set wal=false" with a leftover sap: the entries above
+                // are already folded into the buffer (preserved), so it's
+                // safe to drop the file — it won't be recreated.
+                let _ = fs::remove_file(&sap_p);
+            }
+        } else if wal_declared {
+            wal = Some(sap::Sap::create(&sap_p, comp_size)?);
+        }
+
         Ok(FileStore {
+            dir: dir.to_path_buf(),
+            name: name.to_string(),
             trunk,
             rings,
             chunks,
             comp_size,
-            buffer: Vec::new(),
+            buffer,
             buffer_start,
-            buffer_first_ms: None,
-            buffer_last_ms: 0,
+            buffer_first_ms,
+            buffer_last_ms,
             cache: None,
             staged: None,
+            wal,
         })
     }
 
@@ -445,6 +568,16 @@ impl FileStore {
             self.buffer_last_ms = self.buffer_last_ms.max(last_ms);
         }
         self.buffer.extend_from_slice(data);
+        // Staged (atomic) delivery bypasses the sap entirely: nothing is
+        // durable — or even visible — before commit_stage, by design, so
+        // there is nothing for the wal to add. append_frames never reaches
+        // here (it copies compressed frames directly, never through the
+        // buffer).
+        if self.staged.is_none() {
+            if let Some(wal) = &mut self.wal {
+                wal.append(first_ms, last_ms, data)?;
+            }
+        }
         if self.buffer.len() >= cfg.chunk_size {
             self.flush_chunk(cfg)?;
         }
@@ -494,12 +627,43 @@ impl FileStore {
     /// Compress the buffer into a zstd frame, append it to the .trunk, then
     /// append the index record. Data-first ordering is what makes crash
     /// recovery in open() safe.
+    ///
+    /// When a wal is live and unstaged, this is also the sap's
+    /// seal-and-swap handoff: the segment about to be superseded by this
+    /// flush is sealed (renamed to `.sap.seal`) before the frame lands, so
+    /// a crash between "compressed" and "indexed" is decidable on the next
+    /// open (base < comp_size => landed => the seal is stale; base ==
+    /// comp_size => never landed => replay it). Every flush rotates the
+    /// segment, so a segment's lifetime spans exactly one chunk cycle and
+    /// its eventual flush lands its frame at exactly its `base`.
     pub fn flush_chunk(&mut self, cfg: &Config) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
+        // Compress first: it's the step most likely to be skipped if
+        // anything below fails, and it doesn't touch any on-disk state, so
+        // failing here leaves the sap untouched and still live.
         let comp = zstd::stream::encode_all(&self.buffer[..], cfg.level)?;
-        self.trunk.write_all_at(&comp, self.comp_size)?;
+        let sealing = self.staged.is_none() && self.wal.is_some();
+        let sap_p = format::sap_path(&self.dir, &self.name);
+        let seal_p = format::sap_seal_path(&self.dir, &self.name);
+        if sealing {
+            self.wal.as_mut().unwrap().sync()?;
+            fs::rename(&sap_p, &seal_p)?;
+        }
+        // Before the frame + index are durable, a failure here means the
+        // flush never actually happened: undo the rename so the seal is
+        // live again, unchanged — exactly the state it was in before this
+        // call, with a `base` that is still correct.
+        let unseal_before_landed = |e: io::Error| -> io::Error {
+            if sealing {
+                let _ = fs::rename(&seal_p, &sap_p);
+            }
+            e
+        };
+        self.trunk
+            .write_all_at(&comp, self.comp_size)
+            .map_err(unseal_before_landed)?;
         let rec = ChunkRecord {
             uncomp_start: self.buffer_start,
             uncomp_len: self.buffer.len() as u64,
@@ -510,13 +674,43 @@ impl FileStore {
         };
         if self.staged.is_none() {
             let rec_off = RINGS_HEADER_LEN + (self.chunks.len() * RECORD_LEN) as u64;
-            self.rings.write_all_at(&rec.to_bytes(), rec_off)?;
+            self.rings
+                .write_all_at(&rec.to_bytes(), rec_off)
+                .map_err(unseal_before_landed)?;
         }
         self.comp_size += comp.len() as u64;
         self.buffer_start += self.buffer.len() as u64;
         self.buffer.clear();
         self.buffer_first_ms = None;
         self.chunks.push(rec);
+        if sealing {
+            // The frame + index must be durable BEFORE the seal is
+            // unlinked: a plain (unsynced) flush_chunk is fine for a
+            // non-wal store (bounded by --flush-age, as today), but here
+            // the seal is the only record of this data until the frame
+            // lands, so unlinking it early on an unsynced write would be
+            // able to lose data a wal store promises not to.
+            self.trunk.sync_all().map_err(unseal_before_landed)?;
+            self.rings.sync_all().map_err(unseal_before_landed)?;
+            // The flush is now durable regardless of what happens next, so
+            // a failure from here on must NOT resurrect the (now stale)
+            // seal — replaying it later would re-introduce data that is
+            // already safely in the trunk. Degrade instead: drop the wal
+            // for this run (recovered on the next open, once the
+            // transient error — almost certainly ENOSPC — has passed).
+            match sap::Sap::create(&sap_p, self.comp_size) {
+                Ok(fresh) => self.wal = Some(fresh),
+                Err(e) => {
+                    eprintln!(
+                        "timberfs: {}: starting the next wal segment failed ({e}); \
+                         wal durability is off for this store until it is reopened",
+                        self.name
+                    );
+                    self.wal = None;
+                }
+            }
+            let _ = fs::remove_file(&seal_p);
+        }
         Ok(())
     }
 
@@ -572,6 +766,25 @@ impl FileStore {
         Ok(())
     }
 
+    /// The wal's own durability point, decoupled from chunk flushing: push
+    /// the sap's buffered writes to disk and fsync, WITHOUT touching the
+    /// trunk/rings or the chunk-size/age schedule. A no-op when wal isn't
+    /// declared, or while staged (atomic delivery bypasses the sap
+    /// entirely, so there is nothing here to sync). This is the primitive
+    /// a future "ack when durable" ingestion path calls per message; the
+    /// 1-second maintenance loops (append.rs, sink.rs, fs.rs) call it every
+    /// tick so a plain writer's crash window shrinks from `flush_age` to
+    /// that tick interval.
+    pub fn sap_sync(&mut self) -> io::Result<()> {
+        if self.staged.is_some() {
+            return Ok(());
+        }
+        match &mut self.wal {
+            Some(wal) => wal.sync(),
+            None => Ok(()),
+        }
+    }
+
     /// Truncate-to-zero, i.e. copytruncate-style rotation: start over.
     pub fn reset(&mut self, dir: &Path, name: &str) -> io::Result<()> {
         let _ = fs::remove_file(format::grain_path(dir, name));
@@ -583,6 +796,10 @@ impl FileStore {
         self.buffer_start = 0;
         self.buffer_first_ms = None;
         self.cache = None;
+        let _ = fs::remove_file(format::sap_seal_path(dir, name));
+        if self.wal.is_some() {
+            self.wal = Some(sap::Sap::create(&format::sap_path(dir, name), 0)?);
+        }
         Ok(())
     }
 
@@ -670,6 +887,16 @@ impl FileStore {
         self.cache = None;
         self.trunk.sync_all()?;
         self.rings.sync_all()?;
+        // append_frames copies compressed frames directly and never
+        // touches the buffer (the flush_chunk call above already emptied
+        // it), so the sap itself has nothing new to record — but its
+        // `base` header, minted at the trunk's comp_size when the segment
+        // was created, is now stale: comp_size just moved without a flush
+        // of this segment. Refresh it so a later seal's landed/never-landed
+        // comparison stays correct.
+        if let Some(wal) = &mut self.wal {
+            wal.refresh_base(self.comp_size)?;
+        }
         Ok(())
     }
 
@@ -738,6 +965,13 @@ impl FileStore {
         self.comp_size -= comp_cut;
         self.buffer_start -= uncomp_cut;
         self.cache = None;
+        // Retention/rotation touch only already-flushed chunks — the
+        // buffer (and thus the sap's entries) are untouched — but this
+        // just moved comp_size out from under the sap's `base`, same as
+        // append_frames: refresh it.
+        if let Some(wal) = &mut self.wal {
+            wal.refresh_base(self.comp_size)?;
+        }
         Ok(())
     }
 
@@ -895,6 +1129,19 @@ impl FileStore {
         self.comp_size -= aligned;
         self.buffer_start -= uncomp_cut;
         self.cache = None;
+        // Same reasoning as remove_head: the collapse just moved comp_size
+        // without touching the buffer/sap, so the sap's `base` is stale.
+        // Best-effort (like the skippable-frame stamp above): a failure
+        // here only risks a spurious "external damage" warning on a very
+        // narrow future crash window, never data loss (replay still wins).
+        if let Some(wal) = &mut self.wal {
+            if let Err(e) = wal.refresh_base(self.comp_size) {
+                eprintln!(
+                    "timberfs: {name}: refreshing the wal segment's base after collapse \
+                     failed ({e}); harmless unless a crash lands before the next flush"
+                );
+            }
+        }
         Ok(true)
     }
 }
@@ -924,7 +1171,7 @@ impl Store {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) == Some(format::RINGS_EXT) {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    files.insert(stem.to_string(), FileStore::open(dir, stem)?);
+                    files.insert(stem.to_string(), FileStore::open(dir, stem, &cfg)?);
                 }
             }
         }
@@ -937,7 +1184,7 @@ impl Store {
 
     pub fn create(&mut self, name: &str) -> io::Result<()> {
         if !self.files.contains_key(name) {
-            let f = FileStore::open(&self.dir, name)?;
+            let f = FileStore::open(&self.dir, name, &self.cfg)?;
             self.files.insert(name.to_string(), f);
         }
         Ok(())
@@ -951,6 +1198,8 @@ impl Store {
         let _ = fs::remove_file(format::rings_path(&self.dir, name));
         let _ = fs::remove_file(format::grain_path(&self.dir, name));
         let _ = fs::remove_file(format::bark_path(&self.dir, name));
+        let _ = fs::remove_file(format::sap_path(&self.dir, name));
+        let _ = fs::remove_file(format::sap_seal_path(&self.dir, name));
         Ok(())
     }
 
@@ -986,6 +1235,15 @@ impl Store {
             format::bark_path(&self.dir, old),
             format::bark_path(&self.dir, new),
         );
+        let _ = fs::rename(
+            format::sap_path(&self.dir, old),
+            format::sap_path(&self.dir, new),
+        );
+        let _ = fs::rename(
+            format::sap_seal_path(&self.dir, old),
+            format::sap_seal_path(&self.dir, new),
+        );
+        f.name = new.to_string();
         self.files.insert(new.to_string(), f);
         Ok(())
     }
@@ -1002,6 +1260,18 @@ impl Store {
                         eprintln!("timberfs: {name}: background flush failed: {e}");
                     }
                 }
+            }
+        }
+    }
+
+    /// Called by the same 1-second maintenance tick as `flush_aged`: the
+    /// wal's own durability point, independent of the chunk flush
+    /// schedule — a plain wal-declared writer's power-loss window shrinks
+    /// from `flush_age` to this tick interval.
+    pub fn sap_sync_all(&mut self) {
+        for (name, f) in self.files.iter_mut() {
+            if let Err(e) = f.sap_sync() {
+                eprintln!("timberfs: {name}: wal sync failed: {e}");
             }
         }
     }
@@ -1607,5 +1877,312 @@ mod tests {
         let dir = TempDir::new();
         // No .trim file at all: nothing to reconcile, no error.
         reconcile_trim(dir.path(), "app").unwrap();
+    }
+
+    // --- .sap / wal integration ---
+
+    fn test_cfg() -> Config {
+        // A large chunk_size so appends in these tests never auto-flush
+        // unless the test calls flush_chunk itself.
+        Config {
+            chunk_size: 1 << 20,
+            level: 1,
+            flush_age_ms: u64::MAX,
+        }
+    }
+
+    /// Build a one-chunk trunk+rings pair from scratch, bypassing
+    /// FileStore entirely — a fixture for the seal-reconcile matrix below,
+    /// which needs full control over `comp_size` independent of any sap.
+    fn write_one_chunk(
+        dir: &Path,
+        name: &str,
+        data: &[u8],
+        first_ms: u64,
+        last_ms: u64,
+    ) -> ChunkRecord {
+        let comp = zstd::stream::encode_all(data, 1).unwrap();
+        fs::write(format::trunk_path(dir, name), &comp).unwrap();
+        let rec = ChunkRecord {
+            uncomp_start: 0,
+            uncomp_len: data.len() as u64,
+            comp_start: 0,
+            comp_len: comp.len() as u64,
+            first_write_ms: first_ms,
+            last_write_ms: last_ms,
+        };
+        let mut idx = Vec::new();
+        idx.extend_from_slice(format::RINGS_MAGIC);
+        idx.extend_from_slice(&rec.to_bytes());
+        fs::write(format::rings_path(dir, name), &idx).unwrap();
+        rec
+    }
+
+    fn write_empty_pair(dir: &Path, name: &str) {
+        fs::write(format::rings_path(dir, name), format::RINGS_MAGIC).unwrap();
+        fs::write(format::trunk_path(dir, name), []).unwrap();
+    }
+
+    #[test]
+    fn open_without_wal_declared_creates_no_sap() {
+        let dir = TempDir::new();
+        let f = FileStore::open(dir.path(), "app", &test_cfg()).unwrap();
+        assert!(f.wal.is_none());
+        assert!(!format::sap_path(dir.path(), "app").exists());
+    }
+
+    #[test]
+    fn open_creates_a_fresh_sap_when_wal_is_declared() {
+        let dir = TempDir::new();
+        crate::bark::declare_wal(dir.path(), "app").unwrap();
+        let f = FileStore::open(dir.path(), "app", &test_cfg()).unwrap();
+        assert!(f.wal.is_some());
+        let replayed = sap::replay(&format::sap_path(dir.path(), "app"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.base, 0);
+        assert!(replayed.entries.is_empty());
+    }
+
+    #[test]
+    fn flush_seals_and_rotates_the_sap() {
+        let dir = TempDir::new();
+        let name = "app";
+        crate::bark::declare_wal(dir.path(), name).unwrap();
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        f.append_windowed(b"hello\n", 100, 100, &cfg).unwrap();
+        // append_windowed only mirrors into the sap's BufWriter; sap_sync
+        // (the actual durability point) is what pushes it to the OS and
+        // makes it visible to an independent fs::read.
+        f.sap_sync().unwrap();
+
+        let sap_p = format::sap_path(dir.path(), name);
+        let before = sap::replay(&sap_p).unwrap().unwrap();
+        assert_eq!(before.entries.len(), 1);
+        assert_eq!(before.base, 0);
+
+        f.flush_chunk(&cfg).unwrap();
+
+        assert!(!format::sap_seal_path(dir.path(), name).exists());
+        let after = sap::replay(&sap_p).unwrap().unwrap();
+        assert!(after.entries.is_empty());
+        assert_eq!(after.base, f.comp_size);
+        assert!(f.comp_size > 0);
+    }
+
+    #[test]
+    fn seal_reconcile_landed_just_removes_the_seal() {
+        let dir = TempDir::new();
+        let name = "app";
+        write_one_chunk(dir.path(), name, b"hello\n", 10, 10);
+        crate::bark::declare_wal(dir.path(), name).unwrap();
+        // base(0) < the trunk's actual comp_size => the flush landed.
+        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 0).unwrap();
+        sap.append(10, 10, b"hello\n").unwrap();
+        sap.sync().unwrap();
+        drop(sap);
+        let seal_p = format::sap_seal_path(dir.path(), name);
+        fs::rename(format::sap_path(dir.path(), name), &seal_p).unwrap();
+
+        let f = FileStore::open(dir.path(), name, &test_cfg()).unwrap();
+        assert!(!seal_p.exists());
+        assert_eq!(
+            f.chunks.len(),
+            1,
+            "the seal's entries must not be re-flushed"
+        );
+        assert!(f.buffer.is_empty());
+        // A fresh sap must be live at the current comp_size.
+        let fresh = sap::replay(&format::sap_path(dir.path(), name))
+            .unwrap()
+            .unwrap();
+        assert!(fresh.entries.is_empty());
+        assert_eq!(fresh.base, f.comp_size);
+    }
+
+    #[test]
+    fn seal_reconcile_never_landed_replays_and_completes_the_flush() {
+        let dir = TempDir::new();
+        let name = "app";
+        write_empty_pair(dir.path(), name);
+        crate::bark::declare_wal(dir.path(), name).unwrap();
+        // base == comp_size (both 0): the flush was staged but never landed.
+        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 0).unwrap();
+        sap.append(5, 5, b"abc").unwrap();
+        sap.append(6, 7, b"def").unwrap();
+        sap.sync().unwrap();
+        drop(sap);
+        let seal_p = format::sap_seal_path(dir.path(), name);
+        fs::rename(format::sap_path(dir.path(), name), &seal_p).unwrap();
+
+        let f = FileStore::open(dir.path(), name, &test_cfg()).unwrap();
+        assert!(!seal_p.exists());
+        assert_eq!(f.chunks.len(), 1, "the interrupted flush must be completed");
+        assert_eq!(f.chunks[0].first_write_ms, 5);
+        assert_eq!(f.chunks[0].last_write_ms, 7);
+        assert!(f.buffer.is_empty());
+        assert_eq!(f.size(), 6);
+        let comp = fs::read(format::trunk_path(dir.path(), name)).unwrap();
+        assert_eq!(zstd::stream::decode_all(&comp[..]).unwrap(), b"abcdef");
+        let fresh = sap::replay(&format::sap_path(dir.path(), name))
+            .unwrap()
+            .unwrap();
+        assert!(fresh.entries.is_empty());
+        assert_eq!(fresh.base, f.comp_size);
+    }
+
+    #[test]
+    fn seal_reconcile_shrank_still_replays_preserving_data_over_tidiness() {
+        let dir = TempDir::new();
+        let name = "app";
+        write_empty_pair(dir.path(), name);
+        crate::bark::declare_wal(dir.path(), name).unwrap();
+        // base(100) > comp_size(0): the trunk shrank underneath the seal
+        // (external damage) — still replay rather than lose the entries.
+        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 100).unwrap();
+        sap.append(1, 1, b"x").unwrap();
+        sap.sync().unwrap();
+        drop(sap);
+        let seal_p = format::sap_seal_path(dir.path(), name);
+        fs::rename(format::sap_path(dir.path(), name), &seal_p).unwrap();
+
+        let f = FileStore::open(dir.path(), name, &test_cfg()).unwrap();
+        assert!(!seal_p.exists());
+        assert_eq!(f.chunks.len(), 1);
+        assert_eq!(f.size(), 1);
+    }
+
+    #[test]
+    fn replay_rebuilds_the_buffer_byte_identical_to_an_uncrashed_run() {
+        let crashed = TempDir::new();
+        let baseline = TempDir::new();
+        let name = "app";
+        crate::bark::declare_wal(crashed.path(), name).unwrap();
+        crate::bark::declare_wal(baseline.path(), name).unwrap();
+        let cfg = test_cfg();
+
+        {
+            let mut f = FileStore::open(crashed.path(), name, &cfg).unwrap();
+            f.append_windowed(b"line one\n", 10, 10, &cfg).unwrap();
+            f.append_windowed(b"line two\n", 20, 25, &cfg).unwrap();
+            // Durable up to here (fsynced), then "crash": dropped with no
+            // chunk flush — the buffer only ever lived in memory and the
+            // sap.
+            f.sap_sync().unwrap();
+        }
+        {
+            let mut g = FileStore::open(baseline.path(), name, &cfg).unwrap();
+            g.append_windowed(b"line one\n", 10, 10, &cfg).unwrap();
+            g.append_windowed(b"line two\n", 20, 25, &cfg).unwrap();
+            g.flush_chunk(&cfg).unwrap();
+        }
+
+        let mut f2 = FileStore::open(crashed.path(), name, &cfg).unwrap();
+        assert_eq!(f2.buffer, b"line one\nline two\n");
+        assert_eq!(f2.buffer_first_ms, Some(10));
+        assert_eq!(f2.buffer_last_ms, 25);
+        f2.flush_chunk(&cfg).unwrap();
+
+        assert_eq!(
+            fs::read(format::trunk_path(crashed.path(), name)).unwrap(),
+            fs::read(format::trunk_path(baseline.path(), name)).unwrap(),
+        );
+        assert_eq!(
+            fs::read(format::rings_path(crashed.path(), name)).unwrap(),
+            fs::read(format::rings_path(baseline.path(), name)).unwrap(),
+        );
+    }
+
+    #[test]
+    fn undeclaring_wal_replays_then_deletes_the_leftover_sap() {
+        let dir = TempDir::new();
+        let name = "app";
+        crate::bark::declare_wal(dir.path(), name).unwrap();
+        let cfg = test_cfg();
+        {
+            let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+            f.append_windowed(b"still here\n", 1, 1, &cfg).unwrap();
+            f.sap_sync().unwrap();
+            // "crash": dropped with no chunk flush.
+        }
+
+        // `timberfs set wal=false`.
+        let mut map = crate::bark::load(dir.path(), name).unwrap();
+        map.insert("wal".to_string(), serde_json::Value::Bool(false));
+        crate::bark::save(dir.path(), name, &map).unwrap();
+
+        let f2 = FileStore::open(dir.path(), name, &cfg).unwrap();
+        assert!(f2.wal.is_none());
+        assert!(!format::sap_path(dir.path(), name).exists());
+        assert_eq!(
+            f2.buffer, b"still here\n",
+            "data must survive undeclaring wal"
+        );
+    }
+
+    #[test]
+    fn staged_appends_never_touch_the_sap() {
+        let dir = TempDir::new();
+        let name = "app";
+        crate::bark::declare_wal(dir.path(), name).unwrap();
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        f.stage();
+        f.append_windowed(b"staged\n", 1, 1, &cfg).unwrap();
+        f.flush_chunk(&cfg).unwrap();
+        // Staged delivery bypasses the sap entirely: the live segment
+        // (still base=0, no entries) must be untouched by any of this.
+        let sap_p = format::sap_path(dir.path(), name);
+        let replayed = sap::replay(&sap_p).unwrap().unwrap();
+        assert_eq!(replayed.base, 0);
+        assert!(replayed.entries.is_empty());
+        assert!(!format::sap_seal_path(dir.path(), name).exists());
+        f.commit_stage(&cfg).unwrap();
+    }
+
+    #[test]
+    fn append_frames_refreshes_the_sap_base() {
+        let dir = TempDir::new();
+        let src_dir = TempDir::new();
+        let name = "app";
+        let rec = write_one_chunk(src_dir.path(), "src", b"verbatim\n", 5, 5);
+        let src_trunk = File::open(format::trunk_path(src_dir.path(), "src")).unwrap();
+
+        crate::bark::declare_wal(dir.path(), name).unwrap();
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        assert_eq!(f.wal.as_ref().unwrap().base(), 0);
+
+        f.append_frames(&src_trunk, &[rec], &cfg).unwrap();
+
+        // append_frames bumps comp_size directly (never through the
+        // buffer), so the sap's base — stale at 0 — must be refreshed to
+        // match, or a later seal's landed/never-landed comparison lies.
+        assert_eq!(f.wal.as_ref().unwrap().base(), f.comp_size);
+        assert!(f.comp_size > 0);
+    }
+
+    #[test]
+    fn remove_head_refreshes_the_sap_base() {
+        let dir = TempDir::new();
+        let name = "app";
+        crate::bark::declare_wal(dir.path(), name).unwrap();
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        f.append_windowed(b"first\n", 1, 1, &cfg).unwrap();
+        f.flush_chunk(&cfg).unwrap();
+        f.append_windowed(b"second\n", 2, 2, &cfg).unwrap();
+        f.flush_chunk(&cfg).unwrap();
+        assert_eq!(f.chunks.len(), 2);
+
+        f.remove_head(1, dir.path(), name).unwrap();
+
+        assert_eq!(f.chunks.len(), 1);
+        assert_eq!(
+            f.wal.as_ref().unwrap().base(),
+            f.comp_size,
+            "the sap's base must track comp_size after a head trim"
+        );
     }
 }

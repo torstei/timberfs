@@ -64,6 +64,12 @@ enum Command {
         /// Declare the token index for this log
         #[arg(long)]
         index: bool,
+        /// Declare the write-ahead sidecar (.sap): every streaming writer
+        /// fsyncs it once a second, so an appender's crash window shrinks
+        /// from --flush-age down to that tick, at the cost of writing raw
+        /// bytes twice (once to the sap, once compressed into the chunk)
+        #[arg(long)]
+        wal: bool,
         /// Declare retention: continuously drop data older than this
         /// (e.g. 90d, 12h) — enforced by every writer
         #[arg(long)]
@@ -85,7 +91,8 @@ enum Command {
         /// Backing file: logical name, .trunk or .rings path
         store: PathBuf,
         /// KEY=VALUE to set: retain=90d, retain_size=50G,
-        /// index=true|false, or any free-form provenance key
+        /// index=true|false, wal=true|false, or any free-form
+        /// provenance key
         #[arg(value_name = "KEY=VALUE")]
         sets: Vec<String>,
         /// Remove a key (repeatable): --unset retain
@@ -122,6 +129,13 @@ enum Command {
         /// write-time granularity of the index and crash data loss
         #[arg(long, default_value_t = 5.0)]
         flush_age: f64,
+        /// Declare the write-ahead sidecar (.sap): entries are fsynced
+        /// once a second (independent of --flush-age), so a crash loses
+        /// at most that tick instead of up to a full unflushed chunk. A
+        /// property of the store (like --index) — once declared, every
+        /// later writer honors it with no flag
+        #[arg(long)]
+        wal: bool,
         /// Continuously drop data older than this (e.g. 30d, 12h, 90m)
         #[arg(long)]
         retain: Option<String>,
@@ -187,6 +201,11 @@ enum Command {
         /// import maintains the index automatically)
         #[arg(long)]
         index: bool,
+        /// Declare the write-ahead sidecar (.sap) for future writers of
+        /// this log (a batch import itself has no live "unflushed tail"
+        /// to protect); a property of the store, like --index
+        #[arg(long)]
+        wal: bool,
     },
     /// Export a time window (or everything) from a timberfs log into a NEW
     /// timberfs log, chunks copied verbatim — no recompression. A DEST
@@ -389,6 +408,7 @@ fn main() -> anyhow::Result<()> {
         Command::Create {
             dest,
             index,
+            wal,
             retain,
             retain_size,
             sets,
@@ -396,6 +416,7 @@ fn main() -> anyhow::Result<()> {
             bark::cmd_create(
                 &dest,
                 index,
+                wal,
                 retain.as_deref(),
                 retain_size.as_deref(),
                 &sets,
@@ -416,6 +437,7 @@ fn main() -> anyhow::Result<()> {
             chunk_size,
             level,
             flush_age,
+            wal,
             retain,
             retain_size,
             exit_on_upgrade,
@@ -447,6 +469,7 @@ fn main() -> anyhow::Result<()> {
                     cfg,
                     sink::Delivery::Streaming,
                     sink::Clock::Now,
+                    wal,
                     retain.as_deref(),
                     retain_size.as_deref(),
                     "append",
@@ -456,6 +479,7 @@ fn main() -> anyhow::Result<()> {
                 append::cmd_append(
                     &into,
                     cfg,
+                    wal,
                     retain.as_deref(),
                     retain_size.as_deref(),
                     exit_on_upgrade,
@@ -473,6 +497,7 @@ fn main() -> anyhow::Result<()> {
             utc,
             quick,
             index,
+            wal,
         } => {
             let cfg = store::Config {
                 chunk_size: chunk_size.max(1),
@@ -499,6 +524,7 @@ fn main() -> anyhow::Result<()> {
                     cfg,
                     sink::Delivery::Atomic,
                     sink::Clock::FromStamps,
+                    wal,
                     None,
                     None,
                     "import",
@@ -519,6 +545,7 @@ fn main() -> anyhow::Result<()> {
                     utc,
                     quick,
                     index,
+                    wal,
                 )?;
             }
         }

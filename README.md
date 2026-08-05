@@ -155,6 +155,30 @@ costs I/O proportional to the compressed size. It runs against a live mount
 (auto-detected, routed through the daemon atomically) and is chunk-granular
 like queries. Details: `man timberfs`.
 
+## Durability (`--wal`)
+
+By default, a crash (SIGKILL, power loss) can lose up to `--flush-age`
+(5s) of buffered-but-unflushed data — chunking wants big, infrequent
+frames, which is at odds with flushing on every write. `--wal` decouples
+the two: `create --wal` / `append --wal` (or `timberfs set store wal=true`
+on an existing one) declares a write-ahead sidecar, `<name>.sap`, that
+every streaming writer fsyncs once a second — shrinking the crash window
+to that tick, independent of `--flush-age` and the chunk-size schedule.
+It's a property of the *store* (like `--index`), declared once in the
+manifest: any later writer honors it with no flag.
+
+```sh
+timberfs create --wal --retain 90d backing/app.log
+myapp 2>&1 | timberfs append --into backing/app.log
+```
+
+The cost is explicit: a wal-enabled writer writes every appended byte
+twice — once raw to the sap, once compressed into its eventual chunk — so
+turn it on for streams where a few seconds of loss actually matters, not
+by default. `timberfs info` shows whether it's declared and how many
+bytes are currently sitting in the sap, unflushed. Design and the crash
+matrix: [docs/design.md](docs/design.md#the-sap-write-ahead-sidecar).
+
 ## Install
 
 Debian/Ubuntu, from the apt repository (rebuilt by CI from the GitHub

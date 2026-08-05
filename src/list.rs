@@ -229,6 +229,8 @@ mod tests {
             rings_bytes: 64,
             grain: if indexed { Some((10, 1)) } else { None },
             index_declared: false,
+            wal_declared: false,
+            sap_pending_bytes: None,
             retain: retain.map(str::to_string),
             retain_size: retain_size.map(str::to_string),
             writer,

@@ -55,6 +55,7 @@ pub fn cmd_records_sink(
     cfg: Config,
     delivery: Delivery,
     clock: Clock,
+    wal: bool,
     retain: Option<&str>,
     retain_size: Option<&str>,
     op: &str,
@@ -110,6 +111,13 @@ pub fn cmd_records_sink(
             map.insert("retain_size".to_string(), Value::String(r.to_string()));
         }
         crate::bark::save(&dir, &name, &map)?;
+    }
+    // --wal DECLARES, like --index/--retain: for `import --records` this
+    // only sets the property for future writers (atomic staging bypasses
+    // the sap entirely, by design); for `append --records` it takes effect
+    // for this run too, via the FileStore::open right below.
+    if wal {
+        crate::bark::declare_wal(&dir, &name)?;
     }
 
     let st = Arc::new(Mutex::new(Store {
@@ -210,6 +218,7 @@ pub fn cmd_records_sink(
                     break;
                 }
                 st.lock().unwrap().flush_aged();
+                st.lock().unwrap().sap_sync_all();
                 match crate::bark::declared_retention(&dir, &name) {
                     Ok(policy) if policy.is_some() => {
                         if let Err(e) = st.lock().unwrap().enforce_retention(

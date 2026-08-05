@@ -68,6 +68,90 @@ bytes are overwritten. `fsync()` through the mount flushes the buffer as a
 chunk and syncs both backing files, so fsync = durable. Unsynced buffered
 data is lost on a crash, bounded by `--flush-age`.
 
+### The .sap write-ahead sidecar
+
+Chunking has two masters that want opposite things: **compression** wants
+chunks big and infrequent (fewer, larger zstd frames compress better and cost
+less index/metadata overhead); **durability** wants every byte on disk the
+instant it arrives. Coupling them — as the plain chunk-on-flush path above
+does — forces a choice between the two: flush tiny chunks to bound data loss
+(bloating the store, since even a 15-byte log line pays a full zstd frame plus
+a 48-byte rings record), or accept losing up to `--flush-age` of buffered data
+on a crash.
+
+`"wal": true` in `.bark` (declared with `create --wal` / `append --wal`, or
+`set wal=true` on an existing store) breaks the coupling with a third file,
+`<name>.sap`: every appended entry is written there **raw**, alongside the
+in-memory buffer, and `sap_sync()` — called every second by the same
+maintenance tick that ages out chunks — fsyncs it. Chunking proceeds
+completely unchanged, on its own size/age schedule; only the crash-loss
+window shrinks, from `--flush-age` down to that tick. The cost is real and
+explicit: wal-enabled writers write every byte twice (raw to the sap, then
+again compressed into the chunk).
+
+The invariant that makes this simple: **the sap and the in-memory buffer
+hold the same bytes, by construction.** It is write-only in steady state and
+is read exactly once, ever — by a writer's `FileStore::open`, after a crash.
+Readers (`query`/`info`/`grep`) never touch it; the "unflushed tail not
+included" note in `query`'s output stays true regardless of `--wal`.
+
+On disk:
+
+```
+segment header (16 bytes): magic "SAP00001" (8) + u64 LE base
+  base = the trunk's comp_size when this segment was created
+
+record: u32 LE len | u64 LE wf | u64 LE wl | len payload bytes | u32 LE crc32
+  crc32 (standard zlib/gzip polynomial 0xEDB88320) covers the 20-byte
+  record header and the payload
+```
+
+Replay reads the **longest valid prefix** — stopping at EOF, a short read, or
+the first CRC mismatch — and truncates the file to it before resuming
+appends. A torn tail is expected crash debris, the same discipline as
+`.rings`' trailing-partial-record handling above, never an error.
+
+Flushing a chunk is a **seal-and-swap**: with a non-empty buffer, (1) fsync
+the live sap (its content equals the buffer about to be flushed), (2) rename
+it to `<name>.sap.seal`, (3) append the compressed frame, write the rings
+record, and (for a wal store specifically) fsync both — a plain,
+undeclared store still does none of that per-flush fsync, unchanged from
+today, (4) create a fresh `<name>.sap` with `base` set to the new
+`comp_size`, (5) unlink the seal. Because every flush rotates the segment, a
+segment's lifetime spans exactly one chunk cycle, and its eventual flush
+lands its frame at exactly its `base` — which is what makes recovery
+decidable. An empty buffer never touches the sap at all.
+
+Recovery at writer-open (after the existing `.trim` reconcile) reads:
+
+| `.sap.seal` present, comparing its `base` to the CURRENT `comp_size` | meaning | action |
+| --- | --- | --- |
+| `base < comp_size` | the flush landed | discard the seal |
+| `base == comp_size` | the flush never landed | replay the seal's entries and complete the flush now |
+| `base > comp_size` | the trunk shrank underneath it (external damage) | warn, and still replay — preserving data wins over tidiness |
+
+Then, independently: a plain `<name>.sap` (not a seal) has its valid prefix
+replayed to **rebuild the in-memory buffer**, byte-identical to an uncrashed
+run — same entries, same wf/wl, no forced flush (resuming the buffer keeps
+chunk sizing stable across a crash). A sap present with `"wal"` no longer
+declared (`set wal=false`) is still replayed — preserving data — then deleted
+and not recreated.
+
+Two operations move `comp_size` without ever touching the buffer or the
+sap's entries: `append_frames` (verbatim chunk merges — rotation, `import`'s
+timberfs-source path) and the retention/rotation head trims
+(`remove_head`/`collapse_head`). Both refresh the live segment's `base`
+header in place immediately afterward, so a `base`-vs-`comp_size` comparison
+on a later crash still tells the truth. Staged/atomic delivery (`import
+--records`, and the staging machinery generally) bypasses the sap
+completely — nothing is durable, or even visible, before commit, by design,
+so there is nothing for a wal to add.
+
+`remove`/`rename`/`reset` carry the sap alongside the rest of the sidecars
+(deleted, renamed, or reset to an empty base-0 segment, respectively); a
+`.timber` bundle never includes it — it is live writer state, not archive
+content.
+
 ### The .bark manifest
 
 An optional `<name>.bark` holds the log's *declared* facts as one flat,
@@ -79,6 +163,7 @@ human-editable JSON object — the label on the timber:
   "created": "2026-07-11T09:14:02Z", //   constant across renames, moves and hosts
   "host": "imap03.example.com",   // provenance: free-form, yours (--set k=v)
   "index": true,                  // settings: CREATE INDEX — imports maintain the grain
+  "wal": true,                    //   write-ahead .sap — crash loss shrinks to ~1s
   "retain": "90d",                //   keep at least this long — enforced by EVERY writer
   "retain_size": "50G",           //   compressed-size budget, oldest dropped first
   "timestamp_regex": "^(...)",    // content: exotic line-timestamp format, declared once

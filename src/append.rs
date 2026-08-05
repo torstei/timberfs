@@ -183,9 +183,11 @@ fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Retentio
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_append(
     target: &Path,
     cfg: Config,
+    wal: bool,
     retain: Option<&str>,
     retain_size: Option<&str>,
     exit_on_upgrade: bool,
@@ -230,6 +232,12 @@ pub fn cmd_append(
         &format!("appender pid={}\n", std::process::id()),
     )?;
 
+    // --wal DECLARES, like --index: written into the manifest before this
+    // run's own FileStore::open so it takes effect immediately, not just
+    // for the next writer.
+    if wal {
+        crate::bark::declare_wal(&dir, &name)?;
+    }
     let mut st = Store {
         dir: dir.clone(),
         cfg,
@@ -289,6 +297,7 @@ pub fn cmd_append(
                 std::process::exit(crate::store::EXIT_BINARY_UPGRADED);
             }
             store.lock().unwrap().flush_aged();
+            store.lock().unwrap().sap_sync_all();
             let p = policy.lock().unwrap().refresh();
             run_retention(&store, &name, p);
         });
