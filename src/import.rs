@@ -2,7 +2,9 @@
 //! backing pair, stamping chunks with timestamps PARSED FROM THE LOG LINES
 //! (the write time of historical data is meaningless).
 //!
-//!     timberfs import /var/log/old-app.log backing/app.log
+//! ```text
+//! timberfs import /var/log/old-app.log backing/app.log
+//! ```
 //!
 //! Timestamp extraction per line, first match wins. Auto-detected
 //! timestamps must sit at the START of the line (which also makes

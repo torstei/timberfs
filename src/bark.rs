@@ -1,7 +1,9 @@
 //! `.bark`: the log's manifest — declared properties and provenance, as
 //! one flat, optional, human-editable JSON object next to the pair:
 //!
-//!     {"index": true, "host": "foo.bar.com", "path": "/var/log/app.log"}
+//! ```text
+//! {"index": true, "host": "foo.bar.com", "path": "/var/log/app.log"}
+//! ```
 //!
 //! Unlike `.grain` (derived, rebuildable, dropped on rings rewrites),
 //! bark is DECLARED: it survives head-drops (provenance and settings

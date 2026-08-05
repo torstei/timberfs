@@ -1,7 +1,9 @@
 //! `timberfs append`: the FUSE-less write path — read stdin, write chunks
 //! straight into the backing store (svlogd/s6-log style):
 //!
-//!     myapp 2>&1 | timberfs append logs-backing/app.log
+//! ```text
+//! myapp 2>&1 | timberfs append logs-backing/app.log
+//! ```
 //!
 //! Locking: a SHARED lock on the backing directory (appenders coexist with
 //! each other and with offline rotation of other files, but never with a

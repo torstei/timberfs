@@ -15,11 +15,10 @@ echo "==> cargo fmt -- --check"
 cargo fmt -- --check
 echo "==> cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
-echo "==> cargo test --lib"
-# --lib only: several doc comments carry example shell sessions (not Rust)
-# that rustdoc tries and fails to compile as doctests — pre-existing and
-# unrelated to the unit tests, which are what this gate cares about.
-cargo test --lib
+echo "==> cargo test"
+# Doctests gate too: shell examples in doc comments are ```text-fenced
+# (rustdoc skips them); any Rust example in docs must compile.
+cargo test
 echo "==> cargo build --release"
 cargo build --release
 echo "==> all checks passed"
