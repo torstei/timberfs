@@ -1,7 +1,9 @@
 //! `.bark`: the log's manifest — declared properties and provenance, as
 //! one flat, optional, human-editable JSON object next to the pair:
 //!
-//!     {"index": true, "host": "foo.bar.com", "path": "/var/log/app.log"}
+//! ```text
+//! {"index": true, "host": "foo.bar.com", "path": "/var/log/app.log"}
+//! ```
 //!
 //! Unlike `.grain` (derived, rebuildable, dropped on rings rewrites),
 //! bark is DECLARED: it survives head-drops (provenance and settings
@@ -196,6 +198,29 @@ pub fn declare_index(dir: &Path, name: &str) -> anyhow::Result<()> {
     save(dir, name, &map)
 }
 
+/// Is the write-ahead sidecar (`.sap`) declared for this log? A property
+/// of the STORE (like `index`), not of whoever happens to be writing it
+/// right now: once declared, every streaming writer maintains and syncs
+/// it with no flag of its own (`FileStore::open`, store.rs).
+pub fn wal_declared(dir: &Path, name: &str) -> bool {
+    load(dir, name)
+        .and_then(|m| m.get("wal").cloned())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Persist `"wal": true` (creating the bark if needed). Used by
+/// `create --wal`, `append --wal` and `import --wal` — any road into a
+/// wal-backed log converges on the same declared state.
+pub fn declare_wal(dir: &Path, name: &str) -> anyhow::Result<()> {
+    let mut map = load(dir, name).unwrap_or_default();
+    if map.get("wal").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(());
+    }
+    map.insert("wal".to_string(), Value::Bool(true));
+    save(dir, name, &map)
+}
+
 /// Reserved keys that never inherit into a derived artifact: fresh
 /// identity and lineage are written instead, and settings ("index") are
 /// per-store operational choices (a read-only bundle cannot maintain a
@@ -209,6 +234,7 @@ const NON_INHERITED: &[&str] = &[
     "window_from",
     "window_to",
     "index",
+    "wal",
     "retain",
     "retain_size",
 ];
@@ -260,9 +286,11 @@ pub fn ensure_identified(dir: &Path, name: &str) -> anyhow::Result<Map<String, V
 }
 
 /// `timberfs create`: make an empty log with declared properties.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_create(
     dest: &Path,
     index: bool,
+    wal: bool,
     retain: Option<&str>,
     retain_size: Option<&str>,
     sets: &[String],
@@ -285,6 +313,9 @@ pub fn cmd_create(
     let mut map = Map::new();
     if index {
         map.insert("index".to_string(), Value::Bool(true));
+    }
+    if wal {
+        map.insert("wal".to_string(), Value::Bool(true));
     }
     if let Some(r) = retain {
         crate::append::parse_duration_ms(r)?;
@@ -316,10 +347,11 @@ pub fn cmd_create(
         save(&dir, &name, &map)?;
     }
     crate::note!(
-        "timberfs: created {}/{}{}{}",
+        "timberfs: created {}/{}{}{}{}",
         dir.display(),
         name,
         if index { " (indexed)" } else { "" },
+        if wal { " (wal)" } else { "" },
         if map.is_empty() {
             String::new()
         } else {
@@ -382,7 +414,7 @@ pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Resu
                 crate::append::parse_size_bytes(&v)?;
                 Value::String(v)
             }
-            "index" | "timestamp_utc" => match v.as_str() {
+            "index" | "wal" | "timestamp_utc" => match v.as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
                 _ => bail!("\"{k}\" is true or false"),

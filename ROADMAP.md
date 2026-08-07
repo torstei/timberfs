@@ -57,14 +57,15 @@ works is in [docs/design.md](docs/design.md).
 - **Appender growth toward s6-log**: `SIGHUP`-triggered and scheduled
   rotation into dated files (for shipping archives off-box), optional line
   timestamping, and a `--tee` passthrough.
-- **Real-time follow (a `.live` write-ahead sidecar)**: `--follow` today only
-  sees entries once their chunk is flushed and compressed, so it lags by the
-  flush interval — the unflushed tail lives only in the appender's memory. A
-  small write-ahead sidecar holding the current chunk's raw bytes would let a
-  follower read the live edge immediately (drain the compressed store, then tail
-  the sidecar; a follower that falls behind drops back to the store and catches
-  up). It doubles as crash durability for the not-yet-flushed buffer, which an
-  appender crash currently loses.
+- **Real-time follow, phase 2 (on the `.sap` substrate)**: phase 1 —
+  durability — shipped as `--wal`: a `<name>.sap` write-ahead sidecar holds
+  every appended entry raw, fsynced once a second, so a crash loses at most
+  that tick instead of up to `--flush-age`. `--follow` today still only sees
+  entries once their chunk is flushed and compressed, lagging by the flush
+  interval; phase 2 is a follower reading the sap's live edge directly
+  (drain the compressed store, then tail the sap; a follower that falls
+  behind drops back to the store and catches up) for sub-flush-age
+  `--follow` latency.
 - **Read-only mount of a live store**: a mount takes the backing directory's
   lock exclusively, so a store with a live appender cannot currently be mounted.
   A read-only mount takes no writer lock and only reads the append-only

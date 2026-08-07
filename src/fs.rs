@@ -927,6 +927,7 @@ pub fn mount(
                     }
                 }
                 store.lock().unwrap().flush_aged();
+                store.lock().unwrap().sap_sync_all();
             }
         });
     }

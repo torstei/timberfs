@@ -4,8 +4,10 @@
 //! recompression) and their records rebased into a fresh offset space, so
 //! the cost is proportional to the compressed size of the window.
 //!
-//!     timberfs export backing/archive.log incident.log --from 13:40 --to 14:10
-//!     timberfs export backing/archive.log incident.timber --from 13:40 --to 14:10
+//! ```text
+//! timberfs export backing/archive.log incident.log --from 13:40 --to 14:10
+//! timberfs export backing/archive.log incident.timber --from 13:40 --to 14:10
+//! ```
 //!
 //! A destination ending in `.timber` writes the single-file transfer
 //! bundle: a plain uncompressed tar (the payload is already zstd) with the

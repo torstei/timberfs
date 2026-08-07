@@ -15,6 +15,10 @@ echo "==> cargo fmt -- --check"
 cargo fmt -- --check
 echo "==> cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
+echo "==> cargo test"
+# Doctests gate too: shell examples in doc comments are ```text-fenced
+# (rustdoc skips them); any Rust example in docs must compile.
+cargo test
 echo "==> cargo build --release"
 cargo build --release
 echo "==> all checks passed"
