@@ -26,6 +26,7 @@ _timberfs_commands() {
         'list:list every store across the configured forests'
         'reindex:rebuild a store'\''s token index'
         'rotate:move or drop chunks written before a cutoff'
+        'forward-intake:receive the Fluentd Forward protocol over TCP'
     )
     _describe -t commands 'timberfs subcommand' subcommands
 }

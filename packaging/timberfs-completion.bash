@@ -16,7 +16,7 @@ _timberfs() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
-    local subcommands="mount create set append import export query info index list reindex rotate"
+    local subcommands="mount create set append import export query info index list reindex rotate forward-intake"
 
     if [ "$COMP_CWORD" -le 1 ]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -27,9 +27,10 @@ _timberfs() {
 
     # A flag that takes a value: the word after it is never a handle.
     case "$prev" in
-    --into | --from | --to | --has | --any | --cutoff | --set | --unset | \
+    --into | --into-dir | --from | --to | --has | --any | --cutoff | --set | --unset | \
         --tail | --max | --chunk-size | --level | --flush-age | --retain | \
-        --retain-size | --timestamp-regex | --timestamp-format)
+        --retain-size | --timestamp-regex | --timestamp-format | --listen | \
+        --payload-key)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;

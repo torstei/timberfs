@@ -789,6 +789,13 @@ impl FileStore {
     /// 1-second maintenance loops (append.rs, sink.rs, fs.rs) call it every
     /// tick so a plain writer's crash window shrinks from `flush_age` to
     /// that tick interval.
+    /// Whether a live write-ahead segment backs this file — i.e. whether
+    /// `sap_sync` is a real durability point (it is a silent no-op
+    /// without one, e.g. undeclared, or degraded after ENOSPC).
+    pub fn has_wal(&self) -> bool {
+        self.wal.is_some()
+    }
+
     pub fn sap_sync(&mut self) -> io::Result<()> {
         if self.staged.is_some() {
             return Ok(());

@@ -55,6 +55,11 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .RI [ DEST ]
 .RB [ \-\-delete ]
 .RB [ \-\-dry\-run ]
+.br
+.B timberfs forward\-intake
+.B \-\-into\-dir
+.I DIR
+.RI [ options ]
 .SH DESCRIPTION
 .B timberfs
 is a FUSE filesystem purpose-built for log files. Files in the mount look
@@ -737,6 +742,98 @@ Show what would move without changing anything.
 .TP
 .B \-\-fail\-on\-empty
 Error when nothing rotates instead of attesting the empty result.
+.SS forward\-intake
+.B timberfs forward\-intake \-\-into\-dir
+.I DIR
+receives the Fluentd Forward protocol v1 over TCP \(em the wire protocol of
+Docker's
+.B fluentd
+log driver, Fluent Bit, Fluentd, and the fluent\-logger client libraries \(em
+and writes each tag into its own store under
+.IR DIR ,
+named
+.IB TAG .log.
+One connection multiplexes many tags; a container's stdout and stderr share
+one tag and interleave in arrival order (the
+.B source
+field is dropped).
+.PP
+Supports the Message, Forward and PackedForward transport modes (str and
+bin blobs both), event times as unix seconds or the EventTime extension
+type (sub\-second precision), and Docker's split\-line
+.B partial_message
+reassembly. A sender that attaches a
+.B chunk
+id to a batch is acked (a
+.B {"ack": id}
+reply on the same connection) only once that batch is durable in the
+store's write\-ahead sidecar \(em every store this receiver touches
+declares
+.B "wal": true
+\(em so acks flow at fsync rate while chunk compression keeps its own
+size/age cadence: the at\-least\-once guarantee a pipe into
+.B append
+could never express, without shredding the store into per\-line chunks.
+.B CompressedPackedForward
+(gzip) is refused: the connection is logged and closed rather than
+silently dropping data.
+.PP
+Deliberate limitations, all downstream of Forward v1 having no
+authentication or negotiation phase: no TLS (deploy on loopback or a
+private network only), no HELO/PING/PONG handshake (clients transition
+straight to event transport, which is spec\-legal and how Docker's driver
+already works), and no UDP heartbeat listener. Event times are whole
+seconds unless the sender opts into sub\-second precision.
+.TP
+.BI \-\-listen " ADDR"
+Address to listen on (default
+.BR 127.0.0.1:24224 ).
+Ignored under systemd socket activation (LISTEN_PID/LISTEN_FDS set), which
+takes the already\-bound listener instead.
+.TP
+.BI \-\-into\-dir " DIR"
+Backing directory: one store per tag, named
+.IB TAG .log.
+Stores are pre\-created by the operator by default (see
+.BR \-\-auto\-create ).
+.TP
+.B \-\-auto\-create
+Create a store for a never\-seen tag automatically \(em the Docker\-host
+mode, where tags are container names that come and go. By default an
+unknown tag is REFUSED: creation is the operator's decision
+.RB ( "timberfs create \-\-wal" ),
+not the network's. A refused tag is logged once, its events are dropped
+and its
+.B chunk
+ids are never acked \(em an acking sender buffers and retries until the
+store exists, so provisioning converges with nothing lost.
+.TP
+.BI \-\-payload\-key " KEY"
+Record field holding the log line (default
+.BR log ,
+Docker's convention). Falls back to the whole record as compact JSON when
+the key is missing or not a string.
+.TP
+.BI \-\-retain " DURATION"
+Declared on every store this receiver creates; same meaning as
+.BR append 's
+.BR \-\-retain .
+.TP
+.BI \-\-retain\-size " SIZE"
+Declared on every store this receiver creates; same meaning as
+.BR append 's
+.BR \-\-retain\-size .
+.TP
+.B \-\-index
+Declare and maintain the
+.B .grain
+token index on every store this receiver creates.
+.TP
+.B \-\-exit\-on\-upgrade
+Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
+unit sets it.
+.PP
+The verb name is provisional.
 .SH RETENTION
 Retention is a property of the LOG, declared in its manifest
 .RB ( retain
@@ -1007,6 +1104,18 @@ and
 streams a producer's
 .BR timberfs\-records (5)
 stream into a store over a FIFO.
+.PP
+A third, socket\-activated pair,
+.B timberfs\-forward.socket
+and
+.BR timberfs\-forward.service ,
+runs
+.B forward\-intake
+listening on TCP for Fluentd Forward protocol v1 senders (Docker's
+.B fluentd
+log driver, Fluent Bit, Fluentd). Not templated: Forward multiplexes every
+tag over the one connection, so one instance serves every tag.
+.PP
 The full directory layout, both unit families, the ownership model and
 self\-restart on upgrade are documented in
 .IR /usr/share/doc/timberfs/deployment.md .

@@ -29,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
 libc = "0.2"
 regex = "1"
+rmpv = "1"
 tar = "0.4"
 serde_json = "1"
 zstd = "0.13"
@@ -53,8 +54,11 @@ is a binary search plus a few frame decompressions regardless of file \
 size. Includes time-based rotation and retention that relocate compressed \
 frames verbatim, and the data files remain recoverable with stock zstd. \
 Ships systemd template units: timberfs@.service for mounting instances at \
-boot, and a socket-activated timberfs-log@.socket/.service pair for streaming \
-a producer's logs into a store over a FIFO."""
+boot, a socket-activated timberfs-log@.socket/.service pair for streaming \
+a producer's logs into a store over a FIFO, and a socket-activated \
+timberfs-forward.socket/.service pair speaking the Fluentd Forward \
+protocol, so Docker's fluentd log driver and Fluent Bit/Fluentd can log \
+straight into a store."""
 assets = [
     ["target/release/timberfs", "usr/bin/", "755"],
     ["target/release/timber-filter", "usr/bin/", "755"],
@@ -70,6 +74,8 @@ assets = [
     ["packaging/timberfs@.service", "lib/systemd/system/timberfs@.service", "644"],
     ["packaging/timberfs-log@.socket", "lib/systemd/system/timberfs-log@.socket", "644"],
     ["packaging/timberfs-log@.service", "lib/systemd/system/timberfs-log@.service", "644"],
+    ["packaging/timberfs-forward.socket", "lib/systemd/system/timberfs-forward.socket", "644"],
+    ["packaging/timberfs-forward.service", "lib/systemd/system/timberfs-forward.service", "644"],
     ["packaging/timberfs-tmpfiles.conf", "usr/lib/tmpfiles.d/timberfs.conf", "644"],
     ["packaging/timberfs.conf.example", "usr/share/doc/timberfs/examples/timberfs.conf.example", "644"],
     ["packaging/etc-README", "etc/timberfs/README", "644"],

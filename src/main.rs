@@ -1,5 +1,6 @@
 use timberfs::{
-    append, bark, export, forest, fs, grain, import, list, note, query, rotate, sink, store,
+    append, bark, export, forest, forward, fs, grain, import, list, note, query, rotate, sink,
+    store,
 };
 
 use std::path::PathBuf;
@@ -368,6 +369,50 @@ enum Command {
         #[arg(long)]
         fail_on_empty: bool,
     },
+    /// Receive the Fluentd Forward protocol v1 over TCP — the wire protocol
+    /// of Docker's fluentd log driver, Fluent Bit, Fluentd, and the
+    /// fluent-logger client libraries — writing each tag into its own store
+    /// under --into-dir. Acks a chunk only after it is flushed and fsynced.
+    /// Deliberate limitations: no TLS/handshake (loopback or a private
+    /// network only), no gzip-compressed PackedForward, no UDP heartbeat.
+    /// The verb name is provisional
+    #[command(name = "forward-intake")]
+    ForwardIntake {
+        /// Address to listen on (systemd socket activation on fd 3 is used
+        /// instead when LISTEN_PID/LISTEN_FDS name this process)
+        #[arg(long, default_value = "127.0.0.1:24224")]
+        listen: String,
+        /// Backing directory: one store per Forward tag, named <tag>.log
+        #[arg(long = "into-dir", value_name = "DIR")]
+        into_dir: PathBuf,
+        /// Record field holding the log line; falls back to the whole
+        /// record as compact JSON when missing or not a string
+        #[arg(long, default_value = "log")]
+        payload_key: String,
+        /// Continuously drop data older than this (e.g. 30d, 12h, 90m) in
+        /// every store this receiver creates
+        #[arg(long)]
+        retain: Option<String>,
+        /// Keep the on-disk (compressed) size of every store this receiver
+        /// creates at or under this budget (e.g. 200G, 512M)
+        #[arg(long)]
+        retain_size: Option<String>,
+        /// Declare and maintain the .grain token index on every store this
+        /// receiver creates
+        #[arg(long)]
+        index: bool,
+        /// Create a store for a never-seen tag automatically (the Docker-
+        /// host mode: tags are container names that come and go). Default:
+        /// refuse unknown tags — pre-create stores with `timberfs create
+        /// --wal`; an acking sender retries until the store exists
+        #[arg(long)]
+        auto_create: bool,
+        /// Exit for a clean re-exec when this binary is upgraded on disk
+        /// (dpkg replaces it). Only for supervised runs (the systemd unit
+        /// sets it and pairs it with RestartForceExitStatus)
+        #[arg(long)]
+        exit_on_upgrade: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -646,6 +691,29 @@ fn main() -> anyhow::Result<()> {
                 delete,
                 dry_run,
                 fail_on_empty,
+            )?;
+        }
+        Command::ForwardIntake {
+            listen,
+            into_dir,
+            payload_key,
+            retain,
+            retain_size,
+            index,
+            auto_create,
+            exit_on_upgrade,
+        } => {
+            forward::cmd_forward_intake(
+                &listen,
+                &into_dir,
+                forward::ForwardOpts {
+                    payload_key,
+                    retain,
+                    retain_size,
+                    index,
+                    auto_create,
+                },
+                exit_on_upgrade,
             )?;
         }
     }

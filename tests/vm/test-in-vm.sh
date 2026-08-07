@@ -676,6 +676,255 @@ run_test "socket intake: declared index maintained while live" socket_intake_ind
 run_test "socket intake: wal declared, .sap live, intake unaffected" socket_intake_wal_declared_and_working
 run_test "socket intake: stop removes the FIFO" socket_intake_stop_removes_fifo
 
+# Fluentd Forward protocol intake (timberfs-forward.socket/.service): a hand-
+# packed msgpack client (struct.pack, no msgpack library assumed) drives the
+# real wire protocol — Message, Forward and PackedForward(+chunk ack), plus a
+# split-line partial pair. A fixed event time (2026-06-20 09:00:00 UTC as a
+# base) makes the write-time assertions below exact instead of racing the
+# wall clock.
+FWD_TAG=vmfwd
+FWD_STORE=/var/log/timberfs/forward/$FWD_TAG.log
+FWD_EPOCH=$(date -u -d "2026-06-20 09:00:00" +%s)
+
+forward_intake_setup() {
+    systemd-tmpfiles --create
+    systemctl enable --now timberfs-forward.socket
+}
+
+# $1 = chunk id to request an ack for (also seeds a distinct partial_id, so
+# two calls in the same test run never collide). Writes ACK_OK on success.
+forward_intake_client() {
+    # ARGS: CHUNK_ID [TAG] [ACK_TIMEOUT] — tag defaults to the suite's
+    # store, the timeout to comfortably-long (a refusal test shortens it).
+    command -v python3 >/dev/null 2>&1 || { echo "NO_PYTHON3"; return 1; }
+    python3 - "$1" "${2:-$FWD_TAG}" "$FWD_EPOCH" "${3:-15}" << 'PYEOF'
+import socket
+import struct
+import sys
+
+chunk_id, tag, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+ack_timeout = float(sys.argv[4])
+
+
+def pack_uint(n):
+    if n < 256:
+        return b"\xcc" + bytes([n])
+    if n < 65536:
+        return b"\xcd" + struct.pack(">H", n)
+    return b"\xce" + struct.pack(">I", n)
+
+
+def pack_str(s):
+    b = s.encode()
+    n = len(b)
+    if n <= 31:
+        return bytes([0xA0 | n]) + b
+    return b"\xd9" + bytes([n]) + b
+
+
+def pack_bin(b):
+    return b"\xc4" + bytes([len(b)]) + b
+
+
+def pack_map(pairs):
+    out = bytes([0x80 | len(pairs)])
+    for k, v in pairs:
+        out += pack_str(k) + pack_str(v)
+    return out
+
+
+def pack_arr(n):
+    return bytes([0x90 | n])
+
+
+s = socket.create_connection(("127.0.0.1", 24224), timeout=10)
+
+# 1. Message mode: [tag, time, record]
+s.sendall(
+    pack_arr(3)
+    + pack_str(tag)
+    + pack_uint(epoch)
+    + pack_map([("log", "message-mode-entry"), ("container_id", "a" * 64)])
+)
+
+# 2. Forward mode: [tag, [[time, record], [time, record]]]
+entries = (
+    pack_arr(2)
+    + pack_arr(2) + pack_uint(epoch) + pack_map([("log", "forward-entry-one")])
+    + pack_arr(2) + pack_uint(epoch + 1) + pack_map([("log", "forward-entry-two")])
+)
+s.sendall(pack_arr(2) + pack_str(tag) + entries)
+
+# 3. A split-line partial pair that must reassemble into ONE entry
+pid = chunk_id + "-p"
+s.sendall(
+    pack_arr(3)
+    + pack_str(tag)
+    + pack_uint(epoch + 2)
+    + pack_map(
+        [
+            ("log", "partial-one "),
+            ("partial_message", "true"),
+            ("partial_id", pid),
+            ("partial_ordinal", "1"),
+            ("partial_last", "false"),
+        ]
+    )
+)
+s.sendall(
+    pack_arr(3)
+    + pack_str(tag)
+    + pack_uint(epoch + 2)
+    + pack_map(
+        [
+            ("log", "partial-two"),
+            ("partial_message", "true"),
+            ("partial_id", pid),
+            ("partial_ordinal", "2"),
+            ("partial_last", "true"),
+        ]
+    )
+)
+
+# 4. PackedForward (bin blob) with a chunk ack request
+pair = pack_arr(2) + pack_uint(epoch + 3) + pack_map([("log", "packed-entry")])
+packed = pack_arr(3) + pack_str(tag) + pack_bin(pair) + pack_map([("chunk", chunk_id)])
+s.sendall(packed)
+
+s.settimeout(ack_timeout)
+try:
+    data = s.recv(4096)
+except socket.timeout:
+    print("NO_ACK")
+    sys.exit(1)
+
+# Decode the ack reply by hand: fixmap(1) {"ack": "<chunk>"}
+if len(data) < 2 or data[0] != 0x81:
+    print("BAD_ACK_FRAME", data.hex())
+    sys.exit(1)
+pos = 1
+klen = data[pos] & 0x1F
+pos += 1 + klen
+vlen = data[pos] & 0x1F
+pos += 1
+got = data[pos : pos + vlen].decode()
+if got == chunk_id:
+    print("ACK_OK")
+    sys.exit(0)
+print("ACK_MISMATCH:" + got)
+sys.exit(1)
+PYEOF
+}
+
+forward_intake_unknown_tag_refused_until_created() {
+    # Conservative default (no --auto-create in the shipped unit): a
+    # never-seen tag gets no store, no lock litter, and no ack.
+    forward_intake_client vmrefchunk vmrefused 4 > /tmp/fwdref.out 2>&1
+    grep -q NO_ACK /tmp/fwdref.out || { cat /tmp/fwdref.out; return 1; }
+    [ ! -e /var/log/timberfs/forward/vmrefused.log.rings ] || return 1
+    [ ! -e /var/log/timberfs/forward/vmrefused.log.lock ] || return 1
+    # The operator provisions the store; the sender's retry then lands and
+    # is acked — provisioning converges with nothing lost.
+    timberfs create --wal /var/log/timberfs/forward/vmrefused.log || return 1
+    forward_intake_client vmrefchunk vmrefused > /tmp/fwdref2.out 2>&1
+    grep -q ACK_OK /tmp/fwdref2.out || { cat /tmp/fwdref2.out; return 1; }
+}
+
+forward_intake_enable_auto_create() {
+    # The Docker-host mode for the rest of the flow: tags are container
+    # names that come and go, so the receiver mints stores itself.
+    mkdir -p /etc/systemd/system/timberfs-forward.service.d
+    cat > /etc/systemd/system/timberfs-forward.service.d/auto-create.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs/forward --exit-on-upgrade --auto-create
+EOF
+    systemctl daemon-reload
+    systemctl restart timberfs-forward.service
+    sleep 0.5
+    systemctl --quiet is-active timberfs-forward.service
+}
+
+forward_intake_receives_and_acks() {
+    forward_intake_client vmtestchunk1 > /tmp/fwd1.out 2>&1
+    local rc=$?
+    cat /tmp/fwd1.out
+    if [ "$rc" != 0 ]; then
+        journalctl -u timberfs-forward.service --no-pager -n 80 >&2
+        return 1
+    fi
+    grep -q ACK_OK /tmp/fwd1.out || return 1
+    # The ack means durable in the .sap write-ahead sidecar (the receiver
+    # declares "wal" on every store it touches) — NOT flushed to a chunk.
+    grep -q '"wal": true' "$FWD_STORE.bark" || return 1
+    [ -s "$FWD_STORE.sap" ] || return 1
+    # Visibility arrives with the normal chunk flush (flush-age): wait for
+    # it, then everything is queryable — and in ONE chunk, not the
+    # chunk-per-ack shredding the wal exists to prevent.
+    local i
+    for i in $(seq 1 20); do
+        timberfs query "$FWD_STORE" 2>/dev/null | grep -q "packed-entry" && break
+        sleep 0.5
+    done
+    timberfs query "$FWD_STORE" 2>/dev/null | grep -q "message-mode-entry" \
+        && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "forward-entry-one" \
+        && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "forward-entry-two" \
+        && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "packed-entry" \
+        && timberfs info "$FWD_STORE" | grep -q "in 1 chunk(s)"
+}
+
+forward_intake_partial_reassembles() {
+    timberfs query "$FWD_STORE" 2>/dev/null | grep -qx "partial-one partial-two"
+}
+
+forward_intake_event_times_landed() {
+    # The chunk's write window is the SENDER'S event times (epoch ..
+    # epoch+3), not "now" — none of these payloads carry a parseable
+    # timestamp of their own, so `timberfs info`'s chunk-granularity
+    # "covers" span is the reliable way to check this (query's entry-aware
+    # modes, e.g. --show-write-time, merge consecutive untimestamped lines
+    # into one multi-line entry annotated only once — a query.rs behavior
+    # this receiver doesn't change, so it isn't what this test is about).
+    timberfs info "$FWD_STORE" > /tmp/fwd_info.out 2>&1
+    if grep -q "covers    2026-06-20 09:00:00.000 .. 2026-06-20 09:00:03.000" /tmp/fwd_info.out; then
+        return 0
+    fi
+    cat /tmp/fwd_info.out >&2
+    return 1
+}
+
+forward_intake_container_id_seeded() {
+    grep -qE '"container_id": "a{64}"' "$FWD_STORE.bark"
+}
+
+forward_intake_restart_survives() {
+    systemctl restart timberfs-forward.service
+    sleep 1
+    local before after
+    before=$(timberfs query "$FWD_STORE" 2>/dev/null | wc -l)
+    forward_intake_client vmtestchunk2 > /tmp/fwd2.out 2>&1
+    grep -q ACK_OK /tmp/fwd2.out || return 1
+    # Acked = durable in the sap; queryable follows at the next chunk
+    # flush — poll for it.
+    local i after
+    for i in $(seq 1 20); do
+        after=$(timberfs query "$FWD_STORE" 2>/dev/null | wc -l)
+        [ "$after" -gt "$before" ] && break
+        sleep 0.5
+    done
+    [ "$after" -gt "$before" ] \
+        && systemctl --quiet is-active timberfs-forward.service
+}
+
+run_test "forward-intake: enable socket, unit activates" forward_intake_setup
+run_test "forward-intake: unknown tag refused until operator creates it" forward_intake_unknown_tag_refused_until_created
+run_test "forward-intake: --auto-create drop-in (Docker-host mode)" forward_intake_enable_auto_create
+run_test "forward-intake: Message/Forward/PackedForward land, chunk acked" forward_intake_receives_and_acks
+run_test "forward-intake: split-line partial reassembles to one entry" forward_intake_partial_reassembles
+run_test "forward-intake: entries carry the sender's own event time" forward_intake_event_times_landed
+run_test "forward-intake: first record's container_id seeds the manifest" forward_intake_container_id_seeded
+run_test "forward-intake: service restart is a sender reconnect, no data lost" forward_intake_restart_survives
+
 forest_handle_resolution() {
     # The package ships /etc/timberfs/forests.d/default.conf with
     # DIR=/var/log/timberfs, so a bare handle names a store under that tree
@@ -701,9 +950,10 @@ run_test "forest: bare handle resolves query/info; full path unchanged; unknown 
 forest_list_command() {
     # `timberfs list`: the directory-level complement to `info`. Clear the
     # default forest of state left by earlier tests (the socket-intake
-    # instance and forest_handle_resolution's nginx store) so the counts
-    # below are exact, then create two nested stores of our own.
-    rm -rf /var/log/timberfs/vmtest /var/log/timberfs/nginx
+    # instance, forest_handle_resolution's nginx store, and the forward-
+    # intake tag store) so the counts below are exact, then create two
+    # nested stores of our own.
+    rm -rf /var/log/timberfs/vmtest /var/log/timberfs/nginx /var/log/timberfs/forward
     printf '2026-07-08T09:00:00 INFO web one\n2026-07-08T09:00:01 INFO web two\n' \
         | timberfs append --into /var/log/timberfs/web/web.log --quiet || return 1
     printf '2026-07-08T09:05:00 INFO db one\n' \
