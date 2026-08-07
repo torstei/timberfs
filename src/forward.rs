@@ -17,6 +17,14 @@
 //! blocking mode acks every line) get wire-speed acks WITHOUT shredding
 //! the store into one chunk per line.
 //!
+//! Stores are pre-created by the operator (`timberfs create --wal`) by
+//! default: creation is the operator's decision, not the network's. An
+//! unknown tag is refused — logged once, its events dropped, its `chunk`
+//! ids never acked — so an acking sender simply buffers and retries until
+//! the store exists, and provisioning converges with nothing lost.
+//! `--auto-create` opts into minting a store per new tag instead: the
+//! Docker-host mode, where tags are container names that come and go.
+//!
 //! Deliberate limitations, all because there is no auth/negotiation phase in
 //! Forward v1 and we don't implement one:
 //!   - no TLS — deploy on loopback or a private network;
@@ -33,7 +41,7 @@
 //! graceful-exit loop, generalized across every file the directory holds and
 //! extended with ack completion.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -450,13 +458,22 @@ struct Intake {
     /// Kept alive for as long as this receiver holds each file's writer
     /// lock; dropped (and so released) only on process exit.
     file_locks: BTreeMap<String, File>,
+    /// Tags whose store couldn't be opened (typically: unknown and
+    /// --auto-create is off) — remembered so the refusal is logged once,
+    /// not once per entry of a retrying sender.
+    refused_tags: BTreeSet<String>,
 }
 
-struct ForwardOpts {
-    payload_key: String,
-    retain: Option<String>,
-    retain_size: Option<String>,
-    index: bool,
+/// Per-store policy for the receiver, one field per CLI flag.
+pub struct ForwardOpts {
+    pub payload_key: String,
+    pub retain: Option<String>,
+    pub retain_size: Option<String>,
+    pub index: bool,
+    /// Mint a store for a never-seen tag. OFF by default: creation is the
+    /// operator's decision (`timberfs create --wal`), not the network's —
+    /// an unknown tag is refused, unacked, and logged once.
+    pub auto_create: bool,
 }
 
 /// Seed a brand-new tag's `.bark` the same way every other writer declares
@@ -510,6 +527,15 @@ fn ensure_store(
         return Ok(());
     }
     let brand_new = !crate::format::rings_path(dir, name).exists();
+    // Refuse BEFORE taking the lock: lock files are never unlinked, so an
+    // unknown tag must not leave even that much litter behind.
+    if brand_new && !opts.auto_create {
+        anyhow::bail!(
+            "unknown tag {tag:?}: no store {name} in {} — pre-create it \
+             (timberfs create --wal) or run with --auto-create",
+            dir.display()
+        );
+    }
     let lock = store::lock_file_exclusive(dir, name)?.ok_or_else(|| {
         anyhow::anyhow!("{name} already has a writer (another timberfs writer or a rotation)")
     })?;
@@ -649,7 +675,9 @@ fn handle_connection(
                     container_id.as_deref(),
                     container_name.as_deref(),
                 ) {
-                    eprintln!("timberfs: forward-intake: {name}: {e}");
+                    if g.refused_tags.insert(name.clone()) {
+                        eprintln!("timberfs: forward-intake: {name}: {e}");
+                    }
                     continue;
                 }
                 if let Some(f) = g.store.files.get_mut(&name) {
@@ -660,6 +688,13 @@ fn handle_connection(
             }
         }
         if let Some(chunk) = decoded.chunk {
+            // Never ack what has no store (refused tag, open failure):
+            // the missing ack is the refusal's honest wire form — an
+            // acking sender buffers and retries until the operator
+            // creates the store, and then converges with nothing lost.
+            if !intake.lock().unwrap().store.files.contains_key(&name) {
+                continue;
+            }
             match writer.try_clone() {
                 Ok(w) => {
                     intake
@@ -717,14 +752,15 @@ fn socket_activated_listener() -> Option<TcpListener> {
 pub fn cmd_forward_intake(
     listen: &str,
     into_dir: &Path,
-    payload_key: &str,
-    retain: Option<&str>,
-    retain_size: Option<&str>,
-    index: bool,
+    opts: ForwardOpts,
     exit_on_upgrade: bool,
 ) -> anyhow::Result<()> {
-    retain.map(crate::append::parse_duration_ms).transpose()?;
-    retain_size
+    opts.retain
+        .as_deref()
+        .map(crate::append::parse_duration_ms)
+        .transpose()?;
+    opts.retain_size
+        .as_deref()
         .map(crate::append::parse_size_bytes)
         .transpose()?;
     fs::create_dir_all(into_dir)
@@ -757,13 +793,9 @@ pub fn cmd_forward_intake(
         },
         pending_acks: BTreeMap::new(),
         file_locks: BTreeMap::new(),
+        refused_tags: BTreeSet::new(),
     }));
-    let opts = Arc::new(ForwardOpts {
-        payload_key: payload_key.to_string(),
-        retain: retain.map(str::to_string),
-        retain_size: retain_size.map(str::to_string),
-        index,
-    });
+    let opts = Arc::new(opts);
 
     crate::append::install_signal_handlers();
 

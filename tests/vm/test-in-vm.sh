@@ -694,13 +694,16 @@ forward_intake_setup() {
 # $1 = chunk id to request an ack for (also seeds a distinct partial_id, so
 # two calls in the same test run never collide). Writes ACK_OK on success.
 forward_intake_client() {
+    # ARGS: CHUNK_ID [TAG] [ACK_TIMEOUT] — tag defaults to the suite's
+    # store, the timeout to comfortably-long (a refusal test shortens it).
     command -v python3 >/dev/null 2>&1 || { echo "NO_PYTHON3"; return 1; }
-    python3 - "$1" "$FWD_TAG" "$FWD_EPOCH" << 'PYEOF'
+    python3 - "$1" "${2:-$FWD_TAG}" "$FWD_EPOCH" "${3:-15}" << 'PYEOF'
 import socket
 import struct
 import sys
 
 chunk_id, tag, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+ack_timeout = float(sys.argv[4])
 
 
 def pack_uint(n):
@@ -788,7 +791,7 @@ pair = pack_arr(2) + pack_uint(epoch + 3) + pack_map([("log", "packed-entry")])
 packed = pack_arr(3) + pack_str(tag) + pack_bin(pair) + pack_map([("chunk", chunk_id)])
 s.sendall(packed)
 
-s.settimeout(15)
+s.settimeout(ack_timeout)
 try:
     data = s.recv(4096)
 except socket.timeout:
@@ -811,6 +814,35 @@ if got == chunk_id:
 print("ACK_MISMATCH:" + got)
 sys.exit(1)
 PYEOF
+}
+
+forward_intake_unknown_tag_refused_until_created() {
+    # Conservative default (no --auto-create in the shipped unit): a
+    # never-seen tag gets no store, no lock litter, and no ack.
+    forward_intake_client vmrefchunk vmrefused 4 > /tmp/fwdref.out 2>&1
+    grep -q NO_ACK /tmp/fwdref.out || { cat /tmp/fwdref.out; return 1; }
+    [ ! -e /var/log/timberfs/forward/vmrefused.log.rings ] || return 1
+    [ ! -e /var/log/timberfs/forward/vmrefused.log.lock ] || return 1
+    # The operator provisions the store; the sender's retry then lands and
+    # is acked — provisioning converges with nothing lost.
+    timberfs create --wal /var/log/timberfs/forward/vmrefused.log || return 1
+    forward_intake_client vmrefchunk vmrefused > /tmp/fwdref2.out 2>&1
+    grep -q ACK_OK /tmp/fwdref2.out || { cat /tmp/fwdref2.out; return 1; }
+}
+
+forward_intake_enable_auto_create() {
+    # The Docker-host mode for the rest of the flow: tags are container
+    # names that come and go, so the receiver mints stores itself.
+    mkdir -p /etc/systemd/system/timberfs-forward.service.d
+    cat > /etc/systemd/system/timberfs-forward.service.d/auto-create.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs/forward --exit-on-upgrade --auto-create
+EOF
+    systemctl daemon-reload
+    systemctl restart timberfs-forward.service
+    sleep 0.5
+    systemctl --quiet is-active timberfs-forward.service
 }
 
 forward_intake_receives_and_acks() {
@@ -885,6 +917,8 @@ forward_intake_restart_survives() {
 }
 
 run_test "forward-intake: enable socket, unit activates" forward_intake_setup
+run_test "forward-intake: unknown tag refused until operator creates it" forward_intake_unknown_tag_refused_until_created
+run_test "forward-intake: --auto-create drop-in (Docker-host mode)" forward_intake_enable_auto_create
 run_test "forward-intake: Message/Forward/PackedForward land, chunk acked" forward_intake_receives_and_acks
 run_test "forward-intake: split-line partial reassembles to one entry" forward_intake_partial_reassembles
 run_test "forward-intake: entries carry the sender's own event time" forward_intake_event_times_landed

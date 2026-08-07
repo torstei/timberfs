@@ -401,6 +401,12 @@ enum Command {
         /// receiver creates
         #[arg(long)]
         index: bool,
+        /// Create a store for a never-seen tag automatically (the Docker-
+        /// host mode: tags are container names that come and go). Default:
+        /// refuse unknown tags — pre-create stores with `timberfs create
+        /// --wal`; an acking sender retries until the store exists
+        #[arg(long)]
+        auto_create: bool,
         /// Exit for a clean re-exec when this binary is upgraded on disk
         /// (dpkg replaces it). Only for supervised runs (the systemd unit
         /// sets it and pairs it with RestartForceExitStatus)
@@ -694,15 +700,19 @@ fn main() -> anyhow::Result<()> {
             retain,
             retain_size,
             index,
+            auto_create,
             exit_on_upgrade,
         } => {
             forward::cmd_forward_intake(
                 &listen,
                 &into_dir,
-                &payload_key,
-                retain.as_deref(),
-                retain_size.as_deref(),
-                index,
+                forward::ForwardOpts {
+                    payload_key,
+                    retain,
+                    retain_size,
+                    index,
+                    auto_create,
+                },
                 exit_on_upgrade,
             )?;
         }

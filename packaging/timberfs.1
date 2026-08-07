@@ -794,6 +794,19 @@ takes the already\-bound listener instead.
 .BI \-\-into\-dir " DIR"
 Backing directory: one store per tag, named
 .IB TAG .log.
+Stores are pre\-created by the operator by default (see
+.BR \-\-auto\-create ).
+.TP
+.B \-\-auto\-create
+Create a store for a never\-seen tag automatically \(em the Docker\-host
+mode, where tags are container names that come and go. By default an
+unknown tag is REFUSED: creation is the operator's decision
+.RB ( "timberfs create \-\-wal" ),
+not the network's. A refused tag is logged once, its events are dropped
+and its
+.B chunk
+ids are never acked \(em an acking sender buffers and retries until the
+store exists, so provisioning converges with nothing lost.
 .TP
 .BI \-\-payload\-key " KEY"
 Record field holding the log line (default

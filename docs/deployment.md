@@ -129,6 +129,21 @@ listener for every tag**, not a template: Forward multiplexes tags over a
 single connection, and each tag lands in its own store under
 `/var/log/timberfs/forward/<tag>.log`.
 
+By default the store set is **operator-controlled**: pre-create each tag's
+store (`timberfs create --wal /var/log/timberfs/forward/<tag>.log`), and an
+unknown tag is refused — logged once, never acked, so an acking sender
+buffers and retries until the store exists. On a Docker host, where tags
+are container names that come and go, opt into per-tag store creation with
+a drop-in:
+
+```ini
+# systemctl edit timberfs-forward.service — Docker hosts: mint stores per tag
+[Service]
+ExecStart=
+ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs/forward \
+    --exit-on-upgrade --auto-create
+```
+
 ```sh
 systemctl enable --now timberfs-forward.socket
 # then point a Forward-protocol producer at 127.0.0.1:24224
@@ -254,6 +269,11 @@ make systemd restart it onto the new binary regardless of `Restart=`.
 - **Ack timing.** Acks are sent synchronously, as soon as the batch is
   durable — a blocking sender's throughput is bounded by fsync rate, not by
   any receiver tick.
+- **An unknown tag is refused, not acked** (unless `--auto-create`). The
+  missing ack is the refusal's wire form: an acking sender buffers and
+  retries until the operator creates the store, then converges with nothing
+  lost. Non-acking senders' events for unknown tags are dropped (logged
+  once per tag).
 - **A decode error closes the connection.** A desynced msgpack stream can't be
   resynchronized, so the connection is dropped and logged; the sender
   reconnects.
