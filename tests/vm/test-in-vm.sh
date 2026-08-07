@@ -821,11 +821,24 @@ forward_intake_receives_and_acks() {
         journalctl -u timberfs-forward.service --no-pager -n 80 >&2
         return 1
     fi
-    grep -q ACK_OK /tmp/fwd1.out \
-        && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "message-mode-entry" \
+    grep -q ACK_OK /tmp/fwd1.out || return 1
+    # The ack means durable in the .sap write-ahead sidecar (the receiver
+    # declares "wal" on every store it touches) — NOT flushed to a chunk.
+    grep -q '"wal": true' "$FWD_STORE.bark" || return 1
+    [ -s "$FWD_STORE.sap" ] || return 1
+    # Visibility arrives with the normal chunk flush (flush-age): wait for
+    # it, then everything is queryable — and in ONE chunk, not the
+    # chunk-per-ack shredding the wal exists to prevent.
+    local i
+    for i in $(seq 1 20); do
+        timberfs query "$FWD_STORE" 2>/dev/null | grep -q "packed-entry" && break
+        sleep 0.5
+    done
+    timberfs query "$FWD_STORE" 2>/dev/null | grep -q "message-mode-entry" \
         && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "forward-entry-one" \
         && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "forward-entry-two" \
-        && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "packed-entry"
+        && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "packed-entry" \
+        && timberfs info "$FWD_STORE" | grep -q "in 1 chunk(s)"
 }
 
 forward_intake_partial_reassembles() {
@@ -859,7 +872,14 @@ forward_intake_restart_survives() {
     before=$(timberfs query "$FWD_STORE" 2>/dev/null | wc -l)
     forward_intake_client vmtestchunk2 > /tmp/fwd2.out 2>&1
     grep -q ACK_OK /tmp/fwd2.out || return 1
-    after=$(timberfs query "$FWD_STORE" 2>/dev/null | wc -l)
+    # Acked = durable in the sap; queryable follows at the next chunk
+    # flush — poll for it.
+    local i after
+    for i in $(seq 1 20); do
+        after=$(timberfs query "$FWD_STORE" 2>/dev/null | wc -l)
+        [ "$after" -gt "$before" ] && break
+        sleep 0.5
+    done
     [ "$after" -gt "$before" ] \
         && systemctl --quiet is-active timberfs-forward.service
 }

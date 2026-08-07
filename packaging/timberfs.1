@@ -766,10 +766,14 @@ reassembly. A sender that attaches a
 .B chunk
 id to a batch is acked (a
 .B {"ack": id}
-reply on the same connection) only once that batch is flushed and fsynced
-\(em the at\-least\-once guarantee a pipe into
+reply on the same connection) only once that batch is durable in the
+store's write\-ahead sidecar \(em every store this receiver touches
+declares
+.B "wal": true
+\(em so acks flow at fsync rate while chunk compression keeps its own
+size/age cadence: the at\-least\-once guarantee a pipe into
 .B append
-could never express.
+could never express, without shredding the store into per\-line chunks.
 .B CompressedPackedForward
 (gzip) is refused: the connection is logged and closed rather than
 silently dropping data.

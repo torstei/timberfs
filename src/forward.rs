@@ -6,9 +6,16 @@
 //!
 //! The motivating property is at-least-once delivery: a sender may attach a
 //! `chunk` id to a batch and retry until it sees `{"ack": id}` back. We ack
-//! only once the batch is flushed and fsynced — a guarantee a pipe into
+//! only once the batch is durable — a guarantee a pipe into
 //! `append` could never express, which is why this is its own subcommand
 //! rather than a stream filter (only `timberfs` writes stores).
+//!
+//! Durable means fsynced into the store's `.sap` write-ahead sidecar
+//! (every store this receiver touches declares `"wal": true`): an ack
+//! costs one raw append + one fsync, immediately, while chunks keep their
+//! own size/age cadence — per-message-ack senders (Docker's driver in
+//! blocking mode acks every line) get wire-speed acks WITHOUT shredding
+//! the store into one chunk per line.
 //!
 //! Deliberate limitations, all because there is no auth/negotiation phase in
 //! Forward v1 and we don't implement one:
@@ -454,8 +461,10 @@ struct ForwardOpts {
 
 /// Seed a brand-new tag's `.bark` the same way every other writer declares
 /// its properties up front: identity + lineage, the tag, the container
-/// fields when the first record carried them, and the declared retention/
-/// index this receiver applies to everything it creates.
+/// fields when the first record carried them, the declared retention/
+/// index this receiver applies to everything it creates — and `"wal"`,
+/// because the ack contract (durable before acked) is delivered by the
+/// sap. Seeded BEFORE the store opens so the sap exists from entry one.
 fn seed_bark(
     dir: &Path,
     name: &str,
@@ -481,6 +490,7 @@ fn seed_bark(
     if opts.index {
         map.insert("index".to_string(), Json::Bool(true));
     }
+    map.insert("wal".to_string(), Json::Bool(true));
     crate::bark::save(dir, name, &map)
 }
 
@@ -507,12 +517,54 @@ fn ensure_store(
         &lock,
         &format!("forward-intake pid={}\n", std::process::id()),
     )?;
-    intake.store.create(name)?;
-    intake.file_locks.insert(name.to_string(), lock);
+    // Declare before create: open() reads the manifest to decide whether
+    // to mint the sap, and the ack contract needs it live from the start.
+    // An existing store converges (the --index roads pattern): being fed
+    // by this receiver declares it.
     if brand_new {
         seed_bark(dir, name, tag, container_id, container_name, opts)?;
+    } else if !crate::bark::wal_declared(dir, name) {
+        crate::bark::declare_wal(dir, name)?;
     }
+    intake.store.create(name)?;
+    intake.file_locks.insert(name.to_string(), lock);
     Ok(())
+}
+
+/// Complete every pending ack for one store: make everything appended so
+/// far durable, then send each `{"ack": id}`. With a live wal, durable =
+/// one sap fsync — the cheap point of the whole design: chunks keep their
+/// size/age cadence no matter how the sender acks, and every ack pending
+/// when one fsync completes shares it (group commit — the store lock is
+/// held across the sync, so anything in the list was appended before it).
+/// Without a wal (degraded, e.g. ENOSPC at segment creation) fall back to
+/// flushing + syncing the chunk itself: an ack must never outrun
+/// durability. On failure the acks are put back — unacked and retried by
+/// the sender and by the next tick's sweep, never sent on hope.
+fn drain_acks(intake: &Mutex<Intake>, name: &str, cfg: &Config) {
+    let acks = {
+        let mut g = intake.lock().unwrap();
+        let Some(acks) = g.pending_acks.get_mut(name).map(std::mem::take) else {
+            return;
+        };
+        if acks.is_empty() {
+            return;
+        }
+        let durable = match g.store.files.get_mut(name) {
+            Some(f) if f.has_wal() => f.sap_sync().is_ok(),
+            Some(f) => f.flush_chunk(cfg).and_then(|()| f.sync(cfg)).is_ok(),
+            None => false,
+        };
+        if !durable {
+            g.pending_acks.insert(name.to_string(), acks);
+            return;
+        }
+        acks
+    };
+    for mut ack in acks {
+        let msg = encode_ack(&ack.chunk);
+        let _ = ack.writer.write_all(&msg);
+    }
 }
 
 fn encode_ack(chunk: &str) -> Vec<u8> {
@@ -621,6 +673,10 @@ fn handle_connection(
                             conn_id,
                             writer: w,
                         });
+                    // Eagerly, not on the next tick: a blocking sender
+                    // waits for this ack before its next message, so ack
+                    // latency IS its throughput.
+                    drain_acks(&intake, &name, &cfg);
                 }
                 Err(e) => {
                     eprintln!(
@@ -752,6 +808,9 @@ pub fn cmd_forward_intake(
                 let names: Vec<String> = {
                     let mut g = intake.lock().unwrap();
                     g.store.flush_aged();
+                    // Un-acked traffic still gets the wal's ≤1s power-loss
+                    // window, same as every other streaming writer.
+                    g.store.sap_sync_all();
                     g.store.files.keys().cloned().collect()
                 };
                 for name in &names {
@@ -790,29 +849,11 @@ pub fn cmd_forward_intake(
                     }
                 }
 
-                // Ack completion: every tag with pending acks gets its file
-                // flushed + synced (durable), then each ack sent; a failed
-                // send just drops that one (the sender retries the chunk).
+                // Acks are completed eagerly in the connection threads
+                // (drain_acks after each registered chunk); this sweep only
+                // retries ones a transient failure left pending there.
                 for name in &names {
-                    let acks = {
-                        let mut g = intake.lock().unwrap();
-                        g.pending_acks.get_mut(name).map(std::mem::take)
-                    };
-                    let Some(acks) = acks else { continue };
-                    if acks.is_empty() {
-                        continue;
-                    }
-                    {
-                        let mut g = intake.lock().unwrap();
-                        if let Some(f) = g.store.files.get_mut(name) {
-                            let _ = f.flush_chunk(&cfg);
-                            let _ = f.sync(&cfg);
-                        }
-                    }
-                    for mut ack in acks {
-                        let msg = encode_ack(&ack.chunk);
-                        let _ = ack.writer.write_all(&msg);
-                    }
+                    drain_acks(&intake, name, &cfg);
                 }
             }
         })

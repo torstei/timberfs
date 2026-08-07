@@ -118,7 +118,8 @@ timberfs mount /var/log/myapp-backing /var/log/myapp
 receiver for the Fluentd Forward protocol v1, the wire protocol Docker's
 `fluentd` log driver, Fluent Bit, Fluentd and the fluent-logger client
 libraries already speak — no plain-file or FIFO producer needed. Every tag
-lands in its own store; a `chunk` id is acked only once flushed and fsynced
+lands in its own store; a `chunk` id is acked only once durable in the
+`.sap` write-ahead sidecar (acks at fsync rate, chunks stay full-size)
 (at-least-once, like the socket intake above):
 
 ```sh

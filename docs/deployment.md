@@ -143,7 +143,7 @@ docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 \
 
 `fluentd-async` keeps a receiver outage from blocking the container's stdout;
 `fluentd-request-ack` makes Docker retry a batch until it sees `{"ack": id}`
-back, which this receiver sends only once the batch is flushed and fsynced
+back, which this receiver sends only once the batch is durable
 (see **Reliability model** below). The default Docker tag is a 12-char
 container id — a poor store name — hence `tag={{.Name}}`.
 
@@ -243,12 +243,17 @@ make systemd restart it onto the new binary regardless of `Restart=`.
 
 ## Reliability model (Forward intake)
 
-- **At-least-once, not exactly-once.** An acked chunk is durable (flushed and
-  fsynced); an unacked one may or may not have landed, so the sender retries
+- **At-least-once, not exactly-once.** An acked chunk is durable; an unacked
+  one may or may not have landed, so the sender retries
   it — a retry after a receiver restart or a lost ack can duplicate entries.
-- **Ack timing.** Acks are sent by a maintenance tick (about once a second),
-  not synchronously per message — expect a small delay, not per-event
-  round-trips.
+- **Durable = fsynced into the `.sap` write-ahead sidecar** (every store this
+  receiver touches declares `"wal": true`, see [design.md](design.md)). An ack
+  costs one raw append plus one fsync — chunk compression keeps its own
+  size/age cadence, so per-message-ack senders don't shred the store into
+  one chunk per line.
+- **Ack timing.** Acks are sent synchronously, as soon as the batch is
+  durable — a blocking sender's throughput is bounded by fsync rate, not by
+  any receiver tick.
 - **A decode error closes the connection.** A desynced msgpack stream can't be
   resynchronized, so the connection is dropped and logged; the sender
   reconnects.
