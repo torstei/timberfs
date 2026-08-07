@@ -227,6 +227,78 @@ retain_size_budget() {
         && timberfs query "$PIPE_BACKING/cap.log" | tail -1 | grep -qx 100000
 }
 
+wal_kill9_durability() {
+    # --wal's whole point: a kill -9 before any chunk flush must not lose
+    # data that already made it through a sap-sync tick. Drive a real
+    # appender over a FIFO (full control over exactly which lines land
+    # before the kill), a --chunk-size/--flush-age big enough that nothing
+    # would ever flush on its own within this test's window, so recovery
+    # can ONLY come from the sap — and after a compression guard: the
+    # recovered data must land in a couple of chunks, not one per line
+    # (durability must not shred the very thing chunking exists for).
+    local d=/var/log/timberfs-waltest
+    rm -rf "$d"
+    mkdir -p "$d"
+    rm -f /tmp/wal.fifo
+    mkfifo /tmp/wal.fifo
+    timberfs append --into "$d/app.log" --wal --chunk-size 10485760 \
+        --flush-age 3600 --quiet < /tmp/wal.fifo &
+    local pid=$!
+    exec 9>/tmp/wal.fifo
+    local i
+    for i in 1 2 3 4 5; do
+        echo "wal-line-$i" >&9
+    done
+    # Let at least two 1-second maintenance ticks (which call sap_sync)
+    # land before the kill.
+    sleep 2.5
+    kill -9 "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    exec 9>&-
+    rm -f /tmp/wal.fifo
+
+    # Confirm the crash landed with NOTHING chunked yet — a plain
+    # (non-wal) store would lose all five lines from exactly this window.
+    local chunks_before
+    chunks_before=$(timberfs info "$d/app.log" --json 2>/dev/null | jq -r .chunks)
+    if [ "$chunks_before" != "0" ]; then
+        echo "expected 0 chunks before recovery (nothing should have flushed yet), got $chunks_before" >&2
+        return 1
+    fi
+
+    # Restart the appender: FileStore::open replays the sap into its
+    # buffer (no forced flush — chunk sizing survives the crash too), and
+    # it keeps accepting writes exactly as before.
+    rm -f /tmp/wal2.fifo
+    mkfifo /tmp/wal2.fifo
+    timberfs append --into "$d/app.log" --wal --chunk-size 10485760 \
+        --flush-age 3600 --quiet < /tmp/wal2.fifo &
+    local pid2=$!
+    exec 9>/tmp/wal2.fifo
+    for i in 6 7 8; do
+        echo "wal-line-$i" >&9
+    done
+    sleep 1.5
+    exec 9>&-
+    rm -f /tmp/wal2.fifo
+    # Graceful stop this time (SIGTERM): flushes and syncs everything.
+    kill -TERM "$pid2"
+    wait "$pid2" 2>/dev/null
+
+    for i in 1 2 3 4 5 6 7 8; do
+        if ! timberfs query "$d/app.log" 2>/dev/null | grep -qx "wal-line-$i"; then
+            echo "missing wal-line-$i after recovery — the kill -9 lost data" >&2
+            return 1
+        fi
+    done
+    local chunks_after
+    chunks_after=$(timberfs info "$d/app.log" --json 2>/dev/null | jq -r .chunks)
+    if [ "$chunks_after" -gt 2 ]; then
+        echo "durability shredded chunking: $chunks_after chunks for 8 short lines" >&2
+        return 1
+    fi
+}
+
 collapse_crash_kill_resilience() {
     # A `fallocate(COLLAPSE_RANGE)` retention cut interrupted mid-flight
     # must always be recoverable. Drive a real appender under a tight
@@ -436,6 +508,7 @@ run_test "appender: file lock blocks rotate while live" appender_lock_blocks_rot
 run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
+run_test "wal: kill -9 after a sap-sync tick loses nothing, chunking intact" wal_kill9_durability
 run_test "collapse-head retention survives repeated kill -9" collapse_crash_kill_resilience
 run_test "info/query: read-only, work for a non-root reader" info_readonly_nonroot
 run_test "records sink flushes by age, before EOF" records_sink_age_flush
@@ -526,9 +599,10 @@ ExecStart=
 ExecStart=/usr/bin/timberfs append --records --into /var/log/timberfs/%i/%i.log --flush-age 1
 EOF
     systemctl daemon-reload
-    # Pre-create the store with a declared index (also makes the instance dir)
-    # so the intake exercises grain maintenance on the live/socket path.
-    timberfs create --index "$LOGSTORE" >/dev/null
+    # Pre-create the store with a declared index AND wal (also makes the
+    # instance dir) so the intake exercises grain maintenance AND the
+    # write-ahead sidecar together on the live/socket path.
+    timberfs create --index --wal "$LOGSTORE" >/dev/null
     systemctl enable --now "timberfs-log@$LOGINST.socket"
     test -p "$LOGPIPE"
 }
@@ -574,6 +648,21 @@ socket_intake_index_maintained() {
         && [ "$(timber-filter --has restart "$LOGSTORE" -c 2>/dev/null)" -ge 1 ]
 }
 
+socket_intake_wal_declared_and_working() {
+    # The store was pre-created with --wal: the streaming sink (append
+    # --records, same maintenance loop as a plain appender) must maintain
+    # a live .sap and report it declared, while intake keeps working
+    # normally — --wal is meant to be transparent to every other path.
+    [ -f "$LOGSTORE.sap" ] || {
+        echo "no .sap sidecar for a wal-declared socket-intake store" >&2
+        return 1
+    }
+    timberfs info "$LOGSTORE" --json 2>/dev/null | jq -e '.wal_declared == true' >/dev/null \
+        || return 1
+    printf '2026-06-05T09:03:00 INFO socket wal check\n' | records > "$LOGPIPE"
+    store_has "socket wal check"
+}
+
 socket_intake_stop_removes_fifo() {
     systemctl stop "timberfs-log@$LOGINST.socket"
     # RemoveOnStop=yes drops the FIFO node from /run
@@ -584,6 +673,7 @@ run_test "socket intake: tmpfiles + drop-in, socket enabled, FIFO created" socke
 run_test "socket intake: records stream lands in the store" socket_intake_receives
 run_test "socket intake: producer survives a service restart" socket_intake_survives_restart
 run_test "socket intake: declared index maintained while live" socket_intake_index_maintained
+run_test "socket intake: wal declared, .sap live, intake unaffected" socket_intake_wal_declared_and_working
 run_test "socket intake: stop removes the FIFO" socket_intake_stop_removes_fifo
 
 # Fluentd Forward protocol intake (timberfs-forward.socket/.service): a hand-

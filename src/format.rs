@@ -33,6 +33,12 @@ pub const SEQ_EXT: &str = "seq";
 /// so `FileStore::open` can tell whether a crashed collapse's
 /// `fallocate(COLLAPSE_RANGE)` landed before reconciling the rings.
 pub const TRIM_EXT: &str = "trim";
+/// The write-ahead sidecar (sap.rs): raw copies of appended entries,
+/// fsynced ahead of the chunk that eventually compresses them — the
+/// durability point for a `"wal": true` store. `.seal` is the mid-flush
+/// handoff name (store.rs's seal-and-swap).
+pub const SAP_EXT: &str = "sap";
+pub const SAP_SEAL_EXT: &str = "sap.seal";
 
 pub fn trunk_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{TRUNK_EXT}"))
@@ -56,6 +62,14 @@ pub fn seq_path(dir: &Path, name: &str) -> PathBuf {
 
 pub fn trim_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{TRIM_EXT}"))
+}
+
+pub fn sap_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.{SAP_EXT}"))
+}
+
+pub fn sap_seal_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.{SAP_SEAL_EXT}"))
 }
 
 /// One chunk: a contiguous run of appended bytes, compressed as a single

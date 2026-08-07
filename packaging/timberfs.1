@@ -125,6 +125,17 @@ maintains the
 automatically (extended incrementally for new chunks, rebuilt if it went
 missing \(em say, dropped by rotation or retention), so there is no
 per-import flag to forget.
+.B \-\-wal
+declares the write-ahead sidecar
+.RB ( .sap ):
+every streaming writer fsyncs it once a second, shrinking a crash's data
+loss from
+.B \-\-flush\-age
+down to that tick, at the cost of writing appended bytes twice (raw to
+the sidecar, compressed into the eventual chunk). A property of the
+store, like
+.BR \-\-index :
+declared once, every later writer honors it with no flag.
 .B \-\-set
 .I KEY=VALUE
 records free-form provenance
@@ -175,7 +186,8 @@ manifest \(em validated and atomic, which hand-editing the JSON is
 neither. Known settings are parse-checked
 .RB ( retain =90d,
 .BR retain_size =50G,
-.BR index =true|false);
+.BR index =true|false,
+.BR wal =true|false);
 anything else is free-form provenance
 .RB ( host =...).
 .B \-\-unset
@@ -192,6 +204,12 @@ means restarting whatever pipes into it. A manifest that stops parsing
 mid-flight (a bad hand-edit) keeps the writer alive on its last good
 policy, with one warning: never silently unbounded, never a dead
 producer.
+.B wal
+is the one exception: it is read once, when a writer opens the store, so
+.B timberfs set backing/app.log wal=true
+takes effect for the
+.I next
+writer, not one already running.
 .SS append
 .B timberfs append \-\-into
 .I DEST
@@ -241,6 +259,13 @@ and
 options as
 .BR mount ,
 plus:
+.TP
+.B \-\-wal
+Declare the write-ahead sidecar
+.RB ( .sap ,
+see
+.BR create ).
+Takes effect for this run immediately (declared before the store opens).
 .TP
 .BI \-\-retain " DURATION"
 Continuously drop data older than
@@ -376,6 +401,13 @@ token index \(em needed once per log (the declaration persists in the
 manifest; see
 .BR create ),
 after which every import maintains the index automatically.
+.B \-\-wal
+declares the write-ahead sidecar for future writers of this log \(em a
+batch import has no live unflushed tail of its own to protect, so this
+only sets the property for the next
+.B append
+or
+.B mount .
 .PP
 Re-importing is idempotent: a non-empty destination is treated as a
 checkpoint. The already-imported bytes are verified against the same
@@ -418,7 +450,11 @@ suffice to recover one:
 (a pair tarred by hand follows the same convention). Export always
 creates; merging into an existing log is
 .BR import 's
-job.
+job. A bundle never carries a
+.B .sap
+sidecar even when the source has
+.B wal
+declared \(em it is live writer state, not archive content.
 .PP
 A window that selects nothing still exports: an empty artifact whose bark
 records the requested window is evidence of absence (\(lqSaturday was
@@ -569,10 +605,15 @@ declared provenance, logical size vs on-disk size and compression
 ratio, the time span covered and its duration, index sizes with grain
 .B coverage
 (a grain lagging its log \(em appender writes, partial extends \(em
-covers fewer chunks than the rings; the gap is scanned), and the writer
-state (none / active appender or import / mounted, probed from the
-actual flocks, never from stale lock-file contents). Works identically
-on backing pairs and read-only
+covers fewer chunks than the rings; the gap is scanned), whether
+.B wal
+is declared and how many bytes currently sit in its
+.B .sap
+sidecar unflushed (a read-only stat \(em never replayed by
+.BR info ),
+and the writer state (none / active appender or import / mounted, probed
+from the actual flocks, never from stale lock-file contents). Works
+identically on backing pairs and read-only
 .B .timber
 bundles.
 .B \-\-json
@@ -987,6 +1028,24 @@ overwritten.
 .BR fsync (2)
 through the mount flushes the buffer as a chunk and syncs both backing
 files.
+.PP
+When
+.B wal
+is declared (see
+.BR create ),
+a third file,
+.IB name .sap ,
+holds every appended entry raw (u32 length, u64 write-from, u64
+write-to, the payload, a trailing crc32), fsynced once a second \(em the
+durability point, independent of the chunk flush schedule. It holds the
+same bytes as the in-memory buffer by construction, is written but never
+read except once, by a writer reopening the store after a crash; a mid-
+flush crash is resolved by comparing the sidecar's recorded
+.I base
+(the trunk size when it was created) against the trunk's current size.
+Readers never see it; the still-buffered tail stays visible only through
+the mount, exactly as without
+.BR \-\-wal .
 .PP
 The daemon holds an exclusive
 .BR flock (2)

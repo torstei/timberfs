@@ -27,6 +27,7 @@ pass its own paths.
     <instance>.log.rings                    the write-time index (per-chunk time bounds)
     <instance>.log.grain                    optional token index (present with --index)
     <instance>.log.bark                     JSON manifest: durable identity + retention
+    <instance>.log.sap                      optional write-ahead sidecar (present with --wal)
     <instance>.log.lock                     the store's writer lock
   .timberfs.lock                            the directory lock (see Locking)
 
@@ -192,6 +193,15 @@ ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade \
 # timberfs-log@applogs.socket — let the producer's group write the FIFO
 [Socket]
 SocketGroup=applog
+```
+
+```ini
+# timberfs-log@applogs.service — opt into the write-ahead sidecar: a crash
+# then loses at most ~1s of intake instead of up to --flush-age
+[Service]
+ExecStart=
+ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade --wal \
+    --into /var/log/timberfs/%i/%i.log
 ```
 
 ```ini
