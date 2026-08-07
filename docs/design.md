@@ -98,8 +98,11 @@ included" note in `query`'s output stays true regardless of `--wal`.
 On disk:
 
 ```
-segment header (16 bytes): magic "SAP00001" (8) + u64 LE base
+segment header (24 bytes): magic "SAP00001" (8) + u64 LE base + u64 LE uncomp_base
   base = the trunk's comp_size when this segment was created
+  uncomp_base = the store's logical (uncompressed) position at the same
+  moment — the segment's address in the uncompressed stream, readable
+  without a rings lookup
 
 record: u32 LE len | u64 LE wf | u64 LE wl | len payload bytes | u32 LE crc32
   crc32 (standard zlib/gzip polynomial 0xEDB88320) covers the 20-byte
@@ -116,8 +119,8 @@ the live sap (its content equals the buffer about to be flushed), (2) rename
 it to `<name>.sap.seal`, (3) append the compressed frame, write the rings
 record, and (for a wal store specifically) fsync both — a plain,
 undeclared store still does none of that per-flush fsync, unchanged from
-today, (4) create a fresh `<name>.sap` with `base` set to the new
-`comp_size`, (5) unlink the seal. Because every flush rotates the segment, a
+today, (4) create a fresh `<name>.sap` with its bases set to the new
+`comp_size` and logical position, (5) unlink the seal. Because every flush rotates the segment, a
 segment's lifetime spans exactly one chunk cycle, and its eventual flush
 lands its frame at exactly its `base` — which is what makes recovery
 decidable. An empty buffer never touches the sap at all.
@@ -140,9 +143,11 @@ and not recreated.
 Two operations move `comp_size` without ever touching the buffer or the
 sap's entries: `append_frames` (verbatim chunk merges — rotation, `import`'s
 timberfs-source path) and the retention/rotation head trims
-(`remove_head`/`collapse_head`). Both refresh the live segment's `base`
-header in place immediately afterward, so a `base`-vs-`comp_size` comparison
-on a later crash still tells the truth. Staged/atomic delivery (`import
+(`remove_head`/`collapse_head`). Both refresh the live segment's base
+headers in place immediately afterward, so a `base`-vs-`comp_size` comparison
+on a later crash still tells the truth; and writer-open re-stamps a resumed
+segment's bases from the store whenever they disagree (the header is a
+witness, the store is the truth), closing the crash-inside-a-refresh window. Staged/atomic delivery (`import
 --records`, and the staging machinery generally) bypasses the sap
 completely — nothing is durable, or even visible, before commit, by design,
 so there is nothing for a wal to add.
@@ -151,6 +156,18 @@ so there is nothing for a wal to add.
 (deleted, renamed, or reset to an empty base-0 segment, respectively); a
 `.timber` bundle never includes it — it is live writer state, not archive
 content.
+
+Four properties above are **load-bearing for the planned live-tail reader**
+(a future `--follow` that tails the sap for sub-second responsiveness) and
+must not be weakened by refactors: (1) a segment's content is exactly the
+next chunk's bytes, so the trunk and the sap are interchangeable sources
+per segment and a reader keyed on logical position can never double-emit or
+gap; (2) the swap is a rename — a reader's open fd never sees bytes mutate
+or truncate in steady state, and the inode change plus the new header are
+the generation marker; (3) the frame and rings are durable before a fresh
+`.sap` exists, so any visible segment is always resolvable against the
+index; (4) the header's `uncomp_base` locates a segment in the uncompressed
+stream on its own, giving a reader an anchor that is valid even mid-rebase.
 
 ### The .bark manifest
 

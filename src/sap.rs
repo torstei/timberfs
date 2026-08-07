@@ -15,11 +15,16 @@
 //!
 //! On disk:
 //!
-//!   segment header (16 bytes): magic "SAP00001" (8) + u64 LE `base`,
-//!   the trunk's compressed size (`comp_size`) when this segment was
-//!   created — the value a `.sap.seal`'s crash reconciliation compares
-//!   against the CURRENT `comp_size` to tell a landed flush from one that
-//!   never happened (store.rs).
+//!   segment header (24 bytes): magic "SAP00001" (8) + u64 LE `base` +
+//!   u64 LE `uncomp_base`. `base` is the trunk's compressed size
+//!   (`comp_size`) when this segment was created — the value a
+//!   `.sap.seal`'s crash reconciliation compares against the CURRENT
+//!   `comp_size` to tell a landed flush from one that never happened
+//!   (store.rs). `uncomp_base` is the store's logical (uncompressed)
+//!   position at the same moment (`buffer_start`): it locates the segment
+//!   in the uncompressed stream without a rings lookup — a recovery
+//!   cross-check today, and the planned live-tail reader's realignment
+//!   anchor.
 //!
 //!   record: u32 LE len | u64 LE wf | u64 LE wl | `len` payload bytes |
 //!   u32 LE crc32 — crc32 (polynomial 0xEDB88320, the standard zlib/gzip
@@ -37,7 +42,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 pub const SAP_MAGIC: &[u8; 8] = b"SAP00001";
-pub const HEADER_LEN: u64 = 16;
+pub const HEADER_LEN: u64 = 24;
 /// len(4) + wf(8) + wl(8), not counting the payload or the trailing crc32.
 const RECORD_HEADER_LEN: usize = 20;
 
@@ -75,10 +80,11 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-fn header_bytes(base: u64) -> [u8; HEADER_LEN as usize] {
+fn header_bytes(base: u64, uncomp_base: u64) -> [u8; HEADER_LEN as usize] {
     let mut h = [0u8; HEADER_LEN as usize];
     h[..8].copy_from_slice(SAP_MAGIC);
     h[8..16].copy_from_slice(&base.to_le_bytes());
+    h[16..24].copy_from_slice(&uncomp_base.to_le_bytes());
     h
 }
 
@@ -102,7 +108,7 @@ pub struct SapEntry {
 }
 
 /// Parse the longest valid prefix of records out of `buf` (the file's
-/// content AFTER the 16-byte header). Stops at EOF, a short/torn record,
+/// content AFTER the header). Stops at EOF, a short/torn record,
 /// or the first CRC mismatch. Returns the entries and how many bytes of
 /// `buf` they occupy — the caller truncates the file to
 /// `HEADER_LEN + that` before resuming appends.
@@ -136,12 +142,13 @@ fn parse_records(buf: &[u8]) -> (Vec<SapEntry>, usize) {
     (entries, off)
 }
 
-/// The result of replaying a sap (or seal) file: its declared `base`, the
+/// The result of replaying a sap (or seal) file: its declared bases, the
 /// entries recovered from its longest valid prefix, and the byte length
 /// of that valid prefix (header included) — what the file should be
 /// truncated to before it is resumed.
 pub struct SapReplay {
     pub base: u64,
+    pub uncomp_base: u64,
     pub entries: Vec<SapEntry>,
     pub valid_len: u64,
 }
@@ -167,47 +174,52 @@ pub fn replay(path: &Path) -> io::Result<Option<SapReplay>> {
         return Ok(None);
     }
     let base = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let uncomp_base = u64::from_le_bytes(buf[16..24].try_into().unwrap());
     let (entries, body_len) = parse_records(&buf[HEADER_LEN as usize..]);
     Ok(Some(SapReplay {
         base,
+        uncomp_base,
         entries,
         valid_len: HEADER_LEN + body_len as u64,
     }))
 }
 
 /// A live write-ahead segment: a buffered, appendable file plus the
-/// `base` (trunk `comp_size`) it was created at. The buffer and this
+/// bases (trunk `comp_size` and logical `buffer_start`) it was created
+/// at. The buffer and this
 /// file hold the same bytes by construction — every write here mirrors
 /// one to the in-memory buffer (store.rs's `append_windowed`).
 pub struct Sap {
     writer: BufWriter<File>,
     base: u64,
+    uncomp_base: u64,
 }
 
 impl Sap {
     /// Start a fresh, empty segment at `path` (truncating anything that
     /// was there — the caller has already dealt with a prior segment,
     /// e.g. sealing it).
-    pub fn create(path: &Path, base: u64) -> io::Result<Sap> {
+    pub fn create(path: &Path, base: u64, uncomp_base: u64) -> io::Result<Sap> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)?;
-        file.write_all_at(&header_bytes(base), 0)?;
+        file.write_all_at(&header_bytes(base, uncomp_base), 0)?;
         let mut file = file;
         file.seek(SeekFrom::Start(HEADER_LEN))?;
         Ok(Sap {
             writer: BufWriter::new(file),
             base,
+            uncomp_base,
         })
     }
 
     /// Resume an existing segment whose valid prefix is `valid_len` bytes
     /// (header included) — the file is truncated to that (dropping any
     /// torn tail) and appends continue from there.
-    pub fn resume(path: &Path, base: u64, valid_len: u64) -> io::Result<Sap> {
+    pub fn resume(path: &Path, base: u64, uncomp_base: u64, valid_len: u64) -> io::Result<Sap> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         file.set_len(valid_len)?;
         let mut file = file;
@@ -215,11 +227,16 @@ impl Sap {
         Ok(Sap {
             writer: BufWriter::new(file),
             base,
+            uncomp_base,
         })
     }
 
     pub fn base(&self) -> u64 {
         self.base
+    }
+
+    pub fn uncomp_base(&self) -> u64 {
+        self.uncomp_base
     }
 
     /// Mirror one append into the sap.
@@ -235,19 +252,22 @@ impl Sap {
         self.writer.get_ref().sync_all()
     }
 
-    /// Refresh this segment's `base` header in place, for the rare case
-    /// where the trunk's `comp_size` moves without a flush of THIS
+    /// Refresh this segment's base headers in place, for the rare case
+    /// where the store's coordinates move without a flush of THIS
     /// segment — `append_frames` (verbatim chunk merge) and
     /// retention/rotation's head trims (`remove_head`/`collapse_head`)
-    /// all change `comp_size` directly. `write_all_at` on a file NOT
+    /// all change `comp_size` (and the head trims `buffer_start` too)
+    /// directly. `write_all_at` on a file NOT
     /// opened with O_APPEND is a real pwrite at the given offset (unlike
     /// O_APPEND fds, where Linux ignores the offset and always appends),
     /// so this never disturbs the writer's own append position.
-    pub fn refresh_base(&mut self, new_base: u64) -> io::Result<()> {
+    pub fn refresh_base(&mut self, new_base: u64, new_uncomp: u64) -> io::Result<()> {
         self.base = new_base;
-        self.writer
-            .get_ref()
-            .write_all_at(&new_base.to_le_bytes(), 8)?;
+        self.uncomp_base = new_uncomp;
+        let mut both = [0u8; 16];
+        both[..8].copy_from_slice(&new_base.to_le_bytes());
+        both[8..].copy_from_slice(&new_uncomp.to_le_bytes());
+        self.writer.get_ref().write_all_at(&both, 8)?;
         self.writer.get_ref().sync_all()
     }
 }
@@ -289,11 +309,15 @@ mod tests {
 
     #[test]
     fn header_roundtrips() {
-        let h = header_bytes(0x1122_3344_5566_7788);
+        let h = header_bytes(0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00);
         assert_eq!(&h[..8], SAP_MAGIC);
         assert_eq!(
             u64::from_le_bytes(h[8..16].try_into().unwrap()),
             0x1122_3344_5566_7788
+        );
+        assert_eq!(
+            u64::from_le_bytes(h[16..24].try_into().unwrap()),
+            0x99AA_BBCC_DDEE_FF00
         );
     }
 
@@ -362,7 +386,7 @@ mod tests {
     fn create_then_replay_roundtrips() {
         let dir = TempDir::new();
         let p = dir.path().join("x.sap");
-        let mut sap = Sap::create(&p, 42).unwrap();
+        let mut sap = Sap::create(&p, 42, 7).unwrap();
         sap.append(1, 2, b"one").unwrap();
         sap.append(3, 4, b"two").unwrap();
         sap.sync().unwrap();
@@ -370,6 +394,7 @@ mod tests {
 
         let replayed = replay(&p).unwrap().unwrap();
         assert_eq!(replayed.base, 42);
+        assert_eq!(replayed.uncomp_base, 7);
         assert_eq!(replayed.entries.len(), 2);
         assert_eq!(replayed.entries[0].payload, b"one");
         assert_eq!(replayed.entries[1].payload, b"two");
@@ -381,7 +406,7 @@ mod tests {
         let dir = TempDir::new();
         let p = dir.path().join("x.sap");
         {
-            let mut sap = Sap::create(&p, 0).unwrap();
+            let mut sap = Sap::create(&p, 0, 0).unwrap();
             sap.append(1, 1, b"first").unwrap();
             sap.sync().unwrap();
         }
@@ -392,7 +417,8 @@ mod tests {
 
         let replayed = replay(&p).unwrap().unwrap();
         assert_eq!(replayed.entries.len(), 1);
-        let mut sap = Sap::resume(&p, replayed.base, replayed.valid_len).unwrap();
+        let mut sap =
+            Sap::resume(&p, replayed.base, replayed.uncomp_base, replayed.valid_len).unwrap();
         assert_eq!(fs::metadata(&p).unwrap().len(), replayed.valid_len);
         sap.append(2, 2, b"second").unwrap();
         sap.sync().unwrap();
@@ -407,14 +433,15 @@ mod tests {
     fn refresh_base_does_not_disturb_appends() {
         let dir = TempDir::new();
         let p = dir.path().join("x.sap");
-        let mut sap = Sap::create(&p, 100).unwrap();
+        let mut sap = Sap::create(&p, 100, 1000).unwrap();
         sap.append(1, 1, b"a").unwrap();
-        sap.refresh_base(200).unwrap();
+        sap.refresh_base(200, 2000).unwrap();
         sap.append(2, 2, b"b").unwrap();
         sap.sync().unwrap();
 
         let replayed = replay(&p).unwrap().unwrap();
         assert_eq!(replayed.base, 200);
+        assert_eq!(replayed.uncomp_base, 2000);
         assert_eq!(replayed.entries.len(), 2);
         assert_eq!(replayed.entries[0].payload, b"a");
         assert_eq!(replayed.entries[1].payload, b"b");

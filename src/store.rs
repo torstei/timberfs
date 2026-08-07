@@ -505,7 +505,21 @@ impl FileStore {
                 &mut buffer_last_ms,
             );
             if wal_declared {
-                wal = Some(sap::Sap::resume(&sap_p, live.base, live.valid_len)?);
+                let mut live_sap =
+                    sap::Sap::resume(&sap_p, live.base, live.uncomp_base, live.valid_len)?;
+                // The header is a witness, the store is the truth: bases
+                // left stale by a crash inside a refresh (append_frames or
+                // a head trim) are re-stamped here, not trusted.
+                if live.base != comp_size || live.uncomp_base != buffer_start {
+                    eprintln!(
+                        "timberfs: {name}: the sap's recorded bases ({}, {}) disagree \
+                         with the store ({comp_size}, {buffer_start}); trusting the \
+                         store and refreshing the header",
+                        live.base, live.uncomp_base
+                    );
+                    live_sap.refresh_base(comp_size, buffer_start)?;
+                }
+                wal = Some(live_sap);
             } else {
                 // "set wal=false" with a leftover sap: the entries above
                 // are already folded into the buffer (preserved), so it's
@@ -513,7 +527,7 @@ impl FileStore {
                 let _ = fs::remove_file(&sap_p);
             }
         } else if wal_declared {
-            wal = Some(sap::Sap::create(&sap_p, comp_size)?);
+            wal = Some(sap::Sap::create(&sap_p, comp_size, buffer_start)?);
         }
 
         Ok(FileStore {
@@ -698,7 +712,7 @@ impl FileStore {
             // already safely in the trunk. Degrade instead: drop the wal
             // for this run (recovered on the next open, once the
             // transient error — almost certainly ENOSPC — has passed).
-            match sap::Sap::create(&sap_p, self.comp_size) {
+            match sap::Sap::create(&sap_p, self.comp_size, self.buffer_start) {
                 Ok(fresh) => self.wal = Some(fresh),
                 Err(e) => {
                     eprintln!(
@@ -798,7 +812,7 @@ impl FileStore {
         self.cache = None;
         let _ = fs::remove_file(format::sap_seal_path(dir, name));
         if self.wal.is_some() {
-            self.wal = Some(sap::Sap::create(&format::sap_path(dir, name), 0)?);
+            self.wal = Some(sap::Sap::create(&format::sap_path(dir, name), 0, 0)?);
         }
         Ok(())
     }
@@ -889,13 +903,13 @@ impl FileStore {
         self.rings.sync_all()?;
         // append_frames copies compressed frames directly and never
         // touches the buffer (the flush_chunk call above already emptied
-        // it), so the sap itself has nothing new to record — but its
-        // `base` header, minted at the trunk's comp_size when the segment
-        // was created, is now stale: comp_size just moved without a flush
-        // of this segment. Refresh it so a later seal's landed/never-landed
+        // it), so the sap itself has nothing new to record — but its base
+        // headers, minted at the store's coordinates when the segment
+        // was created, are now stale: both moved without a flush
+        // of this segment. Refresh them so a later seal's landed/never-landed
         // comparison stays correct.
         if let Some(wal) = &mut self.wal {
-            wal.refresh_base(self.comp_size)?;
+            wal.refresh_base(self.comp_size, self.buffer_start)?;
         }
         Ok(())
     }
@@ -967,10 +981,10 @@ impl FileStore {
         self.cache = None;
         // Retention/rotation touch only already-flushed chunks — the
         // buffer (and thus the sap's entries) are untouched — but this
-        // just moved comp_size out from under the sap's `base`, same as
-        // append_frames: refresh it.
+        // just moved both coordinates out from under the sap's bases, same
+        // as append_frames: refresh them.
         if let Some(wal) = &mut self.wal {
-            wal.refresh_base(self.comp_size)?;
+            wal.refresh_base(self.comp_size, self.buffer_start)?;
         }
         Ok(())
     }
@@ -1135,7 +1149,7 @@ impl FileStore {
         // here only risks a spurious "external damage" warning on a very
         // narrow future crash window, never data loss (replay still wins).
         if let Some(wal) = &mut self.wal {
-            if let Err(e) = wal.refresh_base(self.comp_size) {
+            if let Err(e) = wal.refresh_base(self.comp_size, self.buffer_start) {
                 eprintln!(
                     "timberfs: {name}: refreshing the wal segment's base after collapse \
                      failed ({e}); harmless unless a crash lands before the next flush"
@@ -1978,7 +1992,7 @@ mod tests {
         write_one_chunk(dir.path(), name, b"hello\n", 10, 10);
         crate::bark::declare_wal(dir.path(), name).unwrap();
         // base(0) < the trunk's actual comp_size => the flush landed.
-        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 0).unwrap();
+        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 0, 0).unwrap();
         sap.append(10, 10, b"hello\n").unwrap();
         sap.sync().unwrap();
         drop(sap);
@@ -2008,7 +2022,7 @@ mod tests {
         write_empty_pair(dir.path(), name);
         crate::bark::declare_wal(dir.path(), name).unwrap();
         // base == comp_size (both 0): the flush was staged but never landed.
-        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 0).unwrap();
+        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 0, 0).unwrap();
         sap.append(5, 5, b"abc").unwrap();
         sap.append(6, 7, b"def").unwrap();
         sap.sync().unwrap();
@@ -2040,7 +2054,7 @@ mod tests {
         crate::bark::declare_wal(dir.path(), name).unwrap();
         // base(100) > comp_size(0): the trunk shrank underneath the seal
         // (external damage) — still replay rather than lose the entries.
-        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 100).unwrap();
+        let mut sap = sap::Sap::create(&format::sap_path(dir.path(), name), 100, 0).unwrap();
         sap.append(1, 1, b"x").unwrap();
         sap.sync().unwrap();
         drop(sap);
@@ -2156,10 +2170,11 @@ mod tests {
 
         f.append_frames(&src_trunk, &[rec], &cfg).unwrap();
 
-        // append_frames bumps comp_size directly (never through the
-        // buffer), so the sap's base — stale at 0 — must be refreshed to
+        // append_frames bumps both coordinates directly (never through the
+        // buffer), so the sap's bases — stale at 0 — must be refreshed to
         // match, or a later seal's landed/never-landed comparison lies.
         assert_eq!(f.wal.as_ref().unwrap().base(), f.comp_size);
+        assert_eq!(f.wal.as_ref().unwrap().uncomp_base(), f.buffer_start);
         assert!(f.comp_size > 0);
     }
 
@@ -2183,6 +2198,11 @@ mod tests {
             f.wal.as_ref().unwrap().base(),
             f.comp_size,
             "the sap's base must track comp_size after a head trim"
+        );
+        assert_eq!(
+            f.wal.as_ref().unwrap().uncomp_base(),
+            f.buffer_start,
+            "the sap's logical base must track buffer_start after a head trim"
         );
     }
 }
