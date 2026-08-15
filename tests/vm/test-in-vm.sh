@@ -584,40 +584,73 @@ run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
 grain_rebase_survives_repeated_head_drops() {
-    # The grain is POSITIONAL — record i is chunk i — so every retention
-    # head-drop renumbers it. It is trimmed by the same prefix rather than
-    # rebuilt; this is the test that the trim lands on a record boundary
-    # every time, across many drops and on the real filesystem (tmpfs has
-    # no COLLAPSE_RANGE, so only here does the collapse path run).
-    # A misalignment shows up as a FALSE NEGATIVE, so the oracle is a full
-    # scan: --has must find everything grep finds.
+    # The grain is POSITIONAL — record i is chunk i — so a retention
+    # head-drop renumbers it. It is trimmed by the same prefix instead of
+    # being rebuilt; this is the test that the trim lands on a record
+    # boundary, on a real filesystem (tmpfs has no COLLAPSE_RANGE, so only
+    # here does the collapse path run). A misalignment shows up as a FALSE
+    # NEGATIVE, so the oracle is a full scan.
+    #
+    # Two phases, because "trimmed, not rebuilt" is only guaranteed when
+    # the grain reaches at least as far as the drop: a writer that outruns
+    # the once-a-second indexing tick can produce a drop bigger than the
+    # grain's coverage, which is legitimately a delete-and-rebuild. Phase 1
+    # writes with NO retention, so its shutdown leaves a grain covering
+    # every chunk; phase 2 then declares the budget, and the catch-up drop
+    # at its startup is necessarily within that coverage.
     timberfs create --index "$PIPE_BACKING/reb.log" > /dev/null || return 1
     python3 -c "
 import datetime
 d = datetime.datetime(2026, 6, 7, 10, 0, 0)
-for i in range(600000):
+for i in range(300000):
     ts = (d + datetime.timedelta(seconds=i)).isoformat()
     print(f'{ts} INFO work {i} UNIQ{i:06d}')
-" | timberfs append --into "$PIPE_BACKING/reb.log" --chunk-size 8192 \
-        --retain-size 300K 2> /tmp/reb.err || return 1
-    grep -q 'retention dropped' /tmp/reb.err || return 1
-
-    # Whatever survived retention must be findable THROUGH the index.
-    timberfs query "$PIPE_BACKING/reb.log" --no-filename 2>/dev/null \
-        | awk '{print $NF}' | grep '^UNIQ' > /tmp/reb.all || return 1
-    for TOK in $(shuf -n 40 /tmp/reb.all); do
-        timber-filter --has "$TOK" "$PIPE_BACKING/reb.log" 2>/dev/null \
-            | grep -q "$TOK" || return 1
-    done
-    # And the index still spans the whole store, having never been rebuilt
-    # from scratch after the first build.
-    timberfs info --json "$PIPE_BACKING/reb.log" \
-        | python3 -c "
+" | timberfs append --into "$PIPE_BACKING/reb.log" --chunk-size 8192 2> /tmp/reb1.err \
+        || { tail -5 /tmp/reb1.err; return 1; }
+    timberfs info --json "$PIPE_BACKING/reb.log" | python3 -c "
 import json,sys
 i = json.load(sys.stdin)
-sys.exit(0 if i['grain_chunks'] == i['chunks'] else 1)
+if i['grain_chunks'] != i['chunks'] or i['chunks'] < 10:
+    sys.exit(f\"phase 1 left {i['grain_chunks']}/{i['chunks']} chunks indexed\")
 " || return 1
-    [ "$(grep -c 'timberfs: indexed .* chunk' /tmp/reb.err)" -le 1 ]
+
+    # Phase 2: a budget the store is already far over, so retention cuts a
+    # large prefix out from under a COMPLETE grain — the rebase path.
+    timberfs set "$PIPE_BACKING/reb.log" retain_size=300K > /dev/null || return 1
+    python3 -c "
+import datetime
+d = datetime.datetime(2026, 6, 8, 10, 0, 0)
+for i in range(20000):
+    ts = (d + datetime.timedelta(seconds=i)).isoformat()
+    print(f'{ts} INFO later {i} LATER{i:06d}')
+" | timberfs append --into "$PIPE_BACKING/reb.log" --chunk-size 8192 2> /tmp/reb2.err \
+        || { tail -5 /tmp/reb2.err; return 1; }
+    grep -q 'retention dropped' /tmp/reb2.err || {
+        echo "no head-drop happened; phase 2 log:"; tail -5 /tmp/reb2.err; return 1
+    }
+    # Trimmed, not rebuilt: a full build announces itself as "indexed N
+    # chunk(s)", and phase 2 must contain none.
+    if grep -q 'timberfs: indexed .* chunk' /tmp/reb2.err; then
+        echo "the grain was REBUILT after a head-drop, not trimmed:"
+        grep 'timberfs: indexed .* chunk\|retention dropped' /tmp/reb2.err
+        return 1
+    fi
+
+    # Whatever survived must still be findable THROUGH the index, and the
+    # index must span the whole store.
+    timberfs query "$PIPE_BACKING/reb.log" --no-filename 2>/dev/null \
+        | awk '{print $NF}' | grep -E '^(UNIQ|LATER)' > /tmp/reb.all || return 1
+    [ "$(wc -l < /tmp/reb.all)" -gt 100 ] || { echo "too few survivors to sample"; return 1; }
+    for TOK in $(shuf -n 40 /tmp/reb.all); do
+        timber-filter --has "$TOK" "$PIPE_BACKING/reb.log" 2>/dev/null \
+            | grep -q "$TOK" || { echo "FALSE NEGATIVE for $TOK"; return 1; }
+    done
+    timberfs info --json "$PIPE_BACKING/reb.log" | python3 -c "
+import json,sys
+i = json.load(sys.stdin)
+if i['grain_chunks'] != i['chunks']:
+    sys.exit(f\"index covers {i['grain_chunks']} of {i['chunks']} chunks\")
+"
 }
 
 run_test "appender: maintains a declared grain, no reindex" appender_maintains_grain
