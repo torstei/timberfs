@@ -58,7 +58,7 @@ fn write_seq(dir: &Path, name: &str, v: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn fstatvfs_bsize(f: &File) -> io::Result<u64> {
+pub(crate) fn fstatvfs_bsize(f: &File) -> io::Result<u64> {
     unsafe {
         let mut st: libc::statvfs = std::mem::zeroed();
         if libc::fstatvfs(f.as_raw_fd(), &mut st) != 0 {
@@ -971,11 +971,26 @@ impl FileStore {
             let _ = fs::remove_file(&rings_tmp);
             return Err(e);
         }
+        // Odd for the same reason as collapse_head's window, though this
+        // path swaps whole inodes rather than mutating in place: the rings
+        // and the positional grain are renumbered together, and a reader
+        // that sampled one before and the other after would pair two
+        // numberings and skip chunks. It has no .trim marker to reconcile
+        // from, so a crash inside the window leaves the counter odd until
+        // the next writer opens the store — the same as a crash mid-
+        // collapse, and readers retry rather than read stale offsets.
+        let seq0 = read_seq(dir, name);
+        let _ = write_seq(dir, name, seq0 + 1);
         fs::rename(&trunk_tmp, &trunk_p)?;
         fs::rename(&rings_tmp, &rings_p)?;
-        // Sidecar contract: a rings rewrite invalidates chunk numbering,
-        // so derived indexes are deleted (rebuild with `timberfs reindex`).
-        let _ = fs::remove_file(format::grain_path(dir, name));
+        if let Err(e) = crate::grain::rebase_head(dir, name, k) {
+            eprintln!(
+                "timberfs: {name}: rebasing the token index after a head-drop failed \
+                 ({e}); dropping it — the next write rebuilds it"
+            );
+            let _ = fs::remove_file(format::grain_path(dir, name));
+        }
+        let _ = write_seq(dir, name, seq0 + 2);
         self.trunk = OpenOptions::new().read(true).write(true).open(&trunk_p)?;
         self.rings = OpenOptions::new().read(true).write(true).open(&rings_p)?;
         self.chunks.drain(..k);
@@ -1113,6 +1128,18 @@ impl FileStore {
             );
             std::process::exit(1);
         }
+        // The grain is positional, so the rebased rings just renumbered
+        // every filter: drop its first k records to match. INSIDE the odd
+        // seqlock window, with the rings rename above — the two must never
+        // be observable apart, or a reader pairs one numbering with the
+        // other and skips chunks it should have read.
+        if let Err(e) = crate::grain::rebase_head(dir, name, k) {
+            eprintln!(
+                "timberfs: {name}: rebasing the token index after a head-drop failed \
+                 ({e}); dropping it — the next write rebuilds it"
+            );
+            let _ = fs::remove_file(format::grain_path(dir, name));
+        }
         // Reset the seqlock to even BEFORE the .trim marker goes away: if
         // we die between here and the marker removal, the marker is still
         // there to make the next open's reconcile_trim finalize the
@@ -1126,9 +1153,6 @@ impl FileStore {
                  readers retry until the next collapse or reconcile"
             );
         }
-        // Sidecar contract: a rings rewrite invalidates chunk numbering,
-        // so derived indexes are deleted (rebuild with `timberfs reindex`).
-        let _ = fs::remove_file(format::grain_path(dir, name));
         let _ = fs::remove_file(&trim_p);
 
         self.rings = match OpenOptions::new().read(true).write(true).open(&rings_p) {

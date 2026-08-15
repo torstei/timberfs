@@ -301,18 +301,31 @@ append-only entry per chunk. Three rules:
 2. **Missing means scan.** A chunk without an index entry is "no
    information — scan it". Partial or lagging indexes degrade to
    conservative scans, never wrong answers; this is also the crash story.
-3. **Rings rewrites delete sidecars.** Any operation that rewrites the
-   `.rings` (rotation, retention head-drop) deletes the file's custom
-   indexes; `reindex` recreates them. No coordination logic, no corruption
-   class. (Prefix-trimming sidecars in the same pass is a later
-   optimization, since head-drops remove exactly a chunk prefix.)
+3. **Rings rewrites never leave a sidecar as it was.** A rewrite renumbers
+   chunks, and a positional sidecar left behind would then answer for the
+   wrong ones — a false negative, the one error class this design refuses.
+   A **head-drop** (retention, and rotation's source) removes exactly a
+   chunk *prefix*, so the sidecar is prefix-trimmed in the same pass:
+   `grain::rebase_head` drops its first `k` records with the same
+   `COLLAPSE_RANGE` the trunk uses, and records where the survivors now
+   start in the header. Nothing is decompressed and nothing is
+   re-tokenized, which matters because retention fires repeatedly and a
+   rebuild costs a read of the whole store. Any other rewrite deletes the
+   sidecar, and `reindex` recreates it.
+
+   The rebase happens inside the same seqlock window as the rings rebase,
+   because the two must never be observable apart: a reader that paired
+   filters from one generation with records from the other would skip
+   chunks that do match. Readers sample that seqlock when they open a
+   source and re-check it after loading the grain, dropping the grain (and
+   scanning) rather than trusting a mismatched pair.
 
 Consequences worth knowing: chunk size is an index-selectivity knob
-(smaller chunks → sharper lookups, more overhead), the grain lags a live
-appender until the next `reindex` (lagging entries just mean scanning
-those chunks), and `.timber` bundles carry no grain yet. A
+(smaller chunks → sharper lookups, more overhead), the grain trails a live
+writer by at most its once-a-second maintenance tick (lagging entries just
+mean scanning those chunks), and `.timber` bundles carry no grain yet. A
 chunk-sequence-number field in the rings header was considered to let
-sidecars survive head-drops without deletion, and rejected: rule 3 makes
-it unnecessary, and the on-disk format stays `RING0001`. (Logged-timestamp
+sidecars survive head-drops, and rejected: rule 3's prefix trim needs no
+identity per chunk, so the on-disk format stays `RING0001`. (Logged-timestamp
 zone maps, the other planned index family, became largely moot: import
 already writes logged time into the rings.)

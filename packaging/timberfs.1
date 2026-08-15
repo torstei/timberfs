@@ -124,12 +124,17 @@ makes an empty log with its properties declared up front in a
 manifest \(em one flat, optional, human-editable JSON object beside the
 pair.
 .B \-\-index
-declares the token index, database-style: once declared, EVERY import
+declares the token index, database-style: once declared, EVERY writer
 maintains the
 .B .grain
-automatically (extended incrementally for new chunks, rebuilt if it went
-missing \(em say, dropped by rotation or retention), so there is no
-per-import flag to forget.
+automatically \(em
+.BR import ,
+the appender, the mount and both network intakes alike \(em extending it
+incrementally for new chunks, trimming it by the same prefix when
+retention drops chunks off the head, and rebuilding it if it went missing
+(say, dropped by a rotation), so there is no per-write flag to forget. A streaming writer indexes on its once-a-second tick, so the
+grain trails the newest chunk by up to that tick; an uncovered chunk is
+scanned, never missed.
 .B \-\-wal
 declares the write-ahead sidecar
 .RB ( .sap ):
@@ -731,9 +736,12 @@ builds (or rebuilds) the
 token index for a log: one Bloom filter per chunk over every distinct
 token in it, ~10 bits per token, ~1% false positives \(em roughly 1\(en2%
 of the raw data size. Derived data under the sidecar contract: safe to
-delete, cheap to rebuild, and rotation/retention drop it (rebuild
-afterwards). A grain that lags a growing log is still correct \(em
-uncovered chunks are simply scanned.
+delete and cheap to rebuild, so nothing here can lose data. A retention
+head-drop does NOT drop it \(em the index is trimmed by the same chunk
+prefix the store was, without decompressing anything \(em but any other
+rewrite of the chunk numbering does, and this is how you get it back. A
+grain that lags a growing log is still correct \(em uncovered chunks are
+simply scanned.
 .SS rotate
 .B timberfs rotate \-\-cutoff
 .I TIME SOURCE

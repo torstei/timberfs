@@ -135,6 +135,14 @@ pub struct SourceHandle {
     pub records: Vec<ChunkRecord>,
     pub file: File,
     pub bark: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The store's seqlock as it stood just BEFORE these records were
+    /// read (`None` for a bundle, which nothing can collapse). The
+    /// .grain is positional, so a retention head-drop renumbers the rings
+    /// and the grain together; pairing records from one generation with
+    /// filters from the other would skip chunks that do match. Sampling
+    /// here — not at the grain load — is what makes the comparison in
+    /// `select_chunks` cover the rings read too.
+    pub seq_at_open: Option<u64>,
 }
 
 pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
@@ -187,6 +195,7 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
             records,
             file,
             bark,
+            seq_at_open: None,
         });
     }
     let (dir, base) = resolve_backing(input)?;
@@ -203,6 +212,7 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
             rings.display()
         );
     }
+    let seq_at_open = Some(crate::store::read_seq(&dir, &base));
     let records =
         format::read_index(&rings).with_context(|| format!("reading index {}", rings.display()))?;
     let file = File::open(format::trunk_path(&dir, &base))
@@ -212,6 +222,7 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
         records,
         file,
         bark,
+        seq_at_open,
     })
 }
 
@@ -305,6 +316,7 @@ fn read_chunk(
 pub fn select_chunks(
     file: &Path,
     chunks: &[ChunkRecord],
+    seq_at_open: Option<u64>,
     from_ms: u64,
     to_ms: u64,
     has: &[String],
@@ -338,7 +350,19 @@ pub fn select_chunks(
             None
         } else {
             let (dir, base) = resolve_backing(file)?;
-            crate::grain::load(&crate::format::grain_path(&dir, &base)).ok()
+            let g = crate::grain::load(&crate::format::grain_path(&dir, &base)).ok();
+            // Only trust it if the store has not been head-dropped since
+            // the records were read: a collapse renumbers rings and grain
+            // together, and either half alone answers for the wrong
+            // chunks. Odd = one is in flight. Dropping the grain costs a
+            // scan of the window; keeping a mismatched one would silently
+            // skip matching chunks, so this errs to the slow answer.
+            let after = crate::store::read_seq(&dir, &base);
+            match seq_at_open {
+                Some(before) if before == after && after.is_multiple_of(2) => g,
+                None => g,
+                _ => None,
+            }
         };
         // OR-of-ANDs: a chunk survives when the AND tokens are all
         // present AND (no alternatives, or at least one alternative's
@@ -495,6 +519,7 @@ fn query_entries(
         let (selected, _) = select_chunks(
             f,
             &source.records,
+            source.seq_at_open,
             from_ms.saturating_sub(WIDEN_MS),
             to_ms.saturating_add(WIDEN_MS),
             has,
@@ -526,7 +551,16 @@ fn query_entries(
         // Unfilterable + windowed: fall back to the UNWIDENED selection —
         // never both looser and unexplained.
         let selected = if window.is_none() && windowed {
-            select_chunks(f, &source.records, from_ms, to_ms, has, any)?.0
+            select_chunks(
+                f,
+                &source.records,
+                source.seq_at_open,
+                from_ms,
+                to_ms,
+                has,
+                any,
+            )?
+            .0
         } else {
             selected
         };
@@ -963,7 +997,15 @@ fn query_single(
     any: &[String],
 ) -> anyhow::Result<()> {
     let mut source = open_source(file)?;
-    let (selected, in_window) = select_chunks(file, &source.records, from_ms, to_ms, has, any)?;
+    let (selected, in_window) = select_chunks(
+        file,
+        &source.records,
+        source.seq_at_open,
+        from_ms,
+        to_ms,
+        has,
+        any,
+    )?;
     let total_chunks = source.records.len();
     let guard = seq_guard(file);
 
@@ -1020,7 +1062,15 @@ fn query_multi(
     let mut total_selected = 0usize;
     for f in files {
         let handle = open_source(f)?;
-        let (selected, _) = select_chunks(f, &handle.records, from_ms, to_ms, has, any)?;
+        let (selected, _) = select_chunks(
+            f,
+            &handle.records,
+            handle.seq_at_open,
+            from_ms,
+            to_ms,
+            has,
+            any,
+        )?;
         eprintln!(
             "timberfs: {}: {} of {} chunk(s)",
             f.display(),

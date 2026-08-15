@@ -583,8 +583,46 @@ run_test "appender: file lock blocks rotate while live" appender_lock_blocks_rot
 run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
+grain_rebase_survives_repeated_head_drops() {
+    # The grain is POSITIONAL — record i is chunk i — so every retention
+    # head-drop renumbers it. It is trimmed by the same prefix rather than
+    # rebuilt; this is the test that the trim lands on a record boundary
+    # every time, across many drops and on the real filesystem (tmpfs has
+    # no COLLAPSE_RANGE, so only here does the collapse path run).
+    # A misalignment shows up as a FALSE NEGATIVE, so the oracle is a full
+    # scan: --has must find everything grep finds.
+    timberfs create --index "$PIPE_BACKING/reb.log" > /dev/null || return 1
+    python3 -c "
+import datetime
+d = datetime.datetime(2026, 6, 7, 10, 0, 0)
+for i in range(600000):
+    ts = (d + datetime.timedelta(seconds=i)).isoformat()
+    print(f'{ts} INFO work {i} UNIQ{i:06d}')
+" | timberfs append --into "$PIPE_BACKING/reb.log" --chunk-size 8192 \
+        --retain-size 300K 2> /tmp/reb.err || return 1
+    grep -q 'retention dropped' /tmp/reb.err || return 1
+
+    # Whatever survived retention must be findable THROUGH the index.
+    timberfs query "$PIPE_BACKING/reb.log" --no-filename 2>/dev/null \
+        | awk '{print $NF}' | grep '^UNIQ' > /tmp/reb.all || return 1
+    for TOK in $(shuf -n 40 /tmp/reb.all); do
+        timber-filter --has "$TOK" "$PIPE_BACKING/reb.log" 2>/dev/null \
+            | grep -q "$TOK" || return 1
+    done
+    # And the index still spans the whole store, having never been rebuilt
+    # from scratch after the first build.
+    timberfs info --json "$PIPE_BACKING/reb.log" \
+        | python3 -c "
+import json,sys
+i = json.load(sys.stdin)
+sys.exit(0 if i['grain_chunks'] == i['chunks'] else 1)
+" || return 1
+    [ "$(grep -c 'timberfs: indexed .* chunk' /tmp/reb.err)" -le 1 ]
+}
+
 run_test "appender: maintains a declared grain, no reindex" appender_maintains_grain
 run_test "appender: grain stays correct across retention" appender_grain_survives_retention
+run_test "grain: rebased, not rebuilt, across repeated head-drops" grain_rebase_survives_repeated_head_drops
 run_test "wal: kill -9 after a sap-sync tick loses nothing, chunking intact" wal_kill9_durability
 run_test "collapse-head retention survives repeated kill -9" collapse_crash_kill_resilience
 run_test "info/query: read-only, work for a non-root reader" info_readonly_nonroot

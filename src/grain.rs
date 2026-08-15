@@ -11,13 +11,19 @@
 //! positives, and a false positive costs one needless chunk decompression.
 //!
 //! This is a sidecar under the contract in the README: derived and
-//! rebuildable (`timberfs reindex`), a chunk without an entry means "scan
-//! it", and any rings rewrite (rotation, retention) deletes the file.
+//! rebuildable (`timberfs reindex`), and a chunk without an entry means
+//! "scan it". A rings rewrite renumbers chunks, so it must not leave the
+//! file as it was: a head-drop (retention, rotation's source) rebases it
+//! to match, anything else deletes it.
 //!
 //! On disk: magic "GRAIN001", 16-byte header carrying the tokenizer and
 //! hash parameters, then per chunk (in rings order): u32 LE filter length
 //! in bytes, followed by the filter bits. Hashing is two-seed FNV-1a with
 //! Kirsch-Mitzenmacher double hashing — dependency-free and stable.
+//!
+//! A record carries no chunk id: its POSITION is the chunk index. That is
+//! what makes appending a chunk cost one appended record, and what makes a
+//! retention head-drop hostile — see `rebase_head`.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -30,6 +36,14 @@ use crate::format::{self};
 use crate::store;
 
 pub const GRAIN_MAGIC: &[u8; 8] = b"GRAIN001";
+/// As GRAIN001, but `header[12..16]` holds the byte offset of the first
+/// record, because a head-drop collapsed whole blocks off the front and
+/// left dead bytes behind them (`rebase_head`). Written ONLY there, so a
+/// grain that has never been head-dropped stays GRAIN001 byte for byte
+/// and an older binary keeps using it. Reading one of these with a
+/// GRAIN001-only binary fails the magic check, which means "no index,
+/// scan the chunks" — slower, never wrong.
+pub const GRAIN_MAGIC_V2: &[u8; 8] = b"GRAIN002";
 const HEADER_LEN: usize = 16;
 const K: u64 = 7;
 const MIN_TOKEN: usize = 3;
@@ -86,6 +100,59 @@ pub fn tokenize_query(arg: &str) -> Vec<Vec<u8>> {
     tokens
 }
 
+/// The 16-byte header for a grain whose records start at `first_rec`.
+/// `HEADER_LEN` (the never-rebased case) writes GRAIN001 with the offset
+/// field left zero, so such a file is byte-identical to what every
+/// previous release wrote.
+fn header_bytes(first_rec: usize) -> [u8; HEADER_LEN] {
+    let mut h = [0u8; HEADER_LEN];
+    if first_rec == HEADER_LEN {
+        h[..8].copy_from_slice(GRAIN_MAGIC);
+    } else {
+        h[..8].copy_from_slice(GRAIN_MAGIC_V2);
+        h[12..16].copy_from_slice(&(first_rec as u32).to_le_bytes());
+    }
+    h[8] = 0; // case folding: none
+    h[9] = MIN_TOKEN as u8;
+    h[10] = MAX_TOKEN as u8;
+    h[11] = K as u8;
+    h
+}
+
+/// Where this grain's records start, or None if `buf` is not a grain we
+/// understand — in which case the caller scans (readers) or rebuilds
+/// (writers), never guesses.
+fn first_record_offset(buf: &[u8]) -> Option<usize> {
+    if buf.len() < HEADER_LEN {
+        return None;
+    }
+    match &buf[..8] {
+        m if m == GRAIN_MAGIC => Some(HEADER_LEN),
+        m if m == GRAIN_MAGIC_V2 => {
+            let off = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+            (HEADER_LEN..=buf.len()).contains(&off).then_some(off)
+        }
+        _ => None,
+    }
+}
+
+/// Walk `n` records from `off`, returning where the next one starts.
+/// None when the file ends first — a partial tail (crash debris) or a
+/// grain that simply doesn't reach that far.
+fn skip_records(buf: &[u8], mut off: usize, n: usize) -> Option<usize> {
+    for _ in 0..n {
+        if off + 4 > buf.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        if off + 4 + len > buf.len() {
+            return None;
+        }
+        off += 4 + len;
+    }
+    Some(off)
+}
+
 fn build_filter(tokens: &HashSet<&[u8]>) -> Vec<u8> {
     let n = tokens.len().max(1) as u64;
     let m_bits = (n * BITS_PER_TOKEN).next_multiple_of(64).max(64);
@@ -130,11 +197,11 @@ impl Grain {
 
 pub fn load(path: &Path) -> anyhow::Result<Grain> {
     let buf = fs::read(path).with_context(|| format!("reading grain index {}", path.display()))?;
-    if buf.len() < HEADER_LEN || &buf[..8] != GRAIN_MAGIC {
+    let Some(first) = first_record_offset(&buf) else {
         bail!("{} is not a grain index (bad magic)", path.display());
-    }
+    };
     let mut filters = Vec::new();
-    let mut off = HEADER_LEN;
+    let mut off = first;
     while off + 4 <= buf.len() {
         let len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
@@ -185,10 +252,10 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         Ok(b) => b,
         Err(_) => return build_grain(dir, name),
     };
-    if existing.len() < HEADER_LEN || &existing[..8] != GRAIN_MAGIC {
+    let Some(first) = first_record_offset(&existing) else {
         return build_grain(dir, name);
-    }
-    let mut off = HEADER_LEN;
+    };
+    let mut off = first;
     let mut covered = 0usize;
     loop {
         if off + 4 > existing.len() {
@@ -237,6 +304,85 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drop the first `k` chunks' filters, after retention has cut the same
+/// `k` chunks off the head of the store.
+///
+/// A record's position IS its chunk index, so a rings rebase renumbers
+/// every chunk and leaves each filter answering for the wrong one — a
+/// FALSE NEGATIVE, the single answer a search index must never give. The
+/// cut is always a prefix, so the fix is a prefix too, and it is cheap in
+/// the same way the trunk's own head-drop is cheap: whole blocks come off
+/// the front with `COLLAPSE_RANGE`, the dead bytes left by the alignment
+/// are skipped via the header's first-record offset, and nothing is
+/// decompressed or re-tokenized. Where collapse doesn't apply, the tail is
+/// rewritten instead (still no decompression).
+///
+/// The caller holds the writer locks, has already rebased the rings, and
+/// keeps a seqlock window open around both. Best-effort by contract: a
+/// grain that is missing, unreadable or shorter than the drop is simply
+/// removed, and the next extend rebuilds it.
+pub fn rebase_head(dir: &Path, name: &str, k: usize) -> std::io::Result<()> {
+    let gpath = format::grain_path(dir, name);
+    if k == 0 {
+        return Ok(());
+    }
+    let buf = match fs::read(&gpath) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let drop_to = first_record_offset(&buf).and_then(|first| skip_records(&buf, first, k));
+    let Some(survivors) = drop_to else {
+        // Not a grain we understand, or it covered fewer chunks than were
+        // dropped: nothing left worth rebasing.
+        let _ = fs::remove_file(&gpath);
+        return Ok(());
+    };
+
+    let f = OpenOptions::new().read(true).write(true).open(&gpath)?;
+    // Keep room to re-stamp the header over dead bytes: the cut can never
+    // reach past `survivors - HEADER_LEN`.
+    let bsize = crate::store::fstatvfs_bsize(&f)?;
+    let aligned = ((survivors - HEADER_LEN) as u64 / bsize) * bsize;
+    if aligned > 0 {
+        let rc = unsafe {
+            libc::fallocate(
+                std::os::fd::AsRawFd::as_raw_fd(&f),
+                libc::FALLOC_FL_COLLAPSE_RANGE,
+                0,
+                aligned as libc::off_t,
+            )
+        };
+        if rc == 0 {
+            let first_rec = survivors - aligned as usize;
+            f.write_all_at(&header_bytes(first_rec), 0)?;
+            return f.sync_all();
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            // No COLLAPSE_RANGE here (tmpfs, btrfs, NFS, older ext4/xfs):
+            // rewrite instead, below.
+            Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) => {}
+            _ => return Err(e),
+        }
+    }
+    // Rewrite: a fresh GRAIN001 (records back at HEADER_LEN) staged and
+    // renamed, so a reader sees the whole old file or the whole new one.
+    // A store on a filesystem without COLLAPSE_RANGE therefore never
+    // upgrades its magic at all.
+    drop(f);
+    let tmp = dir.join(format!("{name}.{}.tmp", format::GRAIN_EXT));
+    let out = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    out.write_all_at(&header_bytes(HEADER_LEN), 0)?;
+    out.write_all_at(&buf[survivors..], HEADER_LEN as u64)?;
+    out.sync_all()?;
+    fs::rename(&tmp, &gpath)
+}
+
 /// The grain build itself; the caller holds the writer locks.
 pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     let rings_p = format::rings_path(dir, name);
@@ -249,13 +395,7 @@ pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         .create(true)
         .truncate(true)
         .open(&tmp)?;
-    let mut header = [0u8; HEADER_LEN];
-    header[..8].copy_from_slice(GRAIN_MAGIC);
-    header[8] = 0; // case folding: none
-    header[9] = MIN_TOKEN as u8;
-    header[10] = MAX_TOKEN as u8;
-    header[11] = K as u8;
-    out.write_all_at(&header, 0)?;
+    out.write_all_at(&header_bytes(HEADER_LEN), 0)?;
 
     let mut off = HEADER_LEN as u64;
     let mut total_tokens: u64 = 0;
@@ -299,4 +439,140 @@ pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         off / records.len().max(1) as u64
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("timberfs-grain-test-{}-{n}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A grain whose chunk `i` contains exactly the token `tok<i>`, built
+    /// by hand so the test doesn't need a store behind it.
+    fn write_grain(dir: &Path, name: &str, chunks: usize) -> Vec<Vec<u8>> {
+        let mut out = header_bytes(HEADER_LEN).to_vec();
+        let mut tokens = Vec::new();
+        for i in 0..chunks {
+            let tok = format!("tok{i:04}").into_bytes();
+            // Pad each filter out so the file spans several blocks and the
+            // collapse path is exercised, not just the rewrite fallback.
+            let mut set: HashSet<&[u8]> = HashSet::new();
+            set.insert(&tok);
+            // Big enough that dropping a few records spans a whole
+            // filesystem block, so the COLLAPSE_RANGE branch is the one
+            // under test wherever the filesystem supports it (tmpfs does
+            // not, and takes the rewrite fallback — both are asserted
+            // through the same semantic checks below).
+            let padding: Vec<Vec<u8>> = (0..4000)
+                .map(|p| format!("pad{i}x{p:04}").into_bytes())
+                .collect();
+            for p in &padding {
+                set.insert(p);
+            }
+            let filter = build_filter(&set);
+            out.extend_from_slice(&(filter.len() as u32).to_le_bytes());
+            out.extend_from_slice(&filter);
+            tokens.push(tok);
+        }
+        fs::write(format::grain_path(dir, name), &out).unwrap();
+        tokens
+    }
+
+    #[test]
+    fn a_fresh_grain_is_still_v1_on_disk() {
+        // The V2 header exists only for rebased files: a store that never
+        // hits retention must stay byte-compatible with older readers.
+        let d = TempDir::new();
+        write_grain(d.path(), "a.log", 3);
+        let buf = fs::read(format::grain_path(d.path(), "a.log")).unwrap();
+        assert_eq!(&buf[..8], GRAIN_MAGIC);
+        assert_eq!(&buf[12..16], &[0, 0, 0, 0], "the offset field stays zero");
+        assert_eq!(first_record_offset(&buf), Some(HEADER_LEN));
+    }
+
+    #[test]
+    fn rebase_head_drops_a_prefix_and_keeps_the_rest_aligned() {
+        let d = TempDir::new();
+        let tokens = write_grain(d.path(), "a.log", 12);
+        let before = load(&format::grain_path(d.path(), "a.log")).unwrap();
+        assert_eq!(before.chunk_count(), 12);
+
+        rebase_head(d.path(), "a.log", 5).unwrap();
+
+        let after = load(&format::grain_path(d.path(), "a.log")).unwrap();
+        assert_eq!(after.chunk_count(), 7, "12 chunks minus the 5 dropped");
+        // Chunk i of the rebased grain must answer for what was chunk i+5:
+        // the whole point, since a stale mapping is a FALSE NEGATIVE.
+        for (i, t) in tokens.iter().enumerate().skip(5) {
+            assert!(
+                after.may_contain_all(i - 5, std::slice::from_ref(t)),
+                "token of old chunk {i} lost from new chunk {}",
+                i - 5
+            );
+        }
+        // And the dropped ones are gone rather than shifted into place.
+        let survivors_claim_dropped =
+            (0..7).any(|i| after.may_contain_all(i, std::slice::from_ref(&tokens[0])));
+        assert!(
+            !survivors_claim_dropped,
+            "a dropped chunk's filter survived"
+        );
+    }
+
+    #[test]
+    fn a_rebased_grain_reads_back_through_both_paths() {
+        let d = TempDir::new();
+        write_grain(d.path(), "a.log", 10);
+        rebase_head(d.path(), "a.log", 4).unwrap();
+        let buf = fs::read(format::grain_path(d.path(), "a.log")).unwrap();
+        // Either strategy is correct; both must leave a file `load` and
+        // `extend_grain`'s walker agree on.
+        let first = first_record_offset(&buf).expect("still a grain");
+        if &buf[..8] == GRAIN_MAGIC_V2 {
+            assert!(first > HEADER_LEN, "V2 means dead bytes were left behind");
+        } else {
+            assert_eq!(first, HEADER_LEN, "the rewrite path resets to V1");
+        }
+        assert_eq!(skip_records(&buf, first, 6), Some(buf.len()));
+    }
+
+    #[test]
+    fn rebasing_past_the_end_drops_the_grain() {
+        // A grain lagging its log can cover fewer chunks than retention
+        // just dropped: there is nothing left to rebase, so it goes and
+        // the next extend rebuilds it.
+        let d = TempDir::new();
+        write_grain(d.path(), "a.log", 3);
+        rebase_head(d.path(), "a.log", 9).unwrap();
+        assert!(!format::grain_path(d.path(), "a.log").exists());
+    }
+
+    #[test]
+    fn rebase_is_a_noop_without_a_grain() {
+        let d = TempDir::new();
+        rebase_head(d.path(), "missing.log", 3).unwrap();
+        assert!(!format::grain_path(d.path(), "missing.log").exists());
+    }
 }
