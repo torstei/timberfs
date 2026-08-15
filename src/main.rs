@@ -417,10 +417,12 @@ enum Command {
     /// and the Collector speak — writing each stream into its own store
     /// under --into-dir. Answers 200 only after the batch is fsynced, and
     /// 503 + Retry-After for an undeclared stream, so a sender buffers and
-    /// converges. Deliberate limitations: POST /v1/logs only (no traces or
-    /// metrics), OTLP/JSON bodies only (no protobuf), no gzip, no TLS
-    /// (loopback or a private network only), no gRPC — put a Collector in
-    /// front for :4317. The verb name is provisional
+    /// converges. Both OTLP/HTTP encodings are accepted (binary protobuf,
+    /// what every sender defaults to, and JSON), gzipped or not, so a stock
+    /// Collector needs no configuration. Deliberate limitations: POST
+    /// /v1/logs only (no traces or metrics), no chunked request bodies, no
+    /// TLS (loopback or a private network only), no gRPC — put a Collector
+    /// in front for :4317. The verb name is provisional
     #[command(name = "otlp-intake")]
     OtlpIntake {
         /// Address to listen on (systemd socket activation on fd 3 is used

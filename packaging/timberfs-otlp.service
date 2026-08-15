@@ -2,14 +2,13 @@
 # Not templated — one instance serves every stream it sees, each landing in
 # its own store at /var/log/timberfs/otlp/<service.name>.log.
 #
-# The sender must post OTLP/JSON to /v1/logs, uncompressed. For an
-# OpenTelemetry Collector that means:
+# The sender posts OTLP/HTTP to /v1/logs in either encoding (binary
+# protobuf or JSON), gzipped or not, so an OpenTelemetry Collector needs
+# nothing beyond the endpoint:
 #
 #   exporters:
 #     otlphttp/timberfs:
 #       endpoint: http://127.0.0.1:4318
-#       encoding: json          # the default is protobuf
-#       compression: none       # the default is gzip
 #
 # Override the store directory, routing attribute, or add retention with a
 # drop-in:

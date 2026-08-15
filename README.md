@@ -53,7 +53,7 @@ entries (stack traces stay intact) by named predicates, exact word predicates
 riding the token index automatically. `-f`/`--follow`, `--tail N` and `--max N`
 stream or cap. Stores in a **forest** (`/var/log/timberfs`) take a bare handle
 (`timberfs query nginx`), `timberfs list` shows what's there, and the package
-ships shell completion for both tools. Full reference: `man timberfs`,
+ships shell completion for all three tools. Full reference: `man timberfs`,
 `man timber-filter`.
 
 Ship an investigation — with its provenance — as one self-describing file:
@@ -188,6 +188,11 @@ timberfs query --from 13:42 --to 13:43 collector/host*-app.log
 timber-filter --has req-8f3a collector/*.log        # which hosts saw it?
 ```
 
+The deployment *shapes* all of this composes into — giving an application OTLP
+without touching it, a full-fidelity tier under an expensive backend, container
+logs, replaying an incident window into a backend — are in
+**[Use cases](docs/use-cases.md)**, with the limits that come with them.
+
 The full command reference — every flag, `import`/`export`/`rotate`, retention,
 forests, `.timber` bundles, and the records stream — is in the man pages:
 `man timberfs`, `man timber-filter`, `man timber-otlp`, and `man timberfs-records`.
@@ -303,10 +308,14 @@ Or from crates.io with a Rust toolchain: `cargo install timberfs`.
 
 ## How it works
 
-Two files per log: the data (`<name>.trunk`, concatenated zstd frames) and a
-write-time index (`<name>.rings`). Everything else is derived, and stock tools
-can always recover your data — `zstd -dc <name>.trunk` prints the whole log, no
-timberfs required; the index is pure acceleration.
+Two files carry the log: the data (`<name>.trunk`, concatenated zstd frames)
+and a write-time index (`<name>.rings`). Stock tools can always recover your
+data — `zstd -dc <name>.trunk` prints the whole log, no timberfs required; the
+index is pure acceleration. Three optional sidecars sit beside them, each with
+a different contract: `.grain` (token index) is derived — safe to delete, cheap
+to rebuild; `.sap` (write-ahead) is live writer state, read exactly once, after
+a crash; `.bark` holds what you *declared* — identity, retention, provenance —
+which is why it travels with the store.
 
 The full design — why FUSE, the on-disk format, the `.bark` manifest, the
 semantics table, and the `.grain` token index — lives in
@@ -332,14 +341,16 @@ cargo deb                                        # target/debian/timberfs_*.deb
 sudo dpkg -i target/debian/timberfs_*.deb
 ```
 
-The package installs `/usr/bin/timberfs` and three systemd units:
-`timberfs@<instance>` (a template) to mount a store at boot, a
-socket-activated `timberfs-log@<instance>` (also a template) to stream into
-a store without a mount, and a socket-activated `timberfs-forward` (not
-templated — Forward multiplexes every tag over one connection) for the
-Fluentd Forward intake above. See **[Deploying timberfs](docs/deployment.md)**
-for the directory layout, all three unit families, the ownership/permission
-model, and self-restart-on-upgrade.
+The package installs `/usr/bin/timberfs`, `timber-filter`, `timber-otlp` and
+five systemd unit families: `timberfs@<instance>` (a template) to mount a
+store at boot, a socket-activated `timberfs-log@<instance>` (also a template)
+to stream into a store without a mount, socket-activated `timberfs-forward`
+and `timberfs-otlp` (not templated — both multiplex every stream over one
+listener) for the two network intakes above, and `timberfs-otlp@<instance>`
+(a template, one per store) to ship a store onward. See
+**[Deploying timberfs](docs/deployment.md)** for the directory layout, all
+five unit families, the ownership/permission model, and
+self-restart-on-upgrade.
 
 ## Roadmap
 

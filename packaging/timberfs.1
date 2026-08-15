@@ -193,8 +193,22 @@ neither. Known settings are parse-checked
 .BR retain_size =50G,
 .BR index =true|false,
 .BR wal =true|false);
-anything else is free-form provenance
-.RB ( host =...).
+.BR timestamp_regex ,
+.B timestamp_format
+and
+.B timestamp_utc
+are parse-checked too (see THE TWO CLOCKS); anything else is free-form
+provenance
+.RB ( host =...),
+of which
+.B service
+is a convention rather than a rule \(em
+.BR timber\-otlp (1)
+reads it as the OTLP
+.B service.name
+and
+.B otlp\-intake
+seeds it on the stores it creates.
 .B \-\-unset
 .I KEY
 removes a key. Identity and lineage
@@ -1231,7 +1245,36 @@ listening on TCP for Fluentd Forward protocol v1 senders (Docker's
 log driver, Fluent Bit, Fluentd). Not templated: Forward multiplexes every
 tag over the one connection, so one instance serves every tag.
 .PP
-The full directory layout, both unit families, the ownership model and
+A fourth, socket\-activated pair,
+.B timberfs\-otlp.socket
+and
+.BR timberfs\-otlp.service ,
+runs
+.B otlp\-intake
+listening on TCP for OTLP/HTTP senders (any OpenTelemetry SDK or
+Collector). Also not templated \(em OTLP multiplexes resources inside the
+request body, and each stream lands in its own store.
+.PP
+Finally, the template unit
+.B timberfs\-otlp@.service
+runs
+.BR timber\-otlp (1)
+in the other direction, shipping ONE store to an OTLP/HTTP receiver:
+create
+.IB /etc/timberfs/otlp- instance .conf
+defining
+.BR STORE ,
+.B ENDPOINT
+and optionally
+.BR EXTRA_OPTS ,
+then
+.B systemctl enable \-\-now
+.BI timberfs\-otlp@ instance \fR.
+One instance per store \(em the cursor is a position in one store, and a
+stalled receiver must not hold up an unrelated one. Its cursor lives in
+.IR /var/lib/timberfs/ .
+.PP
+The full directory layout, all five unit families, the ownership model and
 self\-restart on upgrade are documented in
 .IR /usr/share/doc/timberfs/deployment.md .
 .SH EXAMPLES
@@ -1282,6 +1325,8 @@ zstd \-dc logs\-backing/app.log.trunk > app.log.recovered
 .SH EXIT STATUS
 0 on success, non-zero on any error (2 for command-line usage errors).
 .SH SEE ALSO
+.BR timber\-filter (1),
+.BR timber\-otlp (1),
 .BR timberfs-records (5)
 .br
 .BR fusermount3 (1),

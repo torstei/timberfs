@@ -1,4 +1,4 @@
-Instance configurations for timberfs@.service live in this directory.
+Instance configurations for timberfs's template units live in this directory.
 
 Each <instance>.conf defines the environment for one timberfs mount:
 
@@ -8,5 +8,23 @@ Each <instance>.conf defines the environment for one timberfs mount:
 
 Then: systemctl enable --now timberfs@<instance>
 
-A commented example: /usr/share/doc/timberfs/examples/timberfs.conf.example
-Manual: man 1 timberfs
+Each otlp-<instance>.conf defines one OTLP shipper — a store, and the
+OTLP/HTTP receiver its entries are posted to:
+
+    STORE=/var/log/timberfs-backing/applogs/app.log
+    ENDPOINT=http://127.0.0.1:4318
+    EXTRA_OPTS=--service applogs
+
+Then: systemctl enable --now timberfs-otlp@<instance>
+
+Only these two units read a file from this directory. The rest are
+configured with a systemd drop-in instead — the templated log intake
+(systemctl edit timberfs-log@<instance>.service) and the two network
+intakes, which are not templated because one listener serves every stream
+(systemctl edit timberfs-forward.service, timberfs-otlp.service).
+
+forests.d/*.conf lists the directories searched when a command is given a
+bare handle instead of a path (see FORESTS in man 1 timberfs).
+
+Commented examples: /usr/share/doc/timberfs/examples/
+Manuals: man 1 timberfs, man 1 timber-otlp

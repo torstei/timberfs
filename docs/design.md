@@ -158,8 +158,10 @@ so there is nothing for a wal to add.
 content.
 
 Four properties above are **load-bearing for the planned live-tail reader**
-(a future `--follow` that tails the sap for sub-second responsiveness) and
-must not be weakened by refactors: (1) a segment's content is exactly the
+— a second phase for `--follow`, which today surfaces new data a flushed
+chunk at a time (within the writer's `--flush-age`) and would tail the sap
+instead for sub-second responsiveness. They must not be weakened by
+refactors: (1) a segment's content is exactly the
 next chunk's bytes, so the trunk and the sap are interchangeable sources
 per segment and a reader keyed on logical position can never double-emit or
 gap; (2) the swap is a rename — a reader's open fd never sees bytes mutate
@@ -179,12 +181,15 @@ human-editable JSON object — the label on the timber:
   "id": "6f9c2a1e-…",             // identity: random UUID, minted on first write,
   "created": "2026-07-11T09:14:02Z", //   constant across renames, moves and hosts
   "host": "imap03.example.com",   // provenance: free-form, yours (--set k=v)
+  "service": "checkout",          //   free-form, but timber-otlp reads it as the
+                                  //   OTLP service.name (otlp-intake seeds it)
   "index": true,                  // settings: CREATE INDEX — imports maintain the grain
   "wal": true,                    //   write-ahead .sap — crash loss shrinks to ~1s
   "retain": "90d",                //   keep at least this long — enforced by EVERY writer
   "retain_size": "50G",           //   compressed-size budget, oldest dropped first
   "timestamp_regex": "^(...)",    // content: exotic line-timestamp format, declared once
   "timestamp_format": "%m/%d/%Y %H:%M:%S", //   (import flags persist these; inherits)
+  "timestamp_utc": true,          //   zoneless line stamps are UTC, not local time
   "derived_from": "41d0…",        // lineage: source store's id
   "derived_op": "export",         // …and how: export (copy) or rotate (move)
   "window_from": "2026-07-04T22:00:00.000Z", // the REQUESTED window (operation
@@ -224,20 +229,27 @@ head-drops, travels on rename, and ships inside `.timber` bundles.
 | `du` blocks          | compressed size — `du -h` shows the real disk footprint          |
 | subdirectories       | not yet — flat namespace in v0                                   |
 
-Time-range queries are **chunk-granular** — by design, not as a
-placeholder: every chunk whose write-time window overlaps the requested
-range is returned in full. Chunk windows are bounded by `--flush-age`
-(default 5 s) for slow writers and by `--chunk-size` (default 256 KiB) for
-fast ones, so that's the worst-case slop at the edges of the window.
+**Chunk selection** is the write-time index's job and is deliberately
+coarse: every chunk whose write-time window overlaps the requested range
+(widened by about a minute to catch buffered stragglers) is read in full.
+Chunk windows are bounded by `--flush-age` (default 5 s) for slow writers
+and by `--chunk-size` (default 256 KiB) for fast ones, so that is the slop
+the index alone would leave at the edges.
 
-The intended workflow is: `timberfs query` does the coarse seek into a huge
-file (cheap, no parsing, immune to multiline entries and timestamp-less
-lines), then `timber-filter` (entry-aware) or ordinary `grep`/`awk` on the
-small extract trims exactly using the timestamps the log lines carry
-anyway. The slop is a feature there:
-buffered loggers write lines slightly after the timestamp they print, so a
-byte-exact write-time cut could miss edge lines that grep-on-content
-catches.
+**Entry selection** then closes it: `query` verifies each entry against
+`--from`/`--to` by the timestamp its own line carries, so the output
+answers the question in the timestamps you can see — 13:37–13:38 never
+shows a 13:42 line — while an entry whose timestamp can't be read is
+always included rather than silently hidden. The coarse-then-exact split
+is why the widening is safe: buffered loggers write lines slightly after
+the timestamp they print, and over-reading chunks costs a little I/O where
+under-reading would lose edge lines.
+
+`--by-write-time` is the escape hatch to raw chunk output, selected by the
+index alone with no parsing — the pre-0.7.4 behaviour, and the right tool
+when the question really is "what arrived when". Downstream,
+`timber-filter` (entry-aware) or ordinary `grep`/`awk` narrow by content
+on the small extract.
 
 ## Custom indexes: the .grain token index
 

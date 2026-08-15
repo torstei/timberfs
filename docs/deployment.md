@@ -16,7 +16,12 @@ pass its own paths.
 /usr/bin/timber-filter                    the entry-aware records filter
 
 /etc/timberfs/<instance>.conf             config for a mount instance (see below)
+/etc/timberfs/otlp-<instance>.conf        config for an OTLP shipper instance (see below)
 /etc/timberfs/forests.d/*.conf            forests: directories searched by handle (see below)
+
+/var/lib/timberfs/otlp-<instance>.cursor  the OTLP shipper's position in its store —
+                                          CONSUMER state, deliberately not inside the
+                                          store's backing directory (StateDirectory=)
 
 /run/timberfs/<instance>.pipe             intake FIFO, created by the .socket unit
                                           (the directory is created at boot by tmpfiles.d)
@@ -34,7 +39,9 @@ pass its own paths.
 /var/log/timberfs/forward/                one directory shared by every tag the
                                           Fluentd Forward intake sees (it is a
                                           single TCP listener, not templated):
-    <tag>.log.trunk / .rings / .grain / .bark / .lock     one store per tag
+    <tag>.log.trunk / .rings / .grain / .bark / .sap / .lock   one store per tag
+                                          (.sap always: an acking receiver
+                                          declares "wal": true on every store)
   .timberfs.lock                            the directory lock (see Locking)
 
 /var/log/timberfs/otlp/                   likewise for the OTLP intake, one
@@ -81,7 +88,8 @@ custom `--into` in a drop-in.
 
 ## systemd units
 
-Two independent families ship with the package.
+Five independent families ship with the package: one mount, three intakes
+(FIFO, Forward, OTLP) and one shipper.
 
 ### Mounting a store — `timberfs@.service`
 
@@ -227,6 +235,31 @@ The verb name (`otlp-intake`) is provisional. `timber-otlp` ships the same
 wire format in the other direction; a store shipped out and received back
 arrives byte for byte.
 
+### Shipping a store out — `timberfs-otlp@.service`
+
+The other direction: read one store's entry stream and post it to an OTLP/HTTP
+receiver. **A template, one instance per store** — the cursor is a position in
+*one* store, and a stalled receiver must not hold up an unrelated one.
+Configure the instance in `/etc/timberfs/otlp-<instance>.conf`:
+
+```ini
+STORE=/var/log/timberfs-backing/applogs/app.log
+ENDPOINT=http://127.0.0.1:4318
+EXTRA_OPTS=--service checkout --resource deployment.environment=prod
+```
+
+```sh
+systemctl enable --now timberfs-otlp@applogs
+```
+
+It runs `timber-otlp --follow --cursor /var/lib/timberfs/otlp-<instance>.cursor`.
+Being a **reader**, it cannot hurt the store or the appender: an unreachable
+receiver stalls the shipper and nothing else, and the store is the send buffer
+— retention is the disconnection budget (`retain 30d` means the receiver can
+be gone thirty days). The cursor is written only after the receiver accepts a
+batch, so an interrupted send is re-delivered rather than skipped
+(at-least-once); `Restart=always` is therefore safe. Details: `man timber-otlp`.
+
 ## Ownership and permissions
 
 - **The store directory** is created by `LogsDirectory=timberfs/%i` (or plain
@@ -303,13 +336,20 @@ make systemd restart it onto the new binary regardless of `Restart=`.
   swap, so the producer sees no gap.
 - **Mount** is clean: `auto_unmount` tears the old FUSE session down, and systemd
   remounts on the new binary.
-- **Forward intake** is *not* seamless: unlike the FIFO, the `.socket` does not
-  hold TCP connections open across a restart, so a swap drops them. This is by
-  design rather than a gap — Forward-protocol senders already reconnect and
-  retry any unacked chunk (that is what the chunk/ack handshake is for), so the
-  cost is the same at-least-once duplication a network blip would cause anyway.
+- **Forward and OTLP intakes** are *not* seamless: unlike the FIFO, a `.socket`
+  does not hold TCP connections open across a restart, so a swap drops them.
+  This is by design rather than a gap — both protocols' senders already retry
+  what was never acknowledged (that is what the chunk/ack handshake and the
+  HTTP response are for), so the cost is the same at-least-once duplication a
+  network blip would cause anyway.
+- **The OTLP shipper** is a reader, so a restart cannot hurt the store: it
+  resumes from its cursor, which only advances after the receiver accepted a
+  batch, so an interrupted send is re-delivered rather than skipped.
 
-## Reliability model (Forward intake)
+## Reliability model (both intakes)
+
+One contract, spelled in each protocol's own vocabulary: Forward acks a
+`chunk` id, OTLP answers `200`. Below, "acked" means both.
 
 - **At-least-once, not exactly-once.** An acked chunk is durable; an unacked
   one may or may not have landed, so the sender retries
@@ -322,16 +362,20 @@ make systemd restart it onto the new binary regardless of `Restart=`.
 - **Ack timing.** Acks are sent synchronously, as soon as the batch is
   durable — a blocking sender's throughput is bounded by fsync rate, not by
   any receiver tick.
-- **An unknown tag is refused, not acked** (unless `--auto-create`). The
-  missing ack is the refusal's wire form: an acking sender buffers and
+- **An undeclared stream is refused, not acked** (unless `--auto-create`), and
+  the refusal takes each protocol's own form: Forward simply withholds the ack,
+  OTLP answers `503` with `Retry-After`. Either way an acking sender buffers and
   retries until the operator creates the store, then converges with nothing
-  lost. Non-acking senders' events for unknown tags are dropped (logged
+  lost. Non-acking Forward senders' events for unknown tags are dropped (logged
   once per tag).
-- **A decode error closes the connection.** A desynced msgpack stream can't be
-  resynchronized, so the connection is dropped and logged; the sender
-  reconnects.
+- **A malformed request is refused, not fudged.** A desynced msgpack stream
+  can't be resynchronized, so the Forward connection is dropped and logged and
+  the sender reconnects. OTLP names the reason in the status instead and keeps
+  the connection: `400` undecodable, `404` a signal other than `/v1/logs`,
+  `405` a method other than POST, `411` a chunked or unmeasured body, `413`
+  over `--max-body`, `415` a content type that is neither protobuf nor JSON.
 
 ## See also
 
-`timberfs(1)`, `timberfs-records(5)`, `timber-filter(1)`, and the example config
-at `/usr/share/doc/timberfs/examples/timberfs.conf.example`.
+`timberfs(1)`, `timber-filter(1)`, `timber-otlp(1)`, `timberfs-records(5)`, and
+the example configs at `/usr/share/doc/timberfs/examples/`.

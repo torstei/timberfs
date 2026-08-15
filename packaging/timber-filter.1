@@ -184,6 +184,26 @@ prefix by default).
 .TP
 .B \-\-quiet
 Suppress informational notes on standard error; errors still print.
+.SH RAW INPUT
+A store carries its own timestamp declaration; a RAW log file or text
+stream does not, so an exotic line format needs one on the command line.
+.TP
+.BI \-\-timestamp\-regex " PATTERN"
+Where an entry's timestamp is \(em a regex with one capture group around
+it. On raw input this is also what decides ENTRY BOUNDARIES: a line that
+matches starts a new entry, one that does not continues the previous one
+(which is how a stack trace stays one entry).
+.TP
+.BI \-\-timestamp\-format " FMT"
+A
+.B chrono
+format string for the captured timestamp, e.g.
+.RB ' "%Y\-%m\-%d %H:%M:%S%.f" '.
+.PP
+The two are required together. For a store, declare the same thing once
+in the manifest instead
+.RB ( "timberfs set app.log timestamp_regex=" ...),
+where it describes the content and inherits into derived artifacts.
 .SH EXAMPLES
 .nf
 .RS

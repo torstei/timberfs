@@ -195,8 +195,12 @@ Where to start when the cursor file does not exist yet (default
 .TP
 .BI \-\-from " TIME" ", " \-\-to " TIME"
 Replay window, in the formats
-.BR timberfs\-query (1)
-takes.
+.BR timberfs (1)
+takes (TIME FORMATS).
+.SS Other
+.TP
+.B \-\-quiet
+Suppress progress notes on standard error; errors still print.
 .SH DELIVERY
 A retryable answer (429, 502, 503, 504, or a transport failure) is
 retried with capped exponential backoff, honouring

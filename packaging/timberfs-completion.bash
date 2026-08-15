@@ -30,7 +30,7 @@ _timberfs() {
     --into | --into-dir | --from | --to | --has | --any | --cutoff | --set | --unset | \
         --tail | --max | --chunk-size | --level | --flush-age | --retain | \
         --retain-size | --timestamp-regex | --timestamp-format | --listen | \
-        --payload-key)
+        --payload-key | --route | --max-body)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;
