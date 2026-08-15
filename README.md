@@ -161,7 +161,39 @@ timber-filter --has req-8f3a collector/*.log        # which hosts saw it?
 
 The full command reference — every flag, `import`/`export`/`rotate`, retention,
 forests, `.timber` bundles, and the records stream — is in the man pages:
-`man timberfs`, `man timber-filter`, and `man timberfs-records`.
+`man timberfs`, `man timber-filter`, `man timber-otlp`, and `man timberfs-records`.
+
+## Shipping onward (`timber-otlp`)
+
+A store is not a dead end. `timber-otlp` reads a store's entry stream and posts
+it to any OTLP/HTTP receiver — an OpenTelemetry Collector, or a backend that
+speaks OTLP directly — one LogRecord per **entry**, so a stack trace arrives as
+one record rather than forty:
+
+```sh
+# ship as it arrives, resumably across restarts
+timber-otlp --follow --cursor /var/lib/timberfs/app.otlp \
+    --endpoint http://collector:4318 backing/app.log
+
+# replay an incident window into a fresh backend
+timber-otlp --from '2026-08-11 14:00' --to '2026-08-11 15:00' \
+    --endpoint http://new-backend:4318 backing/app.log
+```
+
+It is a reader, so an unreachable receiver can stall the shipper and nothing
+else — the appender never notices. **The store is the send buffer**: where a
+collector's queue is sized by guessing, retention is the disconnection budget
+(`retain 30d` means the receiver can be gone for thirty days), and any window
+can be re-shipped afterwards, which a collector cannot do because it retains
+nothing.
+
+The two OTLP time fields land on timberfs's two axes: `timeUnixNano` gets the
+entry's own logline stamp, `observedTimeUnixNano` the write time it arrived at.
+The position is persisted in a cursor file on the write axis (the only
+monotonic one), so a restart resumes instead of re-sending; delivery is
+at-least-once, as OTLP itself is. `--dry-run` prints exactly what would be
+posted. JSON over plaintext HTTP only — terminate TLS in a collector beside it.
+Details: `man timber-otlp`.
 
 ## Rotation & retention
 

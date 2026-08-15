@@ -18,6 +18,10 @@ path = "src/lib.rs"
 name = "timber-filter"
 path = "src/timber_filter.rs"
 
+[[bin]]
+name = "timber-otlp"
+path = "src/timber_otlp.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = "0.4"
@@ -62,13 +66,17 @@ straight into a store."""
 assets = [
     ["target/release/timberfs", "usr/bin/", "755"],
     ["target/release/timber-filter", "usr/bin/", "755"],
+    ["target/release/timber-otlp", "usr/bin/", "755"],
     ["packaging/timberfs.1", "usr/share/man/man1/", "644"],
     ["packaging/timber-filter.1", "usr/share/man/man1/", "644"],
+    ["packaging/timber-otlp.1", "usr/share/man/man1/", "644"],
     ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
     ["packaging/timberfs-completion.bash", "usr/share/bash-completion/completions/timberfs", "644"],
     ["packaging/timberfs-completion.zsh", "usr/share/zsh/vendor-completions/_timberfs", "644"],
     ["packaging/timber-filter-completion.bash", "usr/share/bash-completion/completions/timber-filter", "644"],
     ["packaging/timber-filter-completion.zsh", "usr/share/zsh/vendor-completions/_timber-filter", "644"],
+    ["packaging/timber-otlp-completion.bash", "usr/share/bash-completion/completions/timber-otlp", "644"],
+    ["packaging/timber-otlp-completion.zsh", "usr/share/zsh/vendor-completions/_timber-otlp", "644"],
     ["README.md", "usr/share/doc/timberfs/README.md", "644"],
     ["docs/deployment.md", "usr/share/doc/timberfs/deployment.md", "644"],
     ["packaging/timberfs@.service", "lib/systemd/system/timberfs@.service", "644"],
@@ -76,8 +84,10 @@ assets = [
     ["packaging/timberfs-log@.service", "lib/systemd/system/timberfs-log@.service", "644"],
     ["packaging/timberfs-forward.socket", "lib/systemd/system/timberfs-forward.socket", "644"],
     ["packaging/timberfs-forward.service", "lib/systemd/system/timberfs-forward.service", "644"],
+    ["packaging/timberfs-otlp@.service", "lib/systemd/system/timberfs-otlp@.service", "644"],
     ["packaging/timberfs-tmpfiles.conf", "usr/lib/tmpfiles.d/timberfs.conf", "644"],
     ["packaging/timberfs.conf.example", "usr/share/doc/timberfs/examples/timberfs.conf.example", "644"],
+    ["packaging/timberfs-otlp.conf.example", "usr/share/doc/timberfs/examples/timberfs-otlp.conf.example", "644"],
     ["packaging/etc-README", "etc/timberfs/README", "644"],
     ["packaging/forests-default.conf", "etc/timberfs/forests.d/default.conf", "644"],
 ]

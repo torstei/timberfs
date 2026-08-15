@@ -38,6 +38,39 @@ works is in [docs/design.md](docs/design.md).
   stays the database; the server owns no state that is not a plain
   timberfs file. Path: lib refactor → .bark → read-only serve → ingest →
   tiering.
+- **OTLP the other way (`otlp-intake`)**: `timber-otlp` ships a store OUT
+  over OTLP/HTTP; RECEIVING it would make every OpenTelemetry SDK and the
+  Collector a timberfs producer, as `forward-intake` did for Docker and
+  Fluent Bit — and the Collector then bridges syslog, journald, k8s tailing
+  and Kafka in for free. Same shape as `forward-intake`: HTTP/1.1 on :4318,
+  `/v1/logs`, a store per `service.name`, resource attributes seeded into
+  `.bark` (OTLP's resource/record split IS the manifest/entry split), and
+  the HTTP response as the ack — 200 only once the batch is durable in the
+  `.sap`, 503 + `Retry-After` for an undeclared stream so a sender buffers
+  and provisioning converges with nothing lost, `partialSuccess` only for
+  what is refused permanently. Deliberately NOT gRPC (:4317 wants HTTP/2
+  and an async runtime; a Collector in front converts) and not metrics.
+- **`timber-otlp` gaps**: protobuf request bodies (the Collector's default
+  encoding — and the RESPONSE is free, since an empty
+  `ExportLogsServiceResponse` is zero bytes); gzip request bodies;
+  `trace_id`/`span_id` and structured attributes lifted into LogRecord
+  fields instead of staying inside the body text (`--has <trace_id>` over
+  the `.grain` index already finds a trace's lines with no trace backend);
+  and a bounded `--max-retries`, since retrying forever is right for a
+  daemon and wrong for a one-shot replay in a script.
+- **A write-time window for one-shot reads (`--written-from`)**: `query
+  --from` means LOGLINE time in a windowed read but WRITE time in
+  `--follow` — the axis switches with the mode instead of being chosen.
+  Naming it would also give `timber-otlp` a durable one-shot drain
+  (`--cursor` without `--follow`, for cron-style shipping), which it
+  refuses today because only the follow path selects on the axis a cursor
+  can safely resume from. The cheap first half of the zone-map entry above.
+- **Cursors beyond one consumer**: `cursor.rs` is a general "consumer's
+  position in a store's entry stream", not an OTLP thing — a Kafka or Loki
+  shipper would reuse it verbatim. Open: a `list`-style view of who is
+  reading a store and how far behind they are (the state directory knows,
+  nothing surfaces it), and whether a cursor should ever hold retention
+  back so a disconnected consumer cannot be truncated out from under.
 - **Watchers (reactive rules)**: evaluate a predicate continuously over the
   append stream and fire a configurable action on a match — a single entry (an
   `OutOfMemoryError` is logged), a windowed count (more than N errors in M
