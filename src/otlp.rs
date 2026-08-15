@@ -1,11 +1,15 @@
 //! OTLP/HTTP for log records: rendering timberfs entries into an
 //! `ExportLogsServiceRequest` and posting it.
 //!
-//! JSON encoding only (the protobuf JSON mapping: lowerCamelCase fields,
-//! 64-bit integers as strings), and plaintext HTTP/1.1 only — the same
-//! stance `forward-intake` takes, for the same reason: TLS belongs to a
-//! collector or a proxy next to the shipper, not to a log tool. That
-//! keeps this module dependency-free, `std::net` and `serde_json`.
+//! Both OTLP/HTTP encodings, over plaintext HTTP/1.1: binary protobuf
+//! (what every sender defaults to) and the protobuf JSON mapping
+//! (lowerCamelCase fields, 64-bit integers as strings). No TLS — the
+//! same stance `forward-intake` takes, for the same reason: that belongs
+//! to a collector or a proxy next to the shipper, not to a log tool.
+//!
+//! The two encodings are one mapping with two spellings, and the tests
+//! below hold them to it: the same entries rendered either way decode to
+//! the same records.
 //!
 //! The mapping worth defending is time. OTLP separates the event's own
 //! timestamp from when it was observed, which is exactly timberfs's two
@@ -24,6 +28,24 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use regex::Regex;
 use serde_json::{json, Map, Value};
+
+use crate::protobuf;
+
+/// Which OTLP/HTTP encoding a request or response is in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Encoding {
+    Proto,
+    Json,
+}
+
+impl Encoding {
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Encoding::Json => "application/json",
+            Encoding::Proto => "application/x-protobuf",
+        }
+    }
+}
 
 /// One entry to ship, as the record stream describes it.
 pub struct Entry<'a> {
@@ -349,6 +371,373 @@ impl Incoming {
 }
 
 // ---------------------------------------------------------------------
+// Protobuf: the same mapping on the binary wire.
+//
+// The encoding every OTLP sender defaults to, so speaking it is what
+// makes a stock OpenTelemetry Collector work with nothing configured.
+// The schema is small and stable enough to read directly off the wire
+// (see protobuf.rs); the field numbers below are the whole of it.
+// ---------------------------------------------------------------------
+
+mod field {
+    // ExportLogsServiceRequest / Response
+    pub const RESOURCE_LOGS: u32 = 1;
+    pub const PARTIAL_SUCCESS: u32 = 1;
+    pub const REJECTED_LOG_RECORDS: u32 = 1;
+    pub const ERROR_MESSAGE: u32 = 2;
+    // ResourceLogs
+    pub const RL_RESOURCE: u32 = 1;
+    pub const RL_SCOPE_LOGS: u32 = 2;
+    // Resource / ScopeLogs
+    pub const RES_ATTRIBUTES: u32 = 1;
+    pub const SL_SCOPE: u32 = 1;
+    pub const SL_LOG_RECORDS: u32 = 2;
+    // InstrumentationScope
+    pub const SCOPE_NAME: u32 = 1;
+    pub const SCOPE_VERSION: u32 = 2;
+    // LogRecord
+    pub const LR_TIME: u32 = 1;
+    pub const LR_SEVERITY_NUMBER: u32 = 2;
+    pub const LR_SEVERITY_TEXT: u32 = 3;
+    pub const LR_BODY: u32 = 5;
+    pub const LR_ATTRIBUTES: u32 = 6;
+    pub const LR_TRACE_ID: u32 = 9;
+    pub const LR_SPAN_ID: u32 = 10;
+    pub const LR_OBSERVED_TIME: u32 = 11;
+    // KeyValue
+    pub const KV_KEY: u32 = 1;
+    pub const KV_VALUE: u32 = 2;
+    // AnyValue
+    pub const AV_STRING: u32 = 1;
+    pub const AV_BOOL: u32 = 2;
+    pub const AV_INT: u32 = 3;
+    pub const AV_DOUBLE: u32 = 4;
+    pub const AV_ARRAY: u32 = 5;
+    pub const AV_KVLIST: u32 = 6;
+    pub const AV_BYTES: u32 = 7;
+    // ArrayValue / KeyValueList
+    pub const VALUES: u32 = 1;
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Standard base64, so a `bytes` value reads the same as it would have
+/// arrived over the JSON encoding (where the wire form IS base64).
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            A[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            A[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn f64_text(v: f64) -> String {
+    serde_json::Number::from_f64(v)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| v.to_string())
+}
+
+/// An `AnyValue` as text, by the same rules the JSON path uses — a
+/// string is itself, anything structured is its compact JSON — so the
+/// two encodings cannot disagree about what a record said.
+fn any_value_text_proto(buf: &[u8]) -> anyhow::Result<String> {
+    let mut r = protobuf::Reader::new(buf);
+    while !r.done() {
+        let (f, wire) = r.key()?;
+        match (f, wire) {
+            (field::AV_STRING, protobuf::WIRE_LEN) => return r.string(),
+            (field::AV_BOOL, protobuf::WIRE_VARINT) => {
+                return Ok(if r.varint()? != 0 { "true" } else { "false" }.to_string())
+            }
+            (field::AV_INT, protobuf::WIRE_VARINT) => return Ok((r.varint()? as i64).to_string()),
+            (field::AV_DOUBLE, protobuf::WIRE_64BIT) => {
+                return Ok(f64_text(f64::from_bits(r.fixed64()?)))
+            }
+            (field::AV_BYTES, protobuf::WIRE_LEN) => return Ok(base64(r.bytes()?)),
+            (field::AV_ARRAY, protobuf::WIRE_LEN) => {
+                let mut items = Vec::new();
+                let mut a = protobuf::Reader::new(r.bytes()?);
+                while !a.done() {
+                    let (af, awire) = a.key()?;
+                    if af == field::VALUES && awire == protobuf::WIRE_LEN {
+                        items.push(Value::String(any_value_text_proto(a.bytes()?)?));
+                    } else {
+                        a.skip(awire)?;
+                    }
+                }
+                return Ok(Value::Array(items).to_string());
+            }
+            (field::AV_KVLIST, protobuf::WIRE_LEN) => {
+                let mut m = Map::new();
+                let mut k = protobuf::Reader::new(r.bytes()?);
+                while !k.done() {
+                    let (kf, kwire) = k.key()?;
+                    if kf == field::VALUES && kwire == protobuf::WIRE_LEN {
+                        let (key, val) = key_value_proto(k.bytes()?)?;
+                        m.insert(key, Value::String(val));
+                    } else {
+                        k.skip(kwire)?;
+                    }
+                }
+                return Ok(Value::Object(m).to_string());
+            }
+            _ => r.skip(wire)?,
+        }
+    }
+    Ok(String::new())
+}
+
+fn key_value_proto(buf: &[u8]) -> anyhow::Result<(String, String)> {
+    let (mut key, mut val) = (String::new(), String::new());
+    let mut r = protobuf::Reader::new(buf);
+    while !r.done() {
+        let (f, wire) = r.key()?;
+        match (f, wire) {
+            (field::KV_KEY, protobuf::WIRE_LEN) => key = r.string()?,
+            (field::KV_VALUE, protobuf::WIRE_LEN) => val = any_value_text_proto(r.bytes()?)?,
+            _ => r.skip(wire)?,
+        }
+    }
+    Ok((key, val))
+}
+
+fn log_record_proto(buf: &[u8]) -> anyhow::Result<Option<Incoming>> {
+    let mut rec = Incoming {
+        time_ms: None,
+        observed_ms: None,
+        severity: None,
+        body: String::new(),
+        attrs: Vec::new(),
+    };
+    let mut has_body = false;
+    let mut ids: Vec<(String, String)> = Vec::new();
+    let mut r = protobuf::Reader::new(buf);
+    while !r.done() {
+        let (f, wire) = r.key()?;
+        match (f, wire) {
+            (field::LR_TIME, protobuf::WIRE_64BIT) => rec.time_ms = nanos_u64_to_ms(r.fixed64()?),
+            (field::LR_OBSERVED_TIME, protobuf::WIRE_64BIT) => {
+                rec.observed_ms = nanos_u64_to_ms(r.fixed64()?)
+            }
+            (field::LR_SEVERITY_NUMBER, protobuf::WIRE_VARINT) => {
+                r.varint()?;
+            }
+            (field::LR_SEVERITY_TEXT, protobuf::WIRE_LEN) => {
+                let t = r.string()?;
+                rec.severity = Some(t).filter(|s| !s.is_empty());
+            }
+            (field::LR_BODY, protobuf::WIRE_LEN) => {
+                rec.body = any_value_text_proto(r.bytes()?)?;
+                has_body = true;
+            }
+            (field::LR_ATTRIBUTES, protobuf::WIRE_LEN) => {
+                rec.attrs.push(key_value_proto(r.bytes()?)?)
+            }
+            (field::LR_TRACE_ID, protobuf::WIRE_LEN) => {
+                let id = hex(r.bytes()?);
+                if !id.is_empty() && id.chars().any(|c| c != '0') {
+                    ids.push(("trace_id".to_string(), id));
+                }
+            }
+            (field::LR_SPAN_ID, protobuf::WIRE_LEN) => {
+                let id = hex(r.bytes()?);
+                if !id.is_empty() && id.chars().any(|c| c != '0') {
+                    ids.push(("span_id".to_string(), id));
+                }
+            }
+            _ => r.skip(wire)?,
+        }
+    }
+    if !has_body {
+        return Ok(None);
+    }
+    rec.attrs.extend(ids);
+    Ok(Some(rec))
+}
+
+fn nanos_u64_to_ms(n: u64) -> Option<u64> {
+    if n == 0 {
+        None
+    } else {
+        Some(n / 1_000_000)
+    }
+}
+
+/// Decode a binary `ExportLogsServiceRequest` into the same batches the
+/// JSON path produces.
+pub fn parse_export_request_proto(buf: &[u8]) -> anyhow::Result<Vec<IncomingBatch>> {
+    let mut out = Vec::new();
+    let mut r = protobuf::Reader::new(buf);
+    while !r.done() {
+        let (f, wire) = r.key()?;
+        if f != field::RESOURCE_LOGS || wire != protobuf::WIRE_LEN {
+            r.skip(wire)?;
+            continue;
+        }
+        let mut batch = IncomingBatch {
+            resource: Vec::new(),
+            records: Vec::new(),
+        };
+        let mut rl = protobuf::Reader::new(r.bytes()?);
+        while !rl.done() {
+            let (rf, rwire) = rl.key()?;
+            match (rf, rwire) {
+                (field::RL_RESOURCE, protobuf::WIRE_LEN) => {
+                    let mut res = protobuf::Reader::new(rl.bytes()?);
+                    while !res.done() {
+                        let (af, awire) = res.key()?;
+                        if af == field::RES_ATTRIBUTES && awire == protobuf::WIRE_LEN {
+                            batch.resource.push(key_value_proto(res.bytes()?)?);
+                        } else {
+                            res.skip(awire)?;
+                        }
+                    }
+                }
+                (field::RL_SCOPE_LOGS, protobuf::WIRE_LEN) => {
+                    let mut sl = protobuf::Reader::new(rl.bytes()?);
+                    while !sl.done() {
+                        let (sf, swire) = sl.key()?;
+                        if sf == field::SL_LOG_RECORDS && swire == protobuf::WIRE_LEN {
+                            if let Some(rec) = log_record_proto(sl.bytes()?)? {
+                                batch.records.push(rec);
+                            }
+                        } else {
+                            sl.skip(swire)?;
+                        }
+                    }
+                }
+                _ => rl.skip(rwire)?,
+            }
+        }
+        out.push(batch);
+    }
+    if out.is_empty() {
+        bail!("not an ExportLogsServiceRequest: no resourceLogs");
+    }
+    Ok(out)
+}
+
+fn write_attributes(w: &mut protobuf::Writer, field_no: u32, pairs: &[(String, String)]) {
+    for (k, v) in pairs {
+        w.message_field(field_no, |kv| {
+            kv.string_field(field::KV_KEY, k);
+            kv.message_field(field::KV_VALUE, |av| av.string_field(field::AV_STRING, v));
+        });
+    }
+}
+
+/// The binary spelling of `render_with` — the same request, field for
+/// field, so which encoding a sender uses is a transport choice and
+/// nothing more.
+pub fn render_proto(
+    resource: &[(String, String)],
+    scope_version: &str,
+    entries: &[Entry],
+    sev: &Severity,
+) -> Vec<u8> {
+    let mut w = protobuf::Writer::new();
+    w.message_field(field::RESOURCE_LOGS, |rl| {
+        rl.message_field(field::RL_RESOURCE, |res| {
+            write_attributes(res, field::RES_ATTRIBUTES, resource)
+        });
+        rl.message_field(field::RL_SCOPE_LOGS, |sl| {
+            sl.message_field(field::SL_SCOPE, |sc| {
+                sc.string_field(field::SCOPE_NAME, "timberfs");
+                sc.string_field(field::SCOPE_VERSION, scope_version);
+            });
+            for e in entries {
+                sl.message_field(field::SL_LOG_RECORDS, |lr| {
+                    let body = e.payload.strip_suffix(b"\n").unwrap_or(e.payload);
+                    lr.fixed64_field(
+                        field::LR_TIME,
+                        e.ts_ms.unwrap_or(e.wf_ms).saturating_mul(1_000_000),
+                    );
+                    lr.fixed64_field(field::LR_OBSERVED_TIME, e.wf_ms.saturating_mul(1_000_000));
+                    if let Some((text, num)) = sev.of(e.payload) {
+                        if num > 0 {
+                            lr.varint_field(field::LR_SEVERITY_NUMBER, num as u64);
+                        }
+                        lr.string_field(field::LR_SEVERITY_TEXT, &text);
+                    }
+                    lr.message_field(field::LR_BODY, |b| {
+                        b.string_field(field::AV_STRING, &String::from_utf8_lossy(body))
+                    });
+                });
+            }
+        });
+    });
+    w.into_bytes()
+}
+
+/// An `ExportLogsServiceResponse`. Full success is the empty message —
+/// zero bytes on the wire — which is why answering protobuf costs a
+/// receiver nothing until it actually has to refuse something.
+pub fn render_response_proto(rejected: u64, message: Option<&str>) -> Vec<u8> {
+    if rejected == 0 && message.is_none() {
+        return Vec::new();
+    }
+    let mut w = protobuf::Writer::new();
+    w.message_field(field::PARTIAL_SUCCESS, |ps| {
+        if rejected > 0 {
+            ps.varint_field(field::REJECTED_LOG_RECORDS, rejected);
+        }
+        if let Some(m) = message {
+            ps.string_field(field::ERROR_MESSAGE, m);
+        }
+    });
+    w.into_bytes()
+}
+
+/// Read a receiver's `ExportLogsServiceResponse`: the rejected count and
+/// message of a partial success, if it reported one.
+pub fn parse_response_proto(buf: &[u8]) -> (u64, Option<String>) {
+    let (mut rejected, mut message) = (0u64, None);
+    let mut r = protobuf::Reader::new(buf);
+    while !r.done() {
+        let Ok((f, wire)) = r.key() else { break };
+        if f == field::PARTIAL_SUCCESS && wire == protobuf::WIRE_LEN {
+            let Ok(inner) = r.bytes() else { break };
+            let mut ps = protobuf::Reader::new(inner);
+            while !ps.done() {
+                let Ok((pf, pwire)) = ps.key() else { break };
+                match (pf, pwire) {
+                    (field::REJECTED_LOG_RECORDS, protobuf::WIRE_VARINT) => {
+                        rejected = ps.varint().unwrap_or(0)
+                    }
+                    (field::ERROR_MESSAGE, protobuf::WIRE_LEN) => {
+                        message = ps.string().ok().filter(|s| !s.is_empty())
+                    }
+                    _ => {
+                        if ps.skip(pwire).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if r.skip(wire).is_err() {
+            break;
+        }
+    }
+    (rejected, message)
+}
+
+// ---------------------------------------------------------------------
 // The endpoint.
 // ---------------------------------------------------------------------
 
@@ -428,15 +817,25 @@ pub struct Client {
     ep: Endpoint,
     headers: Vec<(String, String)>,
     timeout: Duration,
+    encoding: Encoding,
+    gzip: bool,
     conn: Option<BufReader<TcpStream>>,
 }
 
 impl Client {
-    pub fn new(ep: Endpoint, headers: Vec<(String, String)>, timeout: Duration) -> Client {
+    pub fn new(
+        ep: Endpoint,
+        headers: Vec<(String, String)>,
+        timeout: Duration,
+        encoding: Encoding,
+        gzip: bool,
+    ) -> Client {
         Client {
             ep,
             headers,
             timeout,
+            encoding,
+            gzip,
             conn: None,
         }
     }
@@ -466,7 +865,7 @@ impl Client {
     /// POST one rendered request. Transport failures are retryable by
     /// definition; the connection is kept alive across batches and
     /// dropped on any error so the next attempt starts clean.
-    pub fn post(&mut self, body: &str) -> Outcome {
+    pub fn post(&mut self, body: &[u8]) -> Outcome {
         let reused = self.conn.is_some();
         match self.try_post(body) {
             Ok(o) => o,
@@ -490,17 +889,28 @@ impl Client {
         }
     }
 
-    fn try_post(&mut self, body: &str) -> anyhow::Result<Outcome> {
+    fn try_post(&mut self, body: &[u8]) -> anyhow::Result<Outcome> {
         self.connect()?;
+        let payload: Vec<u8> = if self.gzip {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(body)?;
+            e.finish()?
+        } else {
+            body.to_vec()
+        };
         let mut req = format!(
             "POST {} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: timber-otlp/{}\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\n",
+             Content-Type: {}\r\nContent-Length: {}\r\n",
             self.ep.path,
             self.ep.host,
             self.ep.port,
             env!("CARGO_PKG_VERSION"),
-            body.len(),
+            self.encoding.content_type(),
+            payload.len(),
         );
+        if self.gzip {
+            req.push_str("Content-Encoding: gzip\r\n");
+        }
         for (k, v) in &self.headers {
             req.push_str(&format!("{k}: {v}\r\n"));
         }
@@ -509,7 +919,7 @@ impl Client {
             let conn = self.conn.as_mut().expect("connected above");
             let s = conn.get_mut();
             s.write_all(req.as_bytes())?;
-            s.write_all(body.as_bytes())?;
+            s.write_all(&payload)?;
             s.flush()?;
         }
         let (status, headers) = self.read_head()?;
@@ -517,7 +927,7 @@ impl Client {
         if header(&headers, "connection").is_some_and(|v| v.eq_ignore_ascii_case("close")) {
             self.conn = None;
         }
-        Ok(classify(status, &headers, &payload))
+        Ok(classify(status, &headers, &payload, self.encoding))
     }
 
     fn read_head(&mut self) -> anyhow::Result<(u16, Vec<(String, String)>)> {
@@ -552,18 +962,18 @@ impl Client {
     /// response makes the connection unreusable and is not decoded: the
     /// status line already carries the verdict, and the body only ever
     /// adds OTLP's partial-success detail.
-    fn read_body(&mut self, headers: &[(String, String)]) -> anyhow::Result<String> {
+    fn read_body(&mut self, headers: &[(String, String)]) -> anyhow::Result<Vec<u8>> {
         let len = header(headers, "content-length").and_then(|v| v.parse::<usize>().ok());
         let conn = self.conn.as_mut().expect("connected");
         match len {
             Some(n) => {
                 let mut buf = vec![0u8; n];
                 conn.read_exact(&mut buf)?;
-                Ok(String::from_utf8_lossy(&buf).into_owned())
+                Ok(buf)
             }
             None => {
                 self.conn = None;
-                Ok(String::new())
+                Ok(Vec::new())
             }
         }
     }
@@ -579,14 +989,18 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// The OTLP/HTTP contract: 2xx is accepted (possibly partially), 429 and
 /// 502/503/504 are retryable, every other 4xx/5xx is permanent. Honouring
 /// exactly that list is what makes a shipper safe to leave running.
-pub fn classify(status: u16, headers: &[(String, String)], body: &str) -> Outcome {
+pub fn classify(status: u16, headers: &[(String, String)], body: &[u8], enc: Encoding) -> Outcome {
     let retry_after = header(headers, "retry-after")
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_secs);
     match status {
+        200..=299 if enc == Encoding::Proto => {
+            let (rejected, message) = parse_response_proto(body);
+            Outcome::Delivered { rejected, message }
+        }
         200..=299 => {
             let (mut rejected, mut message) = (0u64, None);
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(body) {
+            if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(body) {
                 if let Some(Value::Object(p)) = map.get("partialSuccess") {
                     // The count is a string per the JSON mapping, but
                     // receivers emit both spellings.
@@ -615,7 +1029,14 @@ pub fn classify(status: u16, headers: &[(String, String)], body: &str) -> Outcom
             if body.is_empty() {
                 String::new()
             } else {
-                format!(": {}", body.trim().chars().take(200).collect::<String>())
+                format!(
+                    ": {}",
+                    String::from_utf8_lossy(body)
+                        .trim()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                )
             }
         )),
     }
@@ -750,6 +1171,188 @@ mod tests {
         assert_eq!(batches[0].records[0].observed_ms, Some(1_786_783_226_105));
     }
 
+    /// The two encodings are one mapping with two spellings: the same
+    /// entries rendered either way must decode to the same records, or a
+    /// sender's transport choice would silently change its data.
+    #[test]
+    fn both_encodings_carry_the_same_request() {
+        let payloads: Vec<&[u8]> = vec![
+            b"2026-08-15T09:23:45.123+02:00 INFO starting up\n",
+            b"2026-08-15T09:23:46.500+02:00 ERROR boom\n\tat Foo.java:1\n",
+        ];
+        let entries: Vec<Entry> = payloads
+            .iter()
+            .map(|p| Entry {
+                ts_ms: Some(1_786_778_625_123),
+                wf_ms: 1_786_783_226_105,
+                payload: p,
+            })
+            .collect();
+        let resource = vec![
+            ("service.name".to_string(), "app".to_string()),
+            ("host.name".to_string(), "h1".to_string()),
+        ];
+        let sev = Severity::new(None).unwrap();
+
+        let from_json =
+            parse_export_request(&render_with(&resource, "0.0.0", &entries, &sev)).unwrap();
+        let from_proto =
+            parse_export_request_proto(&render_proto(&resource, "0.0.0", &entries, &sev)).unwrap();
+
+        assert_eq!(from_proto.len(), from_json.len());
+        assert_eq!(from_proto[0].resource, from_json[0].resource);
+        assert_eq!(from_proto[0].resource, resource);
+        assert_eq!(from_proto[0].records.len(), from_json[0].records.len());
+        for (p, j) in from_proto[0].records.iter().zip(&from_json[0].records) {
+            assert_eq!(p.time_ms, j.time_ms);
+            assert_eq!(p.observed_ms, j.observed_ms);
+            assert_eq!(p.severity, j.severity);
+            assert_eq!(p.body, j.body);
+            assert_eq!(p.attrs, j.attrs);
+        }
+    }
+
+    /// The roundtrip property again, over the binary encoding — the one
+    /// a real sender actually uses.
+    #[test]
+    fn stamped_entries_roundtrip_over_protobuf() {
+        let payload: &[u8] =
+            b"2026-08-15T09:23:46.500+02:00 ERROR checkout failed\n\tat Cart.java:44\n";
+        let entries = vec![Entry {
+            ts_ms: Some(1_786_778_626_500),
+            wf_ms: 1_786_783_226_105,
+            payload,
+        }];
+        let sev = Severity::new(None).unwrap();
+        let wire = render_proto(
+            &[("service.name".into(), "app".into())],
+            "0.0.0",
+            &entries,
+            &sev,
+        );
+        let batches = parse_export_request_proto(&wire).unwrap();
+        let rec = &batches[0].records[0];
+        assert_eq!(rec.time_ms, Some(1_786_778_626_500));
+        assert_eq!(rec.observed_ms, Some(1_786_783_226_105));
+        assert_eq!(rec.severity.as_deref(), Some("ERROR"));
+        let extractor = crate::import::Extractor::new(None, None, false).unwrap();
+        let head = rec.body.lines().next().unwrap_or_default();
+        assert_eq!(
+            rec.to_line(extractor.extract(head).is_some(), 0),
+            payload.to_vec()
+        );
+    }
+
+    /// A hand-built message, the way a real SDK sends one: ids as raw
+    /// bytes rather than hex, a structured attribute, an unset time.
+    #[test]
+    fn a_senders_own_protobuf_decodes() {
+        let trace: Vec<u8> = (0..16u8).collect();
+        let mut w = protobuf::Writer::new();
+        w.message_field(1, |rl| {
+            rl.message_field(1, |res| {
+                res.message_field(1, |kv| {
+                    kv.string_field(1, "service.name");
+                    kv.message_field(2, |av| av.string_field(1, "checkout"));
+                });
+            });
+            rl.message_field(2, |sl| {
+                sl.message_field(2, |lr| {
+                    lr.fixed64_field(11, 1_786_778_625_123_000_000); // observed only
+                    lr.string_field(3, "ERROR");
+                    lr.message_field(5, |b| b.string_field(1, "database is on fire"));
+                    lr.message_field(6, |kv| {
+                        kv.string_field(1, "http.status_code");
+                        kv.message_field(2, |av| av.varint_field(3, 500));
+                    });
+                    lr.bytes_field(9, &trace);
+                    lr.bytes_field(10, &[0u8; 8]); // all-zero span id: not an id
+                    lr.varint_field(99, 1); // a field this decoder never heard of
+                });
+            });
+        });
+        let batches = parse_export_request_proto(&w.into_bytes()).unwrap();
+        assert_eq!(
+            batches[0].resource,
+            vec![("service.name".to_string(), "checkout".to_string())]
+        );
+        let rec = &batches[0].records[0];
+        assert_eq!(rec.time_ms, None, "no event time was set");
+        assert_eq!(rec.observed_ms, Some(1_786_778_625_123));
+        assert_eq!(
+            rec.event_ms(7),
+            1_786_778_625_123,
+            "observed is the fallback"
+        );
+        assert_eq!(
+            rec.attrs,
+            vec![
+                ("http.status_code".to_string(), "500".to_string()),
+                (
+                    "trace_id".to_string(),
+                    "000102030405060708090a0b0c0d0e0f".to_string()
+                ),
+            ]
+        );
+        let line = String::from_utf8(rec.to_line(false, 0)).unwrap();
+        assert!(line.ends_with(" ERROR database is on fire http.status_code=500 trace_id=000102030405060708090a0b0c0d0e0f\n"), "{line}");
+    }
+
+    #[test]
+    fn structured_proto_values_read_like_the_json_ones() {
+        let mut w = protobuf::Writer::new();
+        w.message_field(1, |rl| {
+            rl.message_field(2, |sl| {
+                sl.message_field(2, |lr| {
+                    lr.message_field(5, |b| {
+                        b.message_field(6, |kvl| {
+                            kvl.message_field(1, |kv| {
+                                kv.string_field(1, "msg");
+                                kv.message_field(2, |av| av.string_field(1, "hi"));
+                            });
+                        })
+                    });
+                    lr.message_field(6, |kv| {
+                        kv.string_field(1, "ratio");
+                        kv.message_field(2, |av| av.fixed64_field(4, 0.5f64.to_bits()));
+                    });
+                    lr.message_field(6, |kv| {
+                        kv.string_field(1, "ok");
+                        kv.message_field(2, |av| av.varint_field(2, 1));
+                    });
+                    lr.message_field(6, |kv| {
+                        kv.string_field(1, "raw");
+                        kv.message_field(2, |av| av.bytes_field(7, b"hi"));
+                    });
+                });
+            });
+        });
+        let batches = parse_export_request_proto(&w.into_bytes()).unwrap();
+        let rec = &batches[0].records[0];
+        assert_eq!(rec.body, r#"{"msg":"hi"}"#);
+        assert_eq!(
+            rec.attrs,
+            vec![
+                ("ratio".to_string(), "0.5".to_string()),
+                ("ok".to_string(), "true".to_string()),
+                ("raw".to_string(), "aGk=".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_truncated_protobuf_body_is_an_error() {
+        let sev = Severity::new(None).unwrap();
+        let entries = vec![Entry {
+            ts_ms: Some(1),
+            wf_ms: 1,
+            payload: b"x\n",
+        }];
+        let wire = render_proto(&[], "0.0.0", &entries, &sev);
+        assert!(parse_export_request_proto(&wire[..wire.len() - 3]).is_err());
+        assert!(parse_export_request_proto(b"").is_err());
+    }
+
     #[test]
     fn an_unstamped_body_is_stamped_on_the_way_in() {
         let rec = Incoming {
@@ -808,18 +1411,24 @@ mod tests {
     fn the_status_contract_is_the_spec_list() {
         let h = vec![];
         assert!(matches!(
-            classify(200, &h, "{}"),
+            classify(200, &h, b"{}", Encoding::Json),
             Outcome::Delivered { rejected: 0, .. }
         ));
         for code in [429, 502, 503, 504] {
             assert!(
-                matches!(classify(code, &h, ""), Outcome::Retry { .. }),
+                matches!(
+                    classify(code, &h, b"", Encoding::Json),
+                    Outcome::Retry { .. }
+                ),
                 "{code}"
             );
         }
         for code in [400, 401, 404, 500] {
             assert!(
-                matches!(classify(code, &h, ""), Outcome::Rejected(_)),
+                matches!(
+                    classify(code, &h, b"", Encoding::Json),
+                    Outcome::Rejected(_)
+                ),
                 "{code}"
             );
         }
@@ -828,12 +1437,12 @@ mod tests {
     #[test]
     fn partial_success_and_retry_after_are_read() {
         let h = vec![("retry-after".to_string(), "7".to_string())];
-        match classify(503, &h, "") {
+        match classify(503, &h, b"", Encoding::Json) {
             Outcome::Retry { after, .. } => assert_eq!(after, Some(Duration::from_secs(7))),
             _ => panic!("503 must retry"),
         }
         let body = r#"{"partialSuccess":{"rejectedLogRecords":"3","errorMessage":"too old"}}"#;
-        match classify(200, &[], body) {
+        match classify(200, &[], body.as_bytes(), Encoding::Json) {
             Outcome::Delivered { rejected, message } => {
                 assert_eq!(rejected, 3);
                 assert_eq!(message.as_deref(), Some("too old"));

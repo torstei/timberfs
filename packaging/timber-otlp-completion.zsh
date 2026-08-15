@@ -21,6 +21,8 @@ _timber_otlp() {
         '--severity-regex=[where the level is, if not an uppercase level word]:pattern:' \
         '--batch-size=[maximum LogRecords per export request]:n:' \
         '--batch-timeout=[send a partial batch after this long with nothing new]:duration:' \
+        '--encoding=[wire encoding]:encoding:(proto json)' \
+        '--compress=[compress request bodies]:mode:(none gzip)' \
         '--dry-run[print the export requests instead of sending them]' \
         {-f,--follow}'[keep shipping as entries are committed]' \
         '--cursor=[persist the shipping position here]:file:_files' \

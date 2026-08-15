@@ -163,9 +163,23 @@ Maximum LogRecords per export request (default 512).
 .BI \-\-batch\-timeout " DUR"
 Send a partial batch after this long with nothing new (default 1s).
 .TP
+.BI \-\-encoding " proto|json"
+Wire encoding (default
+.BR proto ,
+what every OTLP sender defaults to and what a receiver is likeliest to
+accept).
+.B json
+is readable on the wire; both carry the same request.
+.TP
+.BI \-\-compress " none|gzip"
+Compress request bodies (default
+.BR none ).
+Worth it over a network, noise over loopback.
+.TP
 .B \-\-dry\-run
-Print the export requests instead of sending them. A cursor is read but
-never advanced.
+Print the export requests instead of sending them, always in the JSON
+spelling \(em the two encodings carry the same request, and one of them is
+readable. A cursor is read but never advanced.
 .SS Position
 .TP
 .BR \-f ", " \-\-follow

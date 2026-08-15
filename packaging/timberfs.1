@@ -900,17 +900,19 @@ so the sender buffers and retries until the store exists and provisioning
 converges with nothing lost \(em the same contract as an unacked Forward
 chunk, spelled in HTTP.
 .PP
+Both OTLP/HTTP encodings are accepted \(em binary protobuf
+.RB ( application/x\-protobuf ,
+what every sender defaults to) and JSON \(em and a gzipped body is
+inflated, so a stock OpenTelemetry Collector needs nothing configured
+beyond the endpoint. The response comes back in the encoding the request
+used; a full success in protobuf is the empty message, zero bytes.
+.PP
 Deliberate limitations, each refused explicitly and by name:
 .BR POST\ /v1/logs
-only (traces and metrics are not a log store's job \(em 404); OTLP/JSON
-bodies only (a protobuf body is 415 naming the collector's
-.BR "encoding: json" ); no
-.B Content\-Encoding: gzip
-(415, naming
-.BR "compression: none" ); no chunked bodies (411 \(em a receiver that must
-acknowledge durability needs to know what it is acknowledging); no TLS
-(loopback or a private network); and no gRPC \(em put a Collector in front
-for :4317.
+only (traces and metrics are not a log store's job \(em 404); no chunked
+bodies (411 \(em a receiver that must acknowledge durability needs to know
+what it is acknowledging); no TLS (loopback or a private network); and no
+gRPC \(em put a Collector in front for :4317.
 .TP
 .BI \-\-listen " ADDR"
 Address to listen on (default

@@ -192,12 +192,11 @@ request body, and each `ResourceLogs` lands in its own store under
 `/var/log/timberfs/otlp/<service.name>.log`.
 
 ```yaml
-# an OpenTelemetry Collector exporting to it
+# an OpenTelemetry Collector exporting to it — nothing to configure beyond
+# the endpoint: both OTLP/HTTP encodings are accepted, gzipped or not
 exporters:
   otlphttp/timberfs:
     endpoint: http://127.0.0.1:4318
-    encoding: json          # the default is protobuf, which is refused (415)
-    compression: none       # the default is gzip, which is refused (415)
 ```
 
 ```sh
@@ -220,10 +219,9 @@ they describe the stream rather than any one line.
 
 **Deliberate limitations**, each refused explicitly and by name rather than
 silently: `POST /v1/logs` only (traces and metrics are 404 — not a log
-store's job); OTLP/JSON bodies only; no gzip; no chunked bodies (411 — a
-receiver that must acknowledge durability needs to know what it is
-acknowledging); no TLS; and no gRPC on :4317, which wants HTTP/2 — put a
-Collector in front if a sender needs it.
+store's job); no chunked bodies (411 — a receiver that must acknowledge
+durability needs to know what it is acknowledging); no TLS; and no gRPC on
+:4317, which wants HTTP/2 — put a Collector in front if a sender needs it.
 
 The verb name (`otlp-intake`) is provisional. `timber-otlp` ships the same
 wire format in the other direction; a store shipped out and received back

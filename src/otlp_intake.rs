@@ -20,10 +20,13 @@
 //! so the sender buffers and provisioning converges with nothing lost —
 //! the same contract as an unacked Forward chunk, spelled in HTTP.
 //!
+//! Both OTLP/HTTP encodings are accepted — binary protobuf
+//! (`application/x-protobuf`, what every sender defaults to) and JSON —
+//! and a gzipped body is inflated, so a stock OpenTelemetry Collector
+//! works with nothing configured. The response is sent in the encoding
+//! the request used.
+//!
 //! Deliberate limitations, each refused explicitly rather than fudged:
-//!   - JSON bodies only (`application/json`) — a protobuf body is 415,
-//!     naming the collector setting that fixes it;
-//!   - no `Content-Encoding: gzip` — 415, likewise;
 //!   - no TLS — loopback or a private network, like every other intake;
 //!   - `/v1/logs` only: traces and metrics are not a log store's job;
 //!   - no chunked request bodies — 411, since a receiver that must
@@ -40,7 +43,7 @@ use anyhow::Context;
 use serde_json::{json, Value as Json};
 
 use crate::intake::{self, Intake};
-use crate::otlp::{parse_export_request, IncomingBatch};
+use crate::otlp::{parse_export_request, Encoding, IncomingBatch};
 use crate::store::{self, Config};
 
 /// Per-store policy for the receiver, one field per CLI flag.
@@ -127,17 +130,32 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 struct Reply {
     status: u16,
     reason: &'static str,
-    body: String,
+    body: Vec<u8>,
+    content_type: &'static str,
     /// Extra header lines, already formatted.
     extra: Vec<String>,
 }
 
 impl Reply {
-    fn ok(body: String) -> Reply {
+    /// A success, in the encoding the request used. Full success is `{}`
+    /// in JSON and the EMPTY message in protobuf — zero bytes, which is
+    /// what makes answering protobuf cost a receiver nothing.
+    fn ok(enc: Encoding, rejected: u64, message: Option<&str>) -> Reply {
+        let body = match enc {
+            Encoding::Json if rejected == 0 => b"{}".to_vec(),
+            Encoding::Json => json!({"partialSuccess": {
+                "rejectedLogRecords": rejected.to_string(),
+                "errorMessage": message.unwrap_or_default(),
+            }})
+            .to_string()
+            .into_bytes(),
+            Encoding::Proto => crate::otlp::render_response_proto(rejected, message),
+        };
         Reply {
             status: 200,
             reason: "OK",
             body,
+            content_type: enc.content_type(),
             extra: Vec::new(),
         }
     }
@@ -149,7 +167,8 @@ impl Reply {
         Reply {
             status,
             reason,
-            body: msg.into(),
+            body: msg.into().into_bytes(),
+            content_type: "text/plain; charset=utf-8",
             extra: Vec::new(),
         }
     }
@@ -158,14 +177,6 @@ impl Reply {
         self.extra.push(header_line.into());
         self
     }
-
-    fn content_type(&self) -> &'static str {
-        if self.status < 300 {
-            "application/json"
-        } else {
-            "text/plain; charset=utf-8"
-        }
-    }
 }
 
 fn write_reply(w: &mut TcpStream, reply: &Reply, keep_alive: bool) -> std::io::Result<()> {
@@ -173,7 +184,7 @@ fn write_reply(w: &mut TcpStream, reply: &Reply, keep_alive: bool) -> std::io::R
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
         reply.status,
         reply.reason,
-        reply.content_type(),
+        reply.content_type,
         reply.body.len(),
         if keep_alive { "keep-alive" } else { "close" },
     );
@@ -183,7 +194,7 @@ fn write_reply(w: &mut TcpStream, reply: &Reply, keep_alive: bool) -> std::io::R
     }
     head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
-    w.write_all(reply.body.as_bytes())?;
+    w.write_all(&reply.body)?;
     w.flush()
 }
 
@@ -252,18 +263,16 @@ fn read_request(
 }
 
 /// Everything that can be answered without touching a store: the method,
-/// the path, and the two encodings a default-configured collector would
-/// send. Each refusal names the setting that fixes it.
-fn precheck(req: &Request, max_body: usize) -> Option<Reply> {
+/// the path and the encoding. On success it reports which OTLP/HTTP
+/// encoding the body is in, since the answer goes back in the same one.
+fn precheck(req: &Request, max_body: usize) -> Result<Encoding, Reply> {
     if req.method != "POST" {
-        return Some(
-            Reply::err(
-                405,
-                "Method Not Allowed",
-                format!("{} is not allowed; OTLP/HTTP posts\n", req.method),
-            )
-            .with("Allow: POST"),
-        );
+        return Err(Reply::err(
+            405,
+            "Method Not Allowed",
+            format!("{} is not allowed; OTLP/HTTP posts\n", req.method),
+        )
+        .with("Allow: POST"));
     }
     let path = req
         .path
@@ -277,49 +286,78 @@ fn precheck(req: &Request, max_body: usize) -> Option<Reply> {
         } else {
             "not found; OTLP logs are posted to /v1/logs\n"
         };
-        return Some(Reply::err(404, "Not Found", hint));
+        return Err(Reply::err(404, "Not Found", hint));
     }
+    // gzip is inflated below; anything else is named rather than guessed.
     if let Some(enc) = header(&req.headers, "content-encoding") {
-        if !enc.eq_ignore_ascii_case("identity") {
-            return Some(Reply::err(
+        if !enc.eq_ignore_ascii_case("identity") && !enc.eq_ignore_ascii_case("gzip") {
+            return Err(Reply::err(
                 415,
                 "Unsupported Media Type",
-                format!(
-                    "Content-Encoding {enc} is not supported; send the body uncompressed \
-                     (collector: compression: none)\n"
-                ),
+                format!("Content-Encoding {enc} is not supported; use gzip or none\n"),
             ));
         }
     }
-    let ctype = header(&req.headers, "content-type").unwrap_or("");
-    if !ctype.to_ascii_lowercase().starts_with("application/json") {
-        return Some(Reply::err(
+    let ctype = header(&req.headers, "content-type")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let encoding = if ctype.starts_with("application/json") {
+        Encoding::Json
+    } else if ctype.starts_with("application/x-protobuf")
+        || ctype.starts_with("application/protobuf")
+    {
+        Encoding::Proto
+    } else {
+        return Err(Reply::err(
             415,
             "Unsupported Media Type",
             format!(
-                "Content-Type {ctype:?} is not supported; send OTLP/JSON \
-                 (collector: encoding: json)\n"
+                "Content-Type {ctype:?} is not an OTLP/HTTP encoding; send \
+                 application/x-protobuf or application/json\n"
             ),
         ));
-    }
+    };
     if header(&req.headers, "transfer-encoding").is_some_and(|t| t.contains("chunked")) {
-        return Some(Reply::err(
+        return Err(Reply::err(
             411,
             "Length Required",
             "a chunked body cannot be acknowledged as durable; send Content-Length\n",
         ));
     }
     match header(&req.headers, "content-length").map(str::parse::<usize>) {
-        Some(Ok(n)) if n > max_body => Some(Reply::err(
+        Some(Ok(n)) if n > max_body => Err(Reply::err(
             413,
             "Payload Too Large",
             format!("body of {n} bytes exceeds --max-body\n"),
         )),
-        Some(Ok(_)) => None,
-        _ => Some(Reply::err(
+        Some(Ok(_)) => Ok(encoding),
+        _ => Err(Reply::err(
             411,
             "Length Required",
             "a Content-Length is required\n",
+        )),
+    }
+}
+
+/// How much a gzipped body may inflate to, as a multiple of --max-body:
+/// the cap exists so a small compressed request cannot become an
+/// arbitrarily large allocation.
+const MAX_INFLATE_FACTOR: usize = 8;
+
+fn inflate(body: &[u8], max: usize) -> Result<Vec<u8>, Reply> {
+    let mut out = Vec::new();
+    let mut d = flate2::read::GzDecoder::new(body).take(max as u64 + 1);
+    match d.read_to_end(&mut out) {
+        Ok(_) if out.len() > max => Err(Reply::err(
+            413,
+            "Payload Too Large",
+            format!("the gzipped body inflates past {max} bytes\n"),
+        )),
+        Ok(_) => Ok(out),
+        Err(e) => Err(Reply::err(
+            400,
+            "Bad Request",
+            format!("Content-Encoding says gzip, but the body is not: {e}\n"),
         )),
     }
 }
@@ -342,6 +380,7 @@ fn route_of(batch: &IncomingBatch, route: &str) -> String {
 /// stream whose store cannot be opened makes the whole request retryable
 /// (503), and a sender retrying a request we had half-written would
 /// duplicate the half we kept.
+#[allow(clippy::too_many_arguments)]
 fn handle_export(
     intake: &Mutex<Intake>,
     dir: &Path,
@@ -349,6 +388,7 @@ fn handle_export(
     opts: &OtlpOpts,
     extractor: &crate::import::Extractor,
     batches: &[IncomingBatch],
+    enc: Encoding,
 ) -> Reply {
     let now = store::now_ms();
     let mut targets: Vec<String> = Vec::with_capacity(batches.len());
@@ -421,17 +461,23 @@ fn handle_export(
         }
     }
 
-    if rejected > 0 {
-        return Reply::ok(
-            json!({"partialSuccess": {
-                "rejectedLogRecords": rejected.to_string(),
-                "errorMessage": format!("{rejected} record(s) could not be stored"),
-            }})
-            .to_string(),
-        );
-    }
     let _ = stored;
-    Reply::ok("{}".to_string())
+    if rejected > 0 {
+        let msg = format!("{rejected} record(s) could not be stored");
+        return Reply::ok(enc, rejected, Some(&msg));
+    }
+    Reply::ok(enc, 0, None)
+}
+
+/// One body, in whichever encoding the sender used.
+fn decode(enc: Encoding, body: &[u8]) -> anyhow::Result<Vec<IncomingBatch>> {
+    match enc {
+        Encoding::Json => {
+            let v: Json = serde_json::from_slice(body).context("body is not JSON")?;
+            parse_export_request(&v)
+        }
+        Encoding::Proto => crate::otlp::parse_export_request_proto(body),
+    }
 }
 
 fn handle_connection(
@@ -475,22 +521,36 @@ fn handle_connection(
         };
         let mut keep_alive =
             !header(&req.headers, "connection").is_some_and(|c| c.eq_ignore_ascii_case("close"));
+        let gzipped = header(&req.headers, "content-encoding")
+            .is_some_and(|e| e.eq_ignore_ascii_case("gzip"));
         let reply = match precheck(&req, opts.max_body) {
             // A refusal that left the body unread desynchronizes the
             // stream, so those close rather than pretend to continue.
-            Some(r) => {
+            Err(r) => {
                 if r.status == 413 {
                     keep_alive = false;
                 }
                 r
             }
-            None => match serde_json::from_slice::<Json>(&req.body) {
-                Err(e) => Reply::err(400, "Bad Request", format!("body is not JSON: {e}\n")),
-                Ok(v) => match parse_export_request(&v) {
-                    Err(e) => Reply::err(400, "Bad Request", format!("{e}\n")),
-                    Ok(batches) => handle_export(&intake, &dir, &cfg, &opts, &extractor, &batches),
-                },
-            },
+            Ok(enc) => {
+                let body = if gzipped {
+                    inflate(&req.body, opts.max_body * MAX_INFLATE_FACTOR)
+                } else {
+                    Ok(req.body)
+                };
+                match body {
+                    Err(r) => {
+                        keep_alive = false;
+                        r
+                    }
+                    Ok(body) => match decode(enc, &body) {
+                        Err(e) => Reply::err(400, "Bad Request", format!("{e:#}\n")),
+                        Ok(batches) => {
+                            handle_export(&intake, &dir, &cfg, &opts, &extractor, &batches, enc)
+                        }
+                    },
+                }
+            }
         };
         if write_reply(&mut writer, &reply, keep_alive).is_err() || !keep_alive {
             break;
@@ -544,7 +604,7 @@ pub fn cmd_otlp_intake(
             .with_context(|| format!("binding otlp-intake listener on {listen}"))?,
     };
     eprintln!(
-        "timberfs: otlp-intake listening on {} -> {} (POST /v1/logs, OTLP/JSON)",
+        "timberfs: otlp-intake listening on {} -> {} (POST /v1/logs, OTLP protobuf or JSON, gzip ok)",
         listener
             .local_addr()
             .map(|a| a.to_string())
@@ -589,82 +649,149 @@ mod tests {
     }
 
     const JSON: (&str, &str) = ("content-type", "application/json");
+    const PROTO: (&str, &str) = ("content-type", "application/x-protobuf");
     const LEN: (&str, &str) = ("content-length", "2");
 
-    #[test]
-    fn a_well_formed_request_passes_the_precheck() {
-        assert!(precheck(&req("POST", "/v1/logs", &[JSON, LEN]), 1 << 20).is_none());
-        // A charset parameter and a trailing slash are still OTLP/JSON.
-        assert!(precheck(
-            &req(
-                "POST",
-                "/v1/logs/?x=1",
-                &[("content-type", "application/json; charset=utf-8"), LEN]
-            ),
-            1 << 20
-        )
-        .is_none());
+    fn refused(r: Result<Encoding, Reply>) -> Reply {
+        match r {
+            Err(reply) => reply,
+            Ok(_) => panic!("expected a refusal"),
+        }
     }
 
     #[test]
-    fn the_collector_defaults_are_refused_by_name() {
-        // Both of these are what an out-of-the-box otlphttp exporter
-        // sends, so both refusals must name the setting that fixes them.
-        let proto = precheck(
-            &req(
-                "POST",
-                "/v1/logs",
-                &[("content-type", "application/x-protobuf"), LEN],
-            ),
-            1 << 20,
-        )
-        .unwrap();
-        assert_eq!(proto.status, 415);
-        assert!(proto.body.contains("encoding: json"), "{}", proto.body);
+    fn both_otlp_encodings_are_accepted() {
+        // protobuf is what every sender defaults to; a stock collector
+        // must need no configuration at all.
+        assert_eq!(
+            precheck(&req("POST", "/v1/logs", &[PROTO, LEN]), 1 << 20).ok(),
+            Some(Encoding::Proto)
+        );
+        assert_eq!(
+            precheck(
+                &req(
+                    "POST",
+                    "/v1/logs",
+                    &[("content-type", "application/protobuf"), LEN]
+                ),
+                1 << 20
+            )
+            .ok(),
+            Some(Encoding::Proto)
+        );
+        // A charset parameter and a trailing slash are still OTLP/JSON.
+        assert_eq!(
+            precheck(
+                &req(
+                    "POST",
+                    "/v1/logs/?x=1",
+                    &[("content-type", "application/json; charset=utf-8"), LEN]
+                ),
+                1 << 20
+            )
+            .ok(),
+            Some(Encoding::Json)
+        );
+        // gzip is inflated, not refused.
+        assert_eq!(
+            precheck(
+                &req(
+                    "POST",
+                    "/v1/logs",
+                    &[PROTO, LEN, ("content-encoding", "gzip")]
+                ),
+                1 << 20
+            )
+            .ok(),
+            Some(Encoding::Proto)
+        );
+    }
 
-        let gzip = precheck(
-            &req(
-                "POST",
-                "/v1/logs",
-                &[JSON, LEN, ("content-encoding", "gzip")],
-            ),
+    #[test]
+    fn a_non_otlp_encoding_is_named_not_guessed() {
+        let text = refused(precheck(
+            &req("POST", "/v1/logs", &[("content-type", "text/plain"), LEN]),
             1 << 20,
-        )
-        .unwrap();
-        assert_eq!(gzip.status, 415);
-        assert!(gzip.body.contains("compression: none"), "{}", gzip.body);
+        ));
+        assert_eq!(text.status, 415);
+        assert!(
+            String::from_utf8_lossy(&text.body).contains("application/x-protobuf"),
+            "{}",
+            String::from_utf8_lossy(&text.body)
+        );
+        let br = refused(precheck(
+            &req("POST", "/v1/logs", &[JSON, LEN, ("content-encoding", "br")]),
+            1 << 20,
+        ));
+        assert_eq!(br.status, 415);
+        assert!(String::from_utf8_lossy(&br.body).contains("gzip or none"));
     }
 
     #[test]
     fn other_signals_and_methods_are_named_not_just_refused() {
-        let traces = precheck(&req("POST", "/v1/traces", &[JSON, LEN]), 1 << 20).unwrap();
+        let traces = refused(precheck(&req("POST", "/v1/traces", &[JSON, LEN]), 1 << 20));
         assert_eq!(traces.status, 404);
-        assert!(traces.body.contains("log store"), "{}", traces.body);
-        let get = precheck(&req("GET", "/v1/logs", &[JSON, LEN]), 1 << 20).unwrap();
+        assert!(String::from_utf8_lossy(&traces.body).contains("log store"));
+        let get = refused(precheck(&req("GET", "/v1/logs", &[JSON, LEN]), 1 << 20));
         assert_eq!(get.status, 405);
         assert!(get.extra.iter().any(|h| h == "Allow: POST"));
     }
 
     #[test]
     fn an_unmeasurable_or_oversized_body_is_refused() {
-        let chunked = precheck(
+        let chunked = refused(precheck(
             &req(
                 "POST",
                 "/v1/logs",
                 &[JSON, LEN, ("transfer-encoding", "chunked")],
             ),
             1 << 20,
-        )
-        .unwrap();
+        ));
         assert_eq!(chunked.status, 411);
-        let no_len = precheck(&req("POST", "/v1/logs", &[JSON]), 1 << 20).unwrap();
+        let no_len = refused(precheck(&req("POST", "/v1/logs", &[JSON]), 1 << 20));
         assert_eq!(no_len.status, 411);
-        let big = precheck(
+        let big = refused(precheck(
             &req("POST", "/v1/logs", &[JSON, ("content-length", "99")]),
             10,
-        )
-        .unwrap();
+        ));
         assert_eq!(big.status, 413);
+    }
+
+    #[test]
+    fn gzip_is_inflated_and_bounded() {
+        use std::io::Write;
+        let body = br#"{"resourceLogs":[]}"#;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(body).unwrap();
+        let gz = e.finish().unwrap();
+        assert_eq!(
+            inflate(&gz, 1 << 20).map_err(|r| r.status),
+            Ok(body.to_vec())
+        );
+        // A body that inflates past the cap is 413, not an allocation.
+        assert_eq!(inflate(&gz, 4).map_err(|r| r.status), Err(413));
+        // Content-Encoding says gzip and it is not: a 400, not a panic.
+        assert_eq!(
+            inflate(b"plain text", 1 << 20).map_err(|r| r.status),
+            Err(400)
+        );
+    }
+
+    #[test]
+    fn a_success_answers_in_the_encoding_it_was_asked_in() {
+        // Full success in protobuf is the EMPTY message — zero bytes.
+        let proto = Reply::ok(Encoding::Proto, 0, None);
+        assert_eq!(proto.content_type, "application/x-protobuf");
+        assert!(proto.body.is_empty());
+        let json = Reply::ok(Encoding::Json, 0, None);
+        assert_eq!(json.body, b"{}");
+        // A partial success carries the count in both spellings.
+        let p = Reply::ok(Encoding::Proto, 3, Some("nope"));
+        let (rejected, msg) = crate::otlp::parse_response_proto(&p.body);
+        assert_eq!((rejected, msg.as_deref()), (3, Some("nope")));
+        let j = Reply::ok(Encoding::Json, 3, Some("nope"));
+        let v: Json = serde_json::from_slice(&j.body).unwrap();
+        assert_eq!(v["partialSuccess"]["rejectedLogRecords"], "3");
     }
 
     #[test]
