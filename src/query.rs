@@ -760,7 +760,18 @@ fn query_follow(
         // Last emitted chunk's last_write_ms; new chunks arrive later (the
         // appender stamps now()), so this is a monotonic follow cursor.
         cursor_ms: u64,
+        // Consecutive polls that found nothing new.
+        idle_polls: u32,
     }
+
+    // An entry is only closed by the NEXT stamped line, so the newest
+    // entry of a store that falls quiet would otherwise never be emitted
+    // — exactly the entry an incident cares about. After this many idle
+    // polls (seconds, one poll each) the pending entry is closed: past
+    // any writer's --flush-age, so a producer mid-entry has committed the
+    // rest of it already. A longer --flush-age than this can therefore
+    // split a multiline entry that a chunk boundary split first.
+    const IDLE_FLUSH_POLLS: u32 = 10;
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -868,6 +879,7 @@ fn query_follow(
             label,
             sink,
             cursor_ms,
+            idle_polls: 0,
         });
     }
     out.flush()?;
@@ -895,6 +907,7 @@ fn query_follow(
                 .filter(|c| c.first_write_ms > s.cursor_ms)
                 .copied()
                 .collect();
+            let got = !pending.is_empty();
             for c in pending {
                 if let Some(data) = read_chunk(&s.path, &guard, &mut source, c)? {
                     match &mut s.sink {
@@ -908,6 +921,14 @@ fn query_follow(
                 if capped(&limit) {
                     done = true;
                     break;
+                }
+            }
+            // Fires once per idle streak, and only after new data has
+            // reset it — a quiet store is not re-flushed every second.
+            s.idle_polls = if got { 0 } else { s.idle_polls + 1 };
+            if s.idle_polls == IDLE_FLUSH_POLLS {
+                if let Some(sink) = &mut s.sink {
+                    sink.flush_pending(&mut out)?;
                 }
             }
             if done {

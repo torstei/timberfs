@@ -526,6 +526,17 @@ run the entry pipeline. Filter a live follow with a pipe
 .RB ( "| grep" );
 .B \-\-has
 selects whole chunks offline and does not compose with it.
+.IP
+In the entry pipeline an entry is normally closed by the NEXT stamped
+line, which would leave the newest entry of a store that falls quiet
+unemitted \(em exactly the entry an incident cares about. After ten
+seconds with no new chunk, the pending entry is therefore closed and
+emitted: past any writer's
+.BR \-\-flush\-age ,
+so a producer mid-entry has committed the rest of it already. A
+.B \-\-flush\-age
+longer than that can split a multiline entry that a chunk boundary
+split first.
 .TP
 .BI \-\-tail " N"
 Show (about) the last
