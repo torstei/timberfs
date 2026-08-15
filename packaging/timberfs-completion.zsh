@@ -27,6 +27,7 @@ _timberfs_commands() {
         'reindex:rebuild a store'\''s token index'
         'rotate:move or drop chunks written before a cutoff'
         'forward-intake:receive the Fluentd Forward protocol over TCP'
+        'otlp-intake:receive OTLP/HTTP logs from OpenTelemetry senders'
     )
     _describe -t commands 'timberfs subcommand' subcommands
 }

@@ -20,6 +20,7 @@ pub mod intake;
 pub mod list;
 pub mod note;
 pub mod otlp;
+pub mod otlp_intake;
 pub mod query;
 pub mod records;
 pub mod rotate;
