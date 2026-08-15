@@ -30,6 +30,10 @@ clap = { version = "4", features = ["derive"] }
 # fusermount3). abi-7-19 enables the notify API (Notifier::inval_inode),
 # used to invalidate kernel caches after rotation; ABI 7.19 is ancient
 # (kernel 3.x) so this doesn't restrict where timberfs runs.
+# gzip request bodies for the OTLP intake (the OpenTelemetry Collector
+# compresses by default). The default backend is miniz_oxide — pure Rust,
+# no C, nothing to link.
+flate2 = "1"
 fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
 libc = "0.2"
 regex = "1"

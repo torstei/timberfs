@@ -38,23 +38,15 @@ works is in [docs/design.md](docs/design.md).
   stays the database; the server owns no state that is not a plain
   timberfs file. Path: lib refactor → .bark → read-only serve → ingest →
   tiering.
-- **OTLP intake gaps**: `otlp-intake` receives OTLP/JSON over HTTP; still
-  open are protobuf request bodies (the Collector's default encoding, so
-  `encoding: json` is required today), gzip request bodies (likewise
-  `compression: none`), and gRPC on :4317 — which wants HTTP/2 and an async
-  runtime, so the answer stays "put a Collector in front" until something
-  forces it. Metrics and traces remain out of scope by design. Smaller: a
-  pre-created store keeps the operator's `.bark` untouched, so its resource
-  attributes are never seeded — right, but it means `timberfs create` +
-  `--route` needs the operator to declare `service` themselves.
-- **`timber-otlp` gaps**: protobuf request bodies (the Collector's default
-  encoding — and the RESPONSE is free, since an empty
-  `ExportLogsServiceResponse` is zero bytes); gzip request bodies;
-  `trace_id`/`span_id` and structured attributes lifted into LogRecord
-  fields instead of staying inside the body text (`--has <trace_id>` over
-  the `.grain` index already finds a trace's lines with no trace backend);
-  and a bounded `--max-retries`, since retrying forever is right for a
-  daemon and wrong for a one-shot replay in a script.
+- **OTLP gaps**: gRPC on :4317 wants HTTP/2 and an async runtime, so the
+  answer stays "put a Collector in front" until something forces it.
+  Metrics and traces remain out of scope by design. Smaller: a pre-created
+  store keeps the operator's `.bark` untouched, so its resource attributes
+  are never seeded — right, but it means the operator declares `service`
+  themselves; `trace_id`/`span_id` land in the line as `k=v` rather than in
+  dedicated fields on the way back out; and `timber-otlp` retries a
+  retryable endpoint forever, which is right for a daemon and wrong for a
+  one-shot replay in a script (a bounded `--max-retries`).
 - **A write-time window for one-shot reads (`--written-from`)**: `query
   --from` means LOGLINE time in a windowed read but WRITE time in
   `--follow` — the axis switches with the mode instead of being chosen.

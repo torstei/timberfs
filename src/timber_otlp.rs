@@ -84,6 +84,15 @@ struct Cli {
     /// Send a partial batch after this long with nothing new
     #[arg(long, value_name = "DUR", default_value = "1s", help_heading = HEAD_WHAT)]
     batch_timeout: String,
+    /// Wire encoding: proto is what every OTLP sender defaults to and
+    /// what a receiver is likeliest to accept; json is readable on the
+    /// wire. --dry-run always prints the json spelling
+    #[arg(long, value_name = "ENC", default_value = "proto", value_parser = ["proto", "json"], help_heading = HEAD_WHAT)]
+    encoding: String,
+    /// Compress request bodies with gzip (worth it over a network, noise
+    /// over loopback)
+    #[arg(long, value_name = "MODE", default_value = "none", value_parser = ["none", "gzip"], help_heading = HEAD_WHAT)]
+    compress: String,
     /// Render and print the export requests instead of sending them; a
     /// cursor is read but never advanced
     #[arg(long, help_heading = HEAD_WHAT)]
@@ -262,6 +271,7 @@ fn spawn_reader<R: BufRead + Send + 'static>(r: R) -> mpsc::Receiver<Msg> {
 
 struct Shipper {
     client: Option<Client>,
+    encoding: otlp::Encoding,
     resource: Vec<(String, String)>,
     severity: Severity,
     cursor: Option<(Cursor, PathBuf)>,
@@ -289,16 +299,33 @@ impl Shipper {
                 payload: &e.payload,
             })
             .collect();
-        let body = otlp::render_with(
-            &self.resource,
-            env!("CARGO_PKG_VERSION"),
-            &entries,
-            &self.severity,
-        );
         if self.dry_run {
+            // The json spelling whatever the wire encoding is: the two
+            // carry the same request, and one of them is readable.
+            let body = otlp::render_with(
+                &self.resource,
+                env!("CARGO_PKG_VERSION"),
+                &entries,
+                &self.severity,
+            );
             println!("{}", serde_json::to_string_pretty(&body)?);
         } else {
-            let text = body.to_string();
+            let text: Vec<u8> = match self.encoding {
+                otlp::Encoding::Proto => otlp::render_proto(
+                    &self.resource,
+                    env!("CARGO_PKG_VERSION"),
+                    &entries,
+                    &self.severity,
+                ),
+                otlp::Encoding::Json => otlp::render_with(
+                    &self.resource,
+                    env!("CARGO_PKG_VERSION"),
+                    &entries,
+                    &self.severity,
+                )
+                .to_string()
+                .into_bytes(),
+            };
             let client = self.client.as_mut().expect("a client unless --dry-run");
             let mut backoff = Duration::from_secs(1);
             let mut attempt = 0u32;
@@ -419,6 +446,11 @@ fn run() -> anyhow::Result<()> {
     }
     let mut resume = Resume::new(cursor.as_ref().filter(|c| c.delivered > 0));
 
+    let encoding = if cli.encoding == "json" {
+        otlp::Encoding::Json
+    } else {
+        otlp::Encoding::Proto
+    };
     let client = if cli.dry_run {
         None
     } else {
@@ -426,8 +458,26 @@ fn run() -> anyhow::Result<()> {
         let ep = otlp::parse_endpoint(&url)?;
         let mut headers = env_headers();
         headers.extend(parse_kv(&cli.header, "--header")?);
-        note!("timber-otlp: shipping to {ep}");
-        Some(Client::new(ep, headers, timeout))
+        note!(
+            "timber-otlp: shipping to {ep} ({}{})",
+            if encoding == otlp::Encoding::Json {
+                "json"
+            } else {
+                "protobuf"
+            },
+            if cli.compress == "gzip" {
+                ", gzipped"
+            } else {
+                ""
+            }
+        );
+        Some(Client::new(
+            ep,
+            headers,
+            timeout,
+            encoding,
+            cli.compress == "gzip",
+        ))
     };
 
     // Either spawn the selection layer over a store, or take a record
@@ -486,6 +536,7 @@ fn run() -> anyhow::Result<()> {
 
     let mut shipper = Shipper {
         client,
+        encoding,
         resource,
         severity,
         cursor: cursor.map(|c| (c, cli.cursor.clone().expect("cursor implies a path"))),

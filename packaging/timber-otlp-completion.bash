@@ -17,13 +17,22 @@ _timber_otlp() {
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
     local flags="--endpoint --header --timeout --service --resource \
---severity-regex --batch-size --batch-timeout --dry-run -f --follow \
---cursor --start --from --to --quiet -h --help -V --version"
+--severity-regex --batch-size --batch-timeout --encoding --compress \
+--dry-run -f --follow --cursor --start --from --to --quiet \
+-h --help -V --version"
 
     # A flag that takes a value: the word after it is never a handle.
     case "$prev" in
     --start)
         COMPREPLY=($(compgen -W "end begin" -- "$cur"))
+        return 0
+        ;;
+    --encoding)
+        COMPREPLY=($(compgen -W "proto json" -- "$cur"))
+        return 0
+        ;;
+    --compress)
+        COMPREPLY=($(compgen -W "none gzip" -- "$cur"))
         return 0
         ;;
     --cursor)

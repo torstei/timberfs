@@ -154,19 +154,17 @@ timberfs otlp-intake --into-dir /var/log/timberfs/otlp --auto-create &
 ```
 
 ```yaml
-# an OpenTelemetry Collector pointed at it
+# an OpenTelemetry Collector pointed at it — no settings to change
 exporters:
   otlphttp/timberfs:
     endpoint: http://127.0.0.1:4318
-    encoding: json          # the default is protobuf
-    compression: none       # the default is gzip
 ```
 
-Both of those settings are refused by name if you forget them (415, saying
-which). An undeclared stream gets 503 + `Retry-After` so the sender buffers
-until you create the store — or `--auto-create` mints them. `POST /v1/logs`
-only, no TLS (loopback or a private network), and no gRPC on :4317 — put a
-Collector in front if a sender needs it.
+Both OTLP/HTTP encodings work (binary protobuf, which every sender defaults
+to, and JSON), gzipped or not. An undeclared stream gets 503 + `Retry-After`
+so the sender buffers until you create the store — or `--auto-create` mints
+them. `POST /v1/logs` only, no TLS (loopback or a private network), and no
+gRPC on :4317 — put a Collector in front if a sender needs it.
 
 It pairs with `timber-otlp` below: a store shipped out over OTLP and received
 back arrives byte for byte, which is the property their tests hold each other
@@ -223,8 +221,9 @@ entry's own logline stamp, `observedTimeUnixNano` the write time it arrived at.
 The position is persisted in a cursor file on the write axis (the only
 monotonic one), so a restart resumes instead of re-sending; delivery is
 at-least-once, as OTLP itself is. `--dry-run` prints exactly what would be
-posted. JSON over plaintext HTTP only — terminate TLS in a collector beside it.
-Details: `man timber-otlp`.
+posted. Protobuf by default (`--encoding json` for a readable wire,
+`--compress gzip` over a network); plaintext HTTP only — terminate TLS in a
+collector beside it. Details: `man timber-otlp`.
 
 ## Rotation & retention
 
