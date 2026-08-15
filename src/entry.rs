@@ -254,6 +254,16 @@ impl EntrySink {
         Ok(())
     }
 
+    /// Close the entry held open waiting for the next stamped line — the
+    /// live-stream escape from "the newest entry is never the one you
+    /// see". Only for a source that has been idle longer than any writer
+    /// could hold a flush: a producer still writing an entry would have
+    /// committed the rest of it by then. The partial LINE (bytes after
+    /// the last newline) stays buffered; it is genuinely incomplete.
+    pub fn flush_pending(&mut self, out: &mut dyn Write) -> io::Result<()> {
+        self.close_entry(out)
+    }
+
     /// Flush pending state; call once after the last push.
     pub fn finish(&mut self, out: &mut dyn Write) -> io::Result<()> {
         if !self.line.is_empty() {
