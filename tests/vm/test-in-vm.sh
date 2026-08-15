@@ -1043,16 +1043,17 @@ otlp_intake_undeclared_refused_until_created() {
     otlp_wait_for "$OTLP_DIR/vmrefused.log" "otlp native record"
 }
 
-otlp_intake_refuses_by_name() {
-    # The two that matter are what an out-of-the-box collector sends, so
-    # each refusal must name the setting that fixes it.
-    otlp_request POST /v1/logs application/x-protobuf x > /tmp/o1.out 2>&1
+otlp_intake_refuses_the_right_things() {
+    # What is NOT an OTLP/HTTP encoding is named, not guessed at. (The two
+    # a stock collector sends — protobuf and gzip — are accepted; the
+    # cases below cover the rest.)
+    otlp_request POST /v1/logs text/plain x > /tmp/o1.out 2>&1
     head -1 /tmp/o1.out | grep -q '^415|' || { cat /tmp/o1.out; return 1; }
-    grep -q 'encoding: json' /tmp/o1.out || { cat /tmp/o1.out; return 1; }
+    grep -q 'application/x-protobuf' /tmp/o1.out || { cat /tmp/o1.out; return 1; }
 
-    otlp_request POST /v1/logs application/json '{}' 'Content-Encoding: gzip' > /tmp/o2.out 2>&1
+    otlp_request POST /v1/logs application/json '{}' 'Content-Encoding: br' > /tmp/o2.out 2>&1
     head -1 /tmp/o2.out | grep -q '^415|' || { cat /tmp/o2.out; return 1; }
-    grep -q 'compression: none' /tmp/o2.out || { cat /tmp/o2.out; return 1; }
+    grep -q 'gzip or none' /tmp/o2.out || { cat /tmp/o2.out; return 1; }
 
     # Other signals and methods are named, not merely refused.
     otlp_request POST /v1/traces application/json '{}' > /tmp/o3.out 2>&1
@@ -1139,7 +1140,8 @@ otlp_intake_restart_survives() {
     systemctl --quiet is-active timberfs-otlp.service
 }
 
-# The headline: ship a store OUT over OTLP and receive it back IN. Each
+# The headline: ship a store OUT over OTLP and receive it back IN — over
+# protobuf, the default encoding and the one every real sender uses. Each
 # direction is the other's oracle, so a drift in time, framing or body
 # text on either side shows up here as a diff.
 otlp_roundtrip_is_byte_for_byte() {
@@ -1224,15 +1226,146 @@ timber_otlp_cursor_resumes_without_duplicates() {
     [ "$(jq -r .delivered /tmp/cur.cursor)" = 6 ]
 }
 
+# ARGS: CONTENT_TYPE BODY_FILE [gzip] — post a body from a file, so binary
+# survives the trip. Prints "<status>|<response body length>".
+otlp_post_file() {
+    command -v python3 >/dev/null 2>&1 || { echo "NO_PYTHON3"; return 1; }
+    python3 - "$1" "$2" "${3:-}" << 'PYEOF'
+import sys, gzip, http.client
+ctype, path, comp = sys.argv[1], sys.argv[2], sys.argv[3]
+body = open(path, "rb").read()
+headers = {"Content-Type": ctype}
+if comp == "gzip":
+    body = gzip.compress(body)
+    headers["Content-Encoding"] = "gzip"
+conn = http.client.HTTPConnection("127.0.0.1", 4318, timeout=15)
+conn.request("POST", "/v1/logs", body, headers)
+r = conn.getresponse()
+print("%d|%d" % (r.status, len(r.read())))
+PYEOF
+}
+
+# ARGS: SERVICE OUTFILE — a binary ExportLogsServiceRequest packed here
+# from varints and length-delimited fields, NOT by timberfs's own encoder:
+# the intake has to decode what a foreign sender produces, and a shared
+# bug between encoder and decoder would hide behind a self-roundtrip.
+otlp_write_proto_body() {
+    command -v python3 >/dev/null 2>&1 || { echo "NO_PYTHON3"; return 1; }
+    python3 - "$1" "$2" "$OTLP_NANOS" "$OTLP_TRACE" << 'PYEOF'
+import sys
+service, out, nanos, trace = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+
+def varint(n):
+    b = b""
+    while True:
+        x = n & 0x7F
+        n >>= 7
+        if n:
+            b += bytes([x | 0x80])
+        else:
+            return b + bytes([x])
+
+def tag(f, w):
+    return varint((f << 3) | w)
+
+def ld(f, payload):
+    return tag(f, 2) + varint(len(payload)) + payload
+
+def st(f, text):
+    return ld(f, text.encode())
+
+def fixed64(f, v):
+    return tag(f, 1) + v.to_bytes(8, "little")
+
+def anyval(text):
+    return st(1, text)
+
+def keyvalue(k, v):
+    return st(1, k) + ld(2, anyval(v))
+
+record = (
+    fixed64(1, nanos)
+    + st(3, "ERROR")
+    + ld(5, anyval("protobuf native record"))
+    + ld(6, keyvalue("http.status_code", "500"))
+    + ld(9, bytes.fromhex(trace))
+    + varint((99 << 3) | 0) + varint(7)   # a field this decoder never heard of
+)
+resource = ld(1, keyvalue("service.name", service)) + ld(1, keyvalue("host.name", "vmhost"))
+scope_logs = ld(1, st(1, "vm-sdk")) + ld(2, record)
+resource_logs = ld(1, resource) + ld(2, scope_logs)
+open(out, "wb").write(ld(1, resource_logs))
+PYEOF
+}
+
+otlp_intake_accepts_a_foreign_protobuf_sender() {
+    otlp_write_proto_body vmproto /tmp/vmproto.bin || return 1
+    otlp_post_file application/x-protobuf /tmp/vmproto.bin > /tmp/op1.out 2>&1
+    # Full success in protobuf is the EMPTY message: 200 with a zero-byte body.
+    grep -q '^200|0$' /tmp/op1.out || { cat /tmp/op1.out; return 1; }
+    otlp_wait_for "$OTLP_DIR/vmproto.log" "protobuf native record" || return 1
+    timberfs query "$OTLP_DIR/vmproto.log" > /tmp/op2.out 2>&1
+    grep -q "ERROR protobuf native record http.status_code=500 trace_id=$OTLP_TRACE" /tmp/op2.out \
+        || { cat /tmp/op2.out; return 1; }
+    grep -q '"service.name": "vmproto"' "$OTLP_DIR/vmproto.log.bark" || return 1
+    # The unknown field did not derail the decode, and the event time landed.
+    local covers
+    covers=$(date -d "@$((OTLP_NANOS / 1000000000))" '+%Y-%m-%d %H:%M:%S.000')
+    timberfs info "$OTLP_DIR/vmproto.log" | grep -q "covers    $covers"
+}
+
+otlp_intake_inflates_gzip() {
+    # What a stock collector sends: gzipped. Both encodings, since the
+    # inflate happens before either decoder sees the body.
+    otlp_body vmgzipjson > /tmp/vmgz.json
+    otlp_post_file application/json /tmp/vmgz.json gzip > /tmp/og1.out 2>&1
+    grep -q '^200|2$' /tmp/og1.out || { cat /tmp/og1.out; return 1; }
+    otlp_wait_for "$OTLP_DIR/vmgzipjson.log" "otlp native record" || return 1
+
+    otlp_write_proto_body vmgzipproto /tmp/vmgz.bin || return 1
+    otlp_post_file application/x-protobuf /tmp/vmgz.bin gzip > /tmp/og2.out 2>&1
+    grep -q '^200|0$' /tmp/og2.out || { cat /tmp/og2.out; return 1; }
+    otlp_wait_for "$OTLP_DIR/vmgzipproto.log" "protobuf native record" || return 1
+
+    # A body that claims gzip and is not gets a 400, not a panic.
+    otlp_post_file application/json /tmp/vmgz.json > /dev/null 2>&1
+    printf 'not gzipped at all' > /tmp/vmnotgz.bin
+    python3 - << 'PYEOF' > /tmp/og3.out 2>&1
+import http.client
+conn = http.client.HTTPConnection("127.0.0.1", 4318, timeout=15)
+conn.request("POST", "/v1/logs", b"not gzipped at all",
+             {"Content-Type": "application/json", "Content-Encoding": "gzip"})
+r = conn.getresponse()
+print("%d" % r.status)
+PYEOF
+    grep -q '^400$' /tmp/og3.out || { cat /tmp/og3.out; return 1; }
+}
+
+otlp_roundtrip_over_json_and_gzip() {
+    # The same store, shipped with the other encoding and compressed: a
+    # transport choice must not change the data.
+    rm -f "$OTLP_DIR"/rtjson.log.*
+    timber-otlp --quiet --encoding json --compress gzip --service rtjson \
+        --endpoint http://127.0.0.1:4318 "$PIPE_BACKING/rt.log" > /tmp/rtj.ship 2>&1 \
+        || { cat /tmp/rtj.ship; return 1; }
+    otlp_wait_for "$OTLP_DIR/rtjson.log" "roundtrip retrying" || return 1
+    timberfs query "$PIPE_BACKING/rt.log" > /tmp/rtj.a 2>/dev/null
+    timberfs query "$OTLP_DIR/rtjson.log" > /tmp/rtj.b 2>/dev/null
+    diff -u /tmp/rtj.a /tmp/rtj.b
+}
+
 run_test "otlp-intake: enable socket, unit activates" otlp_intake_setup
 run_test "otlp-intake: undeclared stream 503s until the operator creates it" otlp_intake_undeclared_refused_until_created
-run_test "otlp-intake: protobuf/gzip/traces/GET/bad-JSON refused by name" otlp_intake_refuses_by_name
+run_test "otlp-intake: non-OTLP encodings, signals and methods refused by name" otlp_intake_refuses_the_right_things
 run_test "otlp-intake: --auto-create --index drop-in" otlp_intake_enable_auto_create
 run_test "otlp-intake: a native record becomes a stamped, greppable line" otlp_intake_renders_a_native_record
 run_test "otlp-intake: trace id rides the token index" otlp_intake_trace_id_is_indexed
 run_test "otlp-intake: resource attributes seed the manifest, wal live" otlp_intake_seeds_the_resource
 run_test "otlp-intake: service restart, sender retries, still lands" otlp_intake_restart_survives
+run_test "otlp-intake: a foreign sender's protobuf decodes" otlp_intake_accepts_a_foreign_protobuf_sender
+run_test "otlp-intake: gzipped bodies inflate, both encodings" otlp_intake_inflates_gzip
 run_test "otlp: store shipped out and received back is byte for byte" otlp_roundtrip_is_byte_for_byte
+run_test "otlp: the same roundtrip over json + gzip" otlp_roundtrip_over_json_and_gzip
 run_test "timber-otlp: --dry-run renders one LogRecord per entry" timber_otlp_dry_run_shape
 run_test "timber-otlp: cursor resumes after a kill, no duplicates" timber_otlp_cursor_resumes_without_duplicates
 
