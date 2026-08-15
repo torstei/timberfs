@@ -57,7 +57,7 @@ enum Command {
     },
     /// Create an empty timberfs log with its properties declared up
     /// front in a .bark manifest — database-style: `create --index` is
-    /// CREATE INDEX, and every later import maintains the .grain
+    /// CREATE INDEX, and every later writer maintains the .grain
     /// automatically
     Create {
         /// Backing file to create: logical name, .trunk or .rings path

@@ -262,9 +262,10 @@ in it (~10 bits per distinct token, k=7, ~1% false positives — measured
 it with `query --has`:
 
 The index is a property of the LOG, declared once in its `.bark`
-manifest — after that, every import maintains the grain automatically
-(extended incrementally for new chunks, rebuilt if rotation/retention
-dropped it). There is no per-import flag to forget:
+manifest — after that, every writer maintains the grain automatically:
+`import`, the appender, the mount and both network intakes alike, each
+extending it incrementally for new chunks and rebuilding it if
+rotation/retention dropped it. There is no per-write flag to forget:
 
 ```sh
 timberfs create --index --set host=foo.bar.com logs-backing/app.log

@@ -159,6 +159,29 @@ impl LivePolicy {
     }
 }
 
+/// Flushed chunks of one store; 0 if it is gone (it never is here — the
+/// appender owns it for the whole run).
+fn chunk_count(store: &Mutex<Store>, name: &str) -> usize {
+    store
+        .lock()
+        .unwrap()
+        .files
+        .get(name)
+        .map(|f| f.chunks.len())
+        .unwrap_or(0)
+}
+
+/// Extend the token index if this store declares one. Best-effort: the
+/// grain is derived, a chunk it doesn't cover is simply scanned, so a
+/// failure here must never fail the append.
+fn extend_declared_grain(dir: &Path, name: &str) {
+    if crate::bark::index_declared(dir, name) {
+        if let Err(e) = crate::grain::extend_grain(dir, name) {
+            eprintln!("timberfs: {name}: grain extend failed: {e}");
+        }
+    }
+}
+
 fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Retention) {
     if !policy.is_some() {
         return;
@@ -284,24 +307,45 @@ pub fn cmd_append(
     {
         let store = Arc::clone(&store);
         let name = name.clone();
+        let dir = dir.clone();
         let policy = Arc::clone(&policy);
         let watch = if exit_on_upgrade {
             crate::store::BinaryWatch::current()
         } else {
             None
         };
+        let mut indexed_chunks = chunk_count(&store, &name);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(1000));
             // Binary upgraded on disk: flush and exit for a clean re-exec
             // (the supervisor restarts us on the new one).
             if watch.as_ref().is_some_and(|w| w.changed()) {
                 store.lock().unwrap().flush_all();
+                // Index what we flushed before the re-exec, off the lock:
+                // a full rebuild here would otherwise delay shutdown past
+                // systemd's stop timeout.
+                extend_declared_grain(&dir, &name);
                 std::process::exit(crate::store::EXIT_BINARY_UPGRADED);
             }
             store.lock().unwrap().flush_aged();
             store.lock().unwrap().sap_sync_all();
             let p = policy.lock().unwrap().refresh();
             run_retention(&store, &name, p);
+            // Keep the declared index current while streaming, exactly as
+            // the records sink and the network intakes do: extend whenever
+            // the flushed-chunk set changed (a flush added chunks, or
+            // retention dropped some and deleted the grain). Deliberately
+            // NOT holding the store lock — extend_grain reads only
+            // committed, immutable chunks and is the sole writer of the
+            // grain, so it cannot race the append thread, which only
+            // appends new chunks and never touches the grain.
+            let cur = chunk_count(&store, &name);
+            if cur != indexed_chunks && crate::bark::index_declared(&dir, &name) {
+                match crate::grain::extend_grain(&dir, &name) {
+                    Ok(()) => indexed_chunks = cur,
+                    Err(e) => eprintln!("timberfs: {name}: background grain extend failed: {e}"),
+                }
+            }
         });
     }
 
@@ -339,6 +383,7 @@ pub fn cmd_append(
             }
             Err(e) => {
                 store.lock().unwrap().flush_all();
+                extend_declared_grain(&dir, &name);
                 return Err(e.into());
             }
         }
@@ -347,6 +392,9 @@ pub fn cmd_append(
     store.lock().unwrap().flush_all();
     let p = policy.lock().unwrap().refresh();
     run_retention(&store, &name, p);
+    // Last: index everything this run flushed, retention included, so a
+    // short-lived appender still leaves a complete index behind.
+    extend_declared_grain(&dir, &name);
     eprintln!(
         "timberfs: appended {} bytes to {} ({})",
         total,

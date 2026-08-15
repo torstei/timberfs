@@ -859,6 +859,9 @@ pub fn mount(
             let mut last_good: HashMap<String, crate::bark::Retention> = HashMap::new();
             let mut stamps: HashMap<String, Stamp> = HashMap::new();
             let mut warned: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Flushed-chunk count per store when its grain was last
+            // extended; a change means there is indexing to do.
+            let mut indexed_chunks: HashMap<String, usize> = HashMap::new();
             loop {
                 thread::sleep(Duration::from_millis(1000));
                 // Our binary was replaced on disk (a package upgrade): flush
@@ -928,6 +931,41 @@ pub fn mount(
                 }
                 store.lock().unwrap().flush_aged();
                 store.lock().unwrap().sap_sync_all();
+                // Keep each declared index current, as the appender and the
+                // network intakes do. After the flush above, so this tick's
+                // chunks are covered by this tick's extend. Deliberately NOT
+                // holding the store lock: extend_grain reads only committed,
+                // immutable chunks and is the sole writer of the grain, so it
+                // cannot race the write path, which only appends new chunks
+                // and never touches the grain — and holding the lock through
+                // a rebuild would stall every writer in the mount.
+                let counts: Vec<(String, usize)> = {
+                    let s = store.lock().unwrap();
+                    s.files
+                        .iter()
+                        .map(|(n, f)| (n.clone(), f.chunks.len()))
+                        .collect()
+                };
+                // Forget stores that are gone, so a name reused by a fresh
+                // store (remove + create) can't inherit a count and skip its
+                // first extend.
+                indexed_chunks.retain(|n, _| counts.iter().any(|(c, _)| c == n));
+                for (name, cur) in counts {
+                    if indexed_chunks.get(&name) == Some(&cur) {
+                        continue;
+                    }
+                    if !crate::bark::index_declared(&dir, &name) {
+                        continue;
+                    }
+                    match crate::grain::extend_grain(&dir, &name) {
+                        Ok(()) => {
+                            indexed_chunks.insert(name, cur);
+                        }
+                        Err(e) => {
+                            eprintln!("timberfs: {name}: background grain extend failed: {e}")
+                        }
+                    }
+                }
             }
         });
     }

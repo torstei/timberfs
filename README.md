@@ -105,6 +105,11 @@ by write time, so old data lands under today's timestamps. Historical
 files go through `import`, which parses their own timestamps (and is
 resumable, deduplicating and idempotent).
 
+The token index needs no attention either way: once `index` is declared,
+every writer maintains it — a streaming one on its once-a-second tick, so
+the grain trails the newest chunk by at most that tick, and an uncovered
+chunk is scanned rather than missed. `timberfs info` shows the coverage.
+
 **c) Mount it** — if the software insists on writing to a real file path,
 give it one; compression, indexing and retention happen transparently
 underneath:

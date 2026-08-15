@@ -419,7 +419,7 @@ token index \(em needed once per log (the declaration persists in the
 .B .bark
 manifest; see
 .BR create ),
-after which every import maintains the index automatically.
+after which every writer maintains the index automatically.
 .B \-\-wal
 declares the write-ahead sidecar for future writers of this log \(em a
 batch import has no live unflushed tail of its own to protect, so this
@@ -634,8 +634,9 @@ artifacts \(em the command line that produced it, labelled
 declared provenance, logical size vs on-disk size and compression
 ratio, the time span covered and its duration, index sizes with grain
 .B coverage
-(a grain lagging its log \(em appender writes, partial extends \(em
-covers fewer chunks than the rings; the gap is scanned), whether
+(a grain lagging its log \(em the newest chunks of a live writer,
+partial extends \(em covers fewer chunks than the rings; the gap is
+scanned), whether
 .B wal
 is declared and how many bytes currently sit in its
 .B .sap

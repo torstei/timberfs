@@ -120,6 +120,22 @@ mounted_empty_rotation() {
         && [ ! -e "$BACKING/quiet2.log.rings" ]
 }
 
+mounted_grain_maintained() {
+    # The mount daemon maintains a declared index too — same contract as
+    # the appender and the intakes. Own file: the index declaration must
+    # not follow the shared fixture into downstream tests.
+    for i in $(seq 1 200); do
+        echo "2026-06-06T11:00:00 INFO mounted line $i" >> "$MNT/idx.log"
+    done
+    timberfs set "$BACKING/idx.log" index=true > /dev/null || return 1
+    echo "2026-06-06T11:00:01 INFO MOUNTNEEDLE9A1F" >> "$MNT/idx.log"
+    # the daemon's tick both flushes and indexes; give it room for both
+    sleep 4
+    [ -s "$BACKING/idx.log.grain" ] || return 1
+    timberfs query "$BACKING/idx.log" --has MOUNTNEEDLE9A1F 2>/dev/null \
+        | grep -q MOUNTNEEDLE9A1F
+}
+
 mounted_retention() {
     # declared retention (bark) is enforced by the mount daemon, live: a
     # `timberfs set` while mounted takes effect on the next tick, and
@@ -481,6 +497,7 @@ run_test "mounted empty rotation attests; --fail-on-empty relays" mounted_empty_
 run_test "retention --delete empties file" retention_delete
 run_test "100k-line integrity + stock-zstd recovery" big_file_integrity
 run_test "mounted retention: declared in bark, enforced live" mounted_retention
+run_test "mounted writes maintain a declared grain" mounted_grain_maintained
 run_test "compressed on disk (>5x)" compression_on_disk
 run_test "systemctl stop timberfs@test" stop_unit
 run_test "unmounted and not failed after stop" stopped_cleanly
@@ -507,10 +524,67 @@ records_sink_age_flush() {
     rm -f /tmp/rec.fifo
 }
 
+appender_maintains_grain() {
+    # A declared index is maintained by EVERY streaming writer, not just
+    # import: a plain-text appender must leave a grain covering what it
+    # wrote, with no reindex — else `--has` scans everything forever.
+    timberfs create --index "$PIPE_BACKING/idx.log" > /dev/null || return 1
+    python3 -c "
+import datetime
+d = datetime.datetime(2026, 6, 7, 8, 0, 0)
+for i in range(20000):
+    ts = (d + datetime.timedelta(seconds=i)).isoformat()
+    print(f'{ts} INFO work {i}' + (' APPENDNEEDLE5C2E' if i == 12345 else ''))
+" | timberfs append --into "$PIPE_BACKING/idx.log" --chunk-size 4096 || return 1
+    [ -s "$PIPE_BACKING/idx.log.grain" ] || return 1
+    # covers every chunk, and actually skips: a needle in one chunk of many
+    timberfs info --json "$PIPE_BACKING/idx.log" \
+        | python3 -c "
+import json,sys
+i = json.load(sys.stdin)
+sys.exit(0 if i['grain_chunks'] == i['chunks'] and i['chunks'] > 5 else 1)
+" || return 1
+    timberfs query "$PIPE_BACKING/idx.log" --has APPENDNEEDLE5C2E 2>/tmp/idxsel.txt \
+        | grep -q APPENDNEEDLE5C2E || return 1
+    SEL=$(grep -oE '^timberfs: [0-9]+' /tmp/idxsel.txt | grep -oE '[0-9]+')
+    [ -n "$SEL" ] && [ "$SEL" -lt 20 ]
+}
+
+appender_grain_survives_retention() {
+    # Retention rewrites the rings, which invalidates the positional grain:
+    # the writer must rebuild it, and a surviving token must still be found
+    # through the index (a stale grain would answer with the WRONG chunks).
+    timberfs create --index "$PIPE_BACKING/idxret.log" > /dev/null || return 1
+    python3 -c "
+import datetime
+d = datetime.datetime(2026, 6, 7, 9, 0, 0)
+for i in range(40000):
+    ts = (d + datetime.timedelta(seconds=i)).isoformat()
+    print(f'{ts} INFO work {i} UNIQ{i:06d}')
+" | timberfs append --into "$PIPE_BACKING/idxret.log" --chunk-size 8192 \
+        --retain-size 40K || return 1
+    # the head really was dropped
+    [ "$(stat -c %s "$PIPE_BACKING/idxret.log.trunk")" -le 65536 ] || return 1
+    # the last surviving line's token is findable via --has, and every
+    # sampled survivor agrees with a full scan (no false negatives)
+    LAST=$(timberfs query "$PIPE_BACKING/idxret.log" --no-filename 2>/dev/null \
+        | tail -1 | awk '{print $NF}')
+    timber-filter --has "$LAST" "$PIPE_BACKING/idxret.log" 2>/dev/null \
+        | grep -q "$LAST" || return 1
+    timberfs info --json "$PIPE_BACKING/idxret.log" \
+        | python3 -c "
+import json,sys
+i = json.load(sys.stdin)
+sys.exit(0 if i['grain_chunks'] == i['chunks'] else 1)
+"
+}
+
 run_test "appender: file lock blocks rotate while live" appender_lock_blocks_rotate
 run_test "appender: SIGTERM flushes buffered data" appender_sigterm_flushes
 run_test "appender: two files share one directory" appenders_share_directory
 run_test "appender: --retain-size 16K budget enforced" retain_size_budget
+run_test "appender: maintains a declared grain, no reindex" appender_maintains_grain
+run_test "appender: grain stays correct across retention" appender_grain_survives_retention
 run_test "wal: kill -9 after a sap-sync tick loses nothing, chunking intact" wal_kill9_durability
 run_test "collapse-head retention survives repeated kill -9" collapse_crash_kill_resilience
 run_test "info/query: read-only, work for a non-root reader" info_readonly_nonroot
