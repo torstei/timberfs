@@ -6,6 +6,7 @@
 
 pub mod append;
 pub mod bark;
+pub mod cursor;
 pub mod entry;
 pub mod export;
 pub mod forest;
@@ -17,6 +18,7 @@ pub mod grep;
 pub mod import;
 pub mod list;
 pub mod note;
+pub mod otlp;
 pub mod query;
 pub mod records;
 pub mod rotate;

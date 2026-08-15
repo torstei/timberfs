@@ -1,0 +1,238 @@
+.TH TIMBER\-OTLP 1 "2026-08-15" "timberfs" "User Commands"
+.SH NAME
+timber\-otlp \- ship a timberfs entry stream to an OTLP/HTTP receiver
+.SH SYNOPSIS
+.B timber\-otlp
+.RB [ \-\-endpoint
+.IR URL ]
+.RI [ options ]
+.RI [ STORE ]
+.br
+.B timberfs query \-\-records
+.I ...
+.B | timber\-otlp
+.RI [ options ]
+.SH DESCRIPTION
+.B timber\-otlp
+posts a store's log ENTRIES \(em a stamped line plus its continuation
+lines, so a stack trace stays one record \(em to an OTLP/HTTP receiver:
+an OpenTelemetry Collector, or any backend that speaks OTLP. One
+.B LogRecord
+per entry.
+.PP
+It is a
+.BR reader .
+It consumes the
+.BR timberfs\-records (5)
+stream that
+.B timberfs query \-\-records
+produces (spawning it for a
+.I STORE
+positional, exactly as
+.BR timber\-filter (1)
+does), so the append path is untouched and an unreachable receiver can
+stall the shipper and nothing else. The
+.B store is the send buffer:
+where a collector's queue is sized by guessing, retention is the
+disconnection budget \(em
+.B retain 30d
+means the receiver can be gone for thirty days \(em and any window can
+be re-shipped afterwards, which a collector cannot do because it
+retains nothing.
+.PP
+Raw text is refused rather than guessed at: only the record stream
+carries the write times and logline stamps this needs.
+.SH MODES
+Two, because they need different time axes.
+.TP
+.B Follow
+.B \-\-follow
+with
+.B \-\-cursor
+is the durable shipper: entries are posted as they are committed, and
+the position is persisted on the WRITE axis \(em the only monotonic one,
+since a logline stamp can move backwards and resuming from one would
+skip a late-arriving entry permanently.
+.TP
+.B Replay
+.BR \-\-from / \-\-to
+selects a LOGLINE window \(em \(lqre-ship what happened during the
+incident\(rq \(em and takes no cursor: a replay is a deliberate act, not
+a resumable one.
+.SH THE CURSOR
+A cursor is CONSUMER state, so it lives at a path you name, outside the
+store: several consumers read one store at different positions, and a
+cursor must not travel inside a
+.B .timber
+bundle as if it were provenance. It is a flat JSON object; rewinding by
+editing
+.B wl
+is the supported edit.
+.PP
+The position is
+.RI ( wf ", " wl ", " n ):
+the write window of the chunk an entry arrived in, and how many entries
+with that exact window were already delivered. Positioning is
+chunk-granular, so a resume re-reads the boundary chunk and drops the
+prefix it already sent. Delivery is therefore
+.B at-least-once
+\(em which is all OTLP offers anyway, having no deduplication key. The
+cursor is written after the receiver accepts, never before, so a crash
+re-delivers instead of skipping.
+.PP
+The store is identified by its
+.B .bark
+id when it declares one (identity, not address: a moved store still
+matches), else by its canonical path. Declare an identity with
+.B timberfs set
+to make a cursor survive a move.
+.SH MAPPING
+.TP
+.B time
+.B timeUnixNano
+is the entry's own logline stamp, falling back to arrival when the line
+carries none;
+.B observedTimeUnixNano
+is always the write time of the chunk it arrived in. OTLP's two time
+fields are timberfs's two axes.
+.TP
+.B body
+The entry's bytes verbatim, minus the trailing newline. Multiline
+entries stay one body.
+.TP
+.B severity
+The first UPPERCASE level word in the entry's FIRST line
+(TRACE/DEBUG/INFO/NOTICE/WARN/ERROR/FATAL/CRITICAL and friends), mapped
+to the OTLP severity numbers. Case-sensitive on purpose: \(lqconnection
+error\(rq is not an ERROR. Other conventions need
+.BR \-\-severity\-regex .
+.TP
+.B resource
+What the STORE is:
+.B service.name
+from
+.BR \-\-service ,
+else the
+.B .bark
+\(lqservice\(rq, else the store's name; plus
+.BR host.name ,
+.B timberfs.store.id
+and
+.BR timberfs.store.path .
+.B \-\-resource
+overrides any of them.
+.SH OPTIONS
+.SS Destination
+.TP
+.BI \-\-endpoint " URL"
+A base URL (\fB/v1/logs\fR is appended) or the signal URL itself.
+Default:
+.BR $OTEL_EXPORTER_OTLP_LOGS_ENDPOINT ,
+.BR $OTEL_EXPORTER_OTLP_ENDPOINT ,
+else
+.BR http://localhost:4318 .
+Plaintext
+.B http
+only: terminate TLS in a collector or proxy beside the shipper.
+.TP
+.BI \-\-header " K=V"
+Extra request header (repeatable).
+.B $OTEL_EXPORTER_OTLP_HEADERS
+is also read.
+.TP
+.BI \-\-timeout " DUR"
+Connect/read/write timeout per request (default 10s).
+.SS What is sent
+.TP
+.BI \-\-service " NAME"
+Resource
+.BR service.name .
+.TP
+.BI \-\-resource " K=V"
+Extra resource attribute (repeatable); overrides derived ones.
+.TP
+.BI \-\-severity\-regex " PATTERN"
+Where the level is, when it is not an uppercase level word. The first
+capture group (else the whole match) becomes
+.BR severityText ;
+a name that maps to no OTLP level keeps the text and claims no number.
+.TP
+.BI \-\-batch\-size " N"
+Maximum LogRecords per export request (default 512).
+.TP
+.BI \-\-batch\-timeout " DUR"
+Send a partial batch after this long with nothing new (default 1s).
+.TP
+.B \-\-dry\-run
+Print the export requests instead of sending them. A cursor is read but
+never advanced.
+.SS Position
+.TP
+.BR \-f ", " \-\-follow
+Keep shipping as entries are committed.
+.TP
+.BI \-\-cursor " PATH"
+Persist the position here (requires
+.BR \-\-follow ).
+.TP
+.BI \-\-start " end|begin"
+Where to start when the cursor file does not exist yet (default
+.BR end ).
+.TP
+.BI \-\-from " TIME" ", " \-\-to " TIME"
+Replay window, in the formats
+.BR timberfs\-query (1)
+takes.
+.SH DELIVERY
+A retryable answer (429, 502, 503, 504, or a transport failure) is
+retried with capped exponential backoff, honouring
+.BR Retry\-After ,
+forever: the store holds the backlog, and giving up would turn a
+reachable-again receiver into lost data. Any other 4xx/5xx is permanent
+per the OTLP specification \(em the batch is dropped, loudly, because a
+stream that can never advance is worse.
+.B partialSuccess
+inside a 200 is counted and reported.
+.SH EXIT STATUS
+0 when the stream ended cleanly (a bounded replay), non-zero on a
+configuration error or a truncated record stream. A followed stream is
+unbounded and ends at interrupt.
+.SH EXAMPLES
+.PP
+Ship a store as it is written, resumably:
+.PP
+.RS
+.EX
+timber\-otlp \-\-follow \-\-cursor /var/lib/timberfs/app.otlp \\
+    \-\-endpoint http://collector:4318 backing/app.log
+.EE
+.RE
+.PP
+Replay an incident window into a fresh backend:
+.PP
+.RS
+.EX
+timber\-otlp \-\-from '2026\-08\-11 14:00' \-\-to '2026\-08\-11 15:00' \\
+    \-\-endpoint http://new\-backend:4318 backing/app.log
+.EE
+.RE
+.PP
+See what would be sent, without a receiver:
+.PP
+.RS
+.EX
+timber\-otlp \-\-dry\-run backing/app.log | jq .
+.EE
+.RE
+.PP
+Ship only what matters, by filtering first:
+.PP
+.RS
+.EX
+timber\-filter \-\-has ERROR \-\-records backing/app.log | timber\-otlp
+.EE
+.RE
+.SH SEE ALSO
+.BR timberfs (1),
+.BR timber\-filter (1),
+.BR timberfs\-records (5)
