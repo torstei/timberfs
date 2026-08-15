@@ -36,6 +36,12 @@ pass its own paths.
                                           single TCP listener, not templated):
     <tag>.log.trunk / .rings / .grain / .bark / .lock     one store per tag
   .timberfs.lock                            the directory lock (see Locking)
+
+/var/log/timberfs/otlp/                   likewise for the OTLP intake, one
+                                          store per stream (routed by
+                                          service.name):
+    <service>.log.trunk / .rings / .grain / .bark / .sap / .lock
+  .timberfs.lock                            the directory lock (see Locking)
 ```
 
 The store's **logical name** is `<instance>.log`, so you read it with the full
@@ -175,10 +181,59 @@ authentication or negotiation phase and this receiver adding none of its own:
 The verb name (`forward-intake`) is provisional. Details, the wire modes
 supported, and the partial-message reassembly are in `man timberfs`.
 
+### Speaking OTLP — `timberfs-otlp.socket` + `timberfs-otlp.service`
+
+Receive [OTLP/HTTP](https://opentelemetry.io/docs/specs/otlp/) logs — the
+OpenTelemetry protocol every SDK and the Collector speak — so an existing
+OTel pipeline can write into timberfs, and the Collector bridges syslog,
+journald, Kafka and Fluent Bit in behind it. Like the Forward intake this is
+**one TCP listener for every stream**: OTLP multiplexes resources inside the
+request body, and each `ResourceLogs` lands in its own store under
+`/var/log/timberfs/otlp/<service.name>.log`.
+
+```yaml
+# an OpenTelemetry Collector exporting to it
+exporters:
+  otlphttp/timberfs:
+    endpoint: http://127.0.0.1:4318
+    encoding: json          # the default is protobuf, which is refused (415)
+    compression: none       # the default is gzip, which is refused (415)
+```
+
+```sh
+systemctl enable --now timberfs-otlp.socket
+```
+
+The store set is **operator-controlled** exactly as above: an undeclared
+stream is answered `503` with `Retry-After`, so the sender buffers and
+retries until `timberfs create --wal` has made the store — or run with
+`--auto-create`. Route by a different resource attribute (`host.name`,
+`k8s.namespace.name`) with `--route`.
+
+What arrives is a normal timberfs log: a record body that already opens with
+a timestamp is stored verbatim, an unstamped one is prefixed with
+`<RFC3339> <SEVERITY> `, and record attributes plus any `trace_id`/`span_id`
+trail as `k=v` — so `timberfs query --has <trace_id>` finds a trace's lines
+through the token index, with no trace backend involved. The resource
+attributes are seeded into the store's `.bark` when it is created, because
+they describe the stream rather than any one line.
+
+**Deliberate limitations**, each refused explicitly and by name rather than
+silently: `POST /v1/logs` only (traces and metrics are 404 — not a log
+store's job); OTLP/JSON bodies only; no gzip; no chunked bodies (411 — a
+receiver that must acknowledge durability needs to know what it is
+acknowledging); no TLS; and no gRPC on :4317, which wants HTTP/2 — put a
+Collector in front if a sender needs it.
+
+The verb name (`otlp-intake`) is provisional. `timber-otlp` ships the same
+wire format in the other direction; a store shipped out and received back
+arrives byte for byte.
+
 ## Ownership and permissions
 
 - **The store directory** is created by `LogsDirectory=timberfs/%i` (or plain
-  `timberfs/forward` for the Forward intake), owned by the service's `User=`
+  `timberfs/forward` for the Forward intake, `timberfs/otlp` for the OTLP
+  intake), owned by the service's `User=`
   (root by default). Set `User=` in a drop-in to own the directory as a
   specific user.
 - **The FIFO** is created `root:root 0660`. A non-root producer cannot write it

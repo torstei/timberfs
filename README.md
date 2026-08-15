@@ -73,7 +73,7 @@ oldest data continuously (no rotate-and-delete, no seams), as a property of the
 --retain-size 50G` or `timberfs set backing/app.log retain=90d` (live, no
 restart).
 
-Four ways in, in increasing order of commitment:
+Five ways in, in increasing order of commitment:
 
 **a) Keep importing on a timer** — zero changes to your logging. Re-import
 verifies what's already stored and appends only the growth, so a cron or
@@ -140,6 +140,37 @@ name), hence `tag={{.Name}}`. Deliberate limitations — no TLS/handshake
 (loopback or a private network only), no gzip-compressed mode, no UDP
 heartbeat — are in `man timberfs` and [docs/deployment.md](docs/deployment.md).
 The verb name is provisional.
+
+**e) Let it speak OTLP** — `timberfs otlp-intake` receives OTLP/HTTP logs,
+the OpenTelemetry protocol every SDK and the Collector speak, so an OTel
+pipeline can write straight into timberfs — and the Collector bridges syslog,
+journald, Kafka and Fluent Bit in behind it. Each `ResourceLogs` stream lands
+in its own store (routed by `service.name`), its resource attributes seeded
+into the store's `.bark`, and each `LogRecord` becomes one entry; the HTTP 200
+is sent only once the batch is fsynced:
+
+```sh
+timberfs otlp-intake --into-dir /var/log/timberfs/otlp --auto-create &
+```
+
+```yaml
+# an OpenTelemetry Collector pointed at it
+exporters:
+  otlphttp/timberfs:
+    endpoint: http://127.0.0.1:4318
+    encoding: json          # the default is protobuf
+    compression: none       # the default is gzip
+```
+
+Both of those settings are refused by name if you forget them (415, saying
+which). An undeclared stream gets 503 + `Retry-After` so the sender buffers
+until you create the store — or `--auto-create` mints them. `POST /v1/logs`
+only, no TLS (loopback or a private network), and no gRPC on :4317 — put a
+Collector in front if a sender needs it.
+
+It pairs with `timber-otlp` below: a store shipped out over OTLP and received
+back arrives byte for byte, which is the property their tests hold each other
+to.
 
 One nuance worth knowing: `import` stamps chunks with timestamps **parsed
 from the log lines** (right for historical data), while `append`/`mount`

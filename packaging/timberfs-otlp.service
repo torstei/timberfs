@@ -1,0 +1,57 @@
+# Systemd unit for the OTLP/HTTP logs intake (see timberfs-otlp.socket).
+# Not templated — one instance serves every stream it sees, each landing in
+# its own store at /var/log/timberfs/otlp/<service.name>.log.
+#
+# The sender must post OTLP/JSON to /v1/logs, uncompressed. For an
+# OpenTelemetry Collector that means:
+#
+#   exporters:
+#     otlphttp/timberfs:
+#       endpoint: http://127.0.0.1:4318
+#       encoding: json          # the default is protobuf
+#       compression: none       # the default is gzip
+#
+# Override the store directory, routing attribute, or add retention with a
+# drop-in:
+#
+#   systemctl edit timberfs-otlp.service
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/bin/timberfs otlp-intake --exit-on-upgrade \
+#         --into-dir /var/log/timberfs/otlp --retain 30d --index
+#
+# This is socket-activated: enable the .socket, not this unit.
+
+[Unit]
+Description=timberfs OTLP/HTTP logs intake
+Documentation=https://github.com/torstei/timberfs
+Requires=timberfs-otlp.socket
+After=timberfs-otlp.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/timberfs otlp-intake --into-dir /var/log/timberfs/otlp --exit-on-upgrade
+# NOT StandardInput=socket: this is a listen socket accepting many
+# connections, handed over the standard LISTEN_FDS/LISTEN_PID protocol at
+# fd 3 (SD_LISTEN_FDS_START).
+StandardOutput=journal
+StandardError=journal
+
+# Owns /var/log/timberfs/otlp (0755) — where every stream's .trunk/.rings/
+# .bark/.sap live. A drop-in that sets User= gets that directory owned by
+# that user instead.
+LogsDirectory=timberfs/otlp
+
+# A restart drops in-flight connections. OTLP senders are built for that:
+# an export that gets no response is retried, which is why the response is
+# only sent once the batch is durable (at-least-once, not exactly-once — a
+# retried export after a restart can duplicate records).
+Restart=always
+RestartSec=1
+# --exit-on-upgrade: the daemon exits 85 when its binary is upgraded on
+# disk; force a restart onto the new binary. SuccessExitStatus keeps it out
+# of the failure log. (Keep --exit-on-upgrade in any ExecStart override.)
+SuccessExitStatus=85
+RestartForceExitStatus=85
+
+# No [Install] section: this is socket-activated. Enable the .socket.

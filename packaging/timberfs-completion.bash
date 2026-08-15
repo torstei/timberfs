@@ -16,7 +16,7 @@ _timberfs() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
-    local subcommands="mount create set append import export query info index list reindex rotate forward-intake"
+    local subcommands="mount create set append import export query info index list reindex rotate forward-intake otlp-intake"
 
     if [ "$COMP_CWORD" -le 1 ]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))

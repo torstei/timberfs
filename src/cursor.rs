@@ -203,7 +203,10 @@ impl Resume {
 
     /// Should this entry be delivered? Windows are ordered by `(wl, wf)`
     /// — the appender stamps `now()`, so a live store's chunk windows
-    /// only move forward.
+    /// only move forward. A store written by an INTAKE is the exception:
+    /// those stamp the sender's event time, so a sender replaying old
+    /// events moves the windows backwards and a cursor over such a store
+    /// can skip rather than re-deliver.
     pub fn deliver(&mut self, wf: u64, wl: u64) -> bool {
         if self.done {
             return true;

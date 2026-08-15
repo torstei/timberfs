@@ -38,18 +38,15 @@ works is in [docs/design.md](docs/design.md).
   stays the database; the server owns no state that is not a plain
   timberfs file. Path: lib refactor → .bark → read-only serve → ingest →
   tiering.
-- **OTLP the other way (`otlp-intake`)**: `timber-otlp` ships a store OUT
-  over OTLP/HTTP; RECEIVING it would make every OpenTelemetry SDK and the
-  Collector a timberfs producer, as `forward-intake` did for Docker and
-  Fluent Bit — and the Collector then bridges syslog, journald, k8s tailing
-  and Kafka in for free. Same shape as `forward-intake`: HTTP/1.1 on :4318,
-  `/v1/logs`, a store per `service.name`, resource attributes seeded into
-  `.bark` (OTLP's resource/record split IS the manifest/entry split), and
-  the HTTP response as the ack — 200 only once the batch is durable in the
-  `.sap`, 503 + `Retry-After` for an undeclared stream so a sender buffers
-  and provisioning converges with nothing lost, `partialSuccess` only for
-  what is refused permanently. Deliberately NOT gRPC (:4317 wants HTTP/2
-  and an async runtime; a Collector in front converts) and not metrics.
+- **OTLP intake gaps**: `otlp-intake` receives OTLP/JSON over HTTP; still
+  open are protobuf request bodies (the Collector's default encoding, so
+  `encoding: json` is required today), gzip request bodies (likewise
+  `compression: none`), and gRPC on :4317 — which wants HTTP/2 and an async
+  runtime, so the answer stays "put a Collector in front" until something
+  forces it. Metrics and traces remain out of scope by design. Smaller: a
+  pre-created store keeps the operator's `.bark` untouched, so its resource
+  attributes are never seeded — right, but it means `timberfs create` +
+  `--route` needs the operator to declare `service` themselves.
 - **`timber-otlp` gaps**: protobuf request bodies (the Collector's default
   encoding — and the RESPONSE is free, since an empty
   `ExportLogsServiceResponse` is zero bytes); gzip request bodies;
@@ -65,6 +62,12 @@ works is in [docs/design.md](docs/design.md).
   (`--cursor` without `--follow`, for cron-style shipping), which it
   refuses today because only the follow path selects on the axis a cursor
   can safely resume from. The cheap first half of the zone-map entry above.
+- **Arrival time on a received store**: both intakes stamp chunks with the
+  sender's EVENT time, so a store written by a receiver has no arrival axis
+  of its own — a sender replaying old events moves its chunk windows
+  backwards, and a `timber-otlp --cursor` shipping that store onward would
+  then skip rather than re-deliver. Storing arrival alongside (the zone-map
+  sidecar, or a second ring) is what closes it.
 - **Cursors beyond one consumer**: `cursor.rs` is a general "consumer's
   position in a store's entry stream", not an OTLP thing — a Kafka or Loki
   shipper would reuse it verbatim. Open: a `list`-style view of who is

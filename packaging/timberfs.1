@@ -60,6 +60,11 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .B \-\-into\-dir
 .I DIR
 .RI [ options ]
+.br
+.B timberfs otlp\-intake
+.B \-\-into\-dir
+.I DIR
+.RI [ options ]
 .SH DESCRIPTION
 .B timberfs
 is a FUSE filesystem purpose-built for log files. Files in the mount look
@@ -839,6 +844,103 @@ Declared on every store this receiver creates; same meaning as
 Declare and maintain the
 .B .grain
 token index on every store this receiver creates.
+.TP
+.B \-\-exit\-on\-upgrade
+Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
+unit sets it.
+.PP
+The verb name is provisional.
+.SS otlp\-intake
+Receive OTLP/HTTP logs \(em the OpenTelemetry protocol every SDK and the
+Collector speak \(em and write each stream into its own store under
+.IR \-\-into\-dir .
+The mirror of
+.BR timber\-otlp (1),
+which ships the same wire format out.
+.PP
+It is a subcommand rather than a filter for the reason
+.B forward\-intake
+is: the HTTP response IS the acknowledgement, and only the writer can
+promise durability. A
+.B 200
+is returned once the batch is fsynced into the store's
+.B .sap
+write-ahead sidecar (every store this receiver touches declares
+.BR wal ),
+so a sender's retry logic and the store's chunk cadence stay independent.
+.PP
+OTLP's structure lands on timberfs's: one
+.B ResourceLogs
+is one stream, routed by
+.BR \-\-route ;
+its resource attributes are what the store IS and are seeded into the
+.B .bark
+manifest when the store is created; each
+.B LogRecord
+is one entry. A body that already opens with a parseable timestamp is
+written verbatim \(em so a store shipped out with
+.BR timber\-otlp (1)
+and received here comes back byte for byte \(em while an unstamped body is
+prefixed with
+.RB \(lq "<RFC3339> <SEVERITY> " \(rq
+so the store stays time-indexable. Record attributes and any
+.BR trace_id / span_id
+trail the body as
+.IR k = v ,
+where
+.B query \-\-has
+can find them.
+.PP
+Stores are pre-created by the operator by default; an undeclared stream is
+answered
+.B 503
+with
+.BR Retry\-After ,
+so the sender buffers and retries until the store exists and provisioning
+converges with nothing lost \(em the same contract as an unacked Forward
+chunk, spelled in HTTP.
+.PP
+Deliberate limitations, each refused explicitly and by name:
+.BR POST\ /v1/logs
+only (traces and metrics are not a log store's job \(em 404); OTLP/JSON
+bodies only (a protobuf body is 415 naming the collector's
+.BR "encoding: json" ); no
+.B Content\-Encoding: gzip
+(415, naming
+.BR "compression: none" ); no chunked bodies (411 \(em a receiver that must
+acknowledge durability needs to know what it is acknowledging); no TLS
+(loopback or a private network); and no gRPC \(em put a Collector in front
+for :4317.
+.TP
+.BI \-\-listen " ADDR"
+Address to listen on (default
+.BR 127.0.0.1:4318 ,
+the OTLP/HTTP port). systemd socket activation on fd 3 is used instead when
+.BR LISTEN_PID / LISTEN_FDS
+name this process.
+.TP
+.BI \-\-into\-dir " DIR"
+Backing directory: one store per stream, named after the route value.
+.TP
+.BI \-\-route " ATTR"
+Resource attribute whose value names the store (default
+.BR service.name ).
+A batch without it is stored as OTel's own
+.BR unknown_service ,
+never a guess at a better name. The value is a network-supplied name, so it
+is sanitized to one path component.
+.TP
+.B \-\-auto\-create
+Create a store for a never-seen stream automatically. Default: refuse
+undeclared streams, as above.
+.TP
+.BI \-\-max\-body " SIZE"
+Largest request body accepted (default
+.BR 16M ).
+.TP
+.BI \-\-retain " DURATION" ", " \-\-retain\-size " SIZE" ", " \-\-index
+Declared on every store this receiver creates; same meaning as for
+.BR forward\-intake .
 .TP
 .B \-\-exit\-on\-upgrade
 Exit for a clean re\-exec when this binary is upgraded on disk; the systemd

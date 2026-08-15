@@ -1,6 +1,6 @@
 use timberfs::{
-    append, bark, export, forest, forward, fs, grain, import, list, note, query, rotate, sink,
-    store,
+    append, bark, export, forest, forward, fs, grain, import, list, note, otlp_intake, query,
+    rotate, sink, store,
 };
 
 use std::path::PathBuf;
@@ -413,6 +413,53 @@ enum Command {
         #[arg(long)]
         exit_on_upgrade: bool,
     },
+    /// Receive OTLP/HTTP logs — the OpenTelemetry wire protocol every SDK
+    /// and the Collector speak — writing each stream into its own store
+    /// under --into-dir. Answers 200 only after the batch is fsynced, and
+    /// 503 + Retry-After for an undeclared stream, so a sender buffers and
+    /// converges. Deliberate limitations: POST /v1/logs only (no traces or
+    /// metrics), OTLP/JSON bodies only (no protobuf), no gzip, no TLS
+    /// (loopback or a private network only), no gRPC — put a Collector in
+    /// front for :4317. The verb name is provisional
+    #[command(name = "otlp-intake")]
+    OtlpIntake {
+        /// Address to listen on (systemd socket activation on fd 3 is used
+        /// instead when LISTEN_PID/LISTEN_FDS name this process)
+        #[arg(long, default_value = "127.0.0.1:4318")]
+        listen: String,
+        /// Backing directory: one store per stream, named <route value>.log
+        #[arg(long = "into-dir", value_name = "DIR")]
+        into_dir: PathBuf,
+        /// Resource attribute whose value names the store; absent on a
+        /// batch, OTel's own unknown_service is used
+        #[arg(long, default_value = "service.name", value_name = "ATTR")]
+        route: String,
+        /// Continuously drop data older than this (e.g. 30d, 12h, 90m) in
+        /// every store this receiver creates
+        #[arg(long)]
+        retain: Option<String>,
+        /// Keep the on-disk (compressed) size of every store this receiver
+        /// creates at or under this budget (e.g. 200G, 512M)
+        #[arg(long)]
+        retain_size: Option<String>,
+        /// Declare and maintain the .grain token index on every store this
+        /// receiver creates
+        #[arg(long)]
+        index: bool,
+        /// Create a store for a never-seen stream automatically. Default:
+        /// refuse undeclared streams with 503 — pre-create stores with
+        /// `timberfs create --wal`; the sender retries until they exist
+        #[arg(long)]
+        auto_create: bool,
+        /// Largest request body accepted (e.g. 16M, 64M)
+        #[arg(long, default_value = "16M", value_name = "SIZE")]
+        max_body: String,
+        /// Exit for a clean re-exec when this binary is upgraded on disk
+        /// (dpkg replaces it). Only for supervised runs (the systemd unit
+        /// sets it and pairs it with RestartForceExitStatus)
+        #[arg(long)]
+        exit_on_upgrade: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -712,6 +759,32 @@ fn main() -> anyhow::Result<()> {
                     retain_size,
                     index,
                     auto_create,
+                },
+                exit_on_upgrade,
+            )?;
+        }
+        Command::OtlpIntake {
+            listen,
+            into_dir,
+            route,
+            retain,
+            retain_size,
+            index,
+            auto_create,
+            max_body,
+            exit_on_upgrade,
+        } => {
+            let max_body = timberfs::append::parse_size_bytes(&max_body)? as usize;
+            otlp_intake::cmd_otlp_intake(
+                &listen,
+                &into_dir,
+                otlp_intake::OtlpOpts {
+                    route,
+                    retain,
+                    retain_size,
+                    index,
+                    auto_create,
+                    max_body,
                 },
                 exit_on_upgrade,
             )?;
