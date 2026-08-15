@@ -154,6 +154,201 @@ pub fn render_with(
 }
 
 // ---------------------------------------------------------------------
+// Decoding: the same mapping read backwards, for the intake.
+// ---------------------------------------------------------------------
+
+/// One decoded LogRecord.
+pub struct Incoming {
+    /// The event's own time, when the sender set one.
+    pub time_ms: Option<u64>,
+    /// When the sender observed it — the fallback for `time_ms`.
+    pub observed_ms: Option<u64>,
+    pub severity: Option<String>,
+    /// The body as text: a string body verbatim, anything structured as
+    /// compact JSON (the same fallback `forward-intake` applies to a
+    /// record whose payload key is missing or not a string).
+    pub body: String,
+    /// Record attributes, plus `trace_id`/`span_id` when the record
+    /// carries them — the tokens a trace lookup greps for.
+    pub attrs: Vec<(String, String)>,
+}
+
+/// One ResourceLogs: what the records are ABOUT, and the records.
+pub struct IncomingBatch {
+    pub resource: Vec<(String, String)>,
+    pub records: Vec<Incoming>,
+}
+
+/// An OTLP `AnyValue` as text. A string is itself; everything else is
+/// its compact JSON, so nothing is silently dropped and nothing pretends
+/// to be a string it is not.
+pub fn any_value_text(v: &Value) -> String {
+    let Some(obj) = v.as_object() else {
+        return v.to_string();
+    };
+    for key in [
+        "stringValue",
+        "intValue",
+        "doubleValue",
+        "boolValue",
+        "bytesValue",
+    ] {
+        if let Some(x) = obj.get(key) {
+            return match x {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+        }
+    }
+    if let Some(arr) = obj.get("arrayValue").and_then(|a| a.get("values")) {
+        return Value::Array(
+            arr.as_array()
+                .map(|vs| {
+                    vs.iter()
+                        .map(|v| Value::String(any_value_text(v)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+        .to_string();
+    }
+    if let Some(kvs) = obj.get("kvlistValue").and_then(|k| k.get("values")) {
+        let mut m = Map::new();
+        for kv in kvs.as_array().unwrap_or(&Vec::new()) {
+            if let Some(k) = kv.get("key").and_then(Value::as_str) {
+                let val = kv.get("value").map(any_value_text).unwrap_or_default();
+                m.insert(k.to_string(), Value::String(val));
+            }
+        }
+        return Value::Object(m).to_string();
+    }
+    v.to_string()
+}
+
+/// Unix nanos, as either the canonical JSON string or a bare number
+/// (encoders emit both), to unix ms. Zero means unset.
+fn nanos_to_ms(v: Option<&Value>) -> Option<u64> {
+    let n: u128 = match v? {
+        Value::String(s) => s.parse().ok()?,
+        Value::Number(n) => n.as_u64()? as u128,
+        _ => return None,
+    };
+    if n == 0 {
+        return None;
+    }
+    Some((n / 1_000_000) as u64)
+}
+
+fn key_values(v: Option<&Value>) -> Vec<(String, String)> {
+    v.and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|kv| {
+                    let k = kv.get("key").and_then(Value::as_str)?;
+                    Some((
+                        k.to_string(),
+                        kv.get("value").map(any_value_text).unwrap_or_default(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Decode an `ExportLogsServiceRequest`. Absent optional fields are
+/// absent, never invented: what the sender did not say, the store does
+/// not claim. A body-less record is skipped rather than stored empty.
+pub fn parse_export_request(v: &Value) -> anyhow::Result<Vec<IncomingBatch>> {
+    let Some(resource_logs) = v.get("resourceLogs").and_then(Value::as_array) else {
+        bail!("not an ExportLogsServiceRequest: no resourceLogs array");
+    };
+    let mut out = Vec::new();
+    for rl in resource_logs {
+        let resource = key_values(rl.get("resource").and_then(|r| r.get("attributes")));
+        let mut records = Vec::new();
+        for sl in rl
+            .get("scopeLogs")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
+            for lr in sl
+                .get("logRecords")
+                .and_then(Value::as_array)
+                .unwrap_or(&Vec::new())
+            {
+                let Some(body) = lr.get("body").map(any_value_text) else {
+                    continue;
+                };
+                let mut attrs = key_values(lr.get("attributes"));
+                for (field, key) in [("traceId", "trace_id"), ("spanId", "span_id")] {
+                    if let Some(id) = lr.get(field).and_then(Value::as_str) {
+                        if !id.is_empty() && id.chars().any(|c| c != '0') {
+                            attrs.push((key.to_string(), id.to_string()));
+                        }
+                    }
+                }
+                records.push(Incoming {
+                    time_ms: nanos_to_ms(lr.get("timeUnixNano")),
+                    observed_ms: nanos_to_ms(lr.get("observedTimeUnixNano")),
+                    severity: lr
+                        .get("severityText")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    body,
+                    attrs,
+                });
+            }
+        }
+        out.push(IncomingBatch { resource, records });
+    }
+    Ok(out)
+}
+
+impl Incoming {
+    /// The event time to store this under: its own, else when the sender
+    /// observed it, else now — arrival being the only honest answer left.
+    pub fn event_ms(&self, now_ms: u64) -> u64 {
+        self.time_ms.or(self.observed_ms).unwrap_or(now_ms)
+    }
+
+    /// The log line to append, with a trailing newline.
+    ///
+    /// Prefix only what the body LACKS: a body that already opens with a
+    /// parseable timestamp is written verbatim, so a line that came from
+    /// a timberfs store and went out over OTLP comes back byte for byte.
+    /// An unstamped body gets `<RFC3339> [SEVERITY] ` so the store stays
+    /// time-indexable — the timestamp has to be IN the line, that being
+    /// where the read path looks for it. Attributes (and the trace ids)
+    /// trail as `k=v`, where the token index can find them.
+    pub fn to_line(&self, stamped: bool, now_ms: u64) -> Vec<u8> {
+        let mut line = String::new();
+        if !stamped {
+            line.push_str(&crate::query::fmt_ms_rfc3339(self.event_ms(now_ms)));
+            line.push(' ');
+            if let Some(sev) = &self.severity {
+                line.push_str(sev);
+                line.push(' ');
+            }
+        }
+        line.push_str(&self.body);
+        for (k, v) in &self.attrs {
+            line.push(' ');
+            line.push_str(k);
+            line.push('=');
+            line.push_str(v);
+        }
+        // Internal newlines are kept: a stack trace is ONE entry, and its
+        // continuation lines carry no stamp, so they attach on the way in.
+        let mut bytes = line.into_bytes();
+        if bytes.last() != Some(&b'\n') {
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+}
+
+// ---------------------------------------------------------------------
 // The endpoint.
 // ---------------------------------------------------------------------
 
@@ -510,6 +705,102 @@ mod tests {
         assert_eq!(
             v["resourceLogs"][0]["scopeLogs"][0]["scope"]["name"],
             "timberfs"
+        );
+    }
+
+    /// The property the two directions owe each other: entries shipped
+    /// out over OTLP and received back arrive byte for byte, multiline
+    /// bodies included. Each direction is the other's oracle, so neither
+    /// can be quietly wrong about time, framing or body text.
+    #[test]
+    fn stamped_entries_roundtrip_byte_for_byte() {
+        let payloads: Vec<&[u8]> = vec![
+            b"2026-08-15T09:23:45.123+02:00 INFO starting up\n",
+            b"2026-08-15T09:23:46.500+02:00 ERROR checkout failed for cart 9912\n\tat com.example.Cart.check(Cart.java:44)\n\tat com.example.Main.main(Main.java:9)\n",
+            b"2026-08-15T09:23:47.000+02:00 WARN retrying\n",
+        ];
+        let entries: Vec<Entry> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Entry {
+                ts_ms: Some(1_786_778_625_123 + i as u64),
+                wf_ms: 1_786_783_226_105,
+                payload: p,
+            })
+            .collect();
+        let resource = vec![("service.name".to_string(), "app".to_string())];
+
+        let wire = render(&resource, "0.0.0", &entries);
+        let batches = parse_export_request(&wire).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].resource, resource);
+        assert_eq!(batches[0].records.len(), payloads.len());
+
+        for (rec, original) in batches[0].records.iter().zip(&payloads) {
+            // The intake sees a body that already opens with a stamp, so
+            // it writes it verbatim rather than stamping it twice.
+            let extractor = crate::import::Extractor::new(None, None, false).unwrap();
+            let head = rec.body.lines().next().unwrap_or_default();
+            let stamped = extractor.extract(head).is_some();
+            assert!(stamped, "the shipper's body keeps the line's own stamp");
+            assert_eq!(rec.to_line(stamped, 0), original.to_vec());
+        }
+        // And the event time survives as the entry's own timestamp.
+        assert_eq!(batches[0].records[0].time_ms, Some(1_786_778_625_123));
+        assert_eq!(batches[0].records[0].observed_ms, Some(1_786_783_226_105));
+    }
+
+    #[test]
+    fn an_unstamped_body_is_stamped_on_the_way_in() {
+        let rec = Incoming {
+            time_ms: Some(1_786_778_625_123),
+            observed_ms: None,
+            severity: Some("ERROR".into()),
+            body: "database is on fire".into(),
+            attrs: vec![("trace_id".into(), "4bf92f3577b34da6a3ce929d0e0e4736".into())],
+        };
+        let line = String::from_utf8(rec.to_line(false, 0)).unwrap();
+        assert!(
+            line.ends_with(
+                " ERROR database is on fire trace_id=4bf92f3577b34da6a3ce929d0e0e4736\n"
+            ),
+            "{line}"
+        );
+        // What was prefixed is what the read path parses back out.
+        let extractor = crate::import::Extractor::new(None, None, false).unwrap();
+        assert_eq!(extractor.extract(&line), Some(1_786_778_625_123));
+    }
+
+    #[test]
+    fn structured_values_survive_as_text() {
+        assert_eq!(any_value_text(&json!({"stringValue": "hi"})), "hi");
+        assert_eq!(any_value_text(&json!({"intValue": "42"})), "42");
+        assert_eq!(any_value_text(&json!({"boolValue": true})), "true");
+        let kv = json!({"kvlistValue": {"values": [
+            {"key": "a", "value": {"stringValue": "1"}},
+        ]}});
+        assert_eq!(any_value_text(&kv), r#"{"a":"1"}"#);
+        // A structured body is JSON, not a lie about being a string.
+        let req = json!({"resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"body": {"kvlistValue": {"values": [{"key": "msg", "value": {"stringValue": "hi"}}]}}}
+        ]}]}]});
+        let b = parse_export_request(&req).unwrap();
+        assert_eq!(b[0].records[0].body, r#"{"msg":"hi"}"#);
+        // Nothing said about time: nothing claimed.
+        assert_eq!(b[0].records[0].time_ms, None);
+        assert_eq!(b[0].records[0].event_ms(7), 7);
+    }
+
+    #[test]
+    fn an_all_zero_trace_id_is_not_a_trace_id() {
+        let req = json!({"resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"body": {"stringValue": "x"}, "traceId": "00000000000000000000000000000000",
+             "spanId": "00f067aa0ba902b7"}
+        ]}]}]});
+        let b = parse_export_request(&req).unwrap();
+        assert_eq!(
+            b[0].records[0].attrs,
+            vec![("span_id".to_string(), "00f067aa0ba902b7".to_string())]
         );
     }
 
