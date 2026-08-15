@@ -35,27 +35,24 @@
 //!     asked for it and close rather than silently drop data.
 //!
 //! The decoder half (`decode_message` and friends) is pure — no I/O — so it
-//! is exercised directly by the unit tests below. The receiver half opens
-//! one `Arc<Mutex<Intake>>` over `--into-dir`, one thread per TCP connection,
-//! and one maintenance thread mirroring `sink.rs`'s flush/retention/grain/
-//! graceful-exit loop, generalized across every file the directory holds and
-//! extended with ack completion.
+//! is exercised directly by the unit tests below. The receiver half is the
+//! shared intake core (see intake.rs: the directory of stores, their locks
+//! and the flush/retention/grain/graceful-exit tick) plus one thread per TCP
+//! connection and the ack completion that is Forward's own.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use rmpv::Value;
 use serde_json::Value as Json;
 
-use crate::store::{self, Config, Store};
+use crate::store::{self, Config};
 
 /// One decoded Forward-protocol message: the tag it addresses, the
 /// (event-time-ms, record) pairs it carries, and the ack chunk id if the
@@ -411,39 +408,9 @@ impl PartialReassembler {
     }
 }
 
-/// Tag -> filename: keep `[A-Za-z0-9._-]`, replace everything else with
-/// `_`, strip leading dots, empty -> "untagged". The tag is
-/// network-supplied, so this mapping must be structurally unable to escape
-/// `--into-dir`: no `/` ever survives, and a stripped leading dot rules out
-/// a bare `..` component.
-pub fn sanitize_tag(tag: &str) -> String {
-    let mut out: String = tag
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    while out.starts_with('.') {
-        out.remove(0);
-    }
-    if out.is_empty() {
-        out = "untagged".to_string();
-    }
-    out
-}
-
-/// The store's logical name for a tag: `<into-dir>/<tag>.log`, so a store
-/// created here reads exactly like every other timberfs log.
-fn store_name(tag: &str) -> String {
-    format!("{}.log", sanitize_tag(tag))
-}
-
 // ---------------------------------------------------------------------
-// The receiver.
+// The receiver. The directory of stores, their locks and the maintenance
+// tick are the shared intake core; what is Forward's own is the ack.
 // ---------------------------------------------------------------------
 
 struct PendingAck {
@@ -452,17 +419,11 @@ struct PendingAck {
     writer: TcpStream,
 }
 
-struct Intake {
-    store: Store,
-    pending_acks: BTreeMap<String, Vec<PendingAck>>,
-    /// Kept alive for as long as this receiver holds each file's writer
-    /// lock; dropped (and so released) only on process exit.
-    file_locks: BTreeMap<String, File>,
-    /// Tags whose store couldn't be opened (typically: unknown and
-    /// --auto-create is off) — remembered so the refusal is logged once,
-    /// not once per entry of a retrying sender.
-    refused_tags: BTreeSet<String>,
-}
+/// Chunk ids awaiting durability, per store. Under the intake's own lock
+/// (as `extra`), because an ack may only be sent for what a sync that the
+/// same lock covered has already made durable.
+type AckMap = BTreeMap<String, Vec<PendingAck>>;
+type Intake = crate::intake::Intake<AckMap>;
 
 /// Per-store policy for the receiver, one field per CLI flag.
 pub struct ForwardOpts {
@@ -511,9 +472,10 @@ fn seed_bark(
     crate::bark::save(dir, name, &map)
 }
 
-/// Lazily create a tag's store on first use: take its exclusive per-file
-/// lock (mirroring `cmd_records_sink`), open it, and — only the very first
-/// time this store is ever created on disk — seed its manifest.
+/// Lazily create a tag's store on first use, seeding a brand-new one's
+/// manifest with what this receiver knows about the tag. The locking,
+/// the refusal of an unknown tag and the wal declaration are the shared
+/// intake core's (see intake.rs); only the seed is Forward's own.
 fn ensure_store(
     intake: &mut Intake,
     dir: &Path,
@@ -523,38 +485,14 @@ fn ensure_store(
     container_id: Option<&str>,
     container_name: Option<&str>,
 ) -> anyhow::Result<()> {
-    if intake.store.files.contains_key(name) {
-        return Ok(());
-    }
-    let brand_new = !crate::format::rings_path(dir, name).exists();
-    // Refuse BEFORE taking the lock: lock files are never unlinked, so an
-    // unknown tag must not leave even that much litter behind.
-    if brand_new && !opts.auto_create {
-        anyhow::bail!(
-            "unknown tag {tag:?}: no store {name} in {} — pre-create it \
-             (timberfs create --wal) or run with --auto-create",
-            dir.display()
-        );
-    }
-    let lock = store::lock_file_exclusive(dir, name)?.ok_or_else(|| {
-        anyhow::anyhow!("{name} already has a writer (another timberfs writer or a rotation)")
-    })?;
-    store::write_lock_info(
-        &lock,
-        &format!("forward-intake pid={}\n", std::process::id()),
-    )?;
-    // Declare before create: open() reads the manifest to decide whether
-    // to mint the sap, and the ack contract needs it live from the start.
-    // An existing store converges (the --index roads pattern): being fed
-    // by this receiver declares it.
-    if brand_new {
-        seed_bark(dir, name, tag, container_id, container_name, opts)?;
-    } else if !crate::bark::wal_declared(dir, name) {
-        crate::bark::declare_wal(dir, name)?;
-    }
-    intake.store.create(name)?;
-    intake.file_locks.insert(name.to_string(), lock);
-    Ok(())
+    crate::intake::ensure_store(
+        intake,
+        dir,
+        name,
+        &format!("unknown tag {tag:?}"),
+        opts.auto_create,
+        |dir, name| seed_bark(dir, name, tag, container_id, container_name, opts),
+    )
 }
 
 /// Complete every pending ack for one store: make everything appended so
@@ -570,7 +508,7 @@ fn ensure_store(
 fn drain_acks(intake: &Mutex<Intake>, name: &str, cfg: &Config) {
     let acks = {
         let mut g = intake.lock().unwrap();
-        let Some(acks) = g.pending_acks.get_mut(name).map(std::mem::take) else {
+        let Some(acks) = g.extra.get_mut(name).map(std::mem::take) else {
             return;
         };
         if acks.is_empty() {
@@ -582,7 +520,7 @@ fn drain_acks(intake: &Mutex<Intake>, name: &str, cfg: &Config) {
             None => false,
         };
         if !durable {
-            g.pending_acks.insert(name.to_string(), acks);
+            g.extra.insert(name.to_string(), acks);
             return;
         }
         acks
@@ -660,7 +598,7 @@ fn handle_connection(
                 break;
             }
         };
-        let name = store_name(&decoded.tag);
+        let name = crate::intake::store_name(&decoded.tag);
         for (time_ms, record) in &decoded.entries {
             let container_id = record_str(record, "container_id").map(str::to_string);
             let container_name = record_str(record, "container_name").map(str::to_string);
@@ -675,7 +613,7 @@ fn handle_connection(
                     container_id.as_deref(),
                     container_name.as_deref(),
                 ) {
-                    if g.refused_tags.insert(name.clone()) {
+                    if g.refused.insert(name.clone()) {
                         eprintln!("timberfs: forward-intake: {name}: {e}");
                     }
                     continue;
@@ -700,7 +638,7 @@ fn handle_connection(
                     intake
                         .lock()
                         .unwrap()
-                        .pending_acks
+                        .extra
                         .entry(name.clone())
                         .or_default()
                         .push(PendingAck {
@@ -727,23 +665,9 @@ fn handle_connection(
     // be sent (the pending_acks list may be shared with other connections
     // writing the same tag, so only drop entries that are ours).
     let mut g = intake.lock().unwrap();
-    for acks in g.pending_acks.values_mut() {
+    for acks in g.extra.values_mut() {
         acks.retain(|a| a.conn_id != conn_id);
     }
-}
-
-fn socket_activated_listener() -> Option<TcpListener> {
-    use std::os::unix::io::FromRawFd;
-    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
-    if pid != std::process::id() {
-        return None;
-    }
-    let fds: usize = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
-    if fds < 1 {
-        return None;
-    }
-    // fd 3 is the first inherited descriptor by systemd's convention.
-    Some(unsafe { TcpListener::from_raw_fd(3) })
 }
 
 /// `timberfs forward-intake`: receive Fluentd Forward protocol v1 over TCP
@@ -763,135 +687,36 @@ pub fn cmd_forward_intake(
         .as_deref()
         .map(crate::append::parse_size_bytes)
         .transpose()?;
-    fs::create_dir_all(into_dir)
-        .with_context(|| format!("creating backing directory {}", into_dir.display()))?;
-
-    let _dir_lock = match store::lock_backing_shared(into_dir)? {
-        Some(f) => f,
-        None => {
-            let mounted = store::read_lock_mountpoint(into_dir)
-                .map(|m| format!(" (mounted on {})", m.display()))
-                .unwrap_or_default();
-            bail!(
-                "backing directory {} is served by a timberfs mount{mounted}; \
-                 write through the mount instead, or unmount first",
-                into_dir.display()
-            );
-        }
-    };
+    let _dir_lock = crate::intake::open_backing_dir(into_dir)?;
 
     let cfg = Config {
         chunk_size: 256 * 1024,
         level: 3,
         flush_age_ms: 5000,
     };
-    let intake = Arc::new(Mutex::new(Intake {
-        store: Store {
-            dir: into_dir.to_path_buf(),
-            cfg,
-            files: BTreeMap::new(),
-        },
-        pending_acks: BTreeMap::new(),
-        file_locks: BTreeMap::new(),
-        refused_tags: BTreeSet::new(),
-    }));
+    let intake = Arc::new(Mutex::new(Intake::new(into_dir, cfg, AckMap::new())));
     let opts = Arc::new(opts);
 
     crate::append::install_signal_handlers();
 
     let stop = Arc::new(AtomicBool::new(false));
-    let maint = {
-        let intake = Arc::clone(&intake);
-        let stop = Arc::clone(&stop);
-        let dir = into_dir.to_path_buf();
-        let watch = if exit_on_upgrade {
-            store::BinaryWatch::current()
-        } else {
-            None
-        };
-        let mut indexed_chunks: BTreeMap<String, usize> = BTreeMap::new();
-        thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(1000));
-                let graceful = if crate::append::stopping() {
-                    Some(0)
-                } else if watch.as_ref().is_some_and(|w| w.changed()) {
-                    Some(store::EXIT_BINARY_UPGRADED)
-                } else {
-                    None
-                };
-                if let Some(code) = graceful {
-                    let names: Vec<String> = {
-                        let mut g = intake.lock().unwrap();
-                        g.store.flush_all();
-                        g.store.files.keys().cloned().collect()
-                    };
-                    for name in &names {
-                        if crate::bark::index_declared(&dir, name) {
-                            let _ = crate::grain::extend_grain(&dir, name);
-                        }
-                    }
-                    std::process::exit(code);
-                }
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let names: Vec<String> = {
-                    let mut g = intake.lock().unwrap();
-                    g.store.flush_aged();
-                    // Un-acked traffic still gets the wal's ≤1s power-loss
-                    // window, same as every other streaming writer.
-                    g.store.sap_sync_all();
-                    g.store.files.keys().cloned().collect()
-                };
-                for name in &names {
-                    match crate::bark::declared_retention(&dir, name) {
-                        Ok(policy) if policy.is_some() => {
-                            let res = intake.lock().unwrap().store.enforce_retention(
-                                name,
-                                policy.max_age_ms,
-                                policy.max_comp_bytes,
-                            );
-                            if let Err(e) = res {
-                                eprintln!("timberfs: {name}: background retention failed: {e}");
-                            }
-                        }
-                        _ => {}
-                    }
-                    let cur = intake
-                        .lock()
-                        .unwrap()
-                        .store
-                        .files
-                        .get(name)
-                        .map(|f| f.chunks.len())
-                        .unwrap_or(0);
-                    if cur != *indexed_chunks.get(name).unwrap_or(&0)
-                        && crate::bark::index_declared(&dir, name)
-                    {
-                        match crate::grain::extend_grain(&dir, name) {
-                            Ok(()) => {
-                                indexed_chunks.insert(name.clone(), cur);
-                            }
-                            Err(e) => {
-                                eprintln!("timberfs: {name}: background grain extend failed: {e}")
-                            }
-                        }
-                    }
-                }
-
-                // Acks are completed eagerly in the connection threads
-                // (drain_acks after each registered chunk); this sweep only
-                // retries ones a transient failure left pending there.
-                for name in &names {
-                    drain_acks(&intake, name, &cfg);
-                }
+    // The shared maintenance tick, plus what only Forward owes: acks are
+    // completed eagerly in the connection threads (drain_acks after each
+    // registered chunk), so this sweep only retries ones a transient
+    // failure left pending there.
+    let maint = crate::intake::spawn_maintenance(
+        Arc::clone(&intake),
+        into_dir.to_path_buf(),
+        Arc::clone(&stop),
+        exit_on_upgrade,
+        move |intake, names| {
+            for name in names {
+                drain_acks(intake, name, &cfg);
             }
-        })
-    };
+        },
+    );
 
-    let listener = match socket_activated_listener() {
+    let listener = match crate::intake::socket_activated_listener() {
         Some(l) => l,
         None => TcpListener::bind(listen)
             .with_context(|| format!("binding forward-intake listener on {listen}"))?,
@@ -1133,33 +958,6 @@ mod tests {
         let decoded = decode_message(decoded_val).ok().unwrap();
         assert_eq!(decoded.tag, "wiretest");
         assert_eq!(record_str(&decoded.entries[0].1, "log"), Some("round-trip"));
-    }
-
-    #[test]
-    fn tag_sanitization_keeps_safe_charset() {
-        assert_eq!(sanitize_tag("app.log"), "app.log");
-        assert_eq!(sanitize_tag("nginx-access_01"), "nginx-access_01");
-        assert_eq!(sanitize_tag("weird tag!"), "weird_tag_");
-    }
-
-    #[test]
-    fn tag_sanitization_blocks_traversal() {
-        // '/' is replaced everywhere, so the result is always a single path
-        // component relative to --into-dir — no traversal, no matter what
-        // dots remain in the middle — and a leading run of dots (a bare
-        // ".." included) is stripped outright.
-        assert_eq!(sanitize_tag("../../etc/passwd"), "_.._etc_passwd");
-        assert_eq!(sanitize_tag(".."), "untagged");
-        assert_eq!(sanitize_tag("../app"), "_app");
-        assert_eq!(sanitize_tag(""), "untagged");
-        assert!(!sanitize_tag("../../etc/passwd").contains('/'));
-    }
-
-    #[test]
-    fn store_name_appends_dot_log() {
-        assert_eq!(store_name("nginx"), "nginx.log");
-        assert_eq!(store_name("app.log"), "app.log.log");
-        assert_eq!(store_name("../../etc/passwd"), "_.._etc_passwd.log");
     }
 
     #[test]

@@ -1,0 +1,305 @@
+//! The receiver core shared by every network intake: a directory of
+//! stores, one writer lock each, and the maintenance tick that keeps them
+//! flushed, retained and indexed.
+//!
+//! A protocol module supplies only what is protocol-specific — how bytes
+//! become entries, how a store is named, what a manifest is seeded with,
+//! and what an acknowledgement means on its wire. Everything below is the
+//! same for the Fluentd Forward receiver and the OTLP one, and would be
+//! the same for the next.
+//!
+//! `Intake<X>` carries a protocol's own state in `extra` deliberately,
+//! rather than beside the struct: it sits under the SAME mutex as the
+//! store, which is what lets a receiver hold the store lock across a sync
+//! and then answer every acknowledgement that lock covered.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{bail, Context};
+
+use crate::store::{self, Config, Store};
+
+/// Every store one receiver writes, plus whatever that protocol needs to
+/// keep under the same lock.
+pub struct Intake<X = ()> {
+    pub store: Store,
+    /// Kept alive for as long as this receiver holds each file's writer
+    /// lock; dropped (and so released) only on process exit.
+    pub file_locks: BTreeMap<String, File>,
+    /// Stores that could not be opened (typically: undeclared, with no
+    /// --auto-create) — remembered so the refusal is logged once, not
+    /// once per record of a retrying sender.
+    pub refused: BTreeSet<String>,
+    pub extra: X,
+}
+
+impl<X> Intake<X> {
+    pub fn new(dir: &Path, cfg: Config, extra: X) -> Intake<X> {
+        Intake {
+            store: Store {
+                dir: dir.to_path_buf(),
+                cfg,
+                files: BTreeMap::new(),
+            },
+            file_locks: BTreeMap::new(),
+            refused: BTreeSet::new(),
+            extra,
+        }
+    }
+}
+
+/// Take the backing directory a receiver writes into: create it, and
+/// refuse one a mount already serves (two writers, one directory).
+pub fn open_backing_dir(dir: &Path) -> anyhow::Result<File> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("creating backing directory {}", dir.display()))?;
+    match store::lock_backing_shared(dir)? {
+        Some(f) => Ok(f),
+        None => {
+            let mounted = store::read_lock_mountpoint(dir)
+                .map(|m| format!(" (mounted on {})", m.display()))
+                .unwrap_or_default();
+            bail!(
+                "backing directory {} is served by a timberfs mount{mounted}; \
+                 write through the mount instead, or unmount first",
+                dir.display()
+            );
+        }
+    }
+}
+
+/// Lazily open a store on first use: take its exclusive per-file lock,
+/// open it, and — only the very first time it is created on disk — seed
+/// its manifest.
+///
+/// Creation is the operator's decision, not the network's: an undeclared
+/// store is refused unless `auto_create`, so an acking sender buffers and
+/// retries until it exists and provisioning converges with nothing lost.
+/// `subject` names what the network asked for, in that refusal.
+///
+/// Every store a receiver writes declares `wal`: an acknowledgement means
+/// durable, and the sap is what makes that cost one fsync instead of one
+/// chunk per record.
+pub fn ensure_store<X>(
+    intake: &mut Intake<X>,
+    dir: &Path,
+    name: &str,
+    subject: &str,
+    auto_create: bool,
+    seed: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if intake.store.files.contains_key(name) {
+        return Ok(());
+    }
+    let brand_new = !crate::format::rings_path(dir, name).exists();
+    // Refuse BEFORE taking the lock: lock files are never unlinked, so an
+    // undeclared store must not leave even that much litter behind.
+    if brand_new && !auto_create {
+        bail!(
+            "{subject}: no store {name} in {} — pre-create it \
+             (timberfs create --wal) or run with --auto-create",
+            dir.display()
+        );
+    }
+    let lock = store::lock_file_exclusive(dir, name)?.ok_or_else(|| {
+        anyhow::anyhow!("{name} already has a writer (another timberfs writer or a rotation)")
+    })?;
+    store::write_lock_info(&lock, &format!("intake pid={}\n", std::process::id()))?;
+    // Declare before create: open() reads the manifest to decide whether
+    // to mint the sap, and the ack contract needs it live from the start.
+    if brand_new {
+        seed(dir, name)?;
+    } else if !crate::bark::wal_declared(dir, name) {
+        crate::bark::declare_wal(dir, name)?;
+    }
+    intake.store.create(name)?;
+    intake.file_locks.insert(name.to_string(), lock);
+    Ok(())
+}
+
+/// The once-a-second housekeeping every receiver needs: flush aged
+/// chunks, sync the sap (un-acked traffic still gets the wal's ≤1s
+/// power-loss window), enforce declared retention, extend the token index
+/// for stores that declare one, and exit cleanly on SIGTERM or a binary
+/// upgrade — flushing everything first.
+///
+/// `after_tick` is where a protocol completes whatever its own tick owes
+/// (Forward retries acks a transient failure left pending); it runs with
+/// the lock released, holding only the store names the tick saw.
+pub fn spawn_maintenance<X, F>(
+    intake: Arc<Mutex<Intake<X>>>,
+    dir: PathBuf,
+    stop: Arc<AtomicBool>,
+    exit_on_upgrade: bool,
+    after_tick: F,
+) -> thread::JoinHandle<()>
+where
+    X: Send + 'static,
+    F: Fn(&Arc<Mutex<Intake<X>>>, &[String]) + Send + 'static,
+{
+    let watch = if exit_on_upgrade {
+        store::BinaryWatch::current()
+    } else {
+        None
+    };
+    let mut indexed_chunks: BTreeMap<String, usize> = BTreeMap::new();
+    thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(1000));
+            let graceful = if crate::append::stopping() {
+                Some(0)
+            } else if watch.as_ref().is_some_and(|w| w.changed()) {
+                Some(store::EXIT_BINARY_UPGRADED)
+            } else {
+                None
+            };
+            if let Some(code) = graceful {
+                let names: Vec<String> = {
+                    let mut g = intake.lock().unwrap();
+                    g.store.flush_all();
+                    g.store.files.keys().cloned().collect()
+                };
+                for name in &names {
+                    if crate::bark::index_declared(&dir, name) {
+                        let _ = crate::grain::extend_grain(&dir, name);
+                    }
+                }
+                std::process::exit(code);
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let names: Vec<String> = {
+                let mut g = intake.lock().unwrap();
+                g.store.flush_aged();
+                g.store.sap_sync_all();
+                g.store.files.keys().cloned().collect()
+            };
+            for name in &names {
+                match crate::bark::declared_retention(&dir, name) {
+                    Ok(policy) if policy.is_some() => {
+                        let res = intake.lock().unwrap().store.enforce_retention(
+                            name,
+                            policy.max_age_ms,
+                            policy.max_comp_bytes,
+                        );
+                        if let Err(e) = res {
+                            eprintln!("timberfs: {name}: background retention failed: {e}");
+                        }
+                    }
+                    _ => {}
+                }
+                let cur = intake
+                    .lock()
+                    .unwrap()
+                    .store
+                    .files
+                    .get(name)
+                    .map(|f| f.chunks.len())
+                    .unwrap_or(0);
+                if cur != *indexed_chunks.get(name).unwrap_or(&0)
+                    && crate::bark::index_declared(&dir, name)
+                {
+                    match crate::grain::extend_grain(&dir, name) {
+                        Ok(()) => {
+                            indexed_chunks.insert(name.clone(), cur);
+                        }
+                        Err(e) => {
+                            eprintln!("timberfs: {name}: background grain extend failed: {e}")
+                        }
+                    }
+                }
+            }
+
+            after_tick(&intake, &names);
+        }
+    })
+}
+
+/// A systemd-passed listening socket, when this process was socket-
+/// activated: fd 3 is the first inherited descriptor by convention.
+pub fn socket_activated_listener() -> Option<std::net::TcpListener> {
+    use std::os::unix::io::FromRawFd;
+    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
+    if pid != std::process::id() {
+        return None;
+    }
+    let fds: usize = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if fds < 1 {
+        return None;
+    }
+    Some(unsafe { std::net::TcpListener::from_raw_fd(3) })
+}
+
+/// A network-supplied name mapped to a store filename: keep
+/// `[A-Za-z0-9._-]`, replace everything else with `_`, strip leading
+/// dots, empty -> `untagged`. This mapping must be structurally unable to
+/// escape the backing directory: no `/` ever survives, and a stripped
+/// leading dot rules out a bare `..` component.
+pub fn sanitize_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    while out.starts_with('.') {
+        out.remove(0);
+    }
+    if out.is_empty() {
+        out = "untagged".to_string();
+    }
+    out
+}
+
+/// The store's logical name for a network name: `<sanitized>.log`, so a
+/// store a receiver creates reads exactly like every other timberfs log.
+pub fn store_name(name: &str) -> String {
+    format!("{}.log", sanitize_name(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_sanitization_keeps_safe_charset() {
+        assert_eq!(sanitize_name("app.log"), "app.log");
+        assert_eq!(sanitize_name("nginx-access_01"), "nginx-access_01");
+        assert_eq!(sanitize_name("weird tag!"), "weird_tag_");
+        // What an OTLP service.name looks like when it is a URL or a k8s
+        // path: still one component, still no separator.
+        assert_eq!(sanitize_name("checkout/v2"), "checkout_v2");
+    }
+
+    #[test]
+    fn name_sanitization_blocks_traversal() {
+        // '/' is replaced everywhere, so the result is always a single path
+        // component relative to the backing directory — no traversal, no
+        // matter what dots remain in the middle — and a leading run of dots
+        // (a bare ".." included) is stripped outright.
+        assert_eq!(sanitize_name("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(sanitize_name(".."), "untagged");
+        assert_eq!(sanitize_name("../app"), "_app");
+        assert_eq!(sanitize_name(""), "untagged");
+        assert!(!sanitize_name("../../etc/passwd").contains('/'));
+    }
+
+    #[test]
+    fn store_name_appends_dot_log() {
+        assert_eq!(store_name("nginx"), "nginx.log");
+        assert_eq!(store_name("app.log"), "app.log.log");
+        assert_eq!(store_name("../../etc/passwd"), "_.._etc_passwd.log");
+    }
+}
