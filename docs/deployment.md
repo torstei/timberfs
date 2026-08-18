@@ -190,7 +190,7 @@ DECLARE=index=true retain=90d format=combined-vhost
 ```
 ```ini
 # /etc/timberfs/text-apache-error.conf — errors are worth keeping longer
-DECLARE=index=true retain=1y format=apache-error
+DECLARE=index=true retain=365d format=apache-error
 ```
 
 Two stores rather than one because differentiated retention is the only thing a
