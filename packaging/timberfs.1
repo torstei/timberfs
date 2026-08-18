@@ -279,6 +279,27 @@ directory served by a
 .B timberfs mount
 is unavailable to appenders and vice versa. Appending to an existing log
 continues it.
+.PP
+A supervisor typically starts the replacement writer BEFORE the one it
+replaces has exited \(em Apache spawns a new piped\-log program on reload
+while the old one is still draining its pipe \(em so a held lock is
+normally a handoff in progress, not a conflict. An appender therefore
+waits
+.B \-\-wait\-for\-writer
+seconds (default 5) for the lock, which makes such a restart silent
+instead of one failure per log per reload; nothing is read from standard
+input while waiting, so the producer's pipe buffers \(em which is why the
+wait stays short.
+.B \-\-wait\-for\-writer 0
+fails on the first attempt. A lock still held at the deadline is
+reported with its holder \(em writers record themselves in the
+.B .lock
+file, so the message names the process and its command line (checked
+against /proc, never repeated as fact for a pid that has gone), which is
+what separates a stuck handoff from a writer leaked by something else.
+.B timberfs info
+names it too.
+.PP
 Data is flushed into chunks by the same size and age rules
 as the mount; end of input,
 .B SIGTERM
@@ -292,6 +313,10 @@ and
 options as
 .BR mount ,
 plus:
+.TP
+.BI \-\-wait\-for\-writer " SECS"
+Seconds to wait for a departing writer to release the log before failing
+(default 5; 0 = fail immediately). See above.
 .TP
 .B \-\-wal
 Declare the write-ahead sidecar

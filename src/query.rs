@@ -1147,7 +1147,9 @@ pub enum WriterState {
     /// The backing directory is held exclusively by a mount daemon.
     Mounted(Option<PathBuf>),
     /// The file's own writer lock is held: an appender, import or rotation.
-    Active,
+    /// Carries the holder's own record of itself when it left one and the
+    /// process is still there (see `store::describe_file_writer`).
+    Active(Option<String>),
     /// A lock file exists but couldn't be opened (permissions) — unknown.
     Unreadable,
     /// Nobody holds anything.
@@ -1159,7 +1161,7 @@ impl WriterState {
     /// per-file lock specifically (a mount holds the directory lock
     /// instead, so a mounted store reads `false` here).
     pub fn is_live(&self) -> bool {
-        matches!(self, WriterState::Active)
+        matches!(self, WriterState::Active(_))
     }
 }
 
@@ -1257,7 +1259,7 @@ pub fn summarize_store(
         LockProbe::Held => WriterState::Mounted(crate::store::read_lock_mountpoint(dir)),
         LockProbe::Unreadable => WriterState::Unreadable,
         LockProbe::Absent | LockProbe::Free => match crate::store::probe_file_writer(dir, name) {
-            LockProbe::Held => WriterState::Active,
+            LockProbe::Held => WriterState::Active(crate::store::describe_file_writer(dir, name)),
             LockProbe::Unreadable => WriterState::Unreadable,
             LockProbe::Absent | LockProbe::Free => WriterState::Idle,
         },
@@ -1286,7 +1288,8 @@ fn writer_text(w: &WriterState) -> String {
     match w {
         WriterState::Mounted(Some(mp)) => format!("mounted at {}", mp.display()),
         WriterState::Mounted(None) => "another timberfs process holds the directory".to_string(),
-        WriterState::Active => "active writer (appender, import or rotation)".to_string(),
+        WriterState::Active(Some(who)) => format!("active writer: {who}"),
+        WriterState::Active(None) => "active writer (appender, import or rotation)".to_string(),
         WriterState::Unreadable => "unknown (lock file not readable)".to_string(),
         WriterState::Idle => "none".to_string(),
     }

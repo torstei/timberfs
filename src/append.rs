@@ -208,6 +208,51 @@ fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Retentio
     }
 }
 
+/// Take a log's writer lock, waiting out a departing writer for up to
+/// `wait_secs` (see `store::lock_file_exclusive_waiting`).
+pub fn take_writer_lock(
+    dir: &Path,
+    name: &str,
+    wait_secs: f64,
+) -> anyhow::Result<Option<std::fs::File>> {
+    let wait = Duration::from_millis((wait_secs.max(0.0) * 1000.0) as u64);
+    if wait.is_zero() {
+        Ok(store::lock_file_exclusive(dir, name)?)
+    } else {
+        Ok(store::lock_file_exclusive_waiting(dir, name, wait)?)
+    }
+}
+
+/// The message for a lock we could not get: name the holder if it
+/// recorded itself, and say that we waited, so a reload handoff that
+/// really is stuck reads differently from two writers started by mistake.
+pub fn writer_conflict(dir: &Path, name: &str, wait_secs: f64) -> String {
+    let waited = if wait_secs > 0.0 {
+        format!(" — still held after waiting {}s", fmt_secs(wait_secs))
+    } else {
+        String::new()
+    };
+    match store::describe_file_writer(dir, name) {
+        Some(who) => format!(
+            "{name} already has a writer: {who}{waited}; one writer per log, \
+             so that one must exit before this one can take over"
+        ),
+        None => format!(
+            "{name} already has a writer (another timberfs writer or a \
+             rotation){waited}"
+        ),
+    }
+}
+
+/// Seconds without a trailing ".0" on the whole ones.
+fn fmt_secs(s: f64) -> String {
+    if s.fract() == 0.0 {
+        format!("{}", s as u64)
+    } else {
+        format!("{s}")
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_append(
     target: &Path,
@@ -216,6 +261,7 @@ pub fn cmd_append(
     retain: Option<&str>,
     retain_size: Option<&str>,
     exit_on_upgrade: bool,
+    wait_for_writer: f64,
 ) -> anyhow::Result<()> {
     // Validate the flags up front; they are persisted below.
     retain.map(parse_duration_ms).transpose()?;
@@ -246,11 +292,9 @@ pub fn cmd_append(
             );
         }
     };
-    let file_lock = match store::lock_file_exclusive(&dir, &name)? {
+    let file_lock = match take_writer_lock(&dir, &name, wait_for_writer)? {
         Some(f) => f,
-        None => {
-            bail!("{name} already has a writer (another timberfs appender or a rotation)");
-        }
+        None => bail!(writer_conflict(&dir, &name, wait_for_writer)),
     };
     store::write_lock_info(
         &file_lock,

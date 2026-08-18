@@ -1809,6 +1809,42 @@ sticky_declared_index() {
            | grep -q STICKYNEEDLE42
 }
 
+writer_handoff_waits() {
+    # A supervisor's reload starts the replacement writer before the old
+    # one has exited (Apache's piped logs): the new writer waits out the
+    # handoff instead of failing, and a writer that never leaves is
+    # reported by name.
+    mkfifo /tmp/ho.pipe
+    setsid timberfs append --into "$PIPE_BACKING/handoff.log" < /tmp/ho.pipe 2>/dev/null &
+    sleep 1
+    exec 3>/tmp/ho.pipe
+    printf 'old writer line\n' >&3
+    sleep 1
+    OLD=$(sed -n 's/.*pid=//p' "$PIPE_BACKING/handoff.log.lock")
+    # the old writer goes away a second into the new one's wait
+    ( sleep 1; kill -TERM "$OLD" ) &
+    printf 'new writer line\n' | timberfs append --into "$PIPE_BACKING/handoff.log" 2>/dev/null \
+        && exec 3>&- \
+        && [ "$(timberfs query "$PIPE_BACKING/handoff.log" 2>/dev/null | wc -l)" = 2 ] \
+        || { exec 3>&-; return 1; }
+    # a writer that stays put: named in the error, not just refused
+    mkfifo /tmp/ho2.pipe
+    setsid timberfs append --into "$PIPE_BACKING/squat.log" < /tmp/ho2.pipe 2>/dev/null &
+    sleep 1
+    exec 4>/tmp/ho2.pipe
+    printf 'squatter\n' >&4
+    sleep 1
+    printf 'x\n' | timberfs append --into "$PIPE_BACKING/squat.log" --wait-for-writer 0.5 2>/tmp/squat.err
+    RC=$?
+    SQ=$(sed -n 's/.*pid=//p' "$PIPE_BACKING/squat.log.lock")
+    kill -TERM "$SQ" 2>/dev/null
+    exec 4>&-
+    [ "$RC" != 0 ] \
+        && grep -q "already has a writer: appender pid=$SQ" /tmp/squat.err \
+        && grep -q "timberfs append --into" /tmp/squat.err \
+        && grep -q "still held after waiting 0.5s" /tmp/squat.err
+}
+
 create_if_not_exists() {
     # provisioning that re-runs on every start: the second create is a
     # quiet success, a declaration the standing store disagrees with is
@@ -1868,6 +1904,7 @@ grep_into_artifact() {
 run_test "write guards: forgotten destination after a glob is refused" forgotten_destination_refused
 run_test "bark: create --index makes imports maintain the grain" sticky_declared_index
 run_test "bark: create --if-not-exists is a quiet no-op on an existing store" create_if_not_exists
+run_test "append: a reload's writer handoff waits, a squatter is named" writer_handoff_waits
 run_test "empty results are results: export ships, import no-ops" empty_results_are_results
 run_test "daily bulk-load: day-2 appends, overlap dedups, re-run no-ops" daily_bulk_load
 info_vital_signs() {
