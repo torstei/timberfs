@@ -527,7 +527,19 @@ for that reason.
 sets how often it looks (default 1); below
 .B \-\-flush\-age
 nothing observable improves, since a flushed chunk is the unit of
-visibility. Waits for a source that does not exist yet rather than failing,
+visibility.
+.B \-\-flush\-age
+itself defaults to 60 here rather than the appender's 5, because it means
+something different: the appender's input is a pipe, so unflushed data
+exists only in memory and the age bounds what a crash loses, while a
+follower's input is a file that stays on disk and the store is the
+checkpoint \(em a partial chunk lost to a crash is simply re-read. The age
+therefore only decides how soon new lines become queryable, and setting it
+low costs compression instead, since a chunk then holds too little for zstd
+to work with (3.1x at five seconds against 7.7x at sixty, at one line a
+second). A chunk closes on whichever comes first, that age or
+.B \-\-chunk\-size
+(256 KiB of uncompressed data), plus once at exit. Waits for a source that does not exist yet rather than failing,
 so a unit may start before its producer.
 .SS export
 .B timberfs export

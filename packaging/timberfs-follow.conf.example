@@ -22,7 +22,11 @@ DECLARE=index=true retain=90d
 # Extra flags for `timberfs import --follow`:
 #   --poll SECS        how often to look for new data and for a replaced file
 #                      (default 1; nothing observable improves below --flush-age)
-#   --flush-age SECS   how long followed data may sit unflushed (default 5)
+#   --flush-age SECS   how long followed data may sit unflushed (default 60) —
+#                      a visibility knob, not a durability one: the source file
+#                      is the durable copy, so lowering it only makes lines
+#                      queryable sooner, at the cost of chunks too small to
+#                      compress on a quiet log
 #   --rotated PATH     where rotation moves the source, for data written while
 #                      this follower was NOT running (default: <SOURCE>.1
 #                      and <SOURCE>.0). Rotation while it IS running needs no

@@ -412,6 +412,25 @@ from the start, with the honest note that whatever was written between the copy
 and the truncate is lost to every reader, not just this one. A source that does
 not exist yet is waited for, so the unit may start before its producer.
 
+**Chunk size, and why `--flush-age` defaults to a minute here.** A chunk closes
+on whichever comes first — `--chunk-size` (256 KiB of uncompressed data) or
+`--flush-age` — plus once at exit, so a busy log fills 256 KiB chunks and a
+quiet one closes whatever arrived in the window. For the appender that window
+bounds crash loss, because its input is a pipe and unflushed data exists only
+in memory. A follower's input is a file that stays on disk, and the store is
+its checkpoint: a partial chunk lost to a crash is simply re-read. So the age
+here only decides how soon new lines become queryable, and a short one costs
+compression for nothing:
+
+| followed at | `--flush-age 5` | `--flush-age 60` |
+|---|---|---|
+| ~10 lines/s (25 KiB) | 5 chunks, 1.7 KiB on disk (14.3x) | 1 chunk, 1.2 KiB (20.4x) |
+| ~1 line/s (1.7 KiB) | 4 chunks, 555 B (3.1x) | 1 chunk, 225 B (7.7x) |
+
+The minute matches what a one-shot import of the same bytes achieves, and is
+still far inside a "couple of minutes" freshness budget. Lower it when you want
+new lines queryable sooner, not for safety.
+
 #### Without a daemon: `import` on a trigger
 
 The same job, one-shot, when you would rather not run a follower. A store is

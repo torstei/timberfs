@@ -241,9 +241,16 @@ enum Command {
         /// which bounds when a chunk becomes visible
         #[arg(long, default_value_t = 1.0, value_name = "SECS", requires = "follow")]
         poll: f64,
-        /// Max seconds followed data may sit unflushed (--follow only);
-        /// bounds the write-time granularity of the index and crash loss
-        #[arg(long, default_value_t = 5.0, value_name = "SECS", requires = "follow")]
+        /// Max seconds followed data may sit unflushed (--follow only) —
+        /// a VISIBILITY knob, not a durability one: the source file is the
+        /// durable copy and the store is the checkpoint, so a follower that
+        /// dies with a partial chunk re-reads it on the next start. Hence
+        /// the minute rather than the appender's 5s, whose input is a pipe
+        /// with nowhere else to hold the data: a short age on a quiet log
+        /// closes chunks too small to compress (measured 3.1x against 7.7x
+        /// at one line a second). Lower it only to make new lines
+        /// queryable sooner
+        #[arg(long, default_value_t = 60.0, value_name = "SECS", requires = "follow")]
         flush_age: f64,
         /// Continuously drop data older than this (e.g. 90d) — declared in
         /// the manifest and enforced by every writer (--follow only)
