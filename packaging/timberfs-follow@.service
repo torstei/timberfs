@@ -1,0 +1,70 @@
+# Systemd template for following a log file into a store: `timberfs import
+# --follow`, for a producer that cannot be pointed at a FIFO — or must not be.
+#
+# The producer keeps writing its own file and timberfs reads it, so nothing in
+# the producer's write path depends on this unit. A follower that stalls, dies
+# or is upgraded badly cannot slow or stop the producer; the worst it can do is
+# fall behind. That is the difference from the timberfs-text@ FIFO pair, where
+# the producer's write goes into a pipe this side has to keep draining — and it
+# is why this is the safer default for a mail server, where Exim ends the
+# process whose log write fails.
+#
+# Each instance reads /etc/timberfs/follow-<instance>.conf, which must define
+# SOURCE (there is no sane default) and may override the rest:
+#
+#   /etc/timberfs/follow-exim-main.conf:
+#     SOURCE=/var/log/exim4/mainlog
+#     DECLARE=index=true retain=90d format=exim-main
+#
+#   systemctl enable --now timberfs-follow@exim-main
+#
+# The store lands in <STORE_DIR>/<instance>.log. Rotation of the source needs
+# no configuration while this runs — the descriptor already held is the file
+# that moved, and it is drained before the new one is opened. --rotated only
+# matters for data written while the follower was NOT running; it defaults to
+# <SOURCE>.1 and <SOURCE>.0.
+#
+# The follower reads the producer's file, so if you set User= in a drop-in,
+# that user needs read access to it (group adm on a Debian /var/log, say).
+
+[Unit]
+Description=timberfs log follower (%i)
+Documentation=https://github.com/torstei/timberfs
+After=local-fs.target
+
+[Service]
+Type=simple
+
+# Defaults first; EnvironmentFile= wins over Environment=, and the
+# per-instance file (required, for SOURCE) wins over the site-wide one.
+Environment=STORE_DIR=/var/log/timberfs/follow
+Environment=DECLARE=index=true
+EnvironmentFile=-/etc/timberfs/follow.conf
+EnvironmentFile=/etc/timberfs/follow-%i.conf
+
+# The store's properties, declared idempotently on every start — the same
+# pattern as the FIFO pair: create makes it if missing, set converges DECLARE.
+ExecStartPre=/usr/bin/timberfs create --if-not-exists ${STORE_DIR}/%i.log
+ExecStartPre=/usr/bin/timberfs set ${STORE_DIR}/%i.log host=%H $DECLARE
+ExecStart=/usr/bin/timberfs import --follow ${SOURCE} \
+    --into ${STORE_DIR}/%i.log --exit-on-upgrade $EXTRA_OPTS
+StandardOutput=journal
+StandardError=journal
+
+# Creates and owns the default store directory /var/log/timberfs/follow
+# (0755), shared by every instance so one glob spans them.
+LogsDirectory=timberfs/follow
+
+# Restarting is cheap and safe: the store is the follower's checkpoint, so a
+# restart re-syncs against the store's own lines rather than a position file,
+# and can neither lose nor duplicate.
+Restart=always
+RestartSec=2
+# --exit-on-upgrade: exit 85 when this binary is replaced on disk, so the
+# restart lands on the new one. SuccessExitStatus keeps it out of the failure
+# log. (Keep --exit-on-upgrade in any ExecStart override.)
+SuccessExitStatus=85
+RestartForceExitStatus=85
+
+[Install]
+WantedBy=multi-user.target

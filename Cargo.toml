@@ -90,6 +90,7 @@ assets = [
     ["packaging/timberfs-log@.service", "lib/systemd/system/timberfs-log@.service", "644"],
     ["packaging/timberfs-text@.socket", "lib/systemd/system/timberfs-text@.socket", "644"],
     ["packaging/timberfs-text@.service", "lib/systemd/system/timberfs-text@.service", "644"],
+    ["packaging/timberfs-follow@.service", "lib/systemd/system/timberfs-follow@.service", "644"],
     ["packaging/timberfs-forward.socket", "lib/systemd/system/timberfs-forward.socket", "644"],
     ["packaging/timberfs-forward.service", "lib/systemd/system/timberfs-forward.service", "644"],
     ["packaging/timberfs-otlp@.service", "lib/systemd/system/timberfs-otlp@.service", "644"],
@@ -99,6 +100,7 @@ assets = [
     ["packaging/timberfs.conf.example", "usr/share/doc/timberfs/examples/timberfs.conf.example", "644"],
     ["packaging/timberfs-otlp.conf.example", "usr/share/doc/timberfs/examples/timberfs-otlp.conf.example", "644"],
     ["packaging/timberfs-text.conf.example", "usr/share/doc/timberfs/examples/timberfs-text.conf.example", "644"],
+    ["packaging/timberfs-follow.conf.example", "usr/share/doc/timberfs/examples/timberfs-follow.conf.example", "644"],
     ["packaging/etc-README", "etc/timberfs/README", "644"],
     ["packaging/forests-default.conf", "etc/timberfs/forests.d/default.conf", "644"],
 ]

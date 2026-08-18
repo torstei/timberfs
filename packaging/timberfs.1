@@ -474,6 +474,61 @@ source ranges (every chunk, or first/middle/last with
 then only what the source has grown by is appended; an identical source
 is a no-op, and a source that shrank or changed is refused before
 anything is written (rotated files should be imported to a new target).
+.PP
+.B \-\-follow
+.RB ( \-F )
+does not stop at the source's end: it keeps reading as the producer writes,
+which is how a log gets into a store when its producer cannot be pointed at
+a FIFO \(em or must not be, because nothing in the producer's write path
+should depend on this side. Position and rotation are the whole difficulty
+and are handled by three rules:
+.TP
+The store is the checkpoint.
+A start re-syncs against the lines the store already holds over the window
+the source covers, so a restart can neither lose nor duplicate, and there is
+no position file to go stale, be restored out of step, or disagree with the
+store. The cost is a scan of the source at startup, which is one reason to
+rotate a busy log hourly rather than daily.
+.TP
+A descriptor is never abandoned before EOF.
+When the path stops being the file it was, the file already open is read to
+its end BEFORE the new one is opened \(em so the lines written between the
+last read and the rename cannot be stranded, which is exactly what a
+.B tail \-F
+pipeline drops. Rotation therefore needs no pattern while the follower runs;
+.BI \-\-rotated " PATH"
+exists only for data written while it was NOT running, and defaults to
+.IB SOURCE .1
+and
+.IB SOURCE .0
+when they exist. A source that shrank is reported as a truncation
+(copytruncate) and re-read from the start.
+.TP
+Every position decision is announced.
+Which file, how much, and why. A follower that silently reads the wrong
+thing would be worse than one that stops.
+.PP
+Entries are stamped from their own timestamps, as in any import, which keeps
+a followed store indistinguishable from an imported one \(em where
+.B tail \-F | timberfs append
+stamps ARRIVAL and so builds a store the two can never reconcile. A
+follower is a live writer like the appender: it takes the log's writer lock
+for its lifetime, honours declared retention, keeps a declared
+.B .grain
+current, maintains the
+.B .sap
+when one is declared, and takes
+.BR \-\-flush\-age ,
+.B \-\-exit\-on\-upgrade
+and
+.B \-\-wait\-for\-writer
+for that reason.
+.BI \-\-poll " SECS"
+sets how often it looks (default 1); below
+.B \-\-flush\-age
+nothing observable improves, since a flushed chunk is the unit of
+visibility. Waits for a source that does not exist yet rather than failing,
+so a unit may start before its producer.
 .SS export
 .B timberfs export
 .I SOURCE
@@ -1311,6 +1366,27 @@ and a new site needs no logging configuration at all \(em or a site can have
 its own instance when it needs its own retention or owner; the two layouts
 are the same two units.
 .PP
+.B timberfs\-follow@.service
+takes the other route for such a producer: it leaves the file alone and
+reads it
+.RB ( "import \-\-follow" ).
+Each instance reads
+.IB /etc/timberfs/follow- instance .conf
+for
+.B SOURCE
+(required) and optionally
+.BR STORE_DIR ,
+.B DECLARE
+and
+.BR EXTRA_OPTS ,
+then
+.B systemctl enable \-\-now
+.BI timberfs\-follow@ instance \fR.
+Nothing in the producer's write path depends on it \(em a follower that
+stalls or dies can only fall behind, where a FIFO this side stops draining
+blocks the producer (and ends the process, for Exim). That makes it the
+safer default, at the cost of the plain file continuing to exist.
+.PP
 A fourth, socket\-activated pair,
 .B timberfs\-forward.socket
 and
@@ -1351,7 +1427,7 @@ One instance per store \(em the cursor is a position in one store, and a
 stalled receiver must not hold up an unrelated one. Its cursor lives in
 .IR /var/lib/timberfs/ .
 .PP
-The full directory layout, all six unit families, the ownership model and
+The full directory layout, all seven unit families, the ownership model and
 self\-restart on upgrade are documented in
 .IR /usr/share/doc/timberfs/deployment.md .
 .SH EXAMPLES

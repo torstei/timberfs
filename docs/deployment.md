@@ -47,6 +47,11 @@ pass its own paths.
                                           apache-error.log for a whole web server)
   .timberfs.lock                            the directory lock (see Locking)
 
+/var/log/timberfs/follow/                 one directory shared by every file
+                                          follower (timberfs-follow@), the store
+                                          named after the instance:
+    <instance>.log.trunk / .rings / .grain / .bark / .lock
+
 /var/log/timberfs/forward/                one directory shared by every tag the
                                           Fluentd Forward intake sees (it is a
                                           single TCP listener, not templated):
@@ -306,8 +311,9 @@ whether you want this route at all:
   rather than silent (a fresh process fails at open with `ENXIO`, thanks to
   that `O_NONBLOCK`; a long-lived one gets `EPIPE` on its held descriptor) —
   but for a mail server it turns "never stop the socket while the producer
-  runs" from advice into a rule, and it is the reason to consider importing
-  instead (see below).
+  runs" from advice into a rule — and it is why the **follower** below is the
+  better default for Exim: reading the file it already writes puts nothing of
+  timberfs in the path of a delivery.
 - **`log_file_path` takes one path plus optionally `syslog`.** A second path is
   refused; a path and `syslog` are written to *both*, so syslog can be a
   parallel copy — though it does not protect mail flow, since it is the file
@@ -343,13 +349,74 @@ node fails for the Exim user instead of diverging silently. And enable
 `+0200` it then appends is separated from the time by a space, which the
 built-in ISO clock does not accept, so the entry is read as local time.
 
-### A log you cannot reconfigure — `import` on a trigger
+### A log you cannot reconfigure — follow the file
 
 Some producers cannot be pointed anywhere useful, or should not be: a vendor
-appliance, a package's own log, an MTA where a logging failure defers mail.
-Leave those writing their file and import it instead. A store is its own
-checkpoint, so importing the same growing file repeatedly adds only what is
-new, and rotation needs no bookkeeping:
+appliance, a package's own log, an MTA where a logging failure defers mail —
+and any producer where you would rather nothing of timberfs sat in the path of
+its writes. Leave those writing their own file and read it:
+
+```sh
+timberfs import --follow /var/log/exim4/mainlog \
+    --into /var/log/timberfs/follow/exim-main.log
+```
+
+**The coupling is the point.** With the FIFO pair the producer writes into a
+pipe this side has to keep draining, so a wedged writer becomes the producer's
+problem — a blocked Apache worker, or an ended Exim process. A follower is a
+reader: if it stalls, dies or is upgraded badly, the worst it can do is fall
+behind. The failure mode drops from "the web server stalls" to "the archive
+lags", which is a change of kind rather than degree. What you accept in
+exchange is that the plain file still exists and still needs rotating.
+
+| | latency | coupling to the producer | on a writer restart |
+|---|---|---|---|
+| `timberfs-text@` (FIFO) | flush age | the producer's write blocks on it (Exim: the process ends) | nothing lost — the kernel pipe buffers |
+| `timberfs-follow@` (follower) | poll + flush age | none — it is a reader | nothing lost — the store is the checkpoint |
+| `import` on a timer | the tick | none | nothing lost — same checkpoint |
+
+Rotation of the plain file stays the producer's business, and its retention is
+no longer your archive — only the follower's safety margin. That frees you to
+rotate far more often than you would otherwise: **hourly rotation on a busy
+site** is worth doing, because it bounds both the plain file's size and the
+scan a follower does at startup to re-sync against the store.
+
+```ini
+# /etc/timberfs/follow-exim-main.conf   (SOURCE is required)
+SOURCE=/var/log/exim4/mainlog
+DECLARE=index=true retain=90d format=exim-main
+```
+```sh
+systemctl enable --now timberfs-follow@exim-main
+```
+
+Three rules carry the whole thing, and each is stated where an operator will
+look — in the journal, as it happens:
+
+- **The store is the checkpoint.** A start re-syncs against the lines the store
+  already holds over the window the source covers, so a restart can neither
+  lose nor duplicate. There is no position file to go stale, be restored out of
+  step, or disagree with the store.
+- **A descriptor is never abandoned before EOF.** When the path stops being the
+  file it was, the file already open is drained first — so the lines written
+  between the last read and the rename cannot be stranded, which is exactly
+  what `tail -F` drops. Rotation needs no pattern at all while the follower
+  runs; `--rotated` exists only for data written while it was *not* running,
+  and defaults to `<source>.1` and `<source>.0`.
+- **Every position decision is announced.** `mainlog was replaced (rotation);
+  drained its last 812 byte(s) and switched to the new file` — a follower that
+  silently reads the wrong thing would be worse than one that stops.
+
+A source that shrank is reported as a truncation (`copytruncate?`) and re-read
+from the start, with the honest note that whatever was written between the copy
+and the truncate is lost to every reader, not just this one. A source that does
+not exist yet is waited for, so the unit may start before its producer.
+
+#### Without a daemon: `import` on a trigger
+
+The same job, one-shot, when you would rather not run a follower. A store is
+its own checkpoint, so importing the same growing file repeatedly adds only
+what is new, and rotation needs no bookkeeping:
 
 ```sh
 timberfs import /var/log/exim4/mainlog \
@@ -464,9 +531,10 @@ A timer and a path unit can point at the same service — inotify for immediacy,
 the timer as a floor so a coalesced or missed event cannot leave data
 unimported indefinitely.
 
-**Why not `tail -F | timberfs append`?** It is the obvious shape and it does
-work: `tail -F` follows a rotation, and the latency is immediate. What it has
-no answer for is its own restart. `tail -F -n 0` resumes at the END of the
+**Why not `tail -F | timberfs append`?** It is the obvious shape, and
+`--follow` above is what it should have been. `tail -F` does follow a rotation,
+and the latency is immediate; what it has no answer for is its own
+restart. `tail -F -n 0` resumes at the END of the
 file, so everything written while the pipeline was down is missing from the
 store — silently, with the file still on disk to prove it. Worse, that hole
 cannot be filled afterwards: a tail-fed store's write axis is when the appender
@@ -481,10 +549,11 @@ or to a new target
 
 — by less than a second, because a line's own timestamp necessarily precedes
 its arrival. Starting from the beginning instead (`-n +1`) duplicates the whole
-file on every restart. The two supported routes have a definite answer here
-where `tail` has none: the FIFO's kernel buffer carries the gap across a writer
-restart, and an import cannot lose or duplicate anything because the store is
-its own checkpoint.
+file on every restart. All three supported routes have a definite answer where
+`tail` has none: the FIFO's kernel buffer carries the gap across a writer
+restart, and the follower and the one-shot import cannot lose or duplicate
+anything because the store is their checkpoint — which is also why a follower
+stamps entries from their own timestamps rather than from arrival.
 
 One thing to be clear-eyed about all the same: triggering an import is polling
 avoidance bolted onto a batch tool, and each run re-verifies before it appends.
@@ -624,15 +693,18 @@ batch, so an interrupted send is re-delivered rather than skipped
 ## Ownership and permissions
 
 - **The store directory** is created by `LogsDirectory=timberfs/%i` (or plain
-  `timberfs/text` for the plain-text intake, `timberfs/forward` for the Forward
-  intake, `timberfs/otlp` for the OTLP intake), owned by the service's `User=`
+  `timberfs/text` for the plain-text intake, `timberfs/follow` for the file
+  follower, `timberfs/forward` for the Forward intake, `timberfs/otlp` for the
+  OTLP intake), owned by the service's `User=`
   (root by default). Set `User=` in a drop-in to own the directory as a
   specific user.
 - **The FIFO** is created `root:root 0660`. A non-root producer cannot write it
   until you set the socket's group to one that user belongs to (`SocketGroup=`);
   there is no sane default, because the producer's identity is site-specific.
   Apache and nginx are the case that needs nothing: their privileged parent
-  opens every log file before dropping to the worker user.
+  opens every log file before dropping to the worker user. The file follower has
+  no FIFO at all — it needs READ access to the producer's log instead, so a
+  `User=` drop-in there wants a group like `adm` on a Debian `/var/log`.
   (The Forward intake has no FIFO — it is a TCP listener, gated by the address
   it binds, not by filesystem permissions.)
 - **Readers vs. writers.** `query` and `info` are read-only — they need only
