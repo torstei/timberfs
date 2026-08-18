@@ -144,7 +144,8 @@ single connection, and each tag lands in its own store under
 `/var/log/timberfs/forward/<tag>.log`.
 
 By default the store set is **operator-controlled**: pre-create each tag's
-store (`timberfs create --wal /var/log/timberfs/forward/<tag>.log`), and an
+store (`timberfs create --wal /var/log/timberfs/forward/<tag>.log` — with
+`--if-not-exists` where that provisioning re-runs on every boot), and an
 unknown tag is refused — logged once, never acked, so an acking sender
 buffers and retries until the store exists. On a Docker host, where tags
 are container names that come and go, opt into per-tag store creation with
