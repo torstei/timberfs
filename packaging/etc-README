@@ -17,11 +17,24 @@ OTLP/HTTP receiver its entries are posted to:
 
 Then: systemctl enable --now timberfs-otlp@<instance>
 
-Only these two units read a file from this directory. The rest are
-configured with a systemd drop-in instead — the templated log intake
-(systemctl edit timberfs-log@<instance>.service) and the two network
-intakes, which are not templated because one listener serves every stream
-(systemctl edit timberfs-forward.service, timberfs-otlp.service).
+text.conf and text-<instance>.conf configure the plain-text FIFO intake —
+for a producer that can only log to a path (Apache, nginx). text.conf holds
+the defaults for every instance and text-<instance>.conf overrides them for
+one, key by key:
+
+    STORE_DIR=/var/log/timberfs/text
+    DECLARE=index=true retain=90d
+
+Then: systemctl enable --now timberfs-text@<instance>.socket
+
+DECLARE is applied to the store on every start, so retention lives here
+rather than in someone's shell history.
+
+The remaining units are configured with a systemd drop-in instead — the
+records-format log intake (systemctl edit timberfs-log@<instance>.service)
+and the two network intakes, which are not templated because one listener
+serves every stream (systemctl edit timberfs-forward.service,
+timberfs-otlp.service).
 
 forests.d/*.conf lists the directories searched when a command is given a
 bare handle instead of a path (see FORESTS in man 1 timberfs).

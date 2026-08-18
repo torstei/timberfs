@@ -1,0 +1,69 @@
+# Example configuration for timberfs-text@.service — the plain-text FIFO
+# intake, for a producer that can only log to a path (Apache, nginx, HAProxy).
+#
+# Site-wide defaults:   /etc/timberfs/text.conf
+# One instance only:    /etc/timberfs/text-<instance>.conf   (wins, key by key)
+#
+# Every setting is optional; the values below are the unit's own defaults.
+# A change takes effect when the instance restarts:
+#   systemctl restart timberfs-text@apache-access.service
+# The producer is not involved — systemd holds the FIFO open across it.
+
+# The log is <STORE_DIR>/<instance>.log. One directory for every instance, so
+# a glob spans them all: timberfs query /var/log/timberfs/text/'*'.log
+STORE_DIR=/var/log/timberfs/text
+
+# Properties DECLARED on the store on every start, as KEY=VALUE pairs handed
+# to `timberfs set`: retain=90d, retain_size=50G, index=true|false,
+# wal=true|false, or any free-form provenance key. This file is therefore the
+# source of truth for retention across every instance. (Not a value containing
+# spaces — systemd splits variables at whitespace. Set those once with
+# `timberfs set`; the manifest keeps them.)
+DECLARE=index=true retain=90d
+
+# Extra flags for `timberfs append` (behaviour of this writer, not properties
+# of the store): --flush-age SECS (default 5), --level N, --chunk-size N.
+#EXTRA_OPTS=--flush-age 2
+
+# --- Apache: two instances for the whole server ----------------------------
+#
+# Put the vhost in the line and let every site share one access and one error
+# store. A new vhost then needs no logging configuration at all — the
+# server-level directives are inherited — and chunks fill from every site at
+# once, which compresses better than per-site dribbles.
+#
+#   # httpd, server level, once
+#   LogFormat "%v %h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\"" vhost
+#   CustomLog /run/timberfs/text/apache-access.pipe vhost
+#   ErrorLogFormat "[%{u}t] [%-m:%l] [pid %P] [vhost %v] %M"
+#   ErrorLog /run/timberfs/text/apache-error.pipe
+#
+#   systemctl enable --now timberfs-text@apache-access.socket \
+#                          timberfs-text@apache-error.socket
+#
+#   /etc/timberfs/text-apache-access.conf:
+#     DECLARE=index=true retain=90d format=combined-vhost
+#   /etc/timberfs/text-apache-error.conf:
+#     DECLARE=index=true retain=1y format=apache-error
+#
+# Both of Apache's clocks are timestamps timberfs extracts by itself (the
+# access log's CLF %t, the error log's bracketed ctime), so no LogFormat
+# change is needed for time to work and nothing has to be declared. Keep
+# [%{u}t] at the FRONT of the error format — that is the timestamp read.
+#
+# One site's view is then a filter, not a file:
+#   timber-filter --has shop.example.com /var/log/timberfs/text/apache-'*'.log --from 13:40
+#
+# --- One store per vhost (when a site needs its own policy) ----------------
+#
+# Give a site its own instance for its own retention, owner (User= drop-in) or
+# file. The layouts mix: consolidate the small sites, split out the special one.
+#
+#   CustomLog /run/timberfs/text/www.example.com.pipe combined
+#   ErrorLog  /run/timberfs/text/www.example.com.error.pipe
+#
+#   systemctl enable --now timberfs-text@www.example.com.socket \
+#                          timberfs-text@www.example.com.error.socket
+#
+#   /etc/timberfs/text-www.example.com.error.conf:
+#     DECLARE=index=true retain=1y format=apache-error

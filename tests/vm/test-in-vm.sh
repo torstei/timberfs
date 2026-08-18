@@ -863,6 +863,143 @@ run_test "socket intake: declared index maintained while live" socket_intake_ind
 run_test "socket intake: wal declared, .sap live, intake unaffected" socket_intake_wal_declared_and_working
 run_test "socket intake: stop removes the FIFO" socket_intake_stop_removes_fifo
 
+# The plain-text FIFO pair (timberfs-text@.socket/.service): the route for a
+# producer that can only log to a PATH — Apache's CustomLog/ErrorLog. Covers
+# what is specific to it: the conf-file declaration (site-wide defaults plus a
+# per-instance override, converged on every start), Apache's own two clocks
+# with nothing declared, the shared store directory, and RemoveOnStop=no.
+TEXTINST=vmtext
+TEXTDIR=/var/log/timberfs/text
+TEXTSTORE=$TEXTDIR/$TEXTINST.log
+TEXTERRSTORE=$TEXTDIR/$TEXTINST.error.log
+TEXTPIPE=/run/timberfs/text/$TEXTINST.pipe
+TEXTERRPIPE=/run/timberfs/text/$TEXTINST.error.pipe
+
+# Poll a store (up to ~15s) for a line: socket activation starts the service,
+# then the age timer flushes.
+text_has() {
+    local store=$1 needle=$2 i=0
+    while [ "$i" -lt 15 ]; do
+        if timberfs query "$store" 2>/dev/null | grep -q "$needle"; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+text_intake_setup() {
+    systemd-tmpfiles --create
+    test -d /run/timberfs/text || return 1
+    # Site-wide defaults and a per-instance override, exactly as documented:
+    # the instance file must win on retain and add format=.
+    printf 'DECLARE=index=true retain=90d\nEXTRA_OPTS=--flush-age 1\n' \
+        > /etc/timberfs/text.conf
+    printf 'DECLARE=index=true retain=45d format=combined\n' \
+        > "/etc/timberfs/text-$TEXTINST.conf"
+    printf 'DECLARE=index=true retain=1y format=apache-error\n' \
+        > "/etc/timberfs/text-$TEXTINST.error.conf"
+    systemctl enable --now "timberfs-text@$TEXTINST.socket" \
+        "timberfs-text@$TEXTINST.error.socket"
+    test -p "$TEXTPIPE" && test -p "$TEXTERRPIPE"
+}
+
+text_intake_apache_clocks() {
+    # Apache's real output on both streams, LogFormat untouched: CLF %t on the
+    # access log, bracketed ctime on the error log. Nothing is declared about
+    # either, so this also asserts both are built-in clocks.
+    ACC_T=$(date '+%d/%b/%Y:%H:%M:%S %z')
+    ERR_T=$(date '+%a %b %e %H:%M:%S.123456 %Y')
+    printf '10.0.0.7 - - [%s] "GET /vmtext HTTP/1.1" 200 42 "-" "curl/8.5.0"\n' \
+        "$ACC_T" > "$TEXTPIPE"
+    printf '[%s] [php:error] [pid 9] vmtext boom\n' "$ERR_T" > "$TEXTERRPIPE"
+    # And the consolidated layout's claim: one store holding BOTH shapes
+    # parses both, because each line is stamped by its own clock.
+    printf '[%s] [php:error] [pid 9] vmtext mixed-store boom\n' "$ERR_T" > "$TEXTPIPE"
+    text_has "$TEXTSTORE" "GET /vmtext" || return 1
+    text_has "$TEXTSTORE" "mixed-store boom" || return 1
+    text_has "$TEXTERRSTORE" "vmtext boom" || return 1
+    # Entry-verified: a window ending before both lines must exclude them,
+    # which only holds if each line's own clock was parsed (not write time).
+    PAST=$(date -d '2 hours ago' '+%Y-%m-%d %H:%M:%S')
+    [ "$(timberfs query "$TEXTSTORE" --to "$PAST" 2>/dev/null | wc -l)" = 0 ] \
+        && [ "$(timberfs query "$TEXTERRSTORE" --to "$PAST" 2>/dev/null | wc -l)" = 0 ] \
+        && [ "$(timberfs query "$TEXTSTORE" --from "$PAST" 2>/dev/null | wc -l)" = 2 ] \
+        && [ "$(timberfs query "$TEXTERRSTORE" --from "$PAST" 2>/dev/null | wc -l)" = 1 ]
+}
+
+text_intake_declares_from_conf() {
+    # ExecStartPre declared the store: the per-instance DECLARE won over the
+    # site-wide one, host= was stamped, and the index is live (the appender
+    # maintains the grain because the manifest says index).
+    grep -q '"retain": "45d"' "$TEXTSTORE.bark" \
+        && grep -q '"format": "combined"' "$TEXTSTORE.bark" \
+        && grep -q '"index": true' "$TEXTSTORE.bark" \
+        && grep -q '"host":' "$TEXTSTORE.bark" \
+        && grep -q '"retain": "1y"' "$TEXTERRSTORE.bark" \
+        && [ -f "$TEXTSTORE.grain" ]
+}
+
+text_intake_declaration_converges() {
+    # Change the site's retention and restart: the declaration is applied on
+    # every start, so no hand-run command and no producer involvement.
+    printf 'DECLARE=index=true retain=30d format=combined\n' \
+        > "/etc/timberfs/text-$TEXTINST.conf"
+    systemctl restart "timberfs-text@$TEXTINST.service" || return 1
+    for _ in $(seq 1 10); do
+        grep -q '"retain": "30d"' "$TEXTSTORE.bark" && break
+        sleep 1
+    done
+    grep -q '"retain": "30d"' "$TEXTSTORE.bark" \
+        && timberfs info "$TEXTSTORE" | grep -q 'keep 30d'
+}
+
+text_intake_survives_writer_restart() {
+    # The property the whole route rests on: a producer holds its fd, the
+    # writer is bounced under it, and the line written IN THE GAP still lands
+    # (systemd keeps the read end, so the kernel pipe buffers it).
+    exec 7>"$TEXTPIPE"
+    printf '10.0.0.8 - - [%s] "GET /before-bounce HTTP/1.1" 200 1 "-" "-"\n' \
+        "$(date '+%d/%b/%Y:%H:%M:%S %z')" >&7 || { exec 7>&-; return 1; }
+    systemctl stop "timberfs-text@$TEXTINST.service"
+    printf '10.0.0.9 - - [%s] "GET /in-the-gap HTTP/1.1" 200 1 "-" "-"\n' \
+        "$(date '+%d/%b/%Y:%H:%M:%S %z')" >&7 || { exec 7>&-; return 1; }
+    systemctl start "timberfs-text@$TEXTINST.service"
+    exec 7>&-
+    text_has "$TEXTSTORE" "in-the-gap" \
+        && timberfs query "$TEXTSTORE" | grep -q "before-bounce"
+}
+
+text_intake_merged_vhost_view() {
+    # One directory for every instance, so a vhost's two streams read as one
+    # attributed view (the documented query).
+    OUT=$(timberfs query $TEXTDIR/$TEXTINST.log $TEXTDIR/$TEXTINST.error.log 2>/dev/null)
+    echo "$OUT" | grep -q "^$TEXTSTORE:.*GET /vmtext" \
+        && echo "$OUT" | grep -q "^$TEXTERRSTORE:.*vmtext boom"
+}
+
+text_intake_stop_keeps_the_fifo() {
+    # RemoveOnStop=no, deliberately unlike the records pair: Apache opens its
+    # log with O_CREAT, so a missing node would become a regular file that
+    # silently swallows the log and blocks the socket from returning.
+    systemctl stop "timberfs-text@$TEXTINST.socket" "timberfs-text@$TEXTINST.error.socket"
+    test -p "$TEXTPIPE" && test -p "$TEXTERRPIPE" || return 1
+    systemctl disable "timberfs-text@$TEXTINST.socket" \
+        "timberfs-text@$TEXTINST.error.socket" >/dev/null 2>&1
+    rm -f /etc/timberfs/text.conf "/etc/timberfs/text-$TEXTINST.conf" \
+        "/etc/timberfs/text-$TEXTINST.error.conf"
+    true
+}
+
+run_test "text intake: conf files, two instances, FIFOs created" text_intake_setup
+run_test "text intake: Apache's CLF and ctime clocks, nothing declared" text_intake_apache_clocks
+run_test "text intake: DECLARE applied, per-instance beats site-wide" text_intake_declares_from_conf
+run_test "text intake: changed declaration converges on restart" text_intake_declaration_converges
+run_test "text intake: line written during a writer bounce still lands" text_intake_survives_writer_restart
+run_test "text intake: a vhost's two streams as one attributed view" text_intake_merged_vhost_view
+run_test "text intake: stopping the socket keeps the FIFO node" text_intake_stop_keeps_the_fifo
+
 # Fluentd Forward protocol intake (timberfs-forward.socket/.service): a hand-
 # packed msgpack client (struct.pack, no msgpack library assumed) drives the
 # real wire protocol — Message, Forward and PackedForward(+chunk ack), plus a

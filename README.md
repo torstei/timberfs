@@ -347,14 +347,16 @@ sudo dpkg -i target/debian/timberfs_*.deb
 ```
 
 The package installs `/usr/bin/timberfs`, `timber-filter`, `timber-otlp` and
-five systemd unit families: `timberfs@<instance>` (a template) to mount a
+six systemd unit families: `timberfs@<instance>` (a template) to mount a
 store at boot, a socket-activated `timberfs-log@<instance>` (also a template)
-to stream into a store without a mount, socket-activated `timberfs-forward`
-and `timberfs-otlp` (not templated — both multiplex every stream over one
-listener) for the two network intakes above, and `timberfs-otlp@<instance>`
-(a template, one per store) to ship a store onward. See
-**[Deploying timberfs](docs/deployment.md)** for the directory layout, all
-five unit families, the ownership/permission model, and
+to stream a records producer into a store without a mount, its plain-text
+sibling `timberfs-text@<instance>` for a producer that can only log to a path
+(Apache's `CustomLog`/`ErrorLog`, nginx's `access_log`), socket-activated
+`timberfs-forward` and `timberfs-otlp` (not templated — both multiplex every
+stream over one listener) for the two network intakes above, and
+`timberfs-otlp@<instance>` (a template, one per store) to ship a store onward.
+See **[Deploying timberfs](docs/deployment.md)** for the directory layout, all
+six unit families, the ownership/permission model, and
 self-restart-on-upgrade.
 
 ## Roadmap
