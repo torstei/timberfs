@@ -979,11 +979,47 @@ follow_restart_adds_nothing() {
         || { [ "$(fol_lines)" = 8 ] && [ -f "$FOLSTORE.grain" ]; }
 }
 
+follow_kill_loses_nothing() {
+    # The default flush age is a minute, and that is only safe because the
+    # SOURCE is the durable copy: a follower killed with a chunk unflushed
+    # must re-read it rather than lose it. Runs with the shipped default
+    # deliberately — the other follow tests use --flush-age 1 for speed.
+    local kdir=$FOLDIR/kill klog kstore
+    rm -rf "$kdir"
+    mkdir -p "$kdir"
+    klog=$kdir/app.log
+    kstore=$kdir/store.log
+    : > "$klog"
+    setsid timberfs import -F "$klog" --into "$kstore" --poll 0.3 \
+        >> "$kdir/follower.log" 2>&1 &
+    sleep 2
+    printf '%s app[1]: unflushed when killed\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$klog"
+    sleep 1
+    kill -KILL "$(sed -n 's/.*pid=//p' "$kstore.lock")" 2>/dev/null
+    sleep 1
+    # Nothing should be in the store yet: the chunk never closed.
+    [ "$(timberfs query "$kstore" 2>/dev/null | wc -l)" = 0 ] || {
+        echo "expected an unflushed store after SIGKILL, found:" >&2
+        timberfs query "$kstore" 2>&1 | sed 's/^/  /' >&2
+        return 1
+    }
+    # A restart re-reads it from the file — the flock the killed process
+    # held is gone, so the new one takes it.
+    setsid timberfs import -F "$klog" --into "$kstore" --poll 0.3 \
+        >> "$kdir/follower.log" 2>&1 &
+    sleep 2
+    kill -TERM "$(sed -n 's/.*pid=//p' "$kstore.lock")" 2>/dev/null
+    sleep 2
+    [ "$(timberfs query "$kstore" 2>/dev/null | wc -l)" = 1 ] \
+        && timberfs query "$kstore" 2>/dev/null | grep -q "unflushed when killed"
+}
+
 run_test "follow: picks up an existing file and then tails it" follow_setup
 run_test "follow: drains the held file when rotation replaces it" follow_survives_rotation_under_it
 run_test "follow: recovers what was written while it was down" follow_recovers_a_gap_across_a_restart
 run_test "follow: copytruncate is detected, not misread" follow_handles_copytruncate
 run_test "follow: a restart with nothing new duplicates nothing" follow_restart_adds_nothing
+run_test "follow: a kill with an unflushed chunk loses nothing" follow_kill_loses_nothing
 
 # The plain-text FIFO pair (timberfs-text@.socket/.service): the route for a
 # producer that can only log to a PATH — Apache's CustomLog/ErrorLog. Covers

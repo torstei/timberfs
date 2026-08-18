@@ -24,6 +24,16 @@
 //! the unit of visibility, so nothing observable improves below `--flush-age`,
 //! and one stat per second costs nothing while inotify brings watch limits,
 //! no NFS, and event storms to coalesce.
+//!
+//! `--flush-age` means something different here than it does for the appender,
+//! which is why the default is a minute rather than five seconds. The
+//! appender's input is a pipe, so unflushed data exists only in memory and the
+//! flush age bounds what a crash loses. A follower's input is a file that
+//! stays on disk, and the store is the checkpoint — a partial chunk lost to a
+//! crash is simply re-read — so the age only decides how soon new lines become
+//! queryable. Setting it low costs compression instead: a chunk holds whatever
+//! arrived within it, and on a quiet log that is too little for zstd to work
+//! with (3.1x at five seconds against 7.7x at sixty, one line a second).
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
