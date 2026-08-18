@@ -898,7 +898,7 @@ text_intake_setup() {
         > /etc/timberfs/text.conf
     printf 'DECLARE=index=true retain=45d format=combined\n' \
         > "/etc/timberfs/text-$TEXTINST.conf"
-    printf 'DECLARE=index=true retain=1y format=apache-error\n' \
+    printf 'DECLARE=index=true retain=365d format=apache-error\n' \
         > "/etc/timberfs/text-$TEXTINST.error.conf"
     systemctl enable --now "timberfs-text@$TEXTINST.socket" \
         "timberfs-text@$TEXTINST.error.socket"
@@ -1680,7 +1680,7 @@ forest_list_command() {
     # intakes' store directories) so the counts below are exact, then create
     # two nested stores of our own.
     rm -rf /var/log/timberfs/vmtest /var/log/timberfs/nginx /var/log/timberfs/forward \
-        /var/log/timberfs/otlp
+        /var/log/timberfs/otlp /var/log/timberfs/text
     printf '2026-07-08T09:00:00 INFO web one\n2026-07-08T09:00:01 INFO web two\n' \
         | timberfs append --into /var/log/timberfs/web/web.log --quiet || return 1
     printf '2026-07-08T09:05:00 INFO db one\n' \

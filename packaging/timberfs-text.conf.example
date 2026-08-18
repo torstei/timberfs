@@ -44,7 +44,7 @@ DECLARE=index=true retain=90d
 #   /etc/timberfs/text-apache-access.conf:
 #     DECLARE=index=true retain=90d format=combined-vhost
 #   /etc/timberfs/text-apache-error.conf:
-#     DECLARE=index=true retain=1y format=apache-error
+#     DECLARE=index=true retain=365d format=apache-error
 #
 # Both of Apache's clocks are timestamps timberfs extracts by itself (the
 # access log's CLF %t, the error log's bracketed ctime), so no LogFormat
@@ -66,4 +66,4 @@ DECLARE=index=true retain=90d
 #                          timberfs-text@www.example.com.error.socket
 #
 #   /etc/timberfs/text-www.example.com.error.conf:
-#     DECLARE=index=true retain=1y format=apache-error
+#     DECLARE=index=true retain=365d format=apache-error
