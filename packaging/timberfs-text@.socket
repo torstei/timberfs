@@ -1,0 +1,68 @@
+# Systemd socket template for a PLAIN-TEXT timberfs log intake — the FIFO a
+# producer that can only write to a *path* logs into (Apache's CustomLog and
+# ErrorLog, nginx's access_log, HAProxy, anything with no pipe support).
+#
+# Pairs with timberfs-text@.service. The records-format sibling — for a
+# producer that frames its own entries and timestamps — is timberfs-log@.
+#
+# systemd creates the FIFO and holds it open O_RDWR for as long as this socket
+# is up, so the writer can crash, restart or be upgraded without the producer
+# ever seeing EOF or EPIPE: lines written while no writer is attached buffer in
+# the kernel pipe and land when it returns. That is the point of this route for
+# a producer like Apache — the log writer is NOT a child of the producer, so a
+# reload never spawns, races or kills it, and no line is lost across a restart.
+#
+#   # /run/timberfs/text must exist first — the shipped tmpfiles.d handles it
+#   # at boot; for an immediate first use: systemd-tmpfiles --create
+#   systemctl enable --now timberfs-text@apache-access.socket
+#
+# Then point the producer at /run/timberfs/text/apache-access.pipe:
+#
+#   LogFormat "%v %h %l %u %t \"%r\" %>s %O" vhost      # httpd, server level
+#   CustomLog /run/timberfs/text/apache-access.pipe vhost
+#
+# One instance can serve EVERY vhost that way — the vhost is in the line, so a
+# new site needs no logging configuration at all — or give a site its own
+# instance when it needs its own retention or owner. Both layouts are the same
+# two units; see /usr/share/doc/timberfs/deployment.md.
+#
+# The store lands in /var/log/timberfs/text/<instance>.log — see
+# timberfs-text@.service for the store path, retention and index.
+
+[Unit]
+Description=timberfs plain-text log intake FIFO (%i)
+Documentation=https://github.com/torstei/timberfs
+
+[Socket]
+ListenFIFO=/run/timberfs/text/%i.pipe
+SocketMode=0660
+# Apache and nginx open their log files in the privileged parent before
+# dropping to the worker user, so root:root 0660 is enough for them. A
+# producer that opens its log AS an unprivileged user needs the group set to
+# one it belongs to (there is no sane default — the producer's identity is
+# site-specific):
+#   systemctl edit timberfs-text@%i.socket
+#     [Socket]
+#     SocketGroup=www-data
+
+# Keep the FIFO node in place when the socket is stopped — deliberately
+# UNLIKE the records pair. A producer that opens its log with O_CREAT (both
+# Apache and nginx do) would create a REGULAR FILE where the FIFO belongs,
+# start logging into it unnoticed, and then keep this socket from ever coming
+# back (ListenFIFO cannot claim an existing regular file). With the node left
+# behind, a stopped socket costs lines while it is down (writes get EPIPE) and
+# self-heals when it returns, with no producer reload. /run is a tmpfs, so the
+# node does not survive a reboot anyway.
+RemoveOnStop=no
+
+# The kernel pipe is the buffer that makes a writer restart invisible: 64 KiB
+# by default, which is a second or two of a busy access log. Raise it to cover
+# a slow restart (the value is capped by /proc/sys/fs/pipe-max-size for
+# unprivileged callers; systemd sets it as root, so a larger value than that
+# ceiling is allowed here):
+#   systemctl edit timberfs-text@%i.socket
+#     [Socket]
+#     PipeSize=1M
+
+[Install]
+WantedBy=sockets.target

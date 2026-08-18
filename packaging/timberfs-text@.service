@@ -1,0 +1,82 @@
+# Systemd template for a plain-text timberfs log intake (see
+# timberfs-text@.socket). Drains the instance's FIFO — passed as stdin by the
+# socket unit — into one store, and DECLARES that store's properties on every
+# start, so retention and the token index are configuration rather than a
+# one-off command someone has to remember.
+#
+# Configuration, both files optional, read in this order so the second
+# overrides the first key by key:
+#
+#   /etc/timberfs/text.conf              site-wide defaults, every instance
+#   /etc/timberfs/text-<instance>.conf   this instance only
+#
+#     STORE_DIR=/var/log/timberfs/text   the log is <STORE_DIR>/<instance>.log
+#     DECLARE=index=true retain=90d      store properties (KEY=VALUE, see below)
+#     EXTRA_OPTS=--flush-age 2           extra flags for `timberfs append`
+#
+# One instance can take every vhost of a web server (put %v in the log format)
+# or just one site; see the two layouts in
+# /usr/share/doc/timberfs/deployment.md.
+#
+# DECLARE is handed to `timberfs set`, so it takes any manifest property:
+# retain=90d, retain_size=50G, index=true|false, wal=true|false, or a
+# free-form provenance key. It is applied on every start, so changing a
+# default and restarting the instance is all it takes — the producer is not
+# involved, and there is nothing to run by hand. (A value with spaces cannot
+# travel this way: systemd splits the variable at whitespace. Set such a
+# property once with `timberfs set` — the manifest keeps it.)
+#
+# See /usr/share/doc/timberfs/examples/timberfs-text.conf.example and the
+# Apache/nginx recipe in /usr/share/doc/timberfs/deployment.md.
+#
+# This is socket-activated: enable the .socket, not this unit.
+
+[Unit]
+Description=timberfs plain-text log intake (%i)
+Documentation=https://github.com/torstei/timberfs
+Requires=timberfs-text@%i.socket
+After=timberfs-text@%i.socket
+
+[Service]
+Type=simple
+
+# Defaults first: EnvironmentFile= wins over Environment= whatever the order,
+# and the per-instance file wins over the site-wide one.
+Environment=STORE_DIR=/var/log/timberfs/text
+Environment=DECLARE=index=true
+EnvironmentFile=-/etc/timberfs/text.conf
+EnvironmentFile=-/etc/timberfs/text-%i.conf
+
+# The store and its properties, declared idempotently on every start: create
+# makes the store (and its directory) if missing, set converges DECLARE onto
+# it. Both are no-ops once the store already says what DECLARE says. host= is
+# always passed, so an empty DECLARE is still a valid call.
+ExecStartPre=/usr/bin/timberfs create --if-not-exists ${STORE_DIR}/%i.log
+ExecStartPre=/usr/bin/timberfs set ${STORE_DIR}/%i.log host=%H $DECLARE
+ExecStart=/usr/bin/timberfs append --exit-on-upgrade --into ${STORE_DIR}/%i.log $EXTRA_OPTS
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+
+# Creates and owns the default store directory /var/log/timberfs/text (0755),
+# shared by every instance so one glob spans the fleet:
+#   timberfs query /var/log/timberfs/text/'*'.log --from 13:40
+# A drop-in that sets User= gets that directory owned by that user. A
+# STORE_DIR pointed elsewhere is created by the ExecStartPre above instead,
+# owned by whoever this unit runs as. For a store path that is not
+# <dir>/<instance>.log at all, override the three command lines with a
+# drop-in (systemctl edit timberfs-text@<instance>.service).
+LogsDirectory=timberfs/text
+
+# A crash or upgrade of this unit is invisible to the producer (the socket
+# holds the FIFO open): come back and keep draining.
+Restart=always
+RestartSec=1
+# --exit-on-upgrade: the appender exits 85 when its binary is upgraded on
+# disk; force a restart onto the new binary. The socket holds the FIFO open
+# across it, so the producer sees no gap. SuccessExitStatus keeps it out of
+# the failure log. (Keep --exit-on-upgrade in any ExecStart override.)
+SuccessExitStatus=85
+RestartForceExitStatus=85
+
+# No [Install] section: this is socket-activated. Enable the .socket.

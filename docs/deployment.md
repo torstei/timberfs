@@ -23,8 +23,11 @@ pass its own paths.
                                           CONSUMER state, deliberately not inside the
                                           store's backing directory (StateDirectory=)
 
-/run/timberfs/<instance>.pipe             intake FIFO, created by the .socket unit
-                                          (the directory is created at boot by tmpfiles.d)
+/run/timberfs/<instance>.pipe             records intake FIFO, created by the .socket
+                                          unit (the directory is created at boot by
+                                          tmpfiles.d)
+/run/timberfs/text/<instance>.pipe        plain-text intake FIFO, same but for the
+                                          timberfs-text@ pair (Apache, nginx)
 
 /var/log/timberfs/<instance>/             one directory per log-intake instance,
                                           owned by that instance's service user:
@@ -34,6 +37,14 @@ pass its own paths.
     <instance>.log.bark                     JSON manifest: durable identity + retention
     <instance>.log.sap                      optional write-ahead sidecar (present with --wal)
     <instance>.log.lock                     the store's writer lock
+  .timberfs.lock                            the directory lock (see Locking)
+
+/var/log/timberfs/text/                   one directory shared by every plain-text
+                                          intake instance (timberfs-text@), so one
+                                          glob spans the fleet:
+    <instance>.log.trunk / .rings / .grain / .bark / .lock   one store per instance
+                                          (e.g. apache-access.log and
+                                          apache-error.log for a whole web server)
   .timberfs.lock                            the directory lock (see Locking)
 
 /var/log/timberfs/forward/                one directory shared by every tag the
@@ -132,6 +143,142 @@ stream (that is what `--records` means) — the intended fit for a records-forma
 logging writer that frames its own events and timestamps. To archive a
 plain-text source instead, drop `--records` from the `ExecStart` (see the
 drop-in below).
+
+### Logging from a producer that only writes paths — `timberfs-text@.socket` + `timberfs-text@.service`
+
+The same FIFO pattern for a producer that has no pipe support and can only be
+pointed at a *path*: Apache's `CustomLog`/`ErrorLog`, nginx's `access_log`,
+HAProxy. Plain text rather than records, one store per instance, and
+**socket-activated** like the pair above: enable the `.socket`.
+
+Why route it this way rather than piping (`CustomLog "|timberfs append ..."`)
+or writing into a mount:
+
+- **The writer is not the producer's child.** Apache spawns a piped-log
+  program itself, and on reload it spawns the replacement *before* the old one
+  has drained its pipe and released the store's writer lock — one error per
+  store per reload — while a piped writer left holding a lock takes that log
+  down until someone intervenes. Here Apache only opens a path; the writer's
+  lifecycle is systemd's.
+- **A writer restart loses nothing.** The socket holds the FIFO open `O_RDWR`,
+  so lines written while the service is restarting or being upgraded wait in
+  the kernel pipe and land when it returns — the producer sees no `EOF`, no
+  `EPIPE`, and needs no reload.
+- **Failure is visible.** A wedged writer is a failed unit in
+  `systemctl --failed`, not a silently dead logger.
+
+#### One pair of stores for the whole server (start here)
+
+Put the vhost in the log line and let every site share two stores — access and
+error. A new vhost then needs **no logging configuration at all**: the
+server-level directives are inherited.
+
+```apache
+# httpd, server level, once
+LogFormat "%v %h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\"" vhost
+CustomLog /run/timberfs/text/apache-access.pipe vhost
+ErrorLogFormat "[%{u}t] [%-m:%l] [pid %P] [vhost %v] %M"
+ErrorLog /run/timberfs/text/apache-error.pipe
+```
+```sh
+systemctl enable --now timberfs-text@apache-access.socket \
+                       timberfs-text@apache-error.socket
+```
+```ini
+# /etc/timberfs/text-apache-access.conf
+DECLARE=index=true retain=90d format=combined-vhost
+```
+```ini
+# /etc/timberfs/text-apache-error.conf — errors are worth keeping longer
+DECLARE=index=true retain=1y format=apache-error
+```
+
+Two stores rather than one because differentiated retention is the only thing a
+single store really gives up: both of Apache's clocks are built-in extractors
+(the access log's CLF `%t`, the error log's bracketed `ctime`), so a single
+combined store would parse correctly too — it is the policy, not the parsing,
+that argues for splitting. Keep `[%{u}t]` (or plain `%t`) at the FRONT of the
+error format; that leading bracketed timestamp is what the extractor reads.
+
+Consolidating also compresses better, because each chunk is filled by every
+site at once instead of dribbling in per site: the same lines written in small
+flushes cost about **half** as much on disk in one store as in three (ratio
+11.9x vs 21.9x in a three-vhost measurement — the quieter the sites, the bigger
+the gap).
+
+One store per site is then a *filter*, not a file:
+
+```sh
+# everything one vhost did, both streams, in time order
+timber-filter --has shop.example.com /var/log/timberfs/text/apache-'*'.log --from 13:40
+
+# hand that site's window to someone as a store of its own, provenance recorded
+timber-filter --records --has shop.example.com /var/log/timberfs/text/apache-access.log \
+    | timberfs import --records --into /tmp/shop-case.log
+```
+
+Note what the token index can and cannot do here. A **rare** token — a request
+id, a client IP, a failing URL — is narrowed to the few chunks that contain it,
+and now that search covers every vhost in one pass. A **busy vhost's own name**
+appears in every chunk, so filtering by it is a scan of the selected time
+window rather than an index hit: still an order of magnitude less data than
+plain files, but not free. Filter by time first.
+
+#### One store per vhost (when a site needs its own policy)
+
+Give a site its own instance when it needs its own retention, its own owner
+(`User=` in a drop-in), or its own file for a tool that insists on one:
+
+```sh
+systemctl enable --now timberfs-text@www.example.com.socket \
+                       timberfs-text@www.example.com.error.socket
+```
+```apache
+# in that vhost only; the rest keep inheriting the server-level pair above
+CustomLog /run/timberfs/text/www.example.com.pipe combined
+ErrorLog  /run/timberfs/text/www.example.com.error.pipe
+```
+
+The two layouts mix freely — same units, different instance names — so
+consolidate the small sites and split out the one that needs its own rules.
+Per-vhost instances also contain a stall: a wedged writer holds up only its own
+site, where the consolidated layout has one writer for everything. Their stores
+share one directory, so a vhost's two streams still read as one interleaved,
+attributed view:
+
+```sh
+timberfs query /var/log/timberfs/text/www.example.com'*'.log --from 13:40
+```
+
+#### Both layouts
+
+Retention and the index are configuration, not a command someone has to
+remember — `DECLARE` is applied to the store on every start, so changing a
+default and restarting the instance is enough (the producer is not involved):
+
+```ini
+# /etc/timberfs/text.conf — defaults for every instance
+STORE_DIR=/var/log/timberfs/text
+DECLARE=index=true retain=90d
+```
+
+A `text-<instance>.conf` overrides it key by key. `DECLARE` takes any manifest
+property — `retain`, `retain_size`, `index`, `wal`, or free-form provenance —
+but not a value containing spaces: systemd splits variables at whitespace, so
+set such a property once with `timberfs set` and the manifest keeps it.
+
+The trade against piped logging is backpressure: if the writer stalls (as
+opposed to dying, which systemd fixes), the pipe fills — 64 KiB by default —
+and Apache then blocks on the log write rather than dropping the line. Raise
+the buffer with `PipeSize=` in a socket drop-in to cover a slow restart.
+
+**Never `stop` the socket while the producer runs.** Apache and nginx both
+open their log files with `O_CREAT`: with the FIFO node gone they would create
+a *regular file* at that path, log into it unnoticed, and keep the socket from
+ever coming back. That is why this pair sets `RemoveOnStop=no`, unlike the
+records pair — with the node in place, a stopped socket costs lines while it is
+down and self-heals when it returns. Restarting the *service*, or upgrading the
+package, is always safe.
 
 ### Speaking Fluentd Forward — `timberfs-forward.socket` + `timberfs-forward.service`
 
@@ -264,13 +411,15 @@ batch, so an interrupted send is re-delivered rather than skipped
 ## Ownership and permissions
 
 - **The store directory** is created by `LogsDirectory=timberfs/%i` (or plain
-  `timberfs/forward` for the Forward intake, `timberfs/otlp` for the OTLP
-  intake), owned by the service's `User=`
+  `timberfs/text` for the plain-text intake, `timberfs/forward` for the Forward
+  intake, `timberfs/otlp` for the OTLP intake), owned by the service's `User=`
   (root by default). Set `User=` in a drop-in to own the directory as a
   specific user.
 - **The FIFO** is created `root:root 0660`. A non-root producer cannot write it
   until you set the socket's group to one that user belongs to (`SocketGroup=`);
   there is no sane default, because the producer's identity is site-specific.
+  Apache and nginx are the case that needs nothing: their privileged parent
+  opens every log file before dropping to the worker user.
   (The Forward intake has no FIFO — it is a TCP listener, gated by the address
   it binds, not by filesystem permissions.)
 - **Readers vs. writers.** `query` and `info` are read-only — they need only
@@ -304,6 +453,13 @@ SocketGroup=applog
 ExecStart=
 ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade --wal \
     --into /var/log/timberfs/%i/%i.log
+```
+
+```ini
+# timberfs-text@www.example.com.socket — cover a slower writer restart with a
+# bigger kernel buffer (the default 64 KiB is a second or two of a busy log)
+[Socket]
+PipeSize=1M
 ```
 
 ```ini

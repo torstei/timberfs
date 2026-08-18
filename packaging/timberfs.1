@@ -1277,7 +1277,41 @@ streams a producer's
 .BR timberfs\-records (5)
 stream into a store over a FIFO.
 .PP
-A third, socket\-activated pair,
+Its plain\-text sibling,
+.B timberfs\-text@.socket
+and
+.BR timberfs\-text@.service ,
+does the same for a producer that can only log to a PATH \(em Apache's
+.B CustomLog
+and
+.BR ErrorLog ,
+nginx's
+.BR access_log :
+the producer writes
+.IB /run/timberfs/text/ instance .pipe
+and the store lands in
+.IR /var/log/timberfs/text/ instance .log\fR.
+The point of that route for such a producer is that the writer is NOT its
+child, so a reload never spawns, races or kills it \(em and because the
+socket holds the FIFO open
+.BR O_RDWR ,
+lines written while the writer is restarting or being upgraded wait in the
+kernel pipe instead of being lost. Retention and the token index are
+configuration:
+.I /etc/timberfs/text.conf
+sets
+.B DECLARE
+for every instance and
+.IB /etc/timberfs/text- instance .conf
+overrides it for one, and both are applied to the store on every start.
+ONE instance can take every vhost of a web server \(em put the vhost in the
+log format
+.RB ( %v ),
+and a new site needs no logging configuration at all \(em or a site can have
+its own instance when it needs its own retention or owner; the two layouts
+are the same two units.
+.PP
+A fourth, socket\-activated pair,
 .B timberfs\-forward.socket
 and
 .BR timberfs\-forward.service ,
@@ -1288,7 +1322,7 @@ listening on TCP for Fluentd Forward protocol v1 senders (Docker's
 log driver, Fluent Bit, Fluentd). Not templated: Forward multiplexes every
 tag over the one connection, so one instance serves every tag.
 .PP
-A fourth, socket\-activated pair,
+A fifth, socket\-activated pair,
 .B timberfs\-otlp.socket
 and
 .BR timberfs\-otlp.service ,
@@ -1317,7 +1351,7 @@ One instance per store \(em the cursor is a position in one store, and a
 stalled receiver must not hold up an unrelated one. Its cursor lives in
 .IR /var/lib/timberfs/ .
 .PP
-The full directory layout, all five unit families, the ownership model and
+The full directory layout, all six unit families, the ownership model and
 self\-restart on upgrade are documented in
 .IR /usr/share/doc/timberfs/deployment.md .
 .SH EXAMPLES
