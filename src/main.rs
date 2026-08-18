@@ -83,6 +83,12 @@ enum Command {
         /// repeatable, free-form
         #[arg(long = "set", value_name = "KEY=VALUE")]
         sets: Vec<String>,
+        /// Succeed quietly when the store is already there, instead of
+        /// failing — CREATE IF NOT EXISTS, for provisioning that runs on
+        /// every start. The existing store is left exactly as it is; a
+        /// declaration it disagrees with is warned about, not applied
+        #[arg(long)]
+        if_not_exists: bool,
     },
     /// Declare or change a store's properties in its .bark manifest —
     /// validated and atomic, unlike hand-editing. Live writers re-read
@@ -506,6 +512,7 @@ fn main() -> anyhow::Result<()> {
             retain,
             retain_size,
             sets,
+            if_not_exists,
         } => {
             bark::cmd_create(
                 &dest,
@@ -514,6 +521,7 @@ fn main() -> anyhow::Result<()> {
                 retain.as_deref(),
                 retain_size.as_deref(),
                 &sets,
+                if_not_exists,
             )?;
         }
         Command::Set {

@@ -146,6 +146,14 @@ the sidecar, compressed into the eventual chunk). A property of the
 store, like
 .BR \-\-index :
 declared once, every later writer honors it with no flag.
+.B \-\-if\-not\-exists
+makes an existing store a success instead of an error \(em CREATE IF NOT
+EXISTS, for provisioning that re-runs on every start. The store is left
+exactly as it is: nothing is written, and a declaration its manifest
+disagrees with is WARNED about rather than applied \(em
+.B set
+changes a store that already exists. Without the flag an existing store
+is an error, which is what a one-shot create wants.
 .B \-\-set
 .I KEY=VALUE
 records free-form provenance
@@ -270,7 +278,8 @@ appenders for different files happily share a backing directory; a
 directory served by a
 .B timberfs mount
 is unavailable to appenders and vice versa. Appending to an existing log
-continues it. Data is flushed into chunks by the same size and age rules
+continues it.
+Data is flushed into chunks by the same size and age rules
 as the mount; end of input,
 .B SIGTERM
 or

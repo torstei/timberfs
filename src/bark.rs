@@ -294,22 +294,14 @@ pub fn cmd_create(
     retain: Option<&str>,
     retain_size: Option<&str>,
     sets: &[String],
+    if_not_exists: bool,
 ) -> anyhow::Result<()> {
     ensure_dest_is_not_plain_file(dest, "create")?;
     let (dir, name) = resolve_backing(dest)?;
-    fs::create_dir_all(&dir)?;
-    if format::rings_path(&dir, &name).exists() || format::trunk_path(&dir, &name).exists() {
-        bail!("{name} already exists in {}", dir.display());
-    }
-    let _dir_lock = store::lock_backing_shared(&dir)?.with_context(|| {
-        format!(
-            "backing directory {} is served by a timberfs mount",
-            dir.display()
-        )
-    })?;
-    let _file_lock = store::lock_file_exclusive(&dir, &name)?
-        .with_context(|| format!("{name} already has a writer"))?;
 
+    // Build (and thereby validate) the declaration before deciding
+    // anything: a malformed --retain is an error even when the store is
+    // already there and nothing will be written.
     let mut map = Map::new();
     if index {
         map.insert("index".to_string(), Value::Bool(true));
@@ -331,6 +323,29 @@ pub fn cmd_create(
         };
         map.insert(k.trim().to_string(), Value::String(v.to_string()));
     }
+
+    fs::create_dir_all(&dir)?;
+    if format::rings_path(&dir, &name).exists() || format::trunk_path(&dir, &name).exists() {
+        if !if_not_exists {
+            bail!("{name} already exists in {}", dir.display());
+        }
+        // CREATE IF NOT EXISTS: the store stands as it is, declaration
+        // included — so say so when it declares something else.
+        warn_declaration_drift(&dir, &name, &map);
+        crate::note!(
+            "timberfs: {name} already exists in {}; nothing created",
+            dir.display()
+        );
+        return Ok(());
+    }
+    let _dir_lock = store::lock_backing_shared(&dir)?.with_context(|| {
+        format!(
+            "backing directory {} is served by a timberfs mount",
+            dir.display()
+        )
+    })?;
+    let _file_lock = store::lock_file_exclusive(&dir, &name)?
+        .with_context(|| format!("{name} already has a writer"))?;
 
     // The empty pair (rings header included), then the manifest.
     let mut st = store::Store {
@@ -362,6 +377,35 @@ pub fn cmd_create(
         }
     );
     Ok(())
+}
+
+/// A skipped `create --if-not-exists` writes nothing, so anything it
+/// declared differently from the standing manifest is a discrepancy the
+/// operator has to know about — silence would read as "declared".
+fn warn_declaration_drift(dir: &Path, name: &str, declared: &Map<String, Value>) {
+    if declared.is_empty() {
+        return;
+    }
+    let existing = load(dir, name).unwrap_or_default();
+    let render = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let drift: Vec<String> = declared
+        .iter()
+        .filter(|(k, v)| existing.get(*k) != Some(*v))
+        .map(|(k, v)| match existing.get(k) {
+            Some(cur) => format!("{k} is {}, not {}", render(cur), render(v)),
+            None => format!("{k} is undeclared, not {}", render(v)),
+        })
+        .collect();
+    if !drift.is_empty() {
+        eprintln!(
+            "timberfs: warning: {name} already exists and {} — left as it is \
+             (timberfs set to change it)",
+            drift.join(", ")
+        );
+    }
 }
 
 /// Identity and lineage are facts, not settings — never user-settable.

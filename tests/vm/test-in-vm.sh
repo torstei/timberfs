@@ -1809,6 +1809,21 @@ sticky_declared_index() {
            | grep -q STICKYNEEDLE42
 }
 
+create_if_not_exists() {
+    # provisioning that re-runs on every start: the second create is a
+    # quiet success, a declaration the standing store disagrees with is
+    # warned about and NOT applied, and without the flag an existing
+    # store is still an error
+    timberfs create --if-not-exists --index --retain 90d "$PIPE_BACKING/prov.log" 2>/dev/null \
+        && timberfs create --if-not-exists --index --retain 90d "$PIPE_BACKING/prov.log" 2>/tmp/prov.err \
+        && grep -q "nothing created" /tmp/prov.err \
+        && ! grep -q "warning" /tmp/prov.err \
+        && timberfs create --if-not-exists --retain 30d "$PIPE_BACKING/prov.log" 2>/tmp/prov2.err \
+        && grep -q "retain is 90d, not 30d" /tmp/prov2.err \
+        && grep -q '"retain": "90d"' "$PIPE_BACKING/prov.log.bark" \
+        && ! timberfs create --index "$PIPE_BACKING/prov.log" 2>/dev/null
+}
+
 empty_results_are_results() {
     # a quiet day: the empty export still ships (bark records the asked
     # window), imports as a clean no-op, and --fail-on-empty restores
@@ -1852,6 +1867,7 @@ grep_into_artifact() {
 
 run_test "write guards: forgotten destination after a glob is refused" forgotten_destination_refused
 run_test "bark: create --index makes imports maintain the grain" sticky_declared_index
+run_test "bark: create --if-not-exists is a quiet no-op on an existing store" create_if_not_exists
 run_test "empty results are results: export ships, import no-ops" empty_results_are_results
 run_test "daily bulk-load: day-2 appends, overlap dedups, re-run no-ops" daily_bulk_load
 info_vital_signs() {
