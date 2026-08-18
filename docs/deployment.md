@@ -363,7 +363,8 @@ timberfs import /var/log/exim4/mainlog \
 Because a redundant run is a no-op, any trigger is safe to fire more often
 than necessary. Three of them, in order of how well they fit a busy log:
 
-**A timer** — the default choice for a log that is written continuously.
+**A timer** — the default choice for a log that is written continuously. Import
+the ROTATED file first and the live one second, on every tick:
 
 ```ini
 # /etc/systemd/system/timberfs-import-exim.service
@@ -371,6 +372,10 @@ than necessary. Three of them, in order of how well they fit a busy log:
 Type=oneshot
 ExecStartPre=/usr/bin/timberfs create --if-not-exists --index --retain 90d \
     /var/log/timberfs/text/exim-main.log
+# The leading "-" matters: before the first rotation there is no mainlog.1,
+# and a failing ExecStart would abort the unit before the live import ran.
+ExecStart=-/usr/bin/timberfs import --quick /var/log/exim4/mainlog.1 \
+    --into /var/log/timberfs/text/exim-main.log
 ExecStart=/usr/bin/timberfs import --quick /var/log/exim4/mainlog \
     --into /var/log/timberfs/text/exim-main.log
 ```
@@ -381,10 +386,27 @@ ExecStart=/usr/bin/timberfs import --quick /var/log/exim4/mainlog \
 # service DEACTIVATED, so on its own it never schedules a first run (the
 # timer sits with no NEXT). OnActiveSec= gives it that first elapse.
 OnActiveSec=1min
-OnUnitInactiveSec=5min
+OnUnitInactiveSec=2min
 [Install]
 WantedBy=timers.target
 ```
+
+Two sources per tick is what closes the rotation gap. Lines written between the
+last tick and the rotation exist only in the rotated file, and a tick that
+imported just the live one would never see them; taking the rotated file first
+picks them up on the next tick, and the overlap is deduplicated. It also has to
+be that ORDER: importing the fresh file first and the rotated one afterwards is
+refused, because the store then holds newer data than the file being offered —
+
+```
+Error: already-imported data differs from the source (bytes 147..196)
+— rotated or rewritten file? import it to a new target instead
+```
+
+— and that stranded tail cannot be added to the store afterwards. One
+requirement: the rotated file must still be readable as text at tick time, so
+keep logrotate's `delaycompress` (Debian's exim4 config already does).
+`import` reads plain logs and `.timber` bundles, not `.gz`.
 
 `--quick` matters once the store is large: a full import verifies every
 already-imported chunk against the source, which is proportional to the store
@@ -416,8 +438,9 @@ WantedBy=paths.target
 Watch the *file*, not the directory: `DirectoryNotEmpty=` on a log directory is
 true forever, so it triggers once and never again.
 
-**logrotate's `postrotate`** — the exact trigger for rotation, firing once when
-there is a complete unit of work and knowing the rotated file's name:
+**logrotate's `postrotate`** — an alternative to the two-source tick above, if
+you would rather close the rotation gap at the moment it opens than one tick
+later:
 
 ```
 postrotate
@@ -426,20 +449,49 @@ postrotate
 endscript
 ```
 
-An existence-style path trigger is a poor substitute here, because a rotated
-file persists and `PathExists=`/`PathExistsGlob=` do not re-fire while the path
-is still there.
+It carries an ordering race the two-source tick does not: the hook has to win
+against the next timer tick, because once the tick has imported the fresh file
+the rotated one is refused (the error above) and its tail is unrecoverable in
+place. logrotate runs `postrotate` immediately after the rename, so it normally
+wins — but a hook that fails or is skipped leaves a hole. Prefer the two
+`ExecStart` lines unless you need the tighter timing.
+
+An existence-style path trigger is a poor substitute for either, because a
+rotated file persists and `PathExists=`/`PathExistsGlob=` do not re-fire while
+the path is still there.
 
 A timer and a path unit can point at the same service — inotify for immediacy,
 the timer as a floor so a coalesced or missed event cannot leave data
 unimported indefinitely.
 
-One thing to be clear-eyed about: triggering an import is polling avoidance
-bolted onto a batch tool, and each run re-verifies before it appends. If low
-latency is the actual goal, the FIFO route above is the design that delivers
-it — the producer's line is pushed to a live writer, with nothing to
-re-verify. Importing on a trigger is what you choose when the producer must
-not be touched.
+**Why not `tail -F | timberfs append`?** It is the obvious shape and it does
+work: `tail -F` follows a rotation, and the latency is immediate. What it has
+no answer for is its own restart. `tail -F -n 0` resumes at the END of the
+file, so everything written while the pipeline was down is missing from the
+store — silently, with the file still on disk to prove it. Worse, that hole
+cannot be filled afterwards: a tail-fed store's write axis is when the appender
+RECEIVED each line, while an import's is the line's own clock, so importing the
+same file into that store is refused —
+
+```
+Error: mainlog (starts 2026-08-18 13:56:48.000) predates everything in
+store.log (starts 2026-08-18 13:56:48.939) — import in chronological order,
+or to a new target
+```
+
+— by less than a second, because a line's own timestamp necessarily precedes
+its arrival. Starting from the beginning instead (`-n +1`) duplicates the whole
+file on every restart. The two supported routes have a definite answer here
+where `tail` has none: the FIFO's kernel buffer carries the gap across a writer
+restart, and an import cannot lose or duplicate anything because the store is
+its own checkpoint.
+
+One thing to be clear-eyed about all the same: triggering an import is polling
+avoidance bolted onto a batch tool, and each run re-verifies before it appends.
+If low latency is the actual goal, the FIFO route above is the design that
+delivers it — the producer's line is pushed to a live writer, with nothing to
+re-verify. Importing on a trigger is what you choose when the producer must not
+be touched.
 
 ### Speaking Fluentd Forward — `timberfs-forward.socket` + `timberfs-forward.service`
 
