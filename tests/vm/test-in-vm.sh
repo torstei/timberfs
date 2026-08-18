@@ -931,14 +931,30 @@ text_intake_apache_clocks() {
 
 text_intake_declares_from_conf() {
     # ExecStartPre declared the store: the per-instance DECLARE won over the
-    # site-wide one, host= was stamped, and the index is live (the appender
-    # maintains the grain because the manifest says index).
-    grep -q '"retain": "45d"' "$TEXTSTORE.bark" \
-        && grep -q '"format": "combined"' "$TEXTSTORE.bark" \
-        && grep -q '"index": true' "$TEXTSTORE.bark" \
-        && grep -q '"host":' "$TEXTSTORE.bark" \
-        && grep -q '"retain": "1y"' "$TEXTERRSTORE.bark" \
-        && [ -f "$TEXTSTORE.grain" ]
+    # site-wide one, host= was stamped, and the declared index is maintained.
+    # The grain lands on the writer's tick AFTER the chunk the entry made
+    # visible, so wait for it rather than racing it.
+    for _ in $(seq 1 10); do
+        [ -f "$TEXTSTORE.grain" ] && break
+        sleep 1
+    done
+    local bad=0
+    want() { # FILE PATTERN WHAT
+        grep -q "$2" "$1" || { echo "$3: $1 does not say $2" >&2; bad=1; }
+    }
+    want "$TEXTSTORE.bark" '"retain": "45d"' "per-instance DECLARE lost to the site-wide one"
+    want "$TEXTSTORE.bark" '"format": "combined"' "free-form provenance not declared"
+    want "$TEXTSTORE.bark" '"index": true' "index not declared"
+    want "$TEXTSTORE.bark" '"host":' "host=%H not stamped"
+    want "$TEXTERRSTORE.bark" '"retain": "365d"' "error instance's own DECLARE not applied"
+    [ -f "$TEXTSTORE.grain" ] || { echo "no grain for an index-declared store" >&2; bad=1; }
+    [ "$bad" = 0 ] || {
+        for b in "$TEXTSTORE.bark" "$TEXTERRSTORE.bark"; do
+            echo "--- $b" >&2
+            cat "$b" >&2 2>/dev/null || echo "(missing)" >&2
+        done
+        return 1
+    }
 }
 
 text_intake_declaration_converges() {
