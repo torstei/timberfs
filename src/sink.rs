@@ -60,6 +60,7 @@ pub fn cmd_records_sink(
     retain_size: Option<&str>,
     op: &str,
     exit_on_upgrade: bool,
+    wait_for_writer: f64,
 ) -> anyhow::Result<()> {
     retain.map(crate::append::parse_duration_ms).transpose()?;
     retain_size
@@ -90,11 +91,9 @@ pub fn cmd_records_sink(
             );
         }
     };
-    let file_lock = match store::lock_file_exclusive(&dir, &name)? {
+    let file_lock = match crate::append::take_writer_lock(&dir, &name, wait_for_writer)? {
         Some(f) => f,
-        None => {
-            bail!("{name} already has a writer (another timberfs appender or a rotation)");
-        }
+        None => bail!(crate::append::writer_conflict(&dir, &name, wait_for_writer)),
     };
     store::write_lock_info(
         &file_lock,

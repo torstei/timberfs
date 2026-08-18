@@ -23,7 +23,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::format::{self, ChunkRecord, RECORD_LEN, RINGS_HEADER_LEN};
 use crate::sap;
@@ -1503,18 +1503,22 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
 
 /// Ok(Some(file)) = lock acquired, keep the File alive to hold it.
 /// Ok(None) = held by someone else in a conflicting mode.
-fn try_flock(f: File, op: libc::c_int) -> io::Result<Option<File>> {
+/// One non-blocking flock attempt: Ok(false) = someone else holds it.
+fn flock_nb(f: &File, op: libc::c_int) -> io::Result<bool> {
     let rc = unsafe { libc::flock(f.as_raw_fd(), op | libc::LOCK_NB) };
     if rc == 0 {
-        Ok(Some(f))
-    } else {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Ok(None)
-        } else {
-            Err(e)
-        }
+        return Ok(true);
     }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(e)
+    }
+}
+
+fn try_flock(f: File, op: libc::c_int) -> io::Result<Option<File>> {
+    Ok(flock_nb(&f, op)?.then_some(f))
 }
 
 /// Directory lock, exclusive: the mount daemon.
@@ -1531,6 +1535,77 @@ pub fn lock_backing_shared(dir: &Path) -> io::Result<Option<File>> {
 /// Per-file writer lock, exclusive.
 pub fn lock_file_exclusive(dir: &Path, name: &str) -> io::Result<Option<File>> {
     try_flock(open_lock_file(&file_lock_path(dir, name))?, libc::LOCK_EX)
+}
+
+/// The same lock, retried until `timeout` runs out.
+///
+/// A supervised streaming writer is routinely started while the writer it
+/// replaces is still exiting: Apache spawns a new piped-log program on
+/// reload before the old one has drained its pipe and released the lock.
+/// That handoff is a normal event, so failing on the first attempt turns
+/// every reload into an error per store; a bounded wait lets it complete,
+/// and a lock still held at the deadline is the real conflict it looks
+/// like. Nothing is read from stdin while waiting — the kernel pipe
+/// buffers for the producer, which is why the wait must stay short.
+pub fn lock_file_exclusive_waiting(
+    dir: &Path,
+    name: &str,
+    timeout: Duration,
+) -> io::Result<Option<File>> {
+    // The lock file is never unlinked, so one open fd serves every
+    // attempt (flock is per open file description, not per path).
+    let f = open_lock_file(&file_lock_path(dir, name))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if flock_nb(&f, libc::LOCK_EX)? {
+            return Ok(Some(f));
+        }
+        // A stop signal during the wait is an answer too: give up now
+        // rather than keeping the supervisor waiting on a lock we are
+        // about to stop wanting.
+        if crate::append::stopping() {
+            return Ok(None);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+/// Who holds a file's writer lock, for the message when we cannot get it.
+/// Writers record themselves in the lock file, but that text is never
+/// cleared on exit — so the pid is checked against /proc rather than
+/// repeated as fact.
+pub fn describe_file_writer(dir: &Path, name: &str) -> Option<String> {
+    let raw = fs::read_to_string(file_lock_path(dir, name)).ok()?;
+    let who = raw.lines().next()?.trim();
+    if who.is_empty() {
+        return None;
+    }
+    let Some(pid) = who
+        .rsplit_once("pid=")
+        .and_then(|(_, p)| p.trim().parse::<u32>().ok())
+    else {
+        return Some(who.to_string());
+    };
+    match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) if !raw.is_empty() => {
+            let cmd: Vec<String> = raw
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            Some(format!("{who} ({})", cmd.join(" ")))
+        }
+        // Gone, or a process we may not inspect: say which, and never
+        // pin the blame on a pid that has been recycled.
+        _ if !Path::new(&format!("/proc/{pid}")).exists() => Some(format!(
+            "{who}, but that process is gone — the live holder did not record itself"
+        )),
+        _ => Some(who.to_string()),
+    }
 }
 
 /// The result of a READ-ONLY lock probe. Read-only commands (`info`)
@@ -1636,6 +1711,35 @@ pub fn read_lock_raw(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recorded_writer_is_named_only_while_it_lives() {
+        let dir = std::env::temp_dir().join(format!("tfs-holder-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Our own pid: the description names the process behind it.
+        fs::write(
+            file_lock_path(&dir, "a.log"),
+            format!("appender pid={}\n", std::process::id()),
+        )
+        .unwrap();
+        let live = describe_file_writer(&dir, "a.log").unwrap();
+        assert!(live.starts_with("appender pid="), "{live}");
+        assert!(live.contains('('), "the live holder's command line: {live}");
+
+        // A pid that cannot exist: the lock file's word is not taken for
+        // it — the text is never cleared on exit, so it goes stale.
+        fs::write(file_lock_path(&dir, "b.log"), "appender pid=999999999\n").unwrap();
+        let stale = describe_file_writer(&dir, "b.log").unwrap();
+        assert!(stale.contains("that process is gone"), "{stale}");
+
+        // No lock file at all, and one that records nothing: no claim.
+        assert!(describe_file_writer(&dir, "c.log").is_none());
+        fs::write(file_lock_path(&dir, "d.log"), "").unwrap();
+        assert!(describe_file_writer(&dir, "d.log").is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn strip_deleted_recovers_install_path() {

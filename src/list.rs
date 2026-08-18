@@ -303,7 +303,14 @@ mod tests {
         let live = row(
             "nginx",
             "default",
-            summary(2048, Some((0, 1000)), WriterState::Active, true, None, None),
+            summary(
+                2048,
+                Some((0, 1000)),
+                WriterState::Active(None),
+                true,
+                None,
+                None,
+            ),
         );
         let cells = row_cells(&live);
         assert_eq!(cells[0], "nginx");
@@ -331,7 +338,7 @@ mod tests {
                 summary(
                     2048,
                     Some((0, 1000)),
-                    WriterState::Active,
+                    WriterState::Active(None),
                     true,
                     Some("30d"),
                     None,
@@ -360,7 +367,7 @@ mod tests {
             summary(
                 2048,
                 Some((5, 10)),
-                WriterState::Active,
+                WriterState::Active(None),
                 true,
                 Some("30d"),
                 Some("50G"),

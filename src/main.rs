@@ -156,6 +156,13 @@ enum Command {
         /// must not vanish on an unrelated upgrade.
         #[arg(long)]
         exit_on_upgrade: bool,
+        /// Seconds to wait for a departing writer to release the log
+        /// before failing. A supervisor starts the replacement before the
+        /// old writer has exited (Apache spawns the new piped-log program
+        /// on reload), so the handoff is normal, not a conflict; 0 fails
+        /// on the first attempt
+        #[arg(long, default_value_t = 5.0, value_name = "SECS")]
+        wait_for_writer: f64,
     },
     /// Import existing plain log files into a timberfs log, stamping
     /// chunks with timestamps parsed from the log lines (auto-detects
@@ -543,6 +550,7 @@ fn main() -> anyhow::Result<()> {
             retain,
             retain_size,
             exit_on_upgrade,
+            wait_for_writer,
         } => {
             let Some(into) = into else {
                 if let Some(l) = legacy.first() {
@@ -576,6 +584,7 @@ fn main() -> anyhow::Result<()> {
                     retain_size.as_deref(),
                     "append",
                     exit_on_upgrade,
+                    wait_for_writer,
                 )?;
             } else {
                 append::cmd_append(
@@ -585,6 +594,7 @@ fn main() -> anyhow::Result<()> {
                     retain.as_deref(),
                     retain_size.as_deref(),
                     exit_on_upgrade,
+                    wait_for_writer,
                 )?;
             }
         }
@@ -631,6 +641,9 @@ fn main() -> anyhow::Result<()> {
                     None,
                     "import",
                     false,
+                    // A one-shot command: no supervisor is handing a
+                    // writer over, so a held lock is the answer.
+                    0.0,
                 )?;
             } else {
                 if sources.is_empty() {
