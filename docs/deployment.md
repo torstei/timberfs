@@ -280,6 +280,167 @@ records pair — with the node in place, a stopped socket costs lines while it i
 down and self-heals when it returns. Restarting the *service*, or upgrading the
 package, is always safe.
 
+#### Exim, and anything else that dies when logging fails
+
+Exim can be pointed at a FIFO — it opens its logs
+`O_WRONLY|O_APPEND|O_CREAT|O_NONBLOCK` and clears the non-blocking flag right
+after, so it attaches to a live FIFO and then blocks on a full pipe like any
+other producer — and its default timestamp (`2026-08-18 10:26:09 …`, with or
+without `+millisec`) is a clock timberfs already extracts, so nothing needs
+declaring. Three things differ from a web server, and the middle one decides
+whether you want this route at all:
+
+- **Logs are opened as the Exim user.** A root Exim forks a child, drops to
+  `exim_uid`, creates the file and passes the descriptor back, so the FIFO must
+  be writable by that user — set `SocketUser=` (or `SocketGroup=`) in a socket
+  drop-in. Apache and nginx need nothing here, because their privileged parent
+  opens logs before dropping to the worker user. Check who Exim will be with
+  `exim4 -bP exim_user`.
+- **A failed log write is fatal to the process.** Exim's write-failure path
+  ends in `log_write_die()`: the SMTP session or delivery is closed down and
+  the process exits. With the socket unit holding the FIFO open this never
+  fires — restarting the *service*, or a package upgrade, is invisible to Exim
+  exactly as it is to any other producer. But stopping the **socket** while
+  Exim runs makes every process that logs die, and mail defers until it is
+  back. Senders retry, so that is delay rather than loss, and it is loud
+  rather than silent (a fresh process fails at open with `ENXIO`, thanks to
+  that `O_NONBLOCK`; a long-lived one gets `EPIPE` on its held descriptor) —
+  but for a mail server it turns "never stop the socket while the producer
+  runs" from advice into a rule, and it is the reason to consider importing
+  instead (see below).
+- **`log_file_path` takes one path plus optionally `syslog`.** A second path is
+  refused; a path and `syslog` are written to *both*, so syslog can be a
+  parallel copy — though it does not protect mail flow, since it is the file
+  write failing that kills Exim. All three logs follow the single `%s`
+  template:
+
+```
+log_file_path = /run/timberfs/text/exim-%s.pipe : syslog
+```
+
+That gives three instances — `exim-main`, `exim-reject`, `exim-panic` — with
+their own retention each, which is the point of splitting them:
+
+```ini
+# /etc/timberfs/text-exim-main.conf
+DECLARE=index=true retain=90d format=exim-main
+# /etc/timberfs/text-exim-reject.conf — security-relevant, keep longer
+DECLARE=index=true retain=365d format=exim-reject
+```
+
+Note that this takes the **panic log** with it, and the panic log is where
+Exim reports being unable to write a log. It is not silent when that happens
+(it falls back to syslog, then stderr), but a mail server is a fair place to
+be conservative: keep `log_file_path` on files and import them, or accept that
+the panic path shares a mechanism with the thing it reports on.
+
+Two smaller notes. Exim stats the log path and compares the inode before
+reusing its open descriptor, so a replaced FIFO node is noticed and reopened;
+`RemoveOnStop=no` keeps the node in place, and because `/run/timberfs/text` is
+root-owned, the `O_CREAT` that plants a stray regular file behind a missing
+node fails for the Exim user instead of diverging silently. And enable
+`log_timezone` only if the store is read in the same zone Exim logs in: the
+`+0200` it then appends is separated from the time by a space, which the
+built-in ISO clock does not accept, so the entry is read as local time.
+
+### A log you cannot reconfigure — `import` on a trigger
+
+Some producers cannot be pointed anywhere useful, or should not be: a vendor
+appliance, a package's own log, an MTA where a logging failure defers mail.
+Leave those writing their file and import it instead. A store is its own
+checkpoint, so importing the same growing file repeatedly adds only what is
+new, and rotation needs no bookkeeping:
+
+```sh
+timberfs import /var/log/exim4/mainlog \
+    --into /var/log/timberfs/text/exim-main.log
+#  imported 2 lines
+#  imported 1 lines after 110 bytes already imported      <- after it grew
+#  exim-main.log is already up to date; nothing imported  <- nothing new
+#  after logrotate: the rotated file adds nothing, the fresh one adds its lines
+```
+
+Because a redundant run is a no-op, any trigger is safe to fire more often
+than necessary. Three of them, in order of how well they fit a busy log:
+
+**A timer** — the default choice for a log that is written continuously.
+
+```ini
+# /etc/systemd/system/timberfs-import-exim.service
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/timberfs create --if-not-exists --index --retain 90d \
+    /var/log/timberfs/text/exim-main.log
+ExecStart=/usr/bin/timberfs import --quick /var/log/exim4/mainlog \
+    --into /var/log/timberfs/text/exim-main.log
+```
+```ini
+# /etc/systemd/system/timberfs-import-exim.timer
+[Timer]
+# Both lines matter: OnUnitInactiveSec= measures from the last time the
+# service DEACTIVATED, so on its own it never schedules a first run (the
+# timer sits with no NEXT). OnActiveSec= gives it that first elapse.
+OnActiveSec=1min
+OnUnitInactiveSec=5min
+[Install]
+WantedBy=timers.target
+```
+
+`--quick` matters once the store is large: a full import verifies every
+already-imported chunk against the source, which is proportional to the store
+(a cold-cache read of the whole thing), while `--quick` checks the first,
+middle and last chunks and is therefore constant. On a 22 MiB, 348-chunk store
+a redundant run measured 0.05 s full versus 0.02 s quick — small either way,
+but one of those grows with the archive and the other does not. What `--quick`
+gives up is noticing a source that was rewritten in the middle, which an
+append-only log does not do.
+
+**A path unit (inotify)** — right for a log that is written *rarely*, wrong for
+a firehose. `PathModified=` fires on every write; `PathChanged=` only when a
+writer that had the file open closes it (for Exim, its short-lived per-message
+processes do exactly that, so this still fires per message). The hazard is the
+trigger limit: it defaults to 200 activations per 2 s, and **if the limit is
+hit the path unit goes into a failure mode and stops watching until it is
+restarted** — a busy log does not make the watcher noisy, it kills it. So use
+it where events are rare and immediacy is worth something:
+
+```ini
+# /etc/systemd/system/timberfs-import-exim-panic.path — paniclog is normally
+# empty, and a write to it is something to act on now
+[Path]
+PathModified=/var/log/exim4/paniclog
+[Install]
+WantedBy=paths.target
+```
+
+Watch the *file*, not the directory: `DirectoryNotEmpty=` on a log directory is
+true forever, so it triggers once and never again.
+
+**logrotate's `postrotate`** — the exact trigger for rotation, firing once when
+there is a complete unit of work and knowing the rotated file's name:
+
+```
+postrotate
+    /usr/bin/timberfs import --quick /var/log/exim4/mainlog.1 \
+        --into /var/log/timberfs/text/exim-main.log
+endscript
+```
+
+An existence-style path trigger is a poor substitute here, because a rotated
+file persists and `PathExists=`/`PathExistsGlob=` do not re-fire while the path
+is still there.
+
+A timer and a path unit can point at the same service — inotify for immediacy,
+the timer as a floor so a coalesced or missed event cannot leave data
+unimported indefinitely.
+
+One thing to be clear-eyed about: triggering an import is polling avoidance
+bolted onto a batch tool, and each run re-verifies before it appends. If low
+latency is the actual goal, the FIFO route above is the design that delivers
+it — the producer's line is pushed to a live writer, with nothing to
+re-verify. Importing on a trigger is what you choose when the producer must
+not be touched.
+
 ### Speaking Fluentd Forward — `timberfs-forward.socket` + `timberfs-forward.service`
 
 Receive the [Fluentd Forward protocol v1](https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1)
