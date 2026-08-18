@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -119,18 +119,18 @@ pub fn parse_size_bytes(s: &str) -> anyhow::Result<u64> {
 /// pipes into it — usually user-visible). A manifest that stops parsing
 /// mid-flight keeps the LAST GOOD policy with one warning: never
 /// silently unbounded, never a dead producer.
-struct LivePolicy {
-    dir: std::path::PathBuf,
-    name: String,
-    last: crate::bark::Retention,
-    warned: bool,
+pub struct LivePolicy {
+    pub dir: std::path::PathBuf,
+    pub name: String,
+    pub last: crate::bark::Retention,
+    pub warned: bool,
     /// (mtime, len) of the manifest at the last parse: the file almost
     /// never changes, so the once-a-second re-read is a stat until it does.
-    stamp: Option<(Option<std::time::SystemTime>, u64)>,
+    pub stamp: Option<(Option<std::time::SystemTime>, u64)>,
 }
 
 impl LivePolicy {
-    fn refresh(&mut self) -> crate::bark::Retention {
+    pub fn refresh(&mut self) -> crate::bark::Retention {
         let cur = std::fs::metadata(crate::format::bark_path(&self.dir, &self.name))
             .ok()
             .map(|m| (m.modified().ok(), m.len()));
@@ -182,7 +182,7 @@ fn extend_declared_grain(dir: &Path, name: &str) {
     }
 }
 
-fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Retention) {
+pub fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Retention) {
     if !policy.is_some() {
         return;
     }
@@ -206,6 +206,59 @@ fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Retentio
             eprintln!("timberfs: {name}: retention failed: {e}");
         }
     }
+}
+
+/// The once-a-second housekeeping a long-lived single-store writer owes:
+/// age-based chunk flushing (same as the mount), the retention check with
+/// the policy re-read each time, keeping a declared grain current, and a
+/// clean exit when this binary is replaced on disk. Shared by the appender
+/// and by `import --follow`, which differ only in where their bytes come
+/// from.
+pub fn spawn_maintenance(
+    store: Arc<Mutex<Store>>,
+    dir: PathBuf,
+    name: String,
+    policy: Arc<Mutex<LivePolicy>>,
+    exit_on_upgrade: bool,
+) {
+    let watch = if exit_on_upgrade {
+        crate::store::BinaryWatch::current()
+    } else {
+        None
+    };
+    let mut indexed_chunks = chunk_count(&store, &name);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(1000));
+        // Binary upgraded on disk: flush and exit for a clean re-exec
+        // (the supervisor restarts us on the new one).
+        if watch.as_ref().is_some_and(|w| w.changed()) {
+            store.lock().unwrap().flush_all();
+            // Index what we flushed before the re-exec, off the lock:
+            // a full rebuild here would otherwise delay shutdown past
+            // systemd's stop timeout.
+            extend_declared_grain(&dir, &name);
+            std::process::exit(crate::store::EXIT_BINARY_UPGRADED);
+        }
+        store.lock().unwrap().flush_aged();
+        store.lock().unwrap().sap_sync_all();
+        let p = policy.lock().unwrap().refresh();
+        run_retention(&store, &name, p);
+        // Keep the declared index current while streaming, exactly as
+        // the records sink and the network intakes do: extend whenever
+        // the flushed-chunk set changed (a flush added chunks, or
+        // retention dropped some and deleted the grain). Deliberately
+        // NOT holding the store lock — extend_grain reads only
+        // committed, immutable chunks and is the sole writer of the
+        // grain, so it cannot race the append thread, which only
+        // appends new chunks and never touches the grain.
+        let cur = chunk_count(&store, &name);
+        if cur != indexed_chunks && crate::bark::index_declared(&dir, &name) {
+            match crate::grain::extend_grain(&dir, &name) {
+                Ok(()) => indexed_chunks = cur,
+                Err(e) => eprintln!("timberfs: {name}: background grain extend failed: {e}"),
+            }
+        }
+    });
 }
 
 /// Take a log's writer lock, waiting out a departing writer for up to
@@ -346,52 +399,13 @@ pub fn cmd_append(
     // Catch up on retention from before this run, then keep enforcing.
     run_retention(&store, &name, policy.lock().unwrap().refresh());
 
-    // Background thread: age-based chunk flushing (same as the mount) and
-    // the once-a-second retention check, policy re-read each time.
-    {
-        let store = Arc::clone(&store);
-        let name = name.clone();
-        let dir = dir.clone();
-        let policy = Arc::clone(&policy);
-        let watch = if exit_on_upgrade {
-            crate::store::BinaryWatch::current()
-        } else {
-            None
-        };
-        let mut indexed_chunks = chunk_count(&store, &name);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(1000));
-            // Binary upgraded on disk: flush and exit for a clean re-exec
-            // (the supervisor restarts us on the new one).
-            if watch.as_ref().is_some_and(|w| w.changed()) {
-                store.lock().unwrap().flush_all();
-                // Index what we flushed before the re-exec, off the lock:
-                // a full rebuild here would otherwise delay shutdown past
-                // systemd's stop timeout.
-                extend_declared_grain(&dir, &name);
-                std::process::exit(crate::store::EXIT_BINARY_UPGRADED);
-            }
-            store.lock().unwrap().flush_aged();
-            store.lock().unwrap().sap_sync_all();
-            let p = policy.lock().unwrap().refresh();
-            run_retention(&store, &name, p);
-            // Keep the declared index current while streaming, exactly as
-            // the records sink and the network intakes do: extend whenever
-            // the flushed-chunk set changed (a flush added chunks, or
-            // retention dropped some and deleted the grain). Deliberately
-            // NOT holding the store lock — extend_grain reads only
-            // committed, immutable chunks and is the sole writer of the
-            // grain, so it cannot race the append thread, which only
-            // appends new chunks and never touches the grain.
-            let cur = chunk_count(&store, &name);
-            if cur != indexed_chunks && crate::bark::index_declared(&dir, &name) {
-                match crate::grain::extend_grain(&dir, &name) {
-                    Ok(()) => indexed_chunks = cur,
-                    Err(e) => eprintln!("timberfs: {name}: background grain extend failed: {e}"),
-                }
-            }
-        });
-    }
+    spawn_maintenance(
+        Arc::clone(&store),
+        dir.clone(),
+        name.clone(),
+        Arc::clone(&policy),
+        exit_on_upgrade,
+    );
 
     install_signal_handlers();
     eprintln!(

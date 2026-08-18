@@ -177,6 +177,85 @@ impl Extractor {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Lines into stamped entries, carrying the inheritance rule that makes a
+/// stack trace one entry: an unstamped line belongs to the last stamped one,
+/// and lines arriving before the FIRST stamp are held until it comes. That
+/// state spans calls, which is why this is a struct — and why `import` and
+/// `import --follow` share it instead of each keeping their own copy of a
+/// rule the store's shape depends on.
+pub struct Stamper {
+    last_ts: Option<u64>,
+    leading: Vec<Vec<u8>>,
+    pub stamped: u64,
+    pub inherited: u64,
+}
+
+impl Stamper {
+    /// `last_ts` seeds inheritance from what the store already ends with,
+    /// so an unstamped first line continues the last imported entry.
+    pub fn resuming_from(last_ts: Option<u64>) -> Stamper {
+        Stamper {
+            last_ts,
+            leading: Vec::new(),
+            stamped: 0,
+            inherited: 0,
+        }
+    }
+
+    pub fn last_ts(&self) -> Option<u64> {
+        self.last_ts
+    }
+
+    /// A stamp the caller saw on a line it is NOT appending (an overlap
+    /// duplicate, or a merged segment's end) still seeds inheritance for
+    /// the unstamped lines that follow it.
+    pub fn observe(&mut self, ts: u64) {
+        self.last_ts = Some(ts);
+    }
+
+    /// Lines held because no timestamp has been seen yet.
+    pub fn unstamped_pending(&self) -> usize {
+        self.leading.len()
+    }
+
+    /// Append one line (newline included) as its own entry, or as a
+    /// continuation of the last stamped one.
+    pub fn feed(
+        &mut self,
+        f: &mut crate::store::FileStore,
+        line: &[u8],
+        ts: Option<u64>,
+        cfg: &Config,
+    ) -> anyhow::Result<()> {
+        match (ts, self.last_ts) {
+            (Some(t), _) => {
+                // The pre-first-timestamp lines belong to this one.
+                for l in self.leading.drain(..) {
+                    f.append_stamped(&l, t, cfg)?;
+                    self.inherited += 1;
+                }
+                f.append_stamped(line, t, cfg)?;
+                self.stamped += 1;
+                self.last_ts = Some(t);
+            }
+            (None, Some(t)) => {
+                f.append_stamped(line, t, cfg)?;
+                self.inherited += 1;
+            }
+            (None, None) => {
+                self.leading.push(line.to_vec());
+                if self.leading.len() > DETECT_WINDOW {
+                    bail!(
+                        "no timestamp found in the first {DETECT_WINDOW} lines; \
+                         try --timestamp-regex/--timestamp-format"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Re-import safety: the target is its own checkpoint. The source must be
 /// a pure-growth descendant of what was imported, which we prove by
 /// comparing already-imported chunks against the same source byte ranges
@@ -219,7 +298,7 @@ fn verify_prefix(
 /// FNV-1a 128 of a line (trailing newline stripped). Overlap dedup only
 /// needs collisions to be unlikelier than hardware failure, not
 /// cryptography: for 10^8 distinct lines the collision odds are ~10^-23.
-fn line_hash(line: &[u8]) -> u128 {
+pub(crate) fn line_hash(line: &[u8]) -> u128 {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
     for &b in line {
@@ -235,7 +314,7 @@ fn line_hash(line: &[u8]) -> u128 {
 /// byte thresholds), so the partial line spilling in from earlier chunks
 /// is carried for exact reconstruction. Memory is one chunk plus ~50
 /// bytes per distinct overlap line.
-fn overlap_line_counts(
+pub(crate) fn overlap_line_counts(
     chunks: &[crate::format::ChunkRecord],
     trunk_path: &Path,
     t0: u64,
@@ -291,7 +370,7 @@ fn overlap_line_counts(
 }
 
 /// First parsed timestamp in a file, scanning at most DETECT_WINDOW lines.
-fn first_stamp(path: &Path, extractor: &Extractor) -> anyhow::Result<u64> {
+pub(crate) fn first_stamp(path: &Path, extractor: &Extractor) -> anyhow::Result<u64> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut reader = BufReader::new(f);
     let mut line: Vec<u8> = Vec::new();
@@ -605,10 +684,8 @@ pub fn cmd_import(
     }
 
     let mut line: Vec<u8> = Vec::new();
-    let mut leading: Vec<Vec<u8>> = Vec::new(); // lines before the first stamp
+    let mut stamper = Stamper::resuming_from(last_ts);
     let mut lines: u64 = 0;
-    let mut stamped: u64 = 0;
-    let mut inherited: u64 = 0;
     let mut merged_chunks: u64 = 0;
     let mut merged_segments: u64 = 0;
     let mut skipped_segments: u64 = 0;
@@ -645,7 +722,7 @@ pub fn cmd_import(
                         .with_context(|| format!("merging {}", source.display()))?;
                     merged_chunks += records.len() as u64;
                     merged_segments += 1;
-                    last_ts = Some(records.last().unwrap().last_write_ms);
+                    stamper.observe(records.last().unwrap().last_write_ms);
                 }
                 bytes_done += fs::metadata(trunk).map(|m| m.len()).unwrap_or(0);
                 continue;
@@ -715,7 +792,7 @@ pub fn cmd_import(
             // consulting (and free) the multiset.
             if dedup
                 .as_ref()
-                .is_some_and(|(_, until)| ts.or(last_ts).is_some_and(|e| e > *until))
+                .is_some_and(|(_, until)| ts.or(stamper.last_ts()).is_some_and(|e| e > *until))
             {
                 dedup = None;
             }
@@ -727,7 +804,7 @@ pub fn cmd_import(
                         // The store already has this line; its stamp still
                         // seeds inheritance for following unstamped lines.
                         if let Some(t) = ts {
-                            last_ts = Some(t);
+                            stamper.observe(t);
                         }
                         continue;
                     }
@@ -735,40 +812,7 @@ pub fn cmd_import(
                 ov_new += 1;
             }
 
-            match (ts, last_ts) {
-                (Some(t), _) => {
-                    if !leading.is_empty() {
-                        // stamp the pre-first-timestamp lines with the first one
-                        let f = st.files.get_mut(&name).unwrap();
-                        for l in leading.drain(..) {
-                            f.append_stamped(&l, t, &cfg)?;
-                            inherited += 1;
-                        }
-                    }
-                    st.files
-                        .get_mut(&name)
-                        .unwrap()
-                        .append_stamped(&line, t, &cfg)?;
-                    stamped += 1;
-                    last_ts = Some(t);
-                }
-                (None, Some(t)) => {
-                    st.files
-                        .get_mut(&name)
-                        .unwrap()
-                        .append_stamped(&line, t, &cfg)?;
-                    inherited += 1;
-                }
-                (None, None) => {
-                    leading.push(line.clone());
-                    if leading.len() > DETECT_WINDOW {
-                        bail!(
-                            "no timestamp found in the first {DETECT_WINDOW} lines; \
-                         try --timestamp-regex/--timestamp-format"
-                        );
-                    }
-                }
-            }
+            stamper.feed(st.files.get_mut(&name).unwrap(), &line, ts, &cfg)?;
 
             if total_bytes > 0 && bytes_done >= next_progress && bytes_done < total_bytes {
                 crate::note!(
@@ -782,11 +826,11 @@ pub fn cmd_import(
         }
     }
 
-    if !leading.is_empty() {
+    if stamper.unstamped_pending() > 0 {
         bail!(
             "no timestamp found in any of the {} line(s); \
              try --timestamp-regex/--timestamp-format",
-            leading.len()
+            stamper.unstamped_pending()
         );
     }
 
@@ -866,7 +910,8 @@ pub fn cmd_import(
     let mut parts: Vec<String> = Vec::new();
     if lines > 0 {
         parts.push(format!(
-            "{lines} lines ({stamped} stamped, {inherited} inherited)"
+            "{lines} lines ({} stamped, {} inherited)",
+            stamper.stamped, stamper.inherited
         ));
     }
     if merged_segments > 0 {
