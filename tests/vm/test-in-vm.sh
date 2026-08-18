@@ -840,8 +840,24 @@ socket_intake_wal_declared_and_working() {
     # --records, same maintenance loop as a plain appender) must maintain
     # a live .sap and report it declared, while intake keeps working
     # normally — --wal is meant to be transparent to every other path.
+    #
+    # The sap exists for as long as the sink holds the store open (it is
+    # created when a wal-declared store is opened), so wait for it rather
+    # than sampling the instant after the restart the previous test did —
+    # and if it never turns up, say enough to identify why.
+    for _ in $(seq 1 10); do
+        [ -f "$LOGSTORE.sap" ] && break
+        sleep 1
+    done
     [ -f "$LOGSTORE.sap" ] || {
         echo "no .sap sidecar for a wal-declared socket-intake store" >&2
+        echo "  service: $(systemctl is-active "timberfs-log@$LOGINST.service" 2>&1)" >&2
+        echo "  socket:  $(systemctl is-active "timberfs-log@$LOGINST.socket" 2>&1)" >&2
+        echo "  store directory:" >&2
+        ls -l "$(dirname "$LOGSTORE")" 2>&1 | sed 's/^/    /' >&2
+        echo "  last journal lines for the service:" >&2
+        journalctl -u "timberfs-log@$LOGINST.service" -n 15 --no-pager 2>&1 \
+            | sed 's/^/    /' >&2
         return 1
     }
     timberfs info "$LOGSTORE" --json 2>/dev/null | jq -e '.wal_declared == true' >/dev/null \
