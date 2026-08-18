@@ -30,6 +30,15 @@ Then: systemctl enable --now timberfs-text@<instance>.socket
 DECLARE is applied to the store on every start, so retention lives here
 rather than in someone's shell history.
 
+follow-<instance>.conf configures one file follower (timberfs-follow@) — for
+a producer that keeps writing its own log file while timberfs reads it. SOURCE
+is required; follow.conf holds the defaults for every instance:
+
+    SOURCE=/var/log/exim4/mainlog
+    DECLARE=index=true retain=90d format=exim-main
+
+Then: systemctl enable --now timberfs-follow@exim-main
+
 The remaining units are configured with a systemd drop-in instead — the
 records-format log intake (systemctl edit timberfs-log@<instance>.service)
 and the two network intakes, which are not templated because one listener

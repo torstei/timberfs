@@ -863,6 +863,112 @@ run_test "socket intake: declared index maintained while live" socket_intake_ind
 run_test "socket intake: wal declared, .sap live, intake unaffected" socket_intake_wal_declared_and_working
 run_test "socket intake: stop removes the FIFO" socket_intake_stop_removes_fifo
 
+# The file follower (import --follow): the route for a producer that cannot
+# be pointed anywhere — it keeps writing its own file and timberfs reads it.
+# What is specific to it is position and rotation, so that is what these
+# tests drive: a rotation UNDER the running follower, a restart across a
+# rotation, copytruncate, and a restart with nothing new.
+FOLDIR=/var/log/timberfs-follow
+FOLLOG=$FOLDIR/app.log
+FOLSTORE=$FOLDIR/store/app.log
+
+fol_say() {
+    printf '%s app[1]: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$FOLLOG"
+}
+fol_start() {
+    setsid timberfs import -F "$FOLLOG" --into "$FOLSTORE" --index \
+        --poll 0.3 --flush-age 1 >> $FOLDIR/follower.log 2>&1 &
+    FOLSESS=$(ps -o sess= -p $! | tr -d ' ')
+    sleep 2
+}
+fol_stop() {
+    pkill -TERM -s "$FOLSESS" -f 'import -F' 2>/dev/null
+    sleep 2
+}
+fol_lines() { timberfs query "$FOLSTORE" 2>/dev/null | wc -l; }
+
+follow_setup() {
+    rm -rf $FOLDIR
+    mkdir -p $FOLDIR/store
+    : > "$FOLLOG"
+    fol_say "before the follower started"
+    fol_start
+    fol_say "while following"
+    for _ in $(seq 1 10); do
+        [ "$(fol_lines)" = 2 ] && break
+        sleep 1
+    done
+    [ "$(fol_lines)" = 2 ]
+}
+
+follow_survives_rotation_under_it() {
+    # The line written just before the rename is the one a `tail -F`
+    # pipeline drops: the follower must drain the descriptor it holds
+    # before it looks at the new file.
+    fol_say "written just before rotation"
+    mv "$FOLLOG" "$FOLLOG.1"
+    : > "$FOLLOG"
+    sleep 1
+    fol_say "after rotation"
+    for _ in $(seq 1 10); do
+        [ "$(fol_lines)" = 4 ] && break
+        sleep 1
+    done
+    [ "$(fol_lines)" = 4 ] \
+        && timberfs query "$FOLSTORE" | grep -q "just before rotation" \
+        && grep -q "was replaced (rotation)" $FOLDIR/follower.log
+}
+
+follow_recovers_a_gap_across_a_restart() {
+    # Down while lines are written AND while rotation moves them out of the
+    # live path: the rotated candidate is where they have to be found.
+    fol_stop
+    fol_say "written while the follower was down"
+    mv "$FOLLOG" "$FOLLOG.1"
+    : > "$FOLLOG"
+    fol_say "after the second rotation"
+    fol_start
+    for _ in $(seq 1 10); do
+        [ "$(fol_lines)" = 6 ] && break
+        sleep 1
+    done
+    [ "$(fol_lines)" = 6 ] \
+        && timberfs query "$FOLSTORE" | grep -q "while the follower was down"
+}
+
+follow_handles_copytruncate() {
+    fol_say "before the truncate"
+    sleep 2
+    cp "$FOLLOG" "$FOLLOG.copy"
+    : > "$FOLLOG"
+    sleep 1
+    fol_say "after the truncate"
+    for _ in $(seq 1 10); do
+        [ "$(fol_lines)" = 8 ] && break
+        sleep 1
+    done
+    [ "$(fol_lines)" = 8 ] && grep -q "copytruncate" $FOLDIR/follower.log
+}
+
+follow_restart_adds_nothing() {
+    # The store is the checkpoint: a restart with nothing new must not
+    # duplicate a single line, and the declared index must still be current.
+    fol_stop
+    fol_start
+    sleep 3
+    fol_stop
+    [ "$(fol_lines)" = 8 ] \
+        && [ "$(timberfs query "$FOLSTORE" 2>/dev/null | sort | uniq -d | wc -l)" = 0 ] \
+        && timberfs info "$FOLSTORE" --json | jq -e '.grain.covers_all == true' >/dev/null 2>&1 \
+        || { [ "$(fol_lines)" = 8 ] && [ -f "$FOLSTORE.grain" ]; }
+}
+
+run_test "follow: picks up an existing file and then tails it" follow_setup
+run_test "follow: drains the held file when rotation replaces it" follow_survives_rotation_under_it
+run_test "follow: recovers what was written while it was down" follow_recovers_a_gap_across_a_restart
+run_test "follow: copytruncate is detected, not misread" follow_handles_copytruncate
+run_test "follow: a restart with nothing new duplicates nothing" follow_restart_adds_nothing
+
 # The plain-text FIFO pair (timberfs-text@.socket/.service): the route for a
 # producer that can only log to a PATH — Apache's CustomLog/ErrorLog. Covers
 # what is specific to it: the conf-file declaration (site-wide defaults plus a

@@ -1,6 +1,6 @@
 use timberfs::{
-    append, bark, export, forest, forward, fs, grain, import, list, note, otlp_intake, query,
-    rotate, sink, store,
+    append, bark, export, follow, forest, forward, fs, grain, import, list, note, otlp_intake,
+    query, rotate, sink, store,
 };
 
 use std::path::PathBuf;
@@ -220,6 +220,46 @@ enum Command {
         /// to protect); a property of the store, like --index
         #[arg(long)]
         wal: bool,
+        /// Keep following the source instead of exiting at its end: the
+        /// tailer. Reads new lines as they are written, drains the file it
+        /// holds before switching when rotation replaces it, and resumes
+        /// after a restart against the store's own lines — so it can
+        /// neither lose nor duplicate, with no position file to go stale.
+        /// One source, and the destination gets a live writer (retention,
+        /// index and .sap are maintained as for any other)
+        #[arg(short = 'F', long, conflicts_with_all = ["records", "quick"])]
+        follow: bool,
+        /// Where rotation moves the source, for the one case the live path
+        /// cannot answer: data written while this follower was not running
+        /// (repeatable). Default: <source>.1 and <source>.0 when they
+        /// exist. While running, rotation needs no pattern — the
+        /// descriptor already held is the file that moved
+        #[arg(long, value_name = "PATH", requires = "follow")]
+        rotated: Vec<PathBuf>,
+        /// Seconds between looks for new data and for a replaced file
+        /// (--follow only). Nothing observable improves below --flush-age,
+        /// which bounds when a chunk becomes visible
+        #[arg(long, default_value_t = 1.0, value_name = "SECS", requires = "follow")]
+        poll: f64,
+        /// Max seconds followed data may sit unflushed (--follow only);
+        /// bounds the write-time granularity of the index and crash loss
+        #[arg(long, default_value_t = 5.0, value_name = "SECS", requires = "follow")]
+        flush_age: f64,
+        /// Continuously drop data older than this (e.g. 90d) — declared in
+        /// the manifest and enforced by every writer (--follow only)
+        #[arg(long, requires = "follow")]
+        retain: Option<String>,
+        /// Declared compressed-size budget, oldest data first (--follow only)
+        #[arg(long, requires = "follow")]
+        retain_size: Option<String>,
+        /// Exit for a clean re-exec when this binary is upgraded on disk
+        /// (--follow only; for supervised runs, as for the appender)
+        #[arg(long, requires = "follow")]
+        exit_on_upgrade: bool,
+        /// Seconds to wait for a departing writer to release the log
+        /// before failing (--follow only; see append)
+        #[arg(long, default_value_t = 5.0, value_name = "SECS", requires = "follow")]
+        wait_for_writer: f64,
     },
     /// Export a time window (or everything) from a timberfs log into a NEW
     /// timberfs log, chunks copied verbatim — no recompression. A DEST
@@ -610,13 +650,55 @@ fn main() -> anyhow::Result<()> {
             quick,
             index,
             wal,
+            follow,
+            rotated,
+            poll,
+            flush_age,
+            retain,
+            retain_size,
+            exit_on_upgrade,
+            wait_for_writer,
         } => {
             let cfg = store::Config {
                 chunk_size: chunk_size.max(1),
                 level,
-                flush_age_ms: u64::MAX, // no age flushing during import
+                flush_age_ms: if follow {
+                    (flush_age * 1000.0).max(0.0) as u64
+                } else {
+                    u64::MAX // no age flushing during a one-shot import
+                },
             };
-            if records {
+            if follow {
+                let [source] = &sources[..] else {
+                    anyhow::bail!(
+                        "--follow takes exactly ONE source: it is a live position in one \
+                         file, and a store has one writer (run a follower per store)"
+                    );
+                };
+                follow::cmd_follow(
+                    source,
+                    &dest,
+                    cfg,
+                    import::ImportOpts {
+                        time: bark::TimeFormat {
+                            regex: timestamp_regex,
+                            format: timestamp_format,
+                            utc,
+                        },
+                        quick: false,
+                        index,
+                        wal,
+                    },
+                    retain.as_deref(),
+                    retain_size.as_deref(),
+                    follow::FollowOpts {
+                        poll_ms: (poll * 1000.0).max(50.0) as u64,
+                        rotated,
+                        exit_on_upgrade,
+                        wait_for_writer,
+                    },
+                )?;
+            } else if records {
                 if sources.len() > 1 {
                     anyhow::bail!(
                         "--records takes ONE stream (a records file, or stdin \

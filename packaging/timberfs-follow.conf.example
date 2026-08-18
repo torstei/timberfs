@@ -1,0 +1,56 @@
+# Example configuration for timberfs-follow@.service — the file follower, for
+# a producer that keeps writing its own log file (Exim, Apache, nginx, a vendor
+# appliance) while timberfs reads it.
+#
+# Site-wide defaults:   /etc/timberfs/follow.conf          (optional)
+# One instance:         /etc/timberfs/follow-<instance>.conf  (REQUIRED: SOURCE)
+#
+#   systemctl enable --now timberfs-follow@exim-main
+
+# --- /etc/timberfs/follow.conf (site-wide, optional) -----------------------
+
+# The store is <STORE_DIR>/<instance>.log. One directory for every instance,
+# so a glob spans them: timberfs query /var/log/timberfs/follow/'*'.log
+STORE_DIR=/var/log/timberfs/follow
+
+# Properties DECLARED on the store on every start, as KEY=VALUE pairs handed
+# to `timberfs set`: retain=90d, retain_size=50G, index=true|false,
+# wal=true|false, or any free-form provenance key. (Not a value containing
+# spaces — systemd splits variables at whitespace.)
+DECLARE=index=true retain=90d
+
+# Extra flags for `timberfs import --follow`:
+#   --poll SECS        how often to look for new data and for a replaced file
+#                      (default 1; nothing observable improves below --flush-age)
+#   --flush-age SECS   how long followed data may sit unflushed (default 5)
+#   --rotated PATH     where rotation moves the source, for data written while
+#                      this follower was NOT running (default: <SOURCE>.1
+#                      and <SOURCE>.0). Rotation while it IS running needs no
+#                      pattern at all
+#EXTRA_OPTS=--poll 2
+
+# --- /etc/timberfs/follow-exim-main.conf (per instance) --------------------
+#
+#   SOURCE=/var/log/exim4/mainlog
+#   DECLARE=index=true retain=90d format=exim-main
+#
+# and for the other two Exim logs, each its own instance and retention:
+#
+#   /etc/timberfs/follow-exim-reject.conf:
+#     SOURCE=/var/log/exim4/rejectlog
+#     DECLARE=index=true retain=365d format=exim-reject
+#   /etc/timberfs/follow-exim-panic.conf:
+#     SOURCE=/var/log/exim4/paniclog
+#     DECLARE=index=true retain=365d format=exim-panic
+#
+# Apache, with the vhost in the line so one instance covers every site:
+#
+#   /etc/timberfs/follow-apache-access.conf:
+#     SOURCE=/var/log/apache2/access.log
+#     DECLARE=index=true retain=90d format=combined-vhost
+#
+# Keep the producer's own logrotate — the plain file is no longer the archive,
+# so it only has to outlive this follower's downtime. On a busy site rotating
+# HOURLY (logrotate supports it, and cron.hourly or a systemd timer will run
+# it) is worth doing: it bounds both the plain file's size and the scan a
+# follower does at startup to re-sync against the store.
