@@ -391,8 +391,29 @@ collapse_crash_kill_resilience() {
     # byte-faithful — it will NOT insert a separator (that is exactly what keeps
     # `zstd -dc` an exact recovery). So a resuming logger opens a fresh line
     # itself, rather than fusing onto the partial line the crash left behind.
-    printf '\npost-kill-resume-marker\n' | timberfs append --into "$d/churn.log" --quiet \
-        && timberfs query "$d/churn.log" 2>/dev/null | tail -1 | grep -qx "post-kill-resume-marker"
+    if ! printf '\npost-kill-resume-marker\n' \
+        | timberfs append --into "$d/churn.log" --quiet 2>/tmp/collapse.resume; then
+        echo "the resuming append failed:" >&2
+        cat /tmp/collapse.resume >&2
+        timberfs info "$d/churn.log" 2>&1 | sed 's/^/  /' >&2
+        return 1
+    fi
+    local last
+    last=$(timberfs query "$d/churn.log" 2>/dev/null | tail -1)
+    if [ "$last" != "post-kill-resume-marker" ]; then
+        # The two steps above used to assert with no diagnostic at all, which
+        # cost a CI round-trip to learn nothing from when this failed once on
+        # focal (unreproducible in 20 local rounds on ext4, and green on a
+        # re-run of the same artifact). Say what the store actually ends with.
+        echo "the last entry is not the resume marker; it is:" >&2
+        printf '  %s\n' "${last:0:120}" >&2
+        echo "append stderr was:" >&2
+        cat /tmp/collapse.resume >&2
+        timberfs info "$d/churn.log" 2>&1 | sed 's/^/  /' >&2
+        echo "last 3 entries:" >&2
+        timberfs query "$d/churn.log" 2>/dev/null | tail -3 | cut -c1-120 | sed 's/^/  /' >&2
+        return 1
+    fi
 }
 
 info_readonly_nonroot() {
