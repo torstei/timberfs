@@ -44,6 +44,7 @@ pub struct Extractor {
     custom: Option<(Regex, String)>,
     iso: Regex,
     clf: Regex,
+    ctime: Regex,
     epoch: Regex,
     utc: bool,
 }
@@ -73,6 +74,13 @@ impl Extractor {
             .unwrap(),
             clf: Regex::new(r"\[(\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4})\]")
                 .unwrap(),
+            // Bracketed ctime, the shape Apache's error log uses (and its
+            // 2.2-era form without the microseconds): the one common log
+            // clock whose year comes last and whose zone is implied local.
+            ctime: Regex::new(
+                r"\[([A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9]\d \d{2}:\d{2}:\d{2}(?:\.\d+)? \d{4})\]",
+            )
+            .unwrap(),
             epoch: Regex::new(r"^(\d{13}|\d{10})\b").unwrap(),
             utc,
         })
@@ -144,6 +152,17 @@ impl Extractor {
             let ms = DateTime::parse_from_str(c.get(1).unwrap().as_str(), "%d/%b/%Y:%H:%M:%S %z")
                 .ok()?
                 .timestamp_millis();
+            return u64::try_from(ms).ok();
+        }
+
+        if let Some(c) = self.ctime.captures(head) {
+            let naive = NaiveDateTime::parse_from_str(
+                c.get(1).unwrap().as_str(),
+                "%a %b %e %H:%M:%S%.f %Y",
+            )
+            .ok()?;
+            // ctime carries no zone; Apache writes it in local time.
+            let ms = self.naive_to_ms(naive)?;
             return u64::try_from(ms).ok();
         }
 
@@ -875,4 +894,40 @@ pub fn cmd_import(
         last.map(fmt_ms).unwrap_or_default(),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The built-in clocks, checked against real producer output. Apache's
+    /// error log is the ctime one: no zone, year last, and (2.2) no
+    /// microseconds — so `query --from/--to` verifies error lines against
+    /// their own clock with nothing declared, exactly as it does the access
+    /// log's CLF.
+    #[test]
+    fn ctime_lines_are_stamped_like_every_other_builtin() {
+        let e = Extractor::new(None, None, true).unwrap();
+        let at = |s: &str| e.extract(s);
+
+        // Apache 2.4 error log, and the same second in CLF and ISO.
+        let ctime = at("[Sat Aug 15 10:26:09.123456 2026] [php:error] [pid 9] boom").unwrap();
+        assert_eq!(
+            ctime,
+            at("[Sat Aug 15 10:26:09 2026] [core:warn] no microseconds").unwrap() + 123
+        );
+        // A space-padded single-digit day parses too (ctime pads with %2d).
+        assert!(at("[Sat Aug  1 10:26:09.000000 2026] [php:error] one").is_some());
+
+        // Not a ctime: no bracket, and a bracketed non-date.
+        assert!(at("Sat Aug 15 10:26:09.123456 2026 unbracketed").is_none());
+        assert!(at("[core:error] [pid 9] boom").is_none());
+
+        // The other built-ins still win where they should: an ISO head is
+        // read as ISO even when a ctime-shaped string trails it.
+        assert_eq!(
+            at("2026-08-15T10:26:09Z said [Sat Aug 15 11:00:00.0 2026]"),
+            at("2026-08-15T10:26:09Z said nothing")
+        );
+    }
 }
