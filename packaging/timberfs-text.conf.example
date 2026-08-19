@@ -9,9 +9,16 @@
 #   systemctl restart timberfs-text@apache-access.service
 # The producer is not involved — systemd holds the FIFO open across it.
 
-# The log is <STORE_DIR>/<instance>.log. One directory for every instance, so
-# a glob spans them all: timberfs query /var/log/timberfs/text/'*'.log
-STORE_DIR=/var/log/timberfs/text
+# The log is <STORE_DIR>/<instance>/<instance>.log — one directory per store,
+# named after the store, which is also the handle it answers to:
+#   timberfs query apache-access --from 13:40
+# A glob spans the fleet through the artifacts the shell can see (a logical
+# name is not a file, so /'*'.log matches nothing):
+#   timberfs query /var/log/timberfs/*/*.trunk --from 13:40
+# Point STORE_DIR at a directory of your own to group stores by subject —
+# one owner, one place — e.g. STORE_DIR=/var/log/timberfs/web. Nothing in the
+# path names the intake.
+STORE_DIR=/var/log/timberfs
 
 # Properties DECLARED on the store on every start, as KEY=VALUE pairs handed
 # to `timberfs set`: retain=90d, retain_size=50G, index=true|false,
@@ -52,7 +59,7 @@ DECLARE=index=true retain=90d
 # [%{u}t] at the FRONT of the error format — that is the timestamp read.
 #
 # One site's view is then a filter, not a file:
-#   timber-filter --has shop.example.com /var/log/timberfs/text/apache-'*'.log --from 13:40
+#   timber-filter --has shop.example.com /var/log/timberfs/apache-*/*.trunk --from 13:40
 #
 # --- One store per vhost (when a site needs its own policy) ----------------
 #

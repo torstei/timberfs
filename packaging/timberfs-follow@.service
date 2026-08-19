@@ -18,11 +18,14 @@
 #
 #   systemctl enable --now timberfs-follow@exim-main
 #
-# The store lands in <STORE_DIR>/<instance>.log. Rotation of the source needs
-# no configuration while this runs — the descriptor already held is the file
-# that moved, and it is drained before the new one is opened. --rotated only
-# matters for data written while the follower was NOT running; it defaults to
-# <SOURCE>.1 and <SOURCE>.0.
+# The store lands in <STORE_DIR>/<instance>/<instance>.log — the layout every
+# timberfs intake writes: the path spells the store's name, which is also its
+# handle (`timberfs query exim-main`), and never how the data got in.
+#
+# Rotation of the source needs no configuration while this runs — the
+# descriptor already held is the file that moved, and it is drained before the
+# new one is opened. --rotated only matters for data written while the follower
+# was NOT running; it defaults to <SOURCE>.1 and <SOURCE>.0.
 #
 # The follower reads the producer's file, so if you set User= in a drop-in,
 # that user needs read access to it (group adm on a Debian /var/log, say).
@@ -37,23 +40,26 @@ Type=simple
 
 # Defaults first; EnvironmentFile= wins over Environment=, and the
 # per-instance file (required, for SOURCE) wins over the site-wide one.
-Environment=STORE_DIR=/var/log/timberfs/follow
+Environment=STORE_DIR=/var/log/timberfs
 Environment=DECLARE=index=true
 EnvironmentFile=-/etc/timberfs/follow.conf
 EnvironmentFile=/etc/timberfs/follow-%i.conf
 
 # The store's properties, declared idempotently on every start — the same
 # pattern as the FIFO pair: create makes it if missing, set converges DECLARE.
-ExecStartPre=/usr/bin/timberfs create --if-not-exists ${STORE_DIR}/%i.log
-ExecStartPre=/usr/bin/timberfs set ${STORE_DIR}/%i.log host=%H $DECLARE
+ExecStartPre=/usr/bin/timberfs create --if-not-exists ${STORE_DIR}/%i/%i.log
+ExecStartPre=/usr/bin/timberfs set ${STORE_DIR}/%i/%i.log host=%H $DECLARE
 ExecStart=/usr/bin/timberfs import --follow ${SOURCE} \
-    --into ${STORE_DIR}/%i.log --exit-on-upgrade $EXTRA_OPTS
+    --into ${STORE_DIR}/%i/%i.log --exit-on-upgrade $EXTRA_OPTS
 StandardOutput=journal
 StandardError=journal
 
-# Creates and owns the default store directory /var/log/timberfs/follow
-# (0755), shared by every instance so one glob spans them.
-LogsDirectory=timberfs/follow
+# Creates and owns this instance's own store directory
+# /var/log/timberfs/%i (0755). Per instance, not per intake kind, because a
+# directory is what a writer needs permission on: each one can then be
+# owned by its own User= drop-in without a directory every instance can
+# write to. A glob still spans the fleet — /var/log/timberfs/*/*.trunk.
+LogsDirectory=timberfs/%i
 
 # Restarting is cheap and safe: the store is the follower's checkpoint, so a
 # restart re-syncs against the store's own lines rather than a position file,

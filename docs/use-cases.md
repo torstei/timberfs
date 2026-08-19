@@ -123,7 +123,7 @@ The mirror of the adapter case, for applications that already speak OTLP. Point
 them at a collector, fan out: everything to timberfs, the warm subset onward.
 
 ```sh
-timberfs otlp-intake --into-dir /var/log/timberfs/otlp --auto-create &
+timberfs otlp-intake --into-dir /var/log/timberfs --auto-create &
 ```
 
 ```yaml
@@ -173,7 +173,7 @@ use. One store per tag, minted on sight in the Docker-host mode, and a `chunk`
 id is acked only once durable:
 
 ```sh
-timberfs forward-intake --into-dir /var/log/timberfs/forward --auto-create &
+timberfs forward-intake --into-dir /var/log/timberfs --auto-create &
 
 docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 \
     --log-opt tag={{.Name}} --log-opt fluentd-async=true \
@@ -196,7 +196,7 @@ tier, a queue behind one) can sit in the middle or replace either end.
 
 ```sh
 # on the central host
-timberfs otlp-intake --into-dir /var/log/timberfs/otlp
+timberfs otlp-intake --into-dir /var/log/timberfs
 
 # on each edge host
 timber-otlp --follow --cursor /var/lib/timberfs/edge.cursor \

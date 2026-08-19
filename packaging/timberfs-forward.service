@@ -1,7 +1,10 @@
 # Systemd unit for the Fluentd Forward protocol intake (see
 # timberfs-forward.socket). Not templated — Forward multiplexes every tag
 # over the one connection, so one instance serves every tag it sees, each
-# landing in its own store at /var/log/timberfs/forward/<tag>.log.
+# landing in its own store at /var/log/timberfs/<tag>/<tag>.log: the same
+# layout every timberfs intake writes, so a tag's store is named after the
+# tag and nothing about the protocol that delivered it (`timberfs query
+# nginx` resolves it by that name).
 #
 # The producer must speak Forward protocol v1 (Message, Forward or
 # PackedForward — CompressedPackedForward/gzip is refused). Override the
@@ -11,7 +14,7 @@
 #     [Service]
 #     ExecStart=
 #     ExecStart=/usr/bin/timberfs forward-intake --exit-on-upgrade \
-#         --into-dir /var/log/timberfs/forward --retain 30d
+#         --into-dir /var/log/timberfs --retain 30d
 #
 # This is socket-activated: enable the .socket, not this unit.
 
@@ -23,7 +26,7 @@ After=timberfs-forward.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs/forward --exit-on-upgrade
+ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs --exit-on-upgrade
 # NOT StandardInput=socket: unlike the FIFO log-intake pair (which reads a
 # single accepted connection straight off stdin), this is a listen socket
 # accepting many connections, handed over the standard LISTEN_FDS/LISTEN_PID
@@ -31,10 +34,13 @@ ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs/forward 
 StandardOutput=journal
 StandardError=journal
 
-# Owns /var/log/timberfs/forward (0755) — where every tag's .trunk/.rings/
-# .bark live. A drop-in that sets User= gets that directory owned by that
-# user instead.
-LogsDirectory=timberfs/forward
+# Owns /var/log/timberfs (0755) — the directory this receiver creates each
+# tag's own store directory in. With --auto-create that means write
+# permission on it, so a confined instance (a User= drop-in) is better given
+# a root of its own: --into-dir /var/log/timberfs/docker, say. Without
+# --auto-create the receiver creates nothing and needs none: the operator
+# pre-creates each store, wherever that store's owner should be.
+LogsDirectory=timberfs
 
 # Unlike the FIFO log-intake pair, the .socket here does NOT hold the
 # client's TCP connections open across a restart of this service — a

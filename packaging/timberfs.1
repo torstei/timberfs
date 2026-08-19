@@ -891,8 +891,13 @@ Docker's
 log driver, Fluent Bit, Fluentd, and the fluent\-logger client libraries \(em
 and writes each tag into its own store under
 .IR DIR ,
-named
-.IB TAG .log.
+in a directory of its own:
+.IB DIR/TAG / TAG .log\fR.
+That is the layout every timberfs intake writes, so a store is named after
+the tag and nothing about the protocol that delivered it \(em
+.B timberfs query
+.I TAG
+resolves it by that name.
 One connection multiplexes many tags; a container's stdout and stderr share
 one tag and interleave in arrival order (the
 .B source
@@ -932,10 +937,13 @@ Ignored under systemd socket activation (LISTEN_PID/LISTEN_FDS set), which
 takes the already\-bound listener instead.
 .TP
 .BI \-\-into\-dir " DIR"
-Backing directory: one store per tag, named
-.IB TAG .log.
+Root directory: one store per tag, each in its own directory,
+.IB DIR/TAG / TAG .log\fR.
 Stores are pre\-created by the operator by default (see
-.BR \-\-auto\-create ).
+.BR \-\-auto\-create ),
+in which case nothing is created here and no write permission on
+.I DIR
+is needed.
 .TP
 .B \-\-auto\-create
 Create a store for a never\-seen tag automatically \(em the Docker\-host
@@ -1046,7 +1054,9 @@ the OTLP/HTTP port). systemd socket activation on fd 3 is used instead when
 name this process.
 .TP
 .BI \-\-into\-dir " DIR"
-Backing directory: one store per stream, named after the route value.
+Root directory: one store per stream, each in its own directory named after
+the route value,
+.IB DIR/NAME / NAME .log\fR.
 .TP
 .BI \-\-route " ATTR"
 Resource attribute whose value names the store (default
@@ -1336,6 +1346,27 @@ Stopping the unit unmounts first, so the daemon flushes all buffers and
 exits cleanly. An example configuration is installed under
 .IR /usr/share/doc/timberfs/examples/ .
 .PP
+Every intake below writes the same layout,
+.IB /var/log/timberfs/ name / name .log\fR:
+one directory per store, named after the store, which is also the handle
+.B timberfs query
+resolves it by (see
+.BR FORESTS ).
+A store's path therefore says what the store IS and nothing about how the
+data reached it \(em the same log keeps its name and its store when it is
+later fed by another route. The directory is per store because a directory
+is what a writer needs permission on, so one store can be given one owner.
+Point an intake's
+.B STORE_DIR
+or
+.B \-\-into\-dir
+somewhere else to group stores by subject, one owner and one place per
+group. What stays intake\-specific is intake configuration \(em
+.IB /etc/timberfs/text- instance .conf\fR,
+or the FIFO under
+.I /run/timberfs
+\(em because that belongs to the mechanism, not to the log.
+.PP
 A socket\-activated log\-intake pair,
 .B timberfs\-log@.socket
 and
@@ -1357,7 +1388,7 @@ nginx's
 the producer writes
 .IB /run/timberfs/text/ instance .pipe
 and the store lands in
-.IR /var/log/timberfs/text/ instance .log\fR.
+.IB /var/log/timberfs/ instance / instance .log\fR.
 The point of that route for such a producer is that the writer is NOT its
 child, so a reload never spawns, races or kills it \(em and because the
 socket holds the FIFO open

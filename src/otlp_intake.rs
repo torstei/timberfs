@@ -34,7 +34,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -380,10 +380,8 @@ fn route_of(batch: &IncomingBatch, route: &str) -> String {
 /// stream whose store cannot be opened makes the whole request retryable
 /// (503), and a sender retrying a request we had half-written would
 /// duplicate the half we kept.
-#[allow(clippy::too_many_arguments)]
 fn handle_export(
     intake: &Mutex<Intake>,
-    dir: &Path,
     cfg: &Config,
     opts: &OtlpOpts,
     extractor: &crate::import::Extractor,
@@ -399,7 +397,6 @@ fn handle_export(
             let name = intake::store_name(&route);
             if let Err(e) = intake::ensure_store(
                 &mut g,
-                dir,
                 &name,
                 &format!("undeclared stream {route:?}"),
                 opts.auto_create,
@@ -424,7 +421,7 @@ fn handle_export(
                 let head = rec.body.split('\n').next().unwrap_or_default();
                 let line = rec.to_line(extractor.extract(head).is_some(), now);
                 let t = rec.event_ms(now);
-                match g.store.files.get_mut(name) {
+                match g.file(name) {
                     Some(f) => match f.append_windowed(&line, t, t, cfg) {
                         Ok(()) => stored += 1,
                         Err(e) => {
@@ -444,7 +441,7 @@ fn handle_export(
     // often senders export.
     for name in &targets {
         let mut g = intake.lock().unwrap();
-        let durable = match g.store.files.get_mut(name) {
+        let durable = match g.file(name) {
             Some(f) if f.has_wal() => f.sap_sync().is_ok(),
             Some(f) => f.flush_chunk(cfg).and_then(|()| f.sync(cfg)).is_ok(),
             None => false,
@@ -483,7 +480,6 @@ fn decode(enc: Encoding, body: &[u8]) -> anyhow::Result<Vec<IncomingBatch>> {
 fn handle_connection(
     stream: TcpStream,
     intake: Arc<Mutex<Intake>>,
-    dir: PathBuf,
     cfg: Config,
     opts: Arc<OtlpOpts>,
 ) {
@@ -546,7 +542,7 @@ fn handle_connection(
                     Ok(body) => match decode(enc, &body) {
                         Err(e) => Reply::err(400, "Bad Request", format!("{e:#}\n")),
                         Ok(batches) => {
-                            handle_export(&intake, &dir, &cfg, &opts, &extractor, &batches, enc)
+                            handle_export(&intake, &cfg, &opts, &extractor, &batches, enc)
                         }
                     },
                 }
@@ -575,7 +571,10 @@ pub fn cmd_otlp_intake(
         .as_deref()
         .map(crate::append::parse_size_bytes)
         .transpose()?;
-    let _dir_lock = intake::open_backing_dir(into_dir)?;
+    // The root, taken up front so an --into-dir pointed at a mounted
+    // store fails at startup rather than on the first stream. Each store's
+    // own directory is taken the same way as it is created.
+    let _root_lock = intake::open_backing_dir(into_dir)?;
 
     let cfg = Config {
         chunk_size: 256 * 1024,
@@ -592,7 +591,6 @@ pub fn cmd_otlp_intake(
     // HTTP response, and the request thread has already waited for it.
     let maint = intake::spawn_maintenance(
         Arc::clone(&intake),
-        into_dir.to_path_buf(),
         Arc::clone(&stop),
         exit_on_upgrade,
         |_, _| {},
@@ -621,9 +619,8 @@ pub fn cmd_otlp_intake(
             }
         };
         let intake = Arc::clone(&intake);
-        let dir = into_dir.to_path_buf();
         let opts = Arc::clone(&opts);
-        thread::spawn(move || handle_connection(stream, intake, dir, cfg, opts));
+        thread::spawn(move || handle_connection(stream, intake, cfg, opts));
     }
 
     stop.store(true, Ordering::Relaxed);

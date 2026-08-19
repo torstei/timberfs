@@ -29,45 +29,89 @@ pass its own paths.
 /run/timberfs/text/<instance>.pipe        plain-text intake FIFO, same but for the
                                           timberfs-text@ pair (Apache, nginx)
 
-/var/log/timberfs/<instance>/             one directory per log-intake instance,
-                                          owned by that instance's service user:
-    <instance>.log.trunk                    the data — chunked zstd frames
-    <instance>.log.rings                    the write-time index (per-chunk time bounds)
-    <instance>.log.grain                    optional token index (present with --index)
-    <instance>.log.bark                     JSON manifest: durable identity + retention
-    <instance>.log.sap                      optional write-ahead sidecar (present with --wal)
-    <instance>.log.lock                     the store's writer lock
+/var/log/timberfs/<name>/                 one directory per STORE, named after the
+                                          store, whatever intake writes it —
+                                          owned by that store's writer:
+    <name>.log.trunk                        the data — chunked zstd frames
+    <name>.log.rings                        the write-time index (per-chunk time bounds)
+    <name>.log.grain                        optional token index (present with --index)
+    <name>.log.bark                         JSON manifest: durable identity + retention
+    <name>.log.sap                          optional write-ahead sidecar (present with --wal;
+                                            always, for the acking network intakes)
+    <name>.log.lock                         the store's writer lock
   .timberfs.lock                            the directory lock (see Locking)
 
-/var/log/timberfs/text/                   one directory shared by every plain-text
-                                          intake instance (timberfs-text@), so one
-                                          glob spans the fleet:
-    <instance>.log.trunk / .rings / .grain / .bark / .lock   one store per instance
-                                          (e.g. apache-access.log and
-                                          apache-error.log for a whole web server)
-  .timberfs.lock                            the directory lock (see Locking)
-
-/var/log/timberfs/follow/                 one directory shared by every file
-                                          follower (timberfs-follow@), the store
-                                          named after the instance:
-    <instance>.log.trunk / .rings / .grain / .bark / .lock
-
-/var/log/timberfs/forward/                one directory shared by every tag the
-                                          Fluentd Forward intake sees (it is a
-                                          single TCP listener, not templated):
-    <tag>.log.trunk / .rings / .grain / .bark / .sap / .lock   one store per tag
-                                          (.sap always: an acking receiver
-                                          declares "wal": true on every store)
-  .timberfs.lock                            the directory lock (see Locking)
-
-/var/log/timberfs/otlp/                   likewise for the OTLP intake, one
-                                          store per stream (routed by
-                                          service.name):
-    <service>.log.trunk / .rings / .grain / .bark / .sap / .lock
-  .timberfs.lock                            the directory lock (see Locking)
+    <name> is the instance for the FIFO and follower templates, the tag for the
+    Forward intake, and the route value (default service.name) for the OTLP one.
 ```
 
-The store's **logical name** is `<instance>.log`, so you read it with the full
+### One layout, no intake in the path
+
+Every intake writes `/var/log/timberfs/<name>/<name>.log`. The path says what the
+store **is**, never how the data reached it: this is the `apache-access` store,
+not the *followed* or *piped* one, and it keeps that name — and that store — if
+the same log is later fed by a different route. It is also the name you query it
+by, since a store's handle is its file name minus `.log` (see below), so path,
+handle and `timberfs list` all say the same word.
+
+The directory is per store rather than per intake because a directory is the unit
+that matters: **any** writer operation (indexing, rotation) needs write
+permission on it, it is what carries the mount exclusion, and it is what one
+owner can be given. Grouping stores is still a `STORE_DIR` / `--into-dir` away —
+by *subject*, the axis timberfs cannot know:
+
+```ini
+# /etc/timberfs/follow.conf — every mail log in one place, one owner
+STORE_DIR=/var/log/timberfs/mail
+```
+
+What *does* stay intake-specific is intake **configuration** —
+`/etc/timberfs/text-<instance>.conf`, `/run/timberfs/text/<instance>.pipe` —
+because that belongs to the mechanism rather than to the log.
+
+#### Upgrading from 0.15.0 or earlier
+
+Four defaults moved to that layout, so an existing install must be told which
+one it wants **before** the units restart. Otherwise the writer creates a store
+at the new path and the old one simply stops growing — nothing is lost, but the
+history is split across two paths.
+
+| intake | store was | store is now |
+|---|---|---|
+| `timberfs-text@<i>` | `/var/log/timberfs/text/<i>.log` | `/var/log/timberfs/<i>/<i>.log` |
+| `timberfs-follow@<i>` | `/var/log/timberfs/follow/<i>.log` | `/var/log/timberfs/<i>/<i>.log` |
+| `forward-intake` | `/var/log/timberfs/forward/<tag>.log` | `/var/log/timberfs/<tag>/<tag>.log` |
+| `otlp-intake` | `/var/log/timberfs/otlp/<name>.log` | `/var/log/timberfs/<name>/<name>.log` |
+
+**Keep the old paths** — one line each, no data movement:
+
+```ini
+# /etc/timberfs/text.conf  (and follow.conf, with its own directory)
+STORE_DIR=/var/log/timberfs/text
+```
+
+For the two network intakes, keep the old `--into-dir` in the drop-in that
+already overrides their `ExecStart`; a stock install has none, so add one
+(`systemctl edit timberfs-forward.service`) or accept the move. Note that the
+old layout put every one of an intake's stores in ONE directory, which the
+receivers no longer do: pinning `--into-dir /var/log/timberfs/forward` now
+yields `/var/log/timberfs/forward/<tag>/<tag>.log`, not the old flat file. For
+those two, moving is usually easier than pinning.
+
+**Or move a store** to the new path, writer stopped (`.log.*` is every artifact
+— trunk, rings, grain, bark, sap, lock):
+
+```sh
+systemctl stop timberfs-text@apache-access.service
+mkdir -p /var/log/timberfs/apache-access
+mv /var/log/timberfs/text/apache-access.log.* /var/log/timberfs/apache-access/
+systemctl start timberfs-text@apache-access.service
+```
+
+The handle is unchanged either way (`timberfs query apache-access`), because a
+handle never contained the directory.
+
+The store's **logical name** is `<name>.log`, so you read it with the full
 path:
 
 ```sh
@@ -91,16 +135,16 @@ resolve as `nginx`. Full paths always win and nothing existing changes; edit
 `DIR`, drop in another `*.conf`, or delete the file to disable the lookup (it's
 a conffile, so edits survive upgrades). See `man timberfs` (FORESTS).
 
-### Why a directory per instance
+A glob spans the fleet through the artifacts a shell can see — a logical name is
+not a file, so `.../'*'.log` matches nothing and `*.trunk` is the form that
+works:
 
-Creating an index, or rotating — in fact **any writer operation** — needs write
-permission on the *directory*, not just on the store files, because it creates
-new files there. A directory per instance lets each one be owned and managed by
-its own user without a directory that every instance can write to, and it keeps
-per-store file ownership clean. The store is named after the instance (rather
-than a fixed name) so its logical name stays unique and meaningful even across
-hundreds of instances. An instance that needs more than one stream just sets a
-custom `--into` in a drop-in.
+```sh
+timberfs query /var/log/timberfs/*/*.trunk --from 13:40
+```
+
+An instance that needs more than one stream in one directory just sets a custom
+`--into` in a drop-in.
 
 ## systemd units
 
@@ -215,10 +259,10 @@ One store per site is then a *filter*, not a file:
 
 ```sh
 # everything one vhost did, both streams, in time order
-timber-filter --has shop.example.com /var/log/timberfs/text/apache-'*'.log --from 13:40
+timber-filter --has shop.example.com /var/log/timberfs/apache-*/*.trunk --from 13:40
 
 # hand that site's window to someone as a store of its own, provenance recorded
-timber-filter --records --has shop.example.com /var/log/timberfs/text/apache-access.log \
+timber-filter --records --has shop.example.com apache-access \
     | timberfs import --records --into /tmp/shop-case.log
 ```
 
@@ -247,12 +291,12 @@ ErrorLog  /run/timberfs/text/www.example.com.error.pipe
 The two layouts mix freely — same units, different instance names — so
 consolidate the small sites and split out the one that needs its own rules.
 Per-vhost instances also contain a stall: a wedged writer holds up only its own
-site, where the consolidated layout has one writer for everything. Their stores
-share one directory, so a vhost's two streams still read as one interleaved,
-attributed view:
+site, where the consolidated layout has one writer for everything. Reading a
+vhost's two streams as one interleaved, attributed view is a query over both
+stores — by handle, since each has its own directory:
 
 ```sh
-timberfs query /var/log/timberfs/text/www.example.com'*'.log --from 13:40
+timberfs query www.example.com www.example.com.error --from 13:40
 ```
 
 #### Both layouts
@@ -263,7 +307,7 @@ default and restarting the instance is enough (the producer is not involved):
 
 ```ini
 # /etc/timberfs/text.conf — defaults for every instance
-STORE_DIR=/var/log/timberfs/text
+STORE_DIR=/var/log/timberfs
 DECLARE=index=true retain=90d
 ```
 
@@ -358,7 +402,7 @@ its writes. Leave those writing their own file and read it:
 
 ```sh
 timberfs import --follow /var/log/exim4/mainlog \
-    --into /var/log/timberfs/follow/exim-main.log
+    --into /var/log/timberfs/exim-main/exim-main.log
 ```
 
 **The coupling is the point.** With the FIFO pair the producer writes into a
@@ -439,7 +483,7 @@ what is new, and rotation needs no bookkeeping:
 
 ```sh
 timberfs import /var/log/exim4/mainlog \
-    --into /var/log/timberfs/text/exim-main.log
+    --into /var/log/timberfs/exim-main/exim-main.log
 #  imported 2 lines
 #  imported 1 lines after 110 bytes already imported      <- after it grew
 #  exim-main.log is already up to date; nothing imported  <- nothing new
@@ -457,13 +501,13 @@ the ROTATED file first and the live one second, on every tick:
 [Service]
 Type=oneshot
 ExecStartPre=/usr/bin/timberfs create --if-not-exists --index --retain 90d \
-    /var/log/timberfs/text/exim-main.log
+    /var/log/timberfs/exim-main/exim-main.log
 # The leading "-" matters: before the first rotation there is no mainlog.1,
 # and a failing ExecStart would abort the unit before the live import ran.
 ExecStart=-/usr/bin/timberfs import --quick /var/log/exim4/mainlog.1 \
-    --into /var/log/timberfs/text/exim-main.log
+    --into /var/log/timberfs/exim-main/exim-main.log
 ExecStart=/usr/bin/timberfs import --quick /var/log/exim4/mainlog \
-    --into /var/log/timberfs/text/exim-main.log
+    --into /var/log/timberfs/exim-main/exim-main.log
 ```
 ```ini
 # /etc/systemd/system/timberfs-import-exim.timer
@@ -531,7 +575,7 @@ later:
 ```
 postrotate
     /usr/bin/timberfs import --quick /var/log/exim4/mainlog.1 \
-        --into /var/log/timberfs/text/exim-main.log
+        --into /var/log/timberfs/exim-main/exim-main.log
 endscript
 ```
 
@@ -588,11 +632,11 @@ over TCP — the wire protocol Docker's `fluentd` log driver, Fluent Bit,
 Fluentd and the fluent-logger client libraries already speak — with no
 producer-side changes needed. Unlike the FIFO pair above this is **one TCP
 listener for every tag**, not a template: Forward multiplexes tags over a
-single connection, and each tag lands in its own store under
-`/var/log/timberfs/forward/<tag>.log`.
+single connection, and each tag lands in its own store at
+`/var/log/timberfs/<tag>/<tag>.log`.
 
 By default the store set is **operator-controlled**: pre-create each tag's
-store (`timberfs create --wal /var/log/timberfs/forward/<tag>.log` — with
+store (`timberfs create --wal /var/log/timberfs/<tag>/<tag>.log` — with
 `--if-not-exists` where that provisioning re-runs on every boot), and an
 unknown tag is refused — logged once, never acked, so an acking sender
 buffers and retries until the store exists. On a Docker host, where tags
@@ -603,7 +647,7 @@ a drop-in:
 # systemctl edit timberfs-forward.service — Docker hosts: mint stores per tag
 [Service]
 ExecStart=
-ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs/forward \
+ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs \
     --exit-on-upgrade --auto-create
 ```
 
@@ -630,7 +674,8 @@ authentication or negotiation phase and this receiver adding none of its own:
 
 - **No TLS, no handshake** — bind it to loopback or a private network only
   (override the address with a drop-in, see below); anything that can reach
-  the listening address can write to any store under `--into-dir`.
+  the listening address can write to any store under `--into-dir`, and with
+  `--auto-create` can create new ones there.
 - **No `CompressedPackedForward` (gzip)** — refused; the connection is logged
   and closed rather than silently dropping data.
 - **No UDP heartbeat listener.**
@@ -645,8 +690,8 @@ OpenTelemetry protocol every SDK and the Collector speak — so an existing
 OTel pipeline can write into timberfs, and the Collector bridges syslog,
 journald, Kafka and Fluent Bit in behind it. Like the Forward intake this is
 **one TCP listener for every stream**: OTLP multiplexes resources inside the
-request body, and each `ResourceLogs` lands in its own store under
-`/var/log/timberfs/otlp/<service.name>.log`.
+request body, and each `ResourceLogs` lands in its own store at
+`/var/log/timberfs/<service.name>/<service.name>.log`.
 
 ```yaml
 # an OpenTelemetry Collector exporting to it — nothing to configure beyond
@@ -711,12 +756,15 @@ batch, so an interrupted send is re-delivered rather than skipped
 
 ## Ownership and permissions
 
-- **The store directory** is created by `LogsDirectory=timberfs/%i` (or plain
-  `timberfs/text` for the plain-text intake, `timberfs/follow` for the file
-  follower, `timberfs/forward` for the Forward intake, `timberfs/otlp` for the
-  OTLP intake), owned by the service's `User=`
-  (root by default). Set `User=` in a drop-in to own the directory as a
-  specific user.
+- **The store directory** is created by `LogsDirectory=timberfs/%i` in the
+  templated intakes, owned by the service's `User=` (root by default). Set
+  `User=` in a drop-in to own one store's directory as a specific user. The two
+  network intakes are not templated, so systemd can only own their root
+  (`LogsDirectory=timberfs`): with `--auto-create` such a receiver creates each
+  store directory itself and therefore needs write permission on that root, so
+  a confined instance is better given a root of its own (`--into-dir
+  /var/log/timberfs/docker`). Without `--auto-create` it creates nothing — the
+  operator pre-creates each store, wherever its owner should be.
 - **The FIFO** is created `root:root 0660`. A non-root producer cannot write it
   until you set the socket's group to one that user belongs to (`SocketGroup=`);
   there is no sane default, because the producer's identity is site-specific.
@@ -729,7 +777,7 @@ batch, so an interrupted send is re-delivered rather than skipped
 - **Readers vs. writers.** `query` and `info` are read-only — they need only
   read access to the store, not write access to its directory. `append`,
   `index`, `reindex` and `rotate` are writers and *do* need directory write
-  (they create files). That asymmetry is the whole reason the per-instance
+  (they create files). That asymmetry is the whole reason the per-store
   directory matters: a store's owner can index and rotate it; anyone with read
   access can still query it.
 

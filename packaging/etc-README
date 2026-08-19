@@ -22,13 +22,15 @@ for a producer that can only log to a path (Apache, nginx). text.conf holds
 the defaults for every instance and text-<instance>.conf overrides them for
 one, key by key:
 
-    STORE_DIR=/var/log/timberfs/text
+    STORE_DIR=/var/log/timberfs
     DECLARE=index=true retain=90d
 
 Then: systemctl enable --now timberfs-text@<instance>.socket
 
 DECLARE is applied to the store on every start, so retention lives here
-rather than in someone's shell history.
+rather than in someone's shell history. The store is
+STORE_DIR/<instance>/<instance>.log: one directory per store, named after
+the store, which is the name you query it by.
 
 follow-<instance>.conf configures one file follower (timberfs-follow@) — for
 a producer that keeps writing its own log file while timberfs reads it. SOURCE

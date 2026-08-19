@@ -1,6 +1,9 @@
 # Systemd unit for the OTLP/HTTP logs intake (see timberfs-otlp.socket).
 # Not templated — one instance serves every stream it sees, each landing in
-# its own store at /var/log/timberfs/otlp/<service.name>.log.
+# its own store at /var/log/timberfs/<service.name>/<service.name>.log: the
+# same layout every timberfs intake writes, so a stream's store is named
+# after the service and nothing about the protocol that carried it
+# (`timberfs query checkout` resolves it by that name).
 #
 # The sender posts OTLP/HTTP to /v1/logs in either encoding (binary
 # protobuf or JSON), gzipped or not, so an OpenTelemetry Collector needs
@@ -17,7 +20,7 @@
 #     [Service]
 #     ExecStart=
 #     ExecStart=/usr/bin/timberfs otlp-intake --exit-on-upgrade \
-#         --into-dir /var/log/timberfs/otlp --retain 30d --index
+#         --into-dir /var/log/timberfs --retain 30d --index
 #
 # This is socket-activated: enable the .socket, not this unit.
 
@@ -29,17 +32,20 @@ After=timberfs-otlp.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs otlp-intake --into-dir /var/log/timberfs/otlp --exit-on-upgrade
+ExecStart=/usr/bin/timberfs otlp-intake --into-dir /var/log/timberfs --exit-on-upgrade
 # NOT StandardInput=socket: this is a listen socket accepting many
 # connections, handed over the standard LISTEN_FDS/LISTEN_PID protocol at
 # fd 3 (SD_LISTEN_FDS_START).
 StandardOutput=journal
 StandardError=journal
 
-# Owns /var/log/timberfs/otlp (0755) — where every stream's .trunk/.rings/
-# .bark/.sap live. A drop-in that sets User= gets that directory owned by
-# that user instead.
-LogsDirectory=timberfs/otlp
+# Owns /var/log/timberfs (0755) — the directory this receiver creates each
+# stream's own store directory in. With --auto-create that means write
+# permission on it, so a confined instance (a User= drop-in) is better given
+# a root of its own: --into-dir /var/log/timberfs/otel, say. Without
+# --auto-create the receiver creates nothing and needs none: the operator
+# pre-creates each store, wherever that store's owner should be.
+LogsDirectory=timberfs
 
 # A restart drops in-flight connections. OTLP senders are built for that:
 # an export that gets no response is retried, which is why the response is
