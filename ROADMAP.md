@@ -38,6 +38,86 @@ works is in [docs/design.md](docs/design.md).
   stays the database; the server owns no state that is not a plain
   timberfs file. Path: lib refactor → .bark → read-only serve → ingest →
   tiering.
+- **Read-only serve**: the next step on that path — the lib boundary and
+  `.bark` are done. Make a forest readable over the network so an operator
+  can search it without shell access on the log host: enumerate stores
+  (`list`), report one (`info`), and select entries by time window and by
+  the existing predicates, grain-accelerated as locally. The protocol is
+  mostly already written — the control plane is what `--json` already
+  emits, and the data plane is a **timberfs-records(5) stream**, whose
+  stream-end totals prove the response arrived complete, which a bare HTTP
+  body cannot. HTTP, not gRPC, for the reason `otlp-intake` gives. The
+  client then stays thin and composable: a remote selection pipes into
+  `timber-filter` and `import --records` unchanged, so the
+  investigation-as-artifact workflow works across the network with the
+  tools that already exist. Two things to design in rather than bolt on:
+  a **cost preflight** (chunk selection precedes decompression, so the
+  server can state how many chunks and roughly how many bytes a query
+  would read *before* reading them — most log servers cannot answer that
+  without doing the work), and **fleet shape**: the client fans out to N
+  hosts and merges, exactly as multi-file `query` interleaves today. No
+  proxying server, no cluster, no leader. A Loki-compatible facade — the
+  compatibility bet worth taking for Grafana and its client ecosystem —
+  layers *over* this, never under it: LogQL's label model would flatten
+  the entry and two-clock semantics if it were the core. Concurrency needs
+  nothing new; a server is just another standalone reader, already covered
+  by the collapse seqlock and the grain/rings generation check.
+- **Scoped, audited read access**: what a serve API makes possible and
+  shell access cannot — a grant of *subject × store or forest × data
+  window × grant lifetime*, the last two being different clocks ("this
+  hour of yesterday, readable until next week"). It enforces where
+  selection already happens, before decompression, so bytes outside the
+  grant are never read rather than read-and-filtered. ⚠ The disposition
+  must invert: `query` deliberately fails OPEN — an entry whose own
+  timestamp cannot be parsed is always included, and the chunk window is
+  widened — which is right for search and a leak for authorization, so a
+  grant has to fail closed. Content predicates are NOT exactly enforceable
+  (`--has` is chunk-level and Bloom filters carry ~1% false positives), so
+  they may narrow a grant but must never be its boundary. A live grant
+  probably implies a **retention hold** on the chunks it covers, else the
+  window ages out mid-investigation — the same open question as a cursor
+  holding retention back. The static alternative already exists and is
+  airtight in a way a server cannot be: `export --from/--to` into a
+  `.timber` bundle makes the capability the data itself — un-widenable,
+  carrying its own recorded window and lineage — at the cost of copying it
+  and of being unrevocable. The two are complementary, and a grant could
+  be implemented as an ephemeral virtual bundle to keep one mental model.
+  Audit records the **selection**, not merely the access (the records
+  stream-start already carries it) plus the preflight's volume, so bulk
+  collection reads differently from investigation; it ships off-box,
+  because a trail on the host it audits is not evidence against local
+  root; and its store stays out of the served forests, or a broad grant
+  reads the record of its own reads.
+- **Native replication (frames on the wire, not entries)**: shipping a
+  store through OTLP — or through a records stream — throws away the
+  compression already paid for at ingest: both decompress at the source,
+  send plaintext, and make the receiver spend CPU compressing it back into
+  something close to what was sent. Moving the `.trunk` frames verbatim
+  reuses that work twice, for storage and for transport, turning
+  replication into a byte copy at roughly a tenth of the bandwidth. Most
+  of the format exists: a `.timber` bundle is already tar(`.rings`,
+  `.trunk`, `.bark`) and `import` takes it directly, so this is the
+  incremental, streaming form of the batch artifact sawmill already plans
+  to accept over HTTP. Chunk boundaries survive the hop, which is also
+  what would let a `.grain` travel — the index is chunk-positional, so it
+  can only be shipped by a transport that preserves alignment (and is why
+  bundles COULD carry one; they don't yet). Three constraints define it:
+  (1) the resume key is a **write window plus lengths, never a byte
+  offset** — a retention head-drop shifts every offset, and windows and
+  lengths are exactly what `read_chunk` already re-locates a chunk by for
+  that reason; (2) raw is **1:1 mirroring, not fan-in** — frames are
+  opaque and the rings must stay sorted, so interleaving two sources into
+  one store requires decoding, which is the records path's job. Raw
+  mirrors, records merge and transform; the two transports are for
+  different jobs, not competitors; (3) validating what arrives costs the
+  decompression the design exists to avoid, so verification is a choice,
+  not a default — trust the link as the intakes do, keep the cheap
+  structural checks (ring records consistent with frame sizes), and leave
+  a corrupt frame to fail at read, where `zstd -dc` is already the stated
+  recovery path. This is the WRITE-direction complement to read-only
+  serve; whether one endpoint family serves both representations — records
+  for "I want to read this", frames for "I want a copy of this" — is worth
+  deciding only once the read side exists.
 - **OTLP gaps**: gRPC on :4317 wants HTTP/2 and an async runtime, so the
   answer stays "put a Collector in front" until something forces it.
   Metrics and traces remain out of scope by design. Smaller: a pre-created
@@ -66,6 +146,65 @@ works is in [docs/design.md](docs/design.md).
   reading a store and how far behind they are (the state directory knows,
   nothing surfaces it), and whether a cursor should ever hold retention
   back so a disconnected consumer cannot be truncated out from under.
+  The larger step is putting a cursor on the RECORDS stream
+  (`query --follow --records --cursor`, a flag rather than a new binary —
+  the tool boundary is destination-shaped, not format-shaped), because it
+  turns durable consumption from a Rust API into a pipe contract: today
+  resuming means linking `cursor.rs`, i.e. writing our own shipper, and
+  after it anyone's script is one. What makes that non-trivial is that a
+  pipe has no acknowledgement — `timber-otlp` advances only once the
+  receiver accepts a batch, and the HTTP 200 IS the durability proof,
+  where a write to stdout proves nothing. So the rule is **the cursor
+  belongs to whoever can prove durability**, and it wants two primitives,
+  not one: `--cursor` on the producer (advance on write-out — correct
+  whenever the consumer is idempotent, which `import --records` is, so
+  store-to-store replication is safe under it), and `--start-after WF:WL`
+  so a consumer that fsyncs can own the position and drive the producer
+  from it, with no protocol at all. `--start-after` is also exactly the
+  resume primitive a remote live tail needs once read-only serve exists.
+  Note the records path is the cursor-FRIENDLY one: `append --records`
+  keeps the source's `wf`/`wl`, so the write axis survives the hop and
+  stays meaningful across chained replication, where the OTLP path
+  restamps (see "Arrival time on a received store"). The axis rule carries
+  over unchanged — a cursor is only sound on the write axis, so it still
+  requires `--follow` and still refuses a stdin stream.
+- **Splitting downstream of a spool (fan-out by cursor)**: one store as the
+  intake spool — everything a web server writes, the vhost in the line — plus a
+  cursor consumer that routes entries into per-stream stores, instead of routing
+  at the intake. The motive is not tidiness: routing AT a FIFO cannot be made
+  safe, because only writes up to `PIPE_BUF` (4096 B) are atomic, so a torn long
+  line lands half in another destination's store — a misroute the router cannot
+  detect, i.e. exactly the answer an index must never give. Read a store
+  instead and entry boundaries are exact (the appender framed them, `--records`
+  states them), which turns the same routing mechanical. The write axis
+  survives too: `append --records` keeps the source's `wf`/`wl`, so a split
+  store's entries carry the spool's write window rather than the splitter's run
+  time, and the pipeline lands in the derived store's bark — a per-vhost
+  artifact then differs from a directly-written one only in lineage, which is
+  the point of recording lineage. Needs the cursor tap above plus a routing
+  sink (`append --into-dir --route ...`; the intake core already keeps N stores
+  flushed, retained and indexed, so the sink is mostly wiring). What the shape
+  buys beyond per-stream files: a routing rule can be FIXED AND REPLAYED from
+  the spool by rewinding one cursor, where a router at the intake has already
+  written its mistakes irrecoverably; several consumers can tap one spool
+  independently (split, ship onward, derive an ERROR-only store), each with its
+  own position; and the tiering thread gets its natural mechanism — a cold
+  consumer that re-carves. It also makes the spool's retention the consumer's
+  downtime budget, exactly as it already is for `timber-otlp`, with the same
+  hazard the cursor entry raises from the other side: retention that outruns an
+  unconsumed cursor drops data silently, which is the strongest argument for
+  either a cursor-aware retention floor or, at minimum, a visible lag. Costs
+  are honest ones: every entry is written twice for the spool's retention
+  window, there is one more thing to supervise, and per-stream stores compress
+  WORSE than the spool they came from (~1.8x on a three-vhost sample, because
+  each chunk is then filled by one site instead of all of them) — so a split
+  earns its keep when a per-stream artifact is the goal, not as a default
+  layout. Open: whether the router is a flag on `append` or its own verb;
+  whether a routing key is a field index, a regex capture, or a records-metadata
+  field once senders can set one; and what an unroutable entry deserves — a
+  fallback store, refuse-and-stall, or drop-with-count (the intakes' "refused,
+  logged once, never acked" precedent argues for the first, since a spool makes
+  the data recoverable either way).
 - **Watchers (reactive rules)**: evaluate a predicate continuously over the
   append stream and fire a configurable action on a match — a single entry (an
   `OutOfMemoryError` is logged), a windowed count (more than N errors in M
