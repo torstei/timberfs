@@ -1,6 +1,14 @@
-//! The receiver core shared by every network intake: a directory of
-//! stores, one writer lock each, and the maintenance tick that keeps them
+//! The receiver core shared by every network intake: the stores it
+//! writes, one writer lock each, and the maintenance tick that keeps them
 //! flushed, retained and indexed.
+//!
+//! Each store gets its own directory, `<root>/<name>/<name>.log` — the
+//! layout a systemd intake template writes too. A store's path spells the
+//! store's name, which is also its query handle, and never the protocol
+//! that delivered it. Per store rather than per protocol because the
+//! directory is the boundary that matters: a writer needs permission on
+//! it, it carries the mount exclusion, and it is what one owner can be
+//! given.
 //!
 //! A protocol module supplies only what is protocol-specific — how bytes
 //! become entries, how a store is named, what a manifest is seeded with,
@@ -28,9 +36,18 @@ use crate::store::{self, Config, Store};
 /// Every store one receiver writes, plus whatever that protocol needs to
 /// keep under the same lock.
 pub struct Intake<X = ()> {
-    pub store: Store,
-    /// Kept alive for as long as this receiver holds each file's writer
-    /// lock; dropped (and so released) only on process exit.
+    /// Where this receiver creates each store's own directory.
+    pub root: PathBuf,
+    pub cfg: Config,
+    /// One store per logical name, alone in its own directory, keyed by
+    /// that name — so the map, the lock maps and the wire all say the same
+    /// word.
+    pub stores: BTreeMap<String, Store>,
+    /// The shared backing-directory lock of each store's directory (the
+    /// mount exclusion) and its exclusive per-file writer lock. Kept alive
+    /// for as long as this receiver writes that store; dropped (and so
+    /// released) only on process exit.
+    pub dir_locks: BTreeMap<String, File>,
     pub file_locks: BTreeMap<String, File>,
     /// Stores that could not be opened (typically: undeclared, with no
     /// --auto-create) — remembered so the refusal is logged once, not
@@ -40,22 +57,77 @@ pub struct Intake<X = ()> {
 }
 
 impl<X> Intake<X> {
-    pub fn new(dir: &Path, cfg: Config, extra: X) -> Intake<X> {
+    pub fn new(root: &Path, cfg: Config, extra: X) -> Intake<X> {
         Intake {
-            store: Store {
-                dir: dir.to_path_buf(),
-                cfg,
-                files: BTreeMap::new(),
-            },
+            root: root.to_path_buf(),
+            cfg,
+            stores: BTreeMap::new(),
+            dir_locks: BTreeMap::new(),
             file_locks: BTreeMap::new(),
             refused: BTreeSet::new(),
             extra,
         }
     }
+
+    /// The one file of the store called `name`, when this receiver has it
+    /// open. Every protocol appends, syncs and acks through this.
+    pub fn file(&mut self, name: &str) -> Option<&mut store::FileStore> {
+        self.stores.get_mut(name)?.files.get_mut(name)
+    }
+
+    /// Whether this receiver has that store open — the question an ack
+    /// asks: never acknowledge what has no store.
+    pub fn holds(&self, name: &str) -> bool {
+        self.stores.contains_key(name)
+    }
+
+    /// Every store open right now, for a tick that walks them.
+    pub fn names(&self) -> Vec<String> {
+        self.stores.keys().cloned().collect()
+    }
+
+    pub fn flush_all(&mut self) {
+        for s in self.stores.values_mut() {
+            s.flush_all();
+        }
+    }
+
+    pub fn flush_aged(&mut self) {
+        for s in self.stores.values_mut() {
+            s.flush_aged();
+        }
+    }
+
+    pub fn sap_sync_all(&mut self) {
+        for s in self.stores.values_mut() {
+            s.sap_sync_all();
+        }
+    }
+
+    pub fn enforce_retention(
+        &mut self,
+        name: &str,
+        max_age_ms: Option<u64>,
+        max_comp_bytes: Option<u64>,
+    ) -> std::io::Result<Option<store::RotateStats>> {
+        match self.stores.get_mut(name) {
+            Some(s) => s.enforce_retention(name, max_age_ms, max_comp_bytes),
+            None => Ok(None),
+        }
+    }
 }
 
-/// Take the backing directory a receiver writes into: create it, and
-/// refuse one a mount already serves (two writers, one directory).
+/// A store's own directory under a receiver's root: the store's name
+/// minus the trailing `.log` its logical name carries, which is exactly
+/// the handle `timberfs query` resolves it by.
+pub fn store_dir(root: &Path, name: &str) -> PathBuf {
+    root.join(name.strip_suffix(".log").unwrap_or(name))
+}
+
+/// Take a backing directory a receiver writes in: create it, and refuse
+/// one a mount already serves (two writers, one directory). Used twice —
+/// once for the root at startup, so a misconfigured `--into-dir` fails
+/// immediately, and once per store directory as it is created.
 pub fn open_backing_dir(dir: &Path) -> anyhow::Result<File> {
     fs::create_dir_all(dir)
         .with_context(|| format!("creating backing directory {}", dir.display()))?;
@@ -88,37 +160,48 @@ pub fn open_backing_dir(dir: &Path) -> anyhow::Result<File> {
 /// chunk per record.
 pub fn ensure_store<X>(
     intake: &mut Intake<X>,
-    dir: &Path,
     name: &str,
     subject: &str,
     auto_create: bool,
     seed: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    if intake.store.files.contains_key(name) {
+    if intake.stores.contains_key(name) {
         return Ok(());
     }
-    let brand_new = !crate::format::rings_path(dir, name).exists();
-    // Refuse BEFORE taking the lock: lock files are never unlinked, so an
-    // undeclared store must not leave even that much litter behind.
+    let dir = store_dir(&intake.root, name);
+    // Refuse BEFORE anything is created: neither a lock file (they are
+    // never unlinked) nor the store's directory, so a tag nobody declared
+    // leaves no litter at all.
+    let brand_new = !crate::format::rings_path(&dir, name).exists();
     if brand_new && !auto_create {
+        let path = dir.join(name);
         bail!(
-            "{subject}: no store {name} in {} — pre-create it \
-             (timberfs create --wal) or run with --auto-create",
-            dir.display()
+            "{subject}: no store {} — pre-create it \
+             (timberfs create --wal {}) or run with --auto-create",
+            path.display(),
+            path.display()
         );
     }
-    let lock = store::lock_file_exclusive(dir, name)?.ok_or_else(|| {
+    let dir_lock = open_backing_dir(&dir)?;
+    let lock = store::lock_file_exclusive(&dir, name)?.ok_or_else(|| {
         anyhow::anyhow!("{name} already has a writer (another timberfs writer or a rotation)")
     })?;
     store::write_lock_info(&lock, &format!("intake pid={}\n", std::process::id()))?;
     // Declare before create: open() reads the manifest to decide whether
     // to mint the sap, and the ack contract needs it live from the start.
     if brand_new {
-        seed(dir, name)?;
-    } else if !crate::bark::wal_declared(dir, name) {
-        crate::bark::declare_wal(dir, name)?;
+        seed(&dir, name)?;
+    } else if !crate::bark::wal_declared(&dir, name) {
+        crate::bark::declare_wal(&dir, name)?;
     }
-    intake.store.create(name)?;
+    let mut opened = Store {
+        dir,
+        cfg: intake.cfg,
+        files: BTreeMap::new(),
+    };
+    opened.create(name)?;
+    intake.stores.insert(name.to_string(), opened);
+    intake.dir_locks.insert(name.to_string(), dir_lock);
     intake.file_locks.insert(name.to_string(), lock);
     Ok(())
 }
@@ -134,7 +217,6 @@ pub fn ensure_store<X>(
 /// the lock released, holding only the store names the tick saw.
 pub fn spawn_maintenance<X, F>(
     intake: Arc<Mutex<Intake<X>>>,
-    dir: PathBuf,
     stop: Arc<AtomicBool>,
     exit_on_upgrade: bool,
     after_tick: F,
@@ -148,6 +230,7 @@ where
     } else {
         None
     };
+    let root = intake.lock().unwrap().root.clone();
     let mut indexed_chunks: BTreeMap<String, usize> = BTreeMap::new();
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
@@ -162,10 +245,11 @@ where
             if let Some(code) = graceful {
                 let names: Vec<String> = {
                     let mut g = intake.lock().unwrap();
-                    g.store.flush_all();
-                    g.store.files.keys().cloned().collect()
+                    g.flush_all();
+                    g.names()
                 };
                 for name in &names {
+                    let dir = store_dir(&root, name);
                     if crate::bark::index_declared(&dir, name) {
                         let _ = crate::grain::extend_grain(&dir, name);
                     }
@@ -178,14 +262,15 @@ where
 
             let names: Vec<String> = {
                 let mut g = intake.lock().unwrap();
-                g.store.flush_aged();
-                g.store.sap_sync_all();
-                g.store.files.keys().cloned().collect()
+                g.flush_aged();
+                g.sap_sync_all();
+                g.names()
             };
             for name in &names {
+                let dir = store_dir(&root, name);
                 match crate::bark::declared_retention(&dir, name) {
                     Ok(policy) if policy.is_some() => {
-                        let res = intake.lock().unwrap().store.enforce_retention(
+                        let res = intake.lock().unwrap().enforce_retention(
                             name,
                             policy.max_age_ms,
                             policy.max_comp_bytes,
@@ -199,9 +284,7 @@ where
                 let cur = intake
                     .lock()
                     .unwrap()
-                    .store
-                    .files
-                    .get(name)
+                    .file(name)
                     .map(|f| f.chunks.len())
                     .unwrap_or(0);
                 if cur != *indexed_chunks.get(name).unwrap_or(&0)
@@ -294,6 +377,29 @@ mod tests {
         assert_eq!(sanitize_name("../app"), "_app");
         assert_eq!(sanitize_name(""), "untagged");
         assert!(!sanitize_name("../../etc/passwd").contains('/'));
+    }
+
+    #[test]
+    fn a_store_lives_in_a_directory_named_after_it() {
+        let root = Path::new("/var/log/timberfs");
+        // The directory is the handle: path, handle and wire name agree,
+        // and the protocol that delivered it appears nowhere.
+        assert_eq!(
+            store_dir(root, "nginx.log"),
+            Path::new("/var/log/timberfs/nginx")
+        );
+        // Only a trailing `.log` is stripped, the same rule the forest's
+        // handle uses, so a store keeps whatever else its name carries.
+        assert_eq!(
+            store_dir(root, "metrics.jsonl"),
+            Path::new("/var/log/timberfs/metrics.jsonl")
+        );
+        // A name off the wire is sanitized into one component first, so
+        // the directory cannot escape the root either.
+        assert_eq!(
+            store_dir(root, &store_name("../../etc/passwd")),
+            Path::new("/var/log/timberfs/_.._etc_passwd")
+        );
     }
 
     #[test]

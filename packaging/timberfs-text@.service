@@ -10,7 +10,7 @@
 #   /etc/timberfs/text.conf              site-wide defaults, every instance
 #   /etc/timberfs/text-<instance>.conf   this instance only
 #
-#     STORE_DIR=/var/log/timberfs/text   the log is <STORE_DIR>/<instance>.log
+#     STORE_DIR=/var/log/timberfs        the log is <STORE_DIR>/<inst>/<inst>.log
 #     DECLARE=index=true retain=90d      store properties (KEY=VALUE, see below)
 #     EXTRA_OPTS=--flush-age 2           extra flags for `timberfs append`
 #
@@ -42,7 +42,7 @@ Type=simple
 
 # Defaults first: EnvironmentFile= wins over Environment= whatever the order,
 # and the per-instance file wins over the site-wide one.
-Environment=STORE_DIR=/var/log/timberfs/text
+Environment=STORE_DIR=/var/log/timberfs
 Environment=DECLARE=index=true
 EnvironmentFile=-/etc/timberfs/text.conf
 EnvironmentFile=-/etc/timberfs/text-%i.conf
@@ -51,22 +51,24 @@ EnvironmentFile=-/etc/timberfs/text-%i.conf
 # makes the store (and its directory) if missing, set converges DECLARE onto
 # it. Both are no-ops once the store already says what DECLARE says. host= is
 # always passed, so an empty DECLARE is still a valid call.
-ExecStartPre=/usr/bin/timberfs create --if-not-exists ${STORE_DIR}/%i.log
-ExecStartPre=/usr/bin/timberfs set ${STORE_DIR}/%i.log host=%H $DECLARE
-ExecStart=/usr/bin/timberfs append --exit-on-upgrade --into ${STORE_DIR}/%i.log $EXTRA_OPTS
+ExecStartPre=/usr/bin/timberfs create --if-not-exists ${STORE_DIR}/%i/%i.log
+ExecStartPre=/usr/bin/timberfs set ${STORE_DIR}/%i/%i.log host=%H $DECLARE
+ExecStart=/usr/bin/timberfs append --exit-on-upgrade --into ${STORE_DIR}/%i/%i.log $EXTRA_OPTS
 StandardInput=socket
 StandardOutput=journal
 StandardError=journal
 
-# Creates and owns the default store directory /var/log/timberfs/text (0755),
-# shared by every instance so one glob spans the fleet:
-#   timberfs query /var/log/timberfs/text/'*'.log --from 13:40
-# A drop-in that sets User= gets that directory owned by that user. A
-# STORE_DIR pointed elsewhere is created by the ExecStartPre above instead,
-# owned by whoever this unit runs as. For a store path that is not
-# <dir>/<instance>.log at all, override the three command lines with a
-# drop-in (systemctl edit timberfs-text@<instance>.service).
-LogsDirectory=timberfs/text
+# Creates and owns this instance's own store directory /var/log/timberfs/%i
+# (0755). Per instance, not per intake kind: a directory is what a writer
+# needs permission on, so each instance can be owned by its own User=
+# drop-in without a directory every instance can write to. A glob still
+# spans the fleet — the artifacts are what the shell can see:
+#   timberfs query /var/log/timberfs/*/*.trunk --from 13:40
+# A STORE_DIR pointed elsewhere is created by the ExecStartPre above
+# instead, owned by whoever this unit runs as. For a store path that is not
+# <dir>/<instance>/<instance>.log at all, override the three command lines
+# with a drop-in (systemctl edit timberfs-text@<instance>.service).
+LogsDirectory=timberfs/%i
 
 # A crash or upgrade of this unit is invisible to the producer (the socket
 # holds the FIFO open): come back and keep draining.

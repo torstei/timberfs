@@ -130,7 +130,7 @@ acked only once durable in the
 (at-least-once, like the socket intake above):
 
 ```sh
-timberfs forward-intake --into-dir /var/log/timberfs/forward &
+timberfs forward-intake --into-dir /var/log/timberfs &
 
 docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 \
     --log-opt tag={{.Name}} --log-opt fluentd-async=true \
@@ -155,7 +155,7 @@ into the store's `.bark`, and each `LogRecord` becomes one entry; the HTTP 200
 is sent only once the batch is fsynced:
 
 ```sh
-timberfs otlp-intake --into-dir /var/log/timberfs/otlp --auto-create &
+timberfs otlp-intake --into-dir /var/log/timberfs --auto-create &
 ```
 
 ```yaml

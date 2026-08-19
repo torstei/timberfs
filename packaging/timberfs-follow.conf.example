@@ -9,9 +9,16 @@
 
 # --- /etc/timberfs/follow.conf (site-wide, optional) -----------------------
 
-# The store is <STORE_DIR>/<instance>.log. One directory for every instance,
-# so a glob spans them: timberfs query /var/log/timberfs/follow/'*'.log
-STORE_DIR=/var/log/timberfs/follow
+# The store is <STORE_DIR>/<instance>/<instance>.log — one directory per
+# store, named after the store, which is also the handle it answers to:
+#   timberfs query exim-main --from 13:40
+# A glob spans the fleet through the artifacts the shell can see (a logical
+# name is not a file, so /'*'.log matches nothing):
+#   timberfs query /var/log/timberfs/*/*.trunk --from 13:40
+# Point STORE_DIR at a directory of your own to group stores by subject —
+# one owner, one place — e.g. STORE_DIR=/var/log/timberfs/mail. Nothing in
+# the path names the intake: this is the exim-main store, not the followed one.
+STORE_DIR=/var/log/timberfs
 
 # Properties DECLARED on the store on every start, as KEY=VALUE pairs handed
 # to `timberfs set`: retain=90d, retain_size=50G, index=true|false,

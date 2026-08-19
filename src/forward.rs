@@ -2,7 +2,8 @@
 //! protocol v1 — the wire protocol shared by Docker's `fluentd` log driver,
 //! Fluent Bit, Fluentd, and the fluent-logger client libraries. One receiver
 //! makes all of those valid timberfs producers, each tag landing in its own
-//! store (one directory, many `FileStore`s, exactly like the mount).
+//! store, in its own directory: `<root>/<tag>/<tag>.log`, the same shape
+//! every other timberfs intake writes.
 //!
 //! The motivating property is at-least-once delivery: a sender may attach a
 //! `chunk` id to a batch and retry until it sees `{"ack": id}` back. We ack
@@ -43,7 +44,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -409,7 +410,7 @@ impl PartialReassembler {
 }
 
 // ---------------------------------------------------------------------
-// The receiver. The directory of stores, their locks and the maintenance
+// The receiver. The stores it writes, their locks and the maintenance
 // tick are the shared intake core; what is Forward's own is the ack.
 // ---------------------------------------------------------------------
 
@@ -478,7 +479,6 @@ fn seed_bark(
 /// intake core's (see intake.rs); only the seed is Forward's own.
 fn ensure_store(
     intake: &mut Intake,
-    dir: &Path,
     name: &str,
     tag: &str,
     opts: &ForwardOpts,
@@ -487,7 +487,6 @@ fn ensure_store(
 ) -> anyhow::Result<()> {
     crate::intake::ensure_store(
         intake,
-        dir,
         name,
         &format!("unknown tag {tag:?}"),
         opts.auto_create,
@@ -514,7 +513,7 @@ fn drain_acks(intake: &Mutex<Intake>, name: &str, cfg: &Config) {
         if acks.is_empty() {
             return;
         }
-        let durable = match g.store.files.get_mut(name) {
+        let durable = match g.file(name) {
             Some(f) if f.has_wal() => f.sap_sync().is_ok(),
             Some(f) => f.flush_chunk(cfg).and_then(|()| f.sync(cfg)).is_ok(),
             None => false,
@@ -552,7 +551,6 @@ fn is_clean_eof(e: &rmpv::decode::Error) -> bool {
 fn handle_connection(
     stream: TcpStream,
     intake: Arc<Mutex<Intake>>,
-    dir: PathBuf,
     cfg: Config,
     opts: Arc<ForwardOpts>,
     conn_id: u64,
@@ -606,7 +604,6 @@ fn handle_connection(
                 let mut g = intake.lock().unwrap();
                 if let Err(e) = ensure_store(
                     &mut g,
-                    &dir,
                     &name,
                     &decoded.tag,
                     &opts,
@@ -618,7 +615,7 @@ fn handle_connection(
                     }
                     continue;
                 }
-                if let Some(f) = g.store.files.get_mut(&name) {
+                if let Some(f) = g.file(&name) {
                     if let Err(e) = f.append_windowed(&payload, t, t, &cfg) {
                         eprintln!("timberfs: forward-intake: {name}: append failed: {e}");
                     }
@@ -630,7 +627,7 @@ fn handle_connection(
             // the missing ack is the refusal's honest wire form — an
             // acking sender buffers and retries until the operator
             // creates the store, and then converges with nothing lost.
-            if !intake.lock().unwrap().store.files.contains_key(&name) {
+            if !intake.lock().unwrap().holds(&name) {
                 continue;
             }
             match writer.try_clone() {
@@ -687,7 +684,10 @@ pub fn cmd_forward_intake(
         .as_deref()
         .map(crate::append::parse_size_bytes)
         .transpose()?;
-    let _dir_lock = crate::intake::open_backing_dir(into_dir)?;
+    // The root, taken up front so a --into-dir pointed at a mounted store
+    // fails at startup rather than on the first tag. Each store's own
+    // directory is taken the same way as it is created.
+    let _root_lock = crate::intake::open_backing_dir(into_dir)?;
 
     let cfg = Config {
         chunk_size: 256 * 1024,
@@ -706,7 +706,6 @@ pub fn cmd_forward_intake(
     // failure left pending there.
     let maint = crate::intake::spawn_maintenance(
         Arc::clone(&intake),
-        into_dir.to_path_buf(),
         Arc::clone(&stop),
         exit_on_upgrade,
         move |intake, names| {
@@ -740,10 +739,9 @@ pub fn cmd_forward_intake(
             }
         };
         let intake = Arc::clone(&intake);
-        let dir = into_dir.to_path_buf();
         let opts = Arc::clone(&opts);
         let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
-        thread::spawn(move || handle_connection(stream, intake, dir, cfg, opts, conn_id));
+        thread::spawn(move || handle_connection(stream, intake, cfg, opts, conn_id));
     }
 
     stop.store(true, Ordering::Relaxed);

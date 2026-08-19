@@ -1046,11 +1046,11 @@ run_test "follow: a kill with an unflushed chunk loses nothing" follow_kill_lose
 # producer that can only log to a PATH — Apache's CustomLog/ErrorLog. Covers
 # what is specific to it: the conf-file declaration (site-wide defaults plus a
 # per-instance override, converged on every start), Apache's own two clocks
-# with nothing declared, the shared store directory, and RemoveOnStop=no.
+# with nothing declared, the store layout, and RemoveOnStop=no.
 TEXTINST=vmtext
-TEXTDIR=/var/log/timberfs/text
-TEXTSTORE=$TEXTDIR/$TEXTINST.log
-TEXTERRSTORE=$TEXTDIR/$TEXTINST.error.log
+TEXTROOT=/var/log/timberfs
+TEXTSTORE=$TEXTROOT/$TEXTINST/$TEXTINST.log
+TEXTERRSTORE=$TEXTROOT/$TEXTINST.error/$TEXTINST.error.log
 TEXTPIPE=/run/timberfs/text/$TEXTINST.pipe
 TEXTERRPIPE=/run/timberfs/text/$TEXTINST.error.pipe
 
@@ -1106,6 +1106,15 @@ text_intake_apache_clocks() {
         && [ "$(timberfs query "$TEXTERRSTORE" --to "$PAST" 2>/dev/null | wc -l)" = 0 ] \
         && [ "$(timberfs query "$TEXTSTORE" --from "$PAST" 2>/dev/null | wc -l)" = 2 ] \
         && [ "$(timberfs query "$TEXTERRSTORE" --from "$PAST" 2>/dev/null | wc -l)" = 1 ]
+}
+
+text_intake_store_path_is_the_store_name() {
+    # The layout claim: <root>/<instance>/<instance>.log — one directory per
+    # store, named after the store, with nothing about the intake in the
+    # path (no /var/log/timberfs/text), and the handle is that same name.
+    [ -f "$TEXTSTORE.rings" ] || return 1
+    [ ! -e "$TEXTROOT/text" ] || return 1
+    timberfs query "$TEXTINST" 2>/dev/null | grep -q "GET /vmtext"
 }
 
 text_intake_declares_from_conf() {
@@ -1167,9 +1176,10 @@ text_intake_survives_writer_restart() {
 }
 
 text_intake_merged_vhost_view() {
-    # One directory for every instance, so a vhost's two streams read as one
-    # attributed view (the documented query).
-    OUT=$(timberfs query $TEXTDIR/$TEXTINST.log $TEXTDIR/$TEXTINST.error.log 2>/dev/null)
+    # A vhost's two streams read as one interleaved, attributed view — a
+    # query over both stores, each in its own directory (the documented one
+    # names them by handle; this one spells the paths to pin the layout).
+    OUT=$(timberfs query "$TEXTSTORE" "$TEXTERRSTORE" 2>/dev/null)
     echo "$OUT" | grep -q "^$TEXTSTORE:.*GET /vmtext" \
         && echo "$OUT" | grep -q "^$TEXTERRSTORE:.*vmtext boom"
 }
@@ -1189,6 +1199,7 @@ text_intake_stop_keeps_the_fifo() {
 
 run_test "text intake: conf files, two instances, FIFOs created" text_intake_setup
 run_test "text intake: Apache's CLF and ctime clocks, nothing declared" text_intake_apache_clocks
+run_test "text intake: store path is the store's name, not the intake's" text_intake_store_path_is_the_store_name
 run_test "text intake: DECLARE applied, per-instance beats site-wide" text_intake_declares_from_conf
 run_test "text intake: changed declaration converges on restart" text_intake_declaration_converges
 run_test "text intake: line written during a writer bounce still lands" text_intake_survives_writer_restart
@@ -1202,7 +1213,7 @@ run_test "text intake: stopping the socket keeps the FIFO node" text_intake_stop
 # base) makes the write-time assertions below exact instead of racing the
 # wall clock.
 FWD_TAG=vmfwd
-FWD_STORE=/var/log/timberfs/forward/$FWD_TAG.log
+FWD_STORE=/var/log/timberfs/$FWD_TAG/$FWD_TAG.log
 FWD_EPOCH=$(date -u -d "2026-06-20 09:00:00" +%s)
 
 forward_intake_setup() {
@@ -1337,15 +1348,20 @@ PYEOF
 
 forward_intake_unknown_tag_refused_until_created() {
     # Conservative default (no --auto-create in the shipped unit): a
-    # never-seen tag gets no store, no lock litter, and no ack.
-    forward_intake_client vmrefchunk vmrefused 4 > /tmp/fwdref.out 2>&1
+    # never-seen tag gets no store, no lock litter, and no ack. The name is
+    # this intake's own: every intake writes into ONE store namespace now,
+    # so sharing "vmrefused" with the OTLP test would have that test find a
+    # store this one created and answer 200 instead of 503.
+    forward_intake_client vmrefchunk vmfwdrefused 4 > /tmp/fwdref.out 2>&1
     grep -q NO_ACK /tmp/fwdref.out || { cat /tmp/fwdref.out; return 1; }
-    [ ! -e /var/log/timberfs/forward/vmrefused.log.rings ] || return 1
-    [ ! -e /var/log/timberfs/forward/vmrefused.log.lock ] || return 1
+    [ ! -e /var/log/timberfs/vmfwdrefused/vmfwdrefused.log.rings ] || return 1
+    [ ! -e /var/log/timberfs/vmfwdrefused/vmfwdrefused.log.lock ] || return 1
+    # Not even the store's directory: a refused tag leaves nothing at all.
+    [ ! -e /var/log/timberfs/vmfwdrefused ] || return 1
     # The operator provisions the store; the sender's retry then lands and
     # is acked — provisioning converges with nothing lost.
-    timberfs create --wal /var/log/timberfs/forward/vmrefused.log || return 1
-    forward_intake_client vmrefchunk vmrefused > /tmp/fwdref2.out 2>&1
+    timberfs create --wal /var/log/timberfs/vmfwdrefused/vmfwdrefused.log || return 1
+    forward_intake_client vmrefchunk vmfwdrefused > /tmp/fwdref2.out 2>&1
     grep -q ACK_OK /tmp/fwdref2.out || { cat /tmp/fwdref2.out; return 1; }
 }
 
@@ -1356,7 +1372,7 @@ forward_intake_enable_auto_create() {
     cat > /etc/systemd/system/timberfs-forward.service.d/auto-create.conf <<'EOF'
 [Service]
 ExecStart=
-ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs/forward --exit-on-upgrade --auto-create
+ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs --exit-on-upgrade --auto-create
 EOF
     systemctl daemon-reload
     systemctl restart timberfs-forward.service
@@ -1390,6 +1406,15 @@ forward_intake_receives_and_acks() {
         && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "forward-entry-two" \
         && timberfs query "$FWD_STORE" 2>/dev/null | grep -q "packed-entry" \
         && timberfs info "$FWD_STORE" | grep -q "in 1 chunk(s)"
+}
+
+forward_intake_store_path_is_the_tag() {
+    # One directory per tag, named after the tag: the receiver writes the
+    # same layout as every other intake, so the store a Fluentd tag created
+    # answers to that tag as a handle and nothing names the protocol.
+    [ -f "$FWD_STORE.rings" ] || return 1
+    [ ! -e /var/log/timberfs/forward ] || return 1
+    timberfs query "$FWD_TAG" 2>/dev/null | grep -q "packed-entry"
 }
 
 forward_intake_partial_reassembles() {
@@ -1439,6 +1464,7 @@ run_test "forward-intake: enable socket, unit activates" forward_intake_setup
 run_test "forward-intake: unknown tag refused until operator creates it" forward_intake_unknown_tag_refused_until_created
 run_test "forward-intake: --auto-create drop-in (Docker-host mode)" forward_intake_enable_auto_create
 run_test "forward-intake: Message/Forward/PackedForward land, chunk acked" forward_intake_receives_and_acks
+run_test "forward-intake: store path is the tag, resolvable as a handle" forward_intake_store_path_is_the_tag
 run_test "forward-intake: split-line partial reassembles to one entry" forward_intake_partial_reassembles
 run_test "forward-intake: entries carry the sender's own event time" forward_intake_event_times_landed
 run_test "forward-intake: first record's container_id seeds the manifest" forward_intake_container_id_seeded
@@ -1450,7 +1476,10 @@ run_test "forward-intake: service restart is a sender reconnect, no data lost" f
 # directions: a store shipped out and received back must be byte for byte
 # the same. A fixed event time (2026-06-20 09:00:00 UTC) keeps the
 # write-window assertions exact instead of racing the wall clock.
-OTLP_DIR=/var/log/timberfs/otlp
+# One store per stream, each in its own directory named after the route
+# value: $OTLP_ROOT/<service>/<service>.log, the layout every intake writes.
+OTLP_ROOT=/var/log/timberfs
+otlp_store() { echo "$OTLP_ROOT/$1/$1.log"; }
 OTLP_NANOS=$(( $(date -u -d "2026-06-20 09:00:00" +%s) * 1000000000 ))
 OTLP_TRACE=4bf92f3577b34da6a3ce929d0e0e4736
 
@@ -1509,15 +1538,17 @@ otlp_intake_undeclared_refused_until_created() {
     # The shipped unit has no --auto-create: an undeclared stream is
     # answered 503 + Retry-After, leaves no store and no lock litter, and
     # the sender keeps the records (which is where they are still safe).
-    otlp_request POST /v1/logs application/json "$(otlp_body vmrefused)" > /tmp/otlpref.out 2>&1
+    otlp_request POST /v1/logs application/json "$(otlp_body vmotlprefused)" > /tmp/otlpref.out 2>&1
     head -1 /tmp/otlpref.out | grep -q '^503|5$' || { cat /tmp/otlpref.out; return 1; }
-    [ ! -e "$OTLP_DIR/vmrefused.log.rings" ] || return 1
-    [ ! -e "$OTLP_DIR/vmrefused.log.lock" ] || return 1
+    [ ! -e "$(otlp_store vmotlprefused).rings" ] || return 1
+    [ ! -e "$(otlp_store vmotlprefused).lock" ] || return 1
+    # Not even the store's directory: a refused stream leaves nothing.
+    [ ! -e "$OTLP_ROOT/vmotlprefused" ] || return 1
     # The operator provisions it; the sender's retry then lands with a 200.
-    timberfs create --wal "$OTLP_DIR/vmrefused.log" || return 1
-    otlp_request POST /v1/logs application/json "$(otlp_body vmrefused)" > /tmp/otlpref2.out 2>&1
+    timberfs create --wal "$(otlp_store vmotlprefused)" || return 1
+    otlp_request POST /v1/logs application/json "$(otlp_body vmotlprefused)" > /tmp/otlpref2.out 2>&1
     head -1 /tmp/otlpref2.out | grep -q '^200|' || { cat /tmp/otlpref2.out; return 1; }
-    otlp_wait_for "$OTLP_DIR/vmrefused.log" "otlp native record"
+    otlp_wait_for "$(otlp_store vmotlprefused)" "otlp native record"
 }
 
 otlp_intake_refuses_the_right_things() {
@@ -1551,7 +1582,7 @@ otlp_intake_enable_auto_create() {
     cat > /etc/systemd/system/timberfs-otlp.service.d/auto-create.conf <<'EOF'
 [Service]
 ExecStart=
-ExecStart=/usr/bin/timberfs otlp-intake --into-dir /var/log/timberfs/otlp --exit-on-upgrade --auto-create --index
+ExecStart=/usr/bin/timberfs otlp-intake --into-dir /var/log/timberfs --exit-on-upgrade --auto-create --index
 EOF
     systemctl daemon-reload
     systemctl restart timberfs-otlp.service
@@ -1562,11 +1593,11 @@ EOF
 otlp_intake_renders_a_native_record() {
     otlp_request POST /v1/logs application/json "$(otlp_body vmotlp)" > /tmp/o6.out 2>&1
     head -1 /tmp/o6.out | grep -q '^200|' || { cat /tmp/o6.out; return 1; }
-    otlp_wait_for "$OTLP_DIR/vmotlp.log" "otlp native record" || return 1
+    otlp_wait_for "$(otlp_store vmotlp)" "otlp native record" || return 1
     # An unstamped body is prefixed with the record's own time and level,
     # so the store stays time-indexable; attributes and the trace id trail
     # as k=v where the token index can find them.
-    timberfs query "$OTLP_DIR/vmotlp.log" > /tmp/o7.out 2>&1
+    timberfs query "$(otlp_store vmotlp)" > /tmp/o7.out 2>&1
     grep -q "ERROR otlp native record http.status_code=500 trace_id=$OTLP_TRACE" /tmp/o7.out \
         || { cat /tmp/o7.out; return 1; }
     # The prefix is a real timestamp: the entry lands in the SENDER'S
@@ -1575,38 +1606,47 @@ otlp_intake_renders_a_native_record() {
     # same way rather than hardcoded to the VM's timezone.
     local covers
     covers=$(date -d "@$((OTLP_NANOS / 1000000000))" '+%Y-%m-%d %H:%M:%S.000')
-    timberfs info "$OTLP_DIR/vmotlp.log" > /tmp/o8.out 2>&1
+    timberfs info "$(otlp_store vmotlp)" > /tmp/o8.out 2>&1
     grep -q "covers    $covers" /tmp/o8.out || { cat /tmp/o8.out; return 1; }
+}
+
+otlp_intake_store_path_is_the_route_value() {
+    # One directory per stream, named after the route value (service.name):
+    # the store answers to that name as a handle, and no directory names the
+    # protocol that carried it.
+    [ -f "$(otlp_store vmotlp).rings" ] || return 1
+    [ ! -e "$OTLP_ROOT/otlp" ] || return 1
+    timberfs query vmotlp 2>/dev/null | grep -q "otlp native record"
 }
 
 otlp_intake_trace_id_is_indexed() {
     # The declared .grain is maintained by the receiver's own tick, so a
     # trace id becomes a chunk-skipping lookup — a trace's log lines with
     # no trace backend involved.
-    grep -q '"index": true' "$OTLP_DIR/vmotlp.log.bark" || return 1
+    grep -q '"index": true' "$(otlp_store vmotlp).bark" || return 1
     local i
     for i in $(seq 1 20); do
-        [ -s "$OTLP_DIR/vmotlp.log.grain" ] && break
+        [ -s "$(otlp_store vmotlp).grain" ] && break
         sleep 0.5
     done
-    [ -s "$OTLP_DIR/vmotlp.log.grain" ] || return 1
-    timberfs query --has "$OTLP_TRACE" "$OTLP_DIR/vmotlp.log" | grep -q "otlp native record" || return 1
+    [ -s "$(otlp_store vmotlp).grain" ] || return 1
+    timberfs query --has "$OTLP_TRACE" "$(otlp_store vmotlp)" | grep -q "otlp native record" || return 1
     # A token that is in no chunk skips everything rather than scanning.
-    [ -z "$(timberfs query --has deadbeefcafe0000deadbeefcafe0000 "$OTLP_DIR/vmotlp.log" 2>/dev/null)" ]
+    [ -z "$(timberfs query --has deadbeefcafe0000deadbeefcafe0000 "$(otlp_store vmotlp)" 2>/dev/null)" ]
 }
 
 otlp_intake_seeds_the_resource() {
     # Resource attributes describe the stream, not any one line, so they
     # are seeded into the manifest — under their OTLP names and under the
     # names the read path and timber-otlp already look for.
-    local bark="$OTLP_DIR/vmotlp.log.bark"
+    local bark="$(otlp_store vmotlp).bark"
     grep -q '"service.name": "vmotlp"' "$bark" || { cat "$bark"; return 1; }
     grep -q '"service": "vmotlp"' "$bark" || { cat "$bark"; return 1; }
     grep -q '"host": "vmhost"' "$bark" || { cat "$bark"; return 1; }
     grep -q '"deployment.environment": "vmtest"' "$bark" || { cat "$bark"; return 1; }
     # The 200 means durable, which is what the wal delivers.
     grep -q '"wal": true' "$bark" || { cat "$bark"; return 1; }
-    [ -s "$OTLP_DIR/vmotlp.log.sap" ]
+    [ -s "$(otlp_store vmotlp).sap" ]
 }
 
 otlp_intake_restart_survives() {
@@ -1629,17 +1669,17 @@ otlp_roundtrip_is_byte_for_byte() {
 	at com.example.Main.main(Main.java:9)
 2026-06-20T09:00:03.000Z WARN roundtrip retrying
 EOF
-    rm -f "$PIPE_BACKING"/rt.log.* "$OTLP_DIR"/rt.log.*
+    rm -f "$PIPE_BACKING"/rt.log.* "$OTLP_ROOT"/rt/rt.log.*
     timberfs import /tmp/rt.src --into "$PIPE_BACKING/rt.log" --quiet --utc || return 1
     timber-otlp --quiet --endpoint http://127.0.0.1:4318 "$PIPE_BACKING/rt.log" > /tmp/rt.ship 2>&1 \
         || { cat /tmp/rt.ship; return 1; }
-    otlp_wait_for "$OTLP_DIR/rt.log" "roundtrip retrying" || return 1
+    otlp_wait_for "$(otlp_store rt)" "roundtrip retrying" || return 1
     timberfs query "$PIPE_BACKING/rt.log" > /tmp/rt.a 2>/dev/null
-    timberfs query "$OTLP_DIR/rt.log" > /tmp/rt.b 2>/dev/null
+    timberfs query "$(otlp_store rt)" > /tmp/rt.b 2>/dev/null
     # Byte for byte, multiline entry included — the stack trace must come
     # back as ONE entry, not three records.
     diff -u /tmp/rt.a /tmp/rt.b || return 1
-    [ "$(timberfs query -0 "$OTLP_DIR/rt.log" | tr -cd '\0' | wc -c)" = 3 ]
+    [ "$(timberfs query -0 "$(otlp_store rt)" | tr -cd '\0' | wc -c)" = 3 ]
 }
 
 timber_otlp_dry_run_shape() {
@@ -1665,7 +1705,7 @@ timber_otlp_cursor_resumes_without_duplicates() {
     # append more, restart it. The cursor is on the write axis and is
     # written only after the receiver accepts, so a restart re-delivers at
     # worst — never skips, never re-sends what was already acknowledged.
-    rm -f "$PIPE_BACKING"/cur.log.* "$OTLP_DIR"/cur.log.* /tmp/cur.cursor
+    rm -f "$PIPE_BACKING"/cur.log.* "$OTLP_ROOT"/cur/cur.log.* /tmp/cur.cursor
     mkfifo /tmp/cur.fifo
     timberfs append --into "$PIPE_BACKING/cur.log" --flush-age 1 < /tmp/cur.fifo &
     local ap=$!
@@ -1694,8 +1734,8 @@ timber_otlp_cursor_resumes_without_duplicates() {
     exec 8>&-; kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null
     rm -f /tmp/cur.fifo
 
-    otlp_wait_for "$OTLP_DIR/cur.log" "cur-six" || return 1
-    timberfs query "$OTLP_DIR/cur.log" > /tmp/cur.out 2>/dev/null
+    otlp_wait_for "$(otlp_store cur)" "cur-six" || return 1
+    timberfs query "$(otlp_store cur)" > /tmp/cur.out 2>/dev/null
     # Every entry exactly once: six lines, none repeated.
     [ "$(wc -l < /tmp/cur.out)" = 6 ] || { cat /tmp/cur.out; return 1; }
     [ "$(sort /tmp/cur.out | uniq -d | wc -l)" = 0 ] || { cat /tmp/cur.out; return 1; }
@@ -1780,15 +1820,15 @@ otlp_intake_accepts_a_foreign_protobuf_sender() {
     otlp_post_file application/x-protobuf /tmp/vmproto.bin > /tmp/op1.out 2>&1
     # Full success in protobuf is the EMPTY message: 200 with a zero-byte body.
     grep -q '^200|0$' /tmp/op1.out || { cat /tmp/op1.out; return 1; }
-    otlp_wait_for "$OTLP_DIR/vmproto.log" "protobuf native record" || return 1
-    timberfs query "$OTLP_DIR/vmproto.log" > /tmp/op2.out 2>&1
+    otlp_wait_for "$(otlp_store vmproto)" "protobuf native record" || return 1
+    timberfs query "$(otlp_store vmproto)" > /tmp/op2.out 2>&1
     grep -q "ERROR protobuf native record http.status_code=500 trace_id=$OTLP_TRACE" /tmp/op2.out \
         || { cat /tmp/op2.out; return 1; }
-    grep -q '"service.name": "vmproto"' "$OTLP_DIR/vmproto.log.bark" || return 1
+    grep -q '"service.name": "vmproto"' "$(otlp_store vmproto).bark" || return 1
     # The unknown field did not derail the decode, and the event time landed.
     local covers
     covers=$(date -d "@$((OTLP_NANOS / 1000000000))" '+%Y-%m-%d %H:%M:%S.000')
-    timberfs info "$OTLP_DIR/vmproto.log" | grep -q "covers    $covers"
+    timberfs info "$(otlp_store vmproto)" | grep -q "covers    $covers"
 }
 
 otlp_intake_inflates_gzip() {
@@ -1797,12 +1837,12 @@ otlp_intake_inflates_gzip() {
     otlp_body vmgzipjson > /tmp/vmgz.json
     otlp_post_file application/json /tmp/vmgz.json gzip > /tmp/og1.out 2>&1
     grep -q '^200|2$' /tmp/og1.out || { cat /tmp/og1.out; return 1; }
-    otlp_wait_for "$OTLP_DIR/vmgzipjson.log" "otlp native record" || return 1
+    otlp_wait_for "$(otlp_store vmgzipjson)" "otlp native record" || return 1
 
     otlp_write_proto_body vmgzipproto /tmp/vmgz.bin || return 1
     otlp_post_file application/x-protobuf /tmp/vmgz.bin gzip > /tmp/og2.out 2>&1
     grep -q '^200|0$' /tmp/og2.out || { cat /tmp/og2.out; return 1; }
-    otlp_wait_for "$OTLP_DIR/vmgzipproto.log" "protobuf native record" || return 1
+    otlp_wait_for "$(otlp_store vmgzipproto)" "protobuf native record" || return 1
 
     # A body that claims gzip and is not gets a 400, not a panic.
     otlp_post_file application/json /tmp/vmgz.json > /dev/null 2>&1
@@ -1821,13 +1861,13 @@ PYEOF
 otlp_roundtrip_over_json_and_gzip() {
     # The same store, shipped with the other encoding and compressed: a
     # transport choice must not change the data.
-    rm -f "$OTLP_DIR"/rtjson.log.*
+    rm -f "$OTLP_ROOT"/rtjson/rtjson.log.*
     timber-otlp --quiet --encoding json --compress gzip --service rtjson \
         --endpoint http://127.0.0.1:4318 "$PIPE_BACKING/rt.log" > /tmp/rtj.ship 2>&1 \
         || { cat /tmp/rtj.ship; return 1; }
-    otlp_wait_for "$OTLP_DIR/rtjson.log" "roundtrip retrying" || return 1
+    otlp_wait_for "$(otlp_store rtjson)" "roundtrip retrying" || return 1
     timberfs query "$PIPE_BACKING/rt.log" > /tmp/rtj.a 2>/dev/null
-    timberfs query "$OTLP_DIR/rtjson.log" > /tmp/rtj.b 2>/dev/null
+    timberfs query "$(otlp_store rtjson)" > /tmp/rtj.b 2>/dev/null
     diff -u /tmp/rtj.a /tmp/rtj.b
 }
 
@@ -1836,6 +1876,7 @@ run_test "otlp-intake: undeclared stream 503s until the operator creates it" otl
 run_test "otlp-intake: non-OTLP encodings, signals and methods refused by name" otlp_intake_refuses_the_right_things
 run_test "otlp-intake: --auto-create --index drop-in" otlp_intake_enable_auto_create
 run_test "otlp-intake: a native record becomes a stamped, greppable line" otlp_intake_renders_a_native_record
+run_test "otlp-intake: store path is the route value, handle-resolvable" otlp_intake_store_path_is_the_route_value
 run_test "otlp-intake: trace id rides the token index" otlp_intake_trace_id_is_indexed
 run_test "otlp-intake: resource attributes seed the manifest, wal live" otlp_intake_seeds_the_resource
 run_test "otlp-intake: service restart, sender retries, still lands" otlp_intake_restart_survives
@@ -1870,12 +1911,14 @@ run_test "forest: bare handle resolves query/info; full path unchanged; unknown 
 
 forest_list_command() {
     # `timberfs list`: the directory-level complement to `info`. Clear the
-    # default forest of state left by earlier tests (the socket-intake
-    # instance, forest_handle_resolution's nginx store, and the two network
-    # intakes' store directories) so the counts below are exact, then create
-    # two nested stores of our own.
-    rm -rf /var/log/timberfs/vmtest /var/log/timberfs/nginx /var/log/timberfs/forward \
-        /var/log/timberfs/otlp /var/log/timberfs/text
+    # default forest of state left by earlier tests (the socket, text,
+    # Forward and OTLP intakes now each write one directory per store, plus
+    # forest_handle_resolution's nginx store) so the counts below are exact,
+    # then create two nested stores of our own. The two receivers are
+    # stopped first: they are idle, but a maintenance tick that finds its
+    # store directory gone logs noise into the journal.
+    systemctl stop timberfs-forward.service timberfs-otlp.service >/dev/null 2>&1
+    find /var/log/timberfs -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
     printf '2026-07-08T09:00:00 INFO web one\n2026-07-08T09:00:01 INFO web two\n' \
         | timberfs append --into /var/log/timberfs/web/web.log --quiet || return 1
     printf '2026-07-08T09:05:00 INFO db one\n' \
