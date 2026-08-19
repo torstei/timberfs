@@ -876,12 +876,14 @@ pub fn mount(
                     let s = store.lock().unwrap();
                     (s.dir.clone(), s.files.keys().cloned().collect::<Vec<_>>())
                 };
+                let mut manifest_moved = false;
                 for name in names {
                     // The manifest almost never changes: stat first, and
                     // only re-parse when (mtime, len) moved.
                     let cur: Stamp = std::fs::metadata(crate::format::bark_path(&dir, &name))
                         .ok()
                         .map(|m| (m.modified().ok(), m.len()));
+                    manifest_moved |= stamps.get(&name) != Some(&cur);
                     let policy = if stamps.get(&name) == Some(&cur) {
                         last_good.get(&name).copied().unwrap_or_default()
                     } else {
@@ -931,6 +933,12 @@ pub fn mount(
                 }
                 store.lock().unwrap().flush_aged();
                 store.lock().unwrap().sap_sync_all();
+                // `set wal=true|false` on a mounted store, applied within
+                // a second like retention — gated on the same stat, so a
+                // steady state re-reads nothing.
+                if manifest_moved {
+                    store.lock().unwrap().sync_wal_declarations();
+                }
                 // Keep each declared index current, as the appender and the
                 // network intakes do. After the flush above, so this tick's
                 // chunks are covered by this tick's extend. Deliberately NOT

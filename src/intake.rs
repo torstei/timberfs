@@ -104,6 +104,16 @@ impl<X> Intake<X> {
         }
     }
 
+    /// Apply `set wal=true|false` to every store this receiver writes —
+    /// the same no-restart contract the appender has, and the one that
+    /// counts here: a receiver is restarted only by dropping its
+    /// senders' connections.
+    pub fn sync_wal_declarations(&mut self) {
+        for s in self.stores.values_mut() {
+            s.sync_wal_declarations();
+        }
+    }
+
     pub fn enforce_retention(
         &mut self,
         name: &str,
@@ -264,6 +274,7 @@ where
                 let mut g = intake.lock().unwrap();
                 g.flush_aged();
                 g.sap_sync_all();
+                g.sync_wal_declarations();
                 g.names()
             };
             for name in &names {

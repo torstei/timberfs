@@ -224,15 +224,15 @@ works is in [docs/design.md](docs/design.md).
 - **Appender growth toward s6-log**: `SIGHUP`-triggered and scheduled
   rotation into dated files (for shipping archives off-box), optional line
   timestamping, and a `--tee` passthrough.
-- **Real-time follow, phase 2 (on the `.sap` substrate)**: phase 1 —
-  durability — shipped as `--wal`: a `<name>.sap` write-ahead sidecar holds
-  every appended entry raw, fsynced once a second, so a crash loses at most
-  that tick instead of up to `--flush-age`. `--follow` today still only sees
-  entries once their chunk is flushed and compressed, lagging by the flush
-  interval; phase 2 is a follower reading the sap's live edge directly
-  (drain the compressed store, then tail the sap; a follower that falls
-  behind drops back to the store and catches up) for sub-flush-age
-  `--follow` latency.
+- **Live follow for the other readers**: `query --follow` now tails the
+  `.sap`, so a wal-declared store is followed at poll latency instead of
+  at `--flush-age`. What has not caught up: `timber-filter` has no
+  `--follow` of its own (a live `query --follow --records | timber-filter`
+  pipeline works, but its record stream ends without a stream-end, which
+  the reader is right to call truncation — a live stream needs a way to
+  say "still going" that a torn one cannot); a mount still shows the
+  buffered tail only through its own daemon; and a future network `serve`
+  has to decide whether a live edge travels as records or as sap frames.
 - **Read-only mount of a live store**: a mount takes the backing directory's
   lock exclusively, so a store with a live appender cannot currently be mounted.
   A read-only mount takes no writer lock and only reads the append-only

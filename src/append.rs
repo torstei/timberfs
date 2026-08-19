@@ -127,6 +127,10 @@ pub struct LivePolicy {
     /// (mtime, len) of the manifest at the last parse: the file almost
     /// never changes, so the once-a-second re-read is a stat until it does.
     pub stamp: Option<(Option<std::time::SystemTime>, u64)>,
+    /// Set by `refresh` when the manifest was actually re-read: the cue
+    /// for the OTHER declared properties to be applied too (the wal),
+    /// without each of them stat-ing the same file again.
+    pub reparsed: bool,
 }
 
 impl LivePolicy {
@@ -134,10 +138,12 @@ impl LivePolicy {
         let cur = std::fs::metadata(crate::format::bark_path(&self.dir, &self.name))
             .ok()
             .map(|m| (m.modified().ok(), m.len()));
+        self.reparsed = false;
         if cur == self.stamp {
             return self.last;
         }
         self.stamp = cur;
+        self.reparsed = true;
         match crate::bark::declared_retention(&self.dir, &self.name) {
             Ok(p) => {
                 self.warned = false;
@@ -241,7 +247,16 @@ pub fn spawn_maintenance(
         }
         store.lock().unwrap().flush_aged();
         store.lock().unwrap().sap_sync_all();
-        let p = policy.lock().unwrap().refresh();
+        let (p, reparsed) = {
+            let mut pol = policy.lock().unwrap();
+            (pol.refresh(), pol.reparsed)
+        };
+        // `set wal=true|false` on a live store, applied within a second
+        // like retention — only when the manifest actually changed, so a
+        // steady state stays one stat per tick.
+        if reparsed {
+            store.lock().unwrap().sync_wal_declarations();
+        }
         run_retention(&store, &name, p);
         // Keep the declared index current while streaming, exactly as
         // the records sink and the network intakes do: extend whenever
@@ -394,6 +409,7 @@ pub fn cmd_append(
         last: crate::bark::Retention::default(),
         warned: false,
         stamp: None,
+        reparsed: false,
     }));
 
     // Catch up on retention from before this run, then keep enforcing.
@@ -433,7 +449,12 @@ pub fn cmd_append(
             Ok(n) => {
                 let mut s = store.lock().unwrap();
                 let cfg = s.cfg;
-                s.files.get_mut(&name).unwrap().append(&buf[..n], &cfg)?;
+                let f = s.files.get_mut(&name).unwrap();
+                f.append(&buf[..n], &cfg)?;
+                // One read(2) from the producer is one batch: make it
+                // visible to a live tail now instead of at the next tick
+                // (the tick's sap_sync reports any failure here).
+                let _ = f.sap_flush();
                 total += n as u64;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {

@@ -112,7 +112,7 @@ pub struct SapEntry {
 /// or the first CRC mismatch. Returns the entries and how many bytes of
 /// `buf` they occupy — the caller truncates the file to
 /// `HEADER_LEN + that` before resuming appends.
-fn parse_records(buf: &[u8]) -> (Vec<SapEntry>, usize) {
+pub(crate) fn parse_records(buf: &[u8]) -> (Vec<SapEntry>, usize) {
     let mut entries = Vec::new();
     let mut off = 0usize;
     loop {
@@ -242,6 +242,16 @@ impl Sap {
     /// Mirror one append into the sap.
     pub fn append(&mut self, wf: u64, wl: u64, payload: &[u8]) -> io::Result<()> {
         self.writer.write_all(&encode_record(wf, wl, payload))
+    }
+
+    /// Push buffered records to the OS WITHOUT fsyncing: they become
+    /// readable by anyone tailing this segment (live.rs) at once, while
+    /// durability still waits for `sync`. The two costs are different —
+    /// one write(2) per batch against one fsync per tick — and so are
+    /// the two questions, "can a reader see it" and "does it survive
+    /// power loss".
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 
     /// The durability point: push buffered writes to the OS and fsync.

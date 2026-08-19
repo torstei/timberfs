@@ -806,6 +806,49 @@ impl FileStore {
         }
     }
 
+    /// Bring the live sap in line with what the manifest declares, for
+    /// `timberfs set wal=true|false` on a RUNNING writer — the same
+    /// no-restart contract retention already has, and the one that
+    /// matters mid-incident, when restarting a writer means restarting
+    /// whatever produces its lines.
+    ///
+    /// Turning it on FLUSHES first: a segment's content must be exactly
+    /// the next chunk's bytes (live.rs and the crash matrix both rest on
+    /// that), and one started mid-buffer would describe a chunk it holds
+    /// only the tail of. Turning it off keeps the buffer and drops the
+    /// file — what is buffered is still flushed as usual.
+    pub fn sync_wal_declaration(&mut self, declared: bool, cfg: &Config) -> io::Result<bool> {
+        if self.staged.is_some() || declared == self.wal.is_some() {
+            return Ok(false);
+        }
+        let sap_p = format::sap_path(&self.dir, &self.name);
+        if declared {
+            self.flush_chunk(cfg)?;
+            self.wal = Some(sap::Sap::create(&sap_p, self.comp_size, self.buffer_start)?);
+        } else {
+            self.wal = None;
+            let _ = fs::remove_file(&sap_p);
+        }
+        Ok(true)
+    }
+
+    /// Make what has been appended VISIBLE to a reader tailing the sap
+    /// (live.rs), without the fsync `sap_sync` pays. Writers call it once
+    /// per batch of appends: the batch is what a follower read in one go
+    /// or what an appender got from one read(2), so this costs one
+    /// syscall per batch, not per line, and it is what puts a written
+    /// line in front of `query --follow` in a poll interval rather than
+    /// in a flush age.
+    pub fn sap_flush(&mut self) -> io::Result<()> {
+        if self.staged.is_some() {
+            return Ok(());
+        }
+        match &mut self.wal {
+            Some(wal) => wal.flush(),
+            None => Ok(()),
+        }
+    }
+
     /// Truncate-to-zero, i.e. copytruncate-style rotation: start over.
     pub fn reset(&mut self, dir: &Path, name: &str) -> io::Result<()> {
         let _ = fs::remove_file(format::grain_path(dir, name));
@@ -1313,6 +1356,29 @@ impl Store {
     /// wal's own durability point, independent of the chunk flush
     /// schedule — a plain wal-declared writer's power-loss window shrinks
     /// from `flush_age` to this tick interval.
+    /// Apply `set wal=…` to every file this store holds; announces each
+    /// change, because a writer quietly changing its durability and
+    /// visibility properties is exactly what an operator needs to see
+    /// having happened.
+    pub fn sync_wal_declarations(&mut self) {
+        let cfg = self.cfg;
+        for (name, f) in self.files.iter_mut() {
+            let declared = crate::bark::wal_declared(&f.dir, name);
+            match f.sync_wal_declaration(declared, &cfg) {
+                Ok(true) => crate::note!(
+                    "timberfs: {name}: wal {} (declared in the manifest)",
+                    if declared {
+                        "started — new entries are visible to a live follower as they arrive"
+                    } else {
+                        "stopped"
+                    }
+                ),
+                Ok(false) => {}
+                Err(e) => eprintln!("timberfs: {name}: applying the wal declaration failed: {e}"),
+            }
+        }
+    }
+
     pub fn sap_sync_all(&mut self) {
         for (name, f) in self.files.iter_mut() {
             if let Err(e) = f.sap_sync() {

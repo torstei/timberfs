@@ -218,6 +218,7 @@ pub fn cmd_records_sink(
                 }
                 st.lock().unwrap().flush_aged();
                 st.lock().unwrap().sap_sync_all();
+                st.lock().unwrap().sync_wal_declarations();
                 match crate::bark::declared_retention(&dir, &name) {
                     Ok(policy) if policy.is_some() => {
                         if let Err(e) = st.lock().unwrap().enforce_retention(

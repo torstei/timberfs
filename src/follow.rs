@@ -20,10 +20,11 @@
 //! (and re-importable into), where `tail -F | timberfs append` stamps arrival
 //! instead and produces a store the two can never reconcile.
 //!
-//! Wakeups are a `stat` loop, not inotify, deliberately: a flushed chunk is
-//! the unit of visibility, so nothing observable improves below `--flush-age`,
-//! and one stat per second costs nothing while inotify brings watch limits,
-//! no NFS, and event storms to coalesce.
+//! Wakeups are a `stat` loop, not inotify, deliberately: one stat per second
+//! costs nothing, while inotify brings watch limits, no NFS, and event storms
+//! to coalesce. `--poll` is what bounds how soon a line reaches the store —
+//! and, with a `wal` declared, how soon a reader sees it, since the sap is
+//! flushed once per batch and `query --follow` tails it.
 //!
 //! `--flush-age` means something different here than it does for the appender,
 //! which is why the default is a minute rather than five seconds. The
@@ -34,6 +35,11 @@
 //! queryable. Setting it low costs compression instead: a chunk holds whatever
 //! arrived within it, and on a quiet log that is too little for zstd to work
 //! with (3.1x at five seconds against 7.7x at sixty, one line a second).
+//!
+//! Which is why `--wal` is the better answer to "I need to see it now": a
+//! follower with one appends every line to the sap as it reads it, and
+//! `query --follow` tails that, so the store keeps its long flush age and its
+//! compression while a reader sees lines within a poll.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -144,6 +150,11 @@ fn drain(
                 let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
                 stamper.feed(f, line, ts, cfg)?;
             }
+            // Once per batch, not per line: put what we just read in front
+            // of anyone tailing the sap now, rather than at the next
+            // maintenance tick. A failure here is reported by that tick's
+            // sap_sync, which hits the same file.
+            let _ = f.sap_flush();
         }
     }
     Ok(consumed)
@@ -437,6 +448,7 @@ pub fn cmd_follow(
         last: crate::bark::Retention::default(),
         warned: false,
         stamp: None,
+        reparsed: false,
     }));
     append::run_retention(&store, &name, policy.lock().unwrap().refresh());
     append::spawn_maintenance(

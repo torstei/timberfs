@@ -157,10 +157,10 @@ so there is nothing for a wal to add.
 `.timber` bundle never includes it — it is live writer state, not archive
 content.
 
-Four properties above are **load-bearing for the planned live-tail reader**
-— a second phase for `--follow`, which today surfaces new data a flushed
-chunk at a time (within the writer's `--flush-age`) and would tail the sap
-instead for sub-second responsiveness. They must not be weakened by
+Four properties above are **load-bearing for the live-tail reader**
+(live.rs) — `query --follow` tails the sap when a store declares one,
+which is what makes a written line visible in a poll interval rather than
+in a flush age. They must not be weakened by
 refactors: (1) a segment's content is exactly the
 next chunk's bytes, so the trunk and the sap are interchangeable sources
 per segment and a reader keyed on logical position can never double-emit or
@@ -170,6 +170,19 @@ the generation marker; (3) the frame and rings are durable before a fresh
 `.sap` exists, so any visible segment is always resolvable against the
 index; (4) the header's `uncomp_base` locates a segment in the uncompressed
 stream on its own, giving a reader an anchor that is valid even mid-rebase.
+
+The reader (live.rs) turns (1) into its whole dedup rule: it counts the
+payload bytes it has SERVED out of the live segment, and drops exactly
+that many from the front of the chunk that segment becomes. The count is
+relative to the segment, never an absolute position, because a retention
+head trim rebases every logical offset in the store — which is also why
+(2) matters twice over: the seal is a rename, so a NEW INODE says the
+segment rolled, while the base rewritten in place by that trim does not.
+A reader reconciles the segment BEFORE emitting newly flushed chunks, so
+a flush landing between the ring snapshot and the write-out is charged to
+the chunk that repeats it. Nothing on the read side calls `sap::replay`:
+that path removes a file whose header it cannot parse, which is correct
+for a writer opening its own store and wrong for a reader.
 
 ### The .bark manifest
 
