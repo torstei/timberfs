@@ -270,6 +270,31 @@ works is in [docs/design.md](docs/design.md).
   until there are), and a "keep 15m even when consumed" floor for local
   forensics (it competes for the same disk that buffers an outage, and
   delivery wins).
+- **`head -f`: following the erasure edge (the drop journal)**: in every
+  other filesystem a file's head is fixed by construction — POSIX has no
+  prefix-delete, so `head` has no `-f` and never could. Here the head
+  MOVES, and under interest-based retention it moves as a function of
+  delivery, which makes following it a meaningful thing to do: it is
+  watching what leaves the box. That is the streaming form of the exact
+  loss record the entry above requires — one event per drop, carrying the
+  window (`<from> .. <to>`), its size, and the REASON: `consumed`
+  (delivered and then erased, the healthy case), `age`/`size` (the
+  declared ceiling doing its job), or `cap override` naming the consumer
+  that had not read it.
+  ⚠ The obvious implementation is the wrong one. A reader tailing the head
+  can only observe that data VANISHED — never why, never by whose
+  authority — and it silently merges two drops that fall between polls, so
+  it can be neither complete nor attributed. Only the WRITER holds both
+  halves of the comparison at the moment it acts, so this record is
+  EMITTED, not observed: the slogan names the property, the implementation
+  lands on the other side of the file. Which also makes it cheap — writers
+  already log their retention actions, so making those structured and
+  complete is most of the value with no new API surface.
+  Open: whether that is enough, or whether the journal deserves to be a
+  store of its own (it is a log, and this project has opinions about where
+  logs go). Either way it must go OFF-BOX — a record of loss that dies
+  with the box it was written on proves nothing — which the systemd
+  journal already gets for free wherever that journal is itself shipped.
 - **Splitting downstream of a spool (fan-out by cursor)**: one store as the
   intake spool — everything a web server writes, the vhost in the line — plus a
   cursor consumer that routes entries into per-stream stores, instead of routing
