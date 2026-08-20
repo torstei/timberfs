@@ -363,7 +363,7 @@ impl Shipper {
         self.batches += 1;
         if let Some((cursor, path)) = &mut self.cursor {
             for e in batch.iter() {
-                cursor.advance(e.wf.unwrap_or(0), e.wl.unwrap_or(0));
+                cursor.advance(e.chunk, e.wl.unwrap_or(0));
             }
             if !self.dry_run {
                 cursor.save(path)?;
@@ -386,25 +386,30 @@ impl Shipper {
 /// clean resume and the skipped entries are never mentioned again. It
 /// stays a warning and not a refusal because the loss is already in the
 /// past, and a shipper that will not start ships nothing.
-fn report_resume(c: &Cursor, store: Option<&Path>) {
-    let standing = store
+/// The store's chunk index, or `None` when it cannot be read (no store
+/// named, no rings yet). Read once per run: resolution and the resume
+/// report both need it, and neither is worth a second pass.
+fn store_records(store: Option<&Path>) -> Option<Vec<timberfs::format::ChunkRecord>> {
+    store
         .and_then(|p| timberfs::query::resolve_backing(p).ok())
         .and_then(|(dir, name)| {
             timberfs::format::read_index(&timberfs::format::rings_path(&dir, &name)).ok()
         })
-        .map(|records| timberfs::cursor::standing(c, &records));
-    if let Some(oldest) = standing.and_then(|s| s.gap_to_ms) {
+}
+
+fn report_resume(c: &Cursor, records: Option<&[timberfs::format::ChunkRecord]>) {
+    let standing = records.map(|records| timberfs::cursor::standing(c, records));
+    if let Some(n) = standing.and_then(|s| s.gap_chunks) {
         eprintln!(
-            "timber-otlp: warning: GAP — the cursor is at {} but the oldest data in the \
-             store is {}; retention dropped {} of entries this consumer never read, and \
-             they are not recoverable. Resuming at the oldest chunk. Either widen the \
-             store's retention or find out why this shipper was behind.",
-            timberfs::query::fmt_ms(c.wl),
-            timberfs::query::fmt_ms(oldest),
-            timberfs::query::human_duration(oldest.saturating_sub(c.wl))
+            "timber-otlp: warning: GAP — this cursor is at chunk {} but the oldest chunk \
+             the store still holds is {}: retention dropped {n} chunk(s) this consumer \
+             never read, and they are not recoverable. Resuming at the oldest one. Either \
+             widen the store's retention or find out why this shipper was behind.",
+            c.seq.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
+            c.seq.map(|s| s + n).unwrap_or(0)
         );
     }
-    let backlog = match standing.filter(|s| s.gap_to_ms.is_none() && !s.caught_up()) {
+    let backlog = match standing.filter(|s| s.gap_chunks.is_none() && !s.caught_up()) {
         Some(s) => format!(
             ", {} unread in {} chunk(s)",
             timberfs::rotate::human_bytes(s.behind_bytes),
@@ -412,10 +417,15 @@ fn report_resume(c: &Cursor, store: Option<&Path>) {
         ),
         None => String::new(),
     };
+    // The chunk is the position; the time is only there to orient a human.
     note!(
-        "timber-otlp: resuming at {} (+{} entries), {} delivered so far{backlog}",
-        timberfs::query::fmt_ms(c.wl),
+        "timber-otlp: resuming at chunk {} (+{} entries, around {}), {} delivered \
+         so far{backlog}",
+        c.seq
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string()),
         c.n,
+        timberfs::query::fmt_ms(c.wl),
         c.delivered
     );
 }
@@ -426,8 +436,8 @@ fn run() -> anyhow::Result<()> {
 
     if cli.cursor.is_some() && !cli.follow {
         bail!(
-            "--cursor needs --follow: a resumable position is on the write axis, and \
-             only the follow path selects by it (a windowed query filters by the \
+            "--cursor needs --follow: a resumable position is a chunk number, and only \
+             the follow path reads forward from one (a windowed query filters by the \
              timestamps the lines carry, which can move backwards)"
         );
     }
@@ -459,9 +469,32 @@ fn run() -> anyhow::Result<()> {
             );
         }
         match Cursor::load(path)? {
-            Some(c) => {
+            Some(mut c) => {
                 c.check_store(&id, path)?;
-                report_resume(&c, store.as_deref());
+                let records = store_records(store.as_deref());
+                // A cursor written before chunk numbers existed holds a
+                // write time. Convert it in memory now; it is persisted by
+                // the first save AFTER a successful send, keeping the rule
+                // that a cursor is never written ahead of a durability
+                // proof. Resolution is a pure function of (wl, rings), so a
+                // crash before that simply resolves again.
+                if c.seq.is_none() && c.delivered > 0 {
+                    let before = c.wl;
+                    match c.resolve(records.as_deref().unwrap_or_default()) {
+                        Some(seq) => note!(
+                            "timber-otlp: converting a pre-numbering cursor: write time {} \
+                             resolves to chunk {seq}, re-read from its start — up to one \
+                             chunk may be re-delivered (at-least-once), and nothing is \
+                             skipped",
+                            timberfs::query::fmt_ms(before)
+                        ),
+                        None => note!(
+                            "timber-otlp: a pre-numbering cursor and no chunks to resolve \
+                             it against yet; honouring --start until there are"
+                        ),
+                    }
+                }
+                report_resume(&c, records.as_deref());
                 cursor = Some(c);
             }
             None => {
@@ -529,10 +562,11 @@ fn run() -> anyhow::Result<()> {
                 cmd.arg("--follow");
             }
             match (&cursor, &cli.from) {
-                // A cursor that has delivered something positions the
-                // read; a fresh one honours --start.
-                (Some(c), _) if c.delivered > 0 => {
-                    cmd.args(["--from", &timberfs::query::fmt_ms_rfc3339(c.from_ms())]);
+                // A cursor with a position drives the read from its chunk
+                // number — exact, and on the one axis that cannot move
+                // backwards. A fresh one honours --start.
+                (Some(c), _) if c.seq.is_some() => {
+                    cmd.args(["--from-chunk", &c.seq.expect("checked").to_string()]);
                 }
                 (Some(_), _) if cli.start == "begin" => {
                     cmd.args(["--from", "0"]);
@@ -589,7 +623,7 @@ fn run() -> anyhow::Result<()> {
                          to be a position in"
                     );
                 }
-                if !resume.deliver(e.wf.unwrap_or(0), e.wl.unwrap_or(0)) {
+                if !resume.deliver(e.chunk) {
                     continue;
                 }
                 batch.push(e);

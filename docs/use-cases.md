@@ -215,7 +215,7 @@ timberfs set backing/app.log cursors=/var/lib/timberfs
 timberfs info backing/app.log     # how far behind, and how much it is holding
 ```
 
-A shipper that fell outside the window says so on resume (`GAP — … of entries
+A shipper that fell outside the window says so on resume (`GAP — N chunk(s)
 were dropped before it read them`) rather than restarting silently from
 whatever is now oldest.
 

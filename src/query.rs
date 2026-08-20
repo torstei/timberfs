@@ -1852,7 +1852,7 @@ fn print_consumers(sv: &crate::cursor::Survey, compressed: u64) {
         crate::rotate::human_bytes(compressed),
         // A gapped consumer has unread bytes but holds nothing back:
         // retention already went past it.
-        if worst.standing.gap_to_ms.is_some() {
+        if worst.standing.gap_chunks.is_some() {
             "unread"
         } else {
             "held"
@@ -1869,14 +1869,14 @@ fn print_consumers(sv: &crate::cursor::Survey, compressed: u64) {
         .max(8);
     for c in &sv.consumers {
         let st = &c.standing;
-        let detail = match st.gap_to_ms {
+        let detail = match st.gap_chunks {
             // The one case where the position itself is the news: what
             // it would resume at is gone, so the entries between are
-            // unrecoverable and no retry re-delivers them.
-            Some(oldest) => format!(
-                "GAP — {} of entries were dropped before it read them; \
-                 it resumes at the oldest chunk",
-                human_duration(oldest.saturating_sub(c.cursor.wl))
+            // unrecoverable and no retry re-delivers them. A count, not a
+            // duration: the chunk numbers say exactly how many went.
+            Some(n) => format!(
+                "GAP — {n} chunk(s) were dropped before it read them; \
+                 it resumes at the oldest one still here"
             ),
             // The open chunk a live-edge consumer sits in is not a
             // backlog, so it is not reported as one.
@@ -1914,7 +1914,13 @@ pub(crate) fn consumers_json(sv: &crate::cursor::Survey) -> serde_json::Value {
                 let mut o = serde_json::Map::new();
                 o.insert("consumer".to_string(), c.name.clone().into());
                 o.insert("cursor".to_string(), c.path.display().to_string().into());
-                o.insert("wf".to_string(), c.cursor.wf.into());
+                o.insert(
+                    "seq".to_string(),
+                    c.cursor
+                        .seq
+                        .map(Into::into)
+                        .unwrap_or(serde_json::Value::Null),
+                );
                 o.insert("wl".to_string(), c.cursor.wl.into());
                 o.insert("n".to_string(), c.cursor.n.into());
                 o.insert("delivered".to_string(), c.cursor.delivered.into());
@@ -1923,8 +1929,8 @@ pub(crate) fn consumers_json(sv: &crate::cursor::Survey) -> serde_json::Value {
                 o.insert("behind_bytes".to_string(), st.behind_bytes.into());
                 o.insert("behind_ms".to_string(), st.behind_ms.into());
                 o.insert(
-                    "gap_to_ms".to_string(),
-                    st.gap_to_ms
+                    "gap_chunks".to_string(),
+                    st.gap_chunks
                         .map(Into::into)
                         .unwrap_or(serde_json::Value::Null),
                 );

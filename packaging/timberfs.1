@@ -1247,7 +1247,9 @@ nothing coordinates it with a consumer's progress, so a consumer down
 longer than the store's
 .B retain
 window has its position dropped out from under it; it then resumes at
-whatever is now oldest, and the entries in between are gone.
+whatever is now oldest, and the chunks in between are gone \(em reported as
+an exact COUNT, the chunk numbers stating how many rather than a timestamp
+comparison implying a duration.
 .BR timber\-otlp (1)
 warns by name on resume with the size of the hole, and this view shows
 the same fact from the store's side, before it becomes loss. What to

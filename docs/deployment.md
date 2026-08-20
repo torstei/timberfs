@@ -811,7 +811,7 @@ per-store cursor directory, and no writing back into it.
 The number to watch is the held bytes: **retention is the disconnection budget,
 and nothing enforces that a consumer stays inside it**. A shipper down longer
 than `retain` comes back to a cursor pointing at a dropped chunk; it warns on
-resume (`GAP — … of entries were dropped before it read them`) and continues
+resume (`GAP — N chunk(s) were dropped before it read them`) and continues
 from the oldest chunk, because the loss is already in the past and a shipper
 that refuses to start ships nothing. Alert on that warning, and on a consumer
 whose lag approaches the retention window.
