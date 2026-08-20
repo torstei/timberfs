@@ -206,6 +206,19 @@ timber-otlp --follow --cursor /var/lib/timberfs/edge.cursor \
 Plaintext HTTP only: loopback or a private network, or terminate TLS in a
 collector beside it.
 
+The edge store's retention is the link's disconnection budget, and nothing
+enforces that the shipper stays inside it. Declare where the cursor lives and
+the budget becomes observable from the store's side:
+
+```sh
+timberfs set backing/app.log cursors=/var/lib/timberfs
+timberfs info backing/app.log     # how far behind, and how much it is holding
+```
+
+A shipper that fell outside the window says so on resume (`GAP — … of entries
+were dropped before it read them`) rather than restarting silently from
+whatever is now oldest.
+
 ## Hand an investigation to someone else
 
 A filtered slice, with its provenance, as one self-describing file — queryable

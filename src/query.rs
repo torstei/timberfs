@@ -1362,6 +1362,11 @@ pub struct StoreSummary {
     pub sap_pending_bytes: Option<u64>,
     pub retain: Option<String>,
     pub retain_size: Option<String>,
+    /// Who is reading this store and how far behind, when it declares a
+    /// `cursors` directory to look in. `None` means no declaration —
+    /// which is not the same as nothing reading it, and a view must not
+    /// render the two alike.
+    pub consumers: Option<crate::cursor::Survey>,
     pub writer: WriterState,
 }
 
@@ -1455,6 +1460,7 @@ pub fn summarize_store(
         sap_pending_bytes,
         retain: get("retain"),
         retain_size: get("retain_size"),
+        consumers: crate::cursor::survey(dir, name, bark, records),
         writer,
     }
 }
@@ -1507,6 +1513,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         "pattern",
         "retain",
         "retain_size",
+        "cursors",
     ];
     let provenance: Vec<(String, String)> = bark
         .iter()
@@ -1530,6 +1537,9 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         .unwrap_or_default();
     let mut location = String::new();
     let mut bundle_bytes: Option<u64> = None;
+    // A pair-only fact, like the writer state: a bundle is a snapshot,
+    // and nothing holds a position in a snapshot.
+    let mut consumers: Option<crate::cursor::Survey> = None;
     let (
         chunks,
         logical,
@@ -1564,6 +1574,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         name = base.clone();
         location = dir.display().to_string();
         let s = summarize_store(&dir, &base, records, handle.bark.as_ref());
+        consumers = s.consumers;
         (
             s.chunks,
             s.logical_bytes,
@@ -1654,6 +1665,14 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         }
         if let Some(w) = &writer {
             put("writer", w.clone().into());
+        }
+        if let Some(sv) = &consumers {
+            put("cursors_dir", sv.dir.display().to_string().into());
+            put("consumers", consumers_json(sv));
+            put("held_bytes", sv.held_bytes().into());
+            if sv.unreadable > 0 {
+                put("cursors_unreadable", sv.unreadable.into());
+            }
         }
         println!("{}", serde_json::to_string_pretty(&o)?);
         return Ok(());
@@ -1767,6 +1786,9 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                 }
             );
         }
+        if let Some(sv) = &consumers {
+            print_consumers(sv, compressed);
+        }
         if let Some(w) = &writer {
             println!("  writer    {w}");
         }
@@ -1774,7 +1796,118 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn human_duration(ms: u64) -> String {
+/// `info`'s consumer block: a header saying what the whole store's
+/// backlog is, then one line per consumer, furthest-behind first. The
+/// header leads with the held bytes because that is the number an
+/// operator acts on — a store is large because someone is behind, and
+/// this names who.
+fn print_consumers(sv: &crate::cursor::Survey, compressed: u64) {
+    let dir = sv.dir.display();
+    if sv.consumers.is_empty() {
+        // Declared but empty is a real state, and a dangerous-looking
+        // one: nothing holds a position, so nothing is protected.
+        println!(
+            "  consumers none in {dir}/ — no cursor here is a position in this store{}",
+            if sv.unreadable > 0 {
+                format!(" ({} unreadable file(s))", sv.unreadable)
+            } else {
+                String::new()
+            }
+        );
+        return;
+    }
+    let held = sv.held_bytes();
+    let worst = sv.worst().expect("non-empty");
+    println!(
+        "  consumers {} in {dir}/; {} of {} {} by {} ({})",
+        sv.consumers.len(),
+        crate::rotate::human_bytes(held),
+        crate::rotate::human_bytes(compressed),
+        // A gapped consumer has unread bytes but holds nothing back:
+        // retention already went past it.
+        if worst.standing.gap_to_ms.is_some() {
+            "unread"
+        } else {
+            "held"
+        },
+        worst.name,
+        worst.standing.lag_text()
+    );
+    let width = sv
+        .consumers
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    for c in &sv.consumers {
+        let st = &c.standing;
+        let detail = match st.gap_to_ms {
+            // The one case where the position itself is the news: what
+            // it would resume at is gone, so the entries between are
+            // unrecoverable and no retry re-delivers them.
+            Some(oldest) => format!(
+                "GAP — {} of entries were dropped before it read them; \
+                 it resumes at the oldest chunk",
+                human_duration(oldest.saturating_sub(c.cursor.wl))
+            ),
+            // The open chunk a live-edge consumer sits in is not a
+            // backlog, so it is not reported as one.
+            None if st.caught_up() || st.at_live_edge() => st.lag_text(),
+            None => format!(
+                "{}, {} unread in {} chunk(s)",
+                st.lag_text(),
+                crate::rotate::human_bytes(st.behind_bytes),
+                st.behind_chunks
+            ),
+        };
+        println!(
+            "            {:<width$}  {detail}; {} delivered",
+            c.name,
+            c.cursor.delivered,
+            width = width
+        );
+    }
+    if sv.unreadable > 0 {
+        println!(
+            "            plus {} file(s) in {dir}/ not readable as cursors",
+            sv.unreadable
+        );
+    }
+}
+
+/// The per-consumer detail, shared by `info --json` and `list --json`
+/// so a script sees the same fields whichever it asks.
+pub(crate) fn consumers_json(sv: &crate::cursor::Survey) -> serde_json::Value {
+    serde_json::Value::Array(
+        sv.consumers
+            .iter()
+            .map(|c| {
+                let st = &c.standing;
+                let mut o = serde_json::Map::new();
+                o.insert("consumer".to_string(), c.name.clone().into());
+                o.insert("cursor".to_string(), c.path.display().to_string().into());
+                o.insert("wf".to_string(), c.cursor.wf.into());
+                o.insert("wl".to_string(), c.cursor.wl.into());
+                o.insert("n".to_string(), c.cursor.n.into());
+                o.insert("delivered".to_string(), c.cursor.delivered.into());
+                o.insert("consumed_chunks".to_string(), st.consumed_chunks.into());
+                o.insert("behind_chunks".to_string(), st.behind_chunks.into());
+                o.insert("behind_bytes".to_string(), st.behind_bytes.into());
+                o.insert("behind_ms".to_string(), st.behind_ms.into());
+                o.insert(
+                    "gap_to_ms".to_string(),
+                    st.gap_to_ms
+                        .map(Into::into)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                serde_json::Value::Object(o)
+            })
+            .collect(),
+    )
+}
+
+pub fn human_duration(ms: u64) -> String {
     let s = ms / 1000;
     let (d, h, m) = (s / 86400, (s % 86400) / 3600, (s % 3600) / 60);
     if d > 0 {

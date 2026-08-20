@@ -239,6 +239,41 @@ posted. Protobuf by default (`--encoding json` for a readable wire,
 `--compress gzip` over a network); plaintext HTTP only — terminate TLS in a
 collector beside it. Details: `man timber-otlp`.
 
+### Who is reading, and how far behind
+
+Retention acts on the head of a store and nothing coordinates it with a
+consumer's progress, so a shipper down longer than the retention window comes
+back to find the chunk its cursor points at already dropped. That is reported
+rather than absorbed: the shipper warns on resume with the size of the hole,
+instead of quietly restarting from whatever is now oldest.
+
+The same fact is visible from the store's side — *before* it becomes loss — once
+the store declares where its consumers keep their cursors. A cursor stays
+consumer state at a path the operator names; the declaration only says where to
+look, and cursors are matched to stores by the identity they carry, so one
+directory serves a whole host:
+
+```sh
+timberfs set backing/app.log cursors=/var/lib/timberfs
+```
+
+```
+$ timberfs list
+HANDLE  FOREST   SIZE     SPAN                    WRITER  INDEX  RETAIN  CONSUMERS
+app     default  1.4 GiB  2026-08-13 .. 08-20     live    grain  30d     2, 6d 2h behind
+
+$ timberfs info backing/app.log
+  …
+  consumers 2 in /var/lib/timberfs/; 1.2 GiB of 1.4 GiB held by splitter (6d 2h behind)
+            splitter  6d 2h behind, 1.2 GiB unread in 4831 chunk(s); 41.2k delivered
+            otlp      at the live edge; 12.4M delivered
+```
+
+`1.2 GiB of 1.4 GiB held by splitter` is the number to act on: the store is
+large because one consumer is behind, and this names which. A store that
+declares no directory shows `-`, which is not the same as `0` — declared, and
+nothing is reading it.
+
 ## Rotation & retention
 
 `timberfs rotate` does **time-based** rotation: everything written before the

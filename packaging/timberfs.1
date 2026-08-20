@@ -209,7 +209,9 @@ neither. Known settings are parse-checked
 .RB ( retain =90d,
 .BR retain_size =50G,
 .BR index =true|false,
-.BR wal =true|false);
+.BR wal =true|false,
+.BR cursors =/var/lib/timberfs \(em an absolute directory, see
+.BR CONSUMERS );
 .BR timestamp_regex ,
 .B timestamp_format
 and
@@ -772,10 +774,18 @@ is declared and how many bytes currently sit in its
 sidecar unflushed (a read-only stat \(em never replayed by
 .BR info ),
 and the writer state (none / active appender or import / mounted, probed
-from the actual flocks, never from stale lock-file contents). Works
-identically on backing pairs and read-only
+from the actual flocks, never from stale lock-file contents). A store
+that declares a
+.B cursors
+directory also gets a
+.B consumers
+block: every consumer holding a position in it, furthest behind first,
+with how far behind it is, how much of the store it alone is holding,
+and how much it has delivered (see
+.BR CONSUMERS ).
+Works identically on backing pairs and read-only
 .B .timber
-bundles.
+bundles \(em a bundle is a snapshot, so it never has consumers.
 .B \-\-json
 prints the same facts as one JSON object for scripting. Read-only and
 safe against live writers.
@@ -827,6 +837,18 @@ and
 .BR retain / retain_size ,
 else
 .IR \- ).
+A
+.B CONSUMERS
+column is added when at least one listed store declares a
+.B cursors
+directory \(em how many consumers hold a position in it and the state of
+the worst of them
+.RI ( "2, 6d 2h behind" ", " "1, caught up" ", " "2, GAP" );
+.I \-
+means the store declares no directory, which is not the same as
+.IR 0 ,
+declared with nothing reading it (see
+.BR CONSUMERS ).
 The same handle found in two forests shows up as two rows \(em
 .B list
 is how an ambiguity that handle resolution would refuse to guess at
@@ -840,8 +862,21 @@ completion consumes.
 A JSON array of objects
 .RI ( handle ", " forest ", " dir ", " path ", " size_bytes ", "
 .IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
-.IR retain_size )
+.IR retain_size ", " cursors_dir ", " consumers ", " held_bytes )
 instead of the human table.
+.I cursors_dir
+and
+.I consumers
+are
+.B null
+when the store declares no directory, and
+.I consumers
+is an empty array when it declares one that holds no position in this
+store \(em the same distinction the table's
+.I \-
+and
+.I 0
+make.
 .PP
 No forests configured and no
 .I DIR
@@ -1133,6 +1168,75 @@ settings, is never inherited by derived stores.
 .B timberfs info
 shows the declared policy and calls out a store that is over budget
 with no writer running to enforce it.
+.SH CONSUMERS
+A
+.I consumer
+is anything that reads a store's entry stream and remembers where it
+got to \(em
+.BR timber\-otlp (1)
+today, any shipper reusing the same cursor file tomorrow. The position
+lives in a
+.I cursor
+file at a path the OPERATOR names, outside the store: it is consumer
+state, not store state, so several consumers can read one store at
+different positions, a cursor never travels inside a
+.B .timber
+bundle as if it were provenance, and a retention head-drop cannot
+delete it.
+.PP
+Which means a store does not know its readers unless it is told where to
+look. Declaring
+.B cursors
+names that directory \(em
+.B timberfs set backing/app.log cursors=/var/lib/timberfs
+\(em and nothing more: the store never writes there, and a reader never
+writes to the store. Cursors are matched to stores by the store
+IDENTITY each one carries (the
+.B .bark
+.IR id ,
+or the canonical path for a store that declares none), so ONE directory
+serves every store on a host \(em typically the shipper units'
+.BR StateDirectory= .
+A cursor for another store is simply not this store's; files that are
+not readable as cursors are counted, not reported one by one, and an
+in-flight
+.I .tmp
+save is skipped.
+.PP
+.B timberfs list
+then carries a
+.B CONSUMERS
+column and
+.B timberfs info
+a
+.B consumers
+block. Per consumer:
+.B how far behind
+on the write axis
+.RI ( "at the live edge"
+when nothing newer than its position exists \(em a consumer keeping up
+with a live store always sits INSIDE the newest chunk, never past it),
+.B how much it is holding
+(compressed bytes from its own chunk to the end of the store), and
+.B how much it has delivered
+in total. The store-level number is the
+.B furthest-behind
+consumer's backlog: a spool is large because one consumer is behind, and
+this names which.
+.PP
+.B GAP
+is the one alarming state. Retention acts on the head of a store and
+nothing coordinates it with a consumer's progress, so a consumer down
+longer than the store's
+.B retain
+window has its position dropped out from under it; it then resumes at
+whatever is now oldest, and the entries in between are gone.
+.BR timber\-otlp (1)
+warns by name on resume with the size of the hole, and this view shows
+the same fact from the store's side, before it becomes loss. What to
+watch is a consumer whose lag approaches the retention window \(em that
+is the disconnection budget being spent, and nothing enforces that a
+consumer stays inside it.
 .SH FORESTS
 A
 .I forest

@@ -1874,6 +1874,101 @@ timber_otlp_cursor_resumes_without_duplicates() {
     [ "$(jq -r .delivered /tmp/cur.cursor)" = 6 ]
 }
 
+consumer_view_and_gap() {
+    # The consumer view, both halves. A store declares WHERE its consumers
+    # keep their cursors and `list`/`info` then say who is reading it and
+    # how far behind; a cursor whose position retention has already dropped
+    # is a GAP, reported by the view AND by the shipper on resume. Nothing
+    # writes into the cursor directory from the store's side, so this test
+    # hand-writes the cursors exactly as a shipper would.
+    local d=/var/log/timberfs/consumed cdir=/tmp/consumer-cursors
+    local store="$d/consumed.log"
+    rm -rf "$d" "$cdir"; mkdir -p "$cdir"
+    # One append run per chunk, spaced so the write windows differ.
+    local i
+    for i in 1 2 3; do
+        printf '2026-08-01T09:00:0%s INFO consumed line %s\n' "$i" "$i" \
+            | timberfs append --into "$store" --quiet || return 1
+        sleep 1.1
+    done
+    timberfs set "$store" "cursors=$cdir" >/dev/null || return 1
+
+    # Two consumers of this store, plus a neighbour's cursor and a
+    # non-cursor file in the same shared directory.
+    python3 - "$store" "$cdir" << 'PYEOF' || return 1
+import json, struct, sys
+store, cdir = sys.argv[1], sys.argv[2]
+sid = json.load(open(store + ".bark"))["id"]
+raw = open(store + ".rings", "rb").read()
+recs = [struct.unpack("<6Q", raw[8 + i * 48:56 + i * 48]) for i in range((len(raw) - 8) // 48)]
+assert len(recs) >= 3, recs
+def cursor(name, wf, wl, delivered):
+    json.dump({"consumer": name, "store": sid, "path": store,
+               "wf": wf, "wl": wl, "n": 1, "delivered": delivered},
+              open("%s/%s.cursor" % (cdir, name), "w"))
+cursor("edge", recs[-1][4], recs[-1][5], 100)   # in the newest chunk: keeping up
+cursor("lagging", recs[0][4], recs[0][5], 10)   # still in the oldest: behind
+json.dump({"consumer": "other", "store": "not-this-store", "wl": 1},
+          open(cdir + "/other.cursor", "w"))
+open(cdir + "/README", "w").write("not a cursor\n")
+PYEOF
+
+    timberfs info "$store" > /tmp/consumers.info 2>&1 || return 1
+    grep -q "consumers 2 in $cdir/" /tmp/consumers.info || { cat /tmp/consumers.info; return 1; }
+    # A consumer keeping up with a live store sits INSIDE the newest chunk.
+    grep -qE '^ +edge +at the live edge' /tmp/consumers.info || { cat /tmp/consumers.info; return 1; }
+    grep -qE '^ +lagging +.*unread in 3 chunk\(s\)' /tmp/consumers.info \
+        || { cat /tmp/consumers.info; return 1; }
+    # The furthest behind leads, and is what the store is held by.
+    grep -q "held by lagging" /tmp/consumers.info || { cat /tmp/consumers.info; return 1; }
+    grep -q "not readable as cursors" /tmp/consumers.info || { cat /tmp/consumers.info; return 1; }
+
+    timberfs info --json "$store" > /tmp/consumers.json || return 1
+    jq -e '.consumers | length == 2' /tmp/consumers.json >/dev/null || return 1
+    jq -e '.consumers[0].consumer == "lagging"' /tmp/consumers.json >/dev/null || return 1
+    jq -e '.consumers[0].behind_bytes > .consumers[1].behind_bytes' /tmp/consumers.json >/dev/null \
+        || return 1
+    jq -e '.held_bytes == .consumers[0].behind_bytes' /tmp/consumers.json >/dev/null || return 1
+    jq -e '.cursors_unreadable == 1' /tmp/consumers.json >/dev/null || return 1
+
+    # `list` grows the column because a listed store declares a directory.
+    timberfs list /var/log/timberfs > /tmp/consumers.list 2>/dev/null || return 1
+    head -1 /tmp/consumers.list | grep -q 'CONSUMERS' || { cat /tmp/consumers.list; return 1; }
+    grep -E '^consumed[[:space:]]' /tmp/consumers.list | grep -q '2, ' \
+        || { cat /tmp/consumers.list; return 1; }
+    # A store that declares nothing keeps a dash in the shared column.
+    timberfs list --json /var/log/timberfs > /tmp/consumers.ljson 2>/dev/null || return 1
+    jq -e '[.[] | select(.handle != "consumed") | .consumers] | all(. == null)' \
+        /tmp/consumers.ljson >/dev/null || return 1
+
+    # A position older than anything the store holds: retention outran it.
+    python3 - "$store" "$cdir" << 'PYEOF' || return 1
+import json, struct, sys
+store, cdir = sys.argv[1], sys.argv[2]
+sid = json.load(open(store + ".bark"))["id"]
+raw = open(store + ".rings", "rb").read()
+first = struct.unpack("<6Q", raw[8:56])[4]
+json.dump({"consumer": "dropped", "store": sid, "path": store,
+           "wf": first - 600000, "wl": first - 600000, "n": 0, "delivered": 5000},
+          open(cdir + "/dropped.cursor", "w"))
+PYEOF
+    timberfs info "$store" | grep -qE '^ +dropped +GAP' || { timberfs info "$store"; return 1; }
+    timberfs list /var/log/timberfs | grep -E '^consumed[[:space:]]' | grep -q 'GAP' || return 1
+
+    # And the shipper says so on resume rather than silently restarting
+    # from whatever is now oldest.
+    timeout 5 timber-otlp --follow --cursor "$cdir/dropped.cursor" --dry-run \
+        "$store" > /dev/null 2> /tmp/consumers.gap
+    grep -q 'GAP' /tmp/consumers.gap || { cat /tmp/consumers.gap; return 1; }
+    # It keeps going: the loss is in the past, and a shipper that refuses
+    # to start ships nothing.
+    grep -q 'resuming at' /tmp/consumers.gap || { cat /tmp/consumers.gap; return 1; }
+
+    rm -rf "$cdir" /tmp/consumers.info /tmp/consumers.json /tmp/consumers.list \
+        /tmp/consumers.ljson /tmp/consumers.gap
+    return 0
+}
+
 # ARGS: CONTENT_TYPE BODY_FILE [gzip] — post a body from a file, so binary
 # survives the trip. Prints "<status>|<response body length>".
 otlp_post_file() {
@@ -2017,6 +2112,7 @@ run_test "otlp: store shipped out and received back is byte for byte" otlp_round
 run_test "otlp: the same roundtrip over json + gzip" otlp_roundtrip_over_json_and_gzip
 run_test "timber-otlp: --dry-run renders one LogRecord per entry" timber_otlp_dry_run_shape
 run_test "timber-otlp: cursor resumes after a kill, no duplicates" timber_otlp_cursor_resumes_without_duplicates
+run_test "consumers: list/info show lag and held bytes; a dropped position is a GAP" consumer_view_and_gap
 
 forest_handle_resolution() {
     # The package ships /etc/timberfs/forests.d/default.conf with

@@ -194,15 +194,7 @@ fn resource_attrs(store: Option<&Path>, cli: &Cli) -> anyhow::Result<StoreIdenti
                 .map(str::to_string)
         };
         let store_id = get("id");
-        anchor = Some(store_id.clone().unwrap_or_else(|| {
-            format!(
-                "path:{}",
-                std::fs::canonicalize(&dir)
-                    .unwrap_or_else(|_| dir.clone())
-                    .join(&name)
-                    .display()
-            )
-        }));
+        anchor = Some(timberfs::cursor::store_anchor(&dir, &name, bark.as_ref()));
         service = service
             .or_else(|| get("service"))
             .or_else(|| Some(name.trim_end_matches(".log").to_string()));
@@ -382,6 +374,52 @@ impl Shipper {
     }
 }
 
+/// What a resume is worth saying out loud: where it starts, and how much
+/// of the store is still ahead of it.
+///
+/// A GAP is the one case that is a warning rather than a note. Retention
+/// acts on the head and nothing coordinates it with a consumer's
+/// progress, so a shipper down longer than the store's `retain` window
+/// comes back to find the chunk its cursor points at already dropped —
+/// and `query --from` then simply starts at whatever is now oldest.
+/// Without this check that loss is invisible: the shipper reports a
+/// clean resume and the skipped entries are never mentioned again. It
+/// stays a warning and not a refusal because the loss is already in the
+/// past, and a shipper that will not start ships nothing.
+fn report_resume(c: &Cursor, store: Option<&Path>) {
+    let standing = store
+        .and_then(|p| timberfs::query::resolve_backing(p).ok())
+        .and_then(|(dir, name)| {
+            timberfs::format::read_index(&timberfs::format::rings_path(&dir, &name)).ok()
+        })
+        .map(|records| timberfs::cursor::standing(c, &records));
+    if let Some(oldest) = standing.and_then(|s| s.gap_to_ms) {
+        eprintln!(
+            "timber-otlp: warning: GAP — the cursor is at {} but the oldest data in the \
+             store is {}; retention dropped {} of entries this consumer never read, and \
+             they are not recoverable. Resuming at the oldest chunk. Either widen the \
+             store's retention or find out why this shipper was behind.",
+            timberfs::query::fmt_ms(c.wl),
+            timberfs::query::fmt_ms(oldest),
+            timberfs::query::human_duration(oldest.saturating_sub(c.wl))
+        );
+    }
+    let backlog = match standing.filter(|s| s.gap_to_ms.is_none() && !s.caught_up()) {
+        Some(s) => format!(
+            ", {} unread in {} chunk(s)",
+            timberfs::rotate::human_bytes(s.behind_bytes),
+            s.behind_chunks
+        ),
+        None => String::new(),
+    };
+    note!(
+        "timber-otlp: resuming at {} (+{} entries), {} delivered so far{backlog}",
+        timberfs::query::fmt_ms(c.wl),
+        c.n,
+        c.delivered
+    );
+}
+
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     timberfs::note::set_quiet(cli.quiet);
@@ -423,12 +461,7 @@ fn run() -> anyhow::Result<()> {
         match Cursor::load(path)? {
             Some(c) => {
                 c.check_store(&id, path)?;
-                note!(
-                    "timber-otlp: resuming at {} (+{} entries), {} delivered so far",
-                    timberfs::query::fmt_ms(c.wl),
-                    c.n,
-                    c.delivered
-                );
+                report_resume(&c, store.as_deref());
                 cursor = Some(c);
             }
             None => {

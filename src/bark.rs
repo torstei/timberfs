@@ -321,7 +321,11 @@ pub fn cmd_create(
         let Some((k, v)) = kv.split_once('=') else {
             bail!("--set wants key=value, got {kv:?}");
         };
-        map.insert(k.trim().to_string(), Value::String(v.to_string()));
+        let k = k.trim();
+        if k == "cursors" {
+            validate_cursors_dir(v)?;
+        }
+        map.insert(k.to_string(), Value::String(v.to_string()));
     }
 
     fs::create_dir_all(&dir)?;
@@ -411,6 +415,28 @@ fn warn_declaration_drift(dir: &Path, name: &str, declared: &Map<String, Value>)
 /// Identity and lineage are facts, not settings — never user-settable.
 const PROTECTED: &[&str] = &["id", "created", "derived_from", "derived_op"];
 
+/// `cursors`: the directory this store's consumers keep their positions
+/// in. Validated at declaration time because a wrong value is SILENT —
+/// the store simply appears to have no consumers, which is also the
+/// state in which nothing holds retention back. Absolute is required: a
+/// relative path resolves against the cwd of whichever daemon reads it
+/// next. A missing directory is only a warning — systemd creates a
+/// `StateDirectory=` at unit start, which can be after the store is
+/// declared.
+fn validate_cursors_dir(v: &str) -> anyhow::Result<()> {
+    let path = Path::new(v);
+    if !path.is_absolute() {
+        bail!("\"cursors\" must be an absolute path (it is read by daemons, from any cwd)");
+    }
+    if !path.is_dir() {
+        eprintln!(
+            "timberfs: warning: {v} is not a directory (yet) — nothing will be \
+             found there until it exists"
+        );
+    }
+    Ok(())
+}
+
 /// `timberfs set`: declare or change a store's properties in its manifest
 /// — validated and atomic, which hand-editing the JSON is not. Known
 /// settings are parse-checked (retain/retain_size/index); everything else
@@ -477,6 +503,10 @@ pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Resu
                 {
                     bail!("\"timestamp_format\" is not a valid chrono format string");
                 }
+                Value::String(v)
+            }
+            "cursors" => {
+                validate_cursors_dir(&v)?;
                 Value::String(v)
             }
             _ => Value::String(v),
