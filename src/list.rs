@@ -301,7 +301,7 @@ mod tests {
             consumers: consumers
                 .into_iter()
                 .map(
-                    |(name, behind_bytes, behind_ms, gap_to_ms)| crate::cursor::Consumer {
+                    |(name, behind_bytes, behind_ms, gap_chunks)| crate::cursor::Consumer {
                         name: name.to_string(),
                         path: PathBuf::from(format!("/var/lib/timberfs/{name}.cursor")),
                         cursor: crate::cursor::Cursor::new(name, "id", "/p"),
@@ -310,7 +310,7 @@ mod tests {
                             behind_chunks: if behind_bytes > 0 { 1 } else { 0 },
                             behind_bytes,
                             behind_ms,
-                            gap_to_ms,
+                            gap_chunks,
                         },
                     },
                 )

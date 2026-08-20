@@ -66,19 +66,43 @@ cursor must not travel inside a
 .B .timber
 bundle as if it were provenance. It is a flat JSON object; rewinding by
 editing
-.B wl
+.B seq
 is the supported edit.
 .PP
 The position is
-.RI ( wf ", " wl ", " n ):
-the write window of the chunk an entry arrived in, and how many entries
-with that exact window were already delivered. Positioning is
-chunk-granular, so a resume re-reads the boundary chunk and drops the
-prefix it already sent. Delivery is therefore
+.RI ( seq ", " n ):
+the NUMBER of the chunk an entry arrived in, and how many entries of that
+chunk were already delivered. A chunk number is the only axis that cannot
+move backwards \(em the write axis is a wall clock an NTP step can push
+back, and an intake stamps the sender's event time on purpose (see THE TWO
+CLOCKS in
+.BR timberfs (1)),
+and a cursor is a single point, where a range or a prefix would have
+survived. Positioning is chunk-granular, so a resume re-reads the boundary
+chunk and drops the prefix it already sent. Delivery is therefore
 .B at-least-once
 \(em which is all OTLP offers anyway, having no deduplication key. The
 cursor is written after the receiver accepts, never before, so a crash
 re-delivers instead of skipping.
+.B wl
+is also recorded, but only to orient a human reading the file; it decides
+nothing.
+.PP
+An entry read from the LIVE EDGE (a store with
+.B wal
+declared, tailed within the second) carries no chunk number, its chunk not
+existing yet. It is delivered and counted, but the position does not move:
+there is nowhere inside an unwritten chunk to resume from. A restart
+therefore re-reads from the last chunk boundary \(em bounded, and the same
+thing chunk-granular resume already does.
+.PP
+A cursor written before chunk numbers existed holds a write time instead.
+It is converted on first use: the time resolves to a chunk the way
+.B \-\-from
+does, that chunk is re-read from its start (so up to one chunk is
+re-delivered, and nothing is skipped), and the converted file is written by
+the first save AFTER a successful send \(em never ahead of a durability
+proof.
 .PP
 The store is identified by its
 .B .bark
@@ -94,7 +118,9 @@ retention acts on the head of a store and nothing coordinates it with
 this shipper's progress, so a shipper down longer than the store's
 .B retain
 window comes back to find the chunk its cursor points at already
-dropped. That is a WARNING naming how much was dropped unread, and then
+dropped. That is a WARNING naming exactly how many chunks were dropped
+unread \(em a count, the numbers stating it rather than a timestamp
+comparison implying it \(em and then
 the run continues from the oldest chunk \(em the loss is already in the
 past, and a shipper that refuses to start ships nothing. Declare
 .B cursors

@@ -7,19 +7,24 @@
 //! not drop it. `.bark` is what the store declares about itself; this is
 //! what someone reading it remembers.
 //!
-//! The position is on the WRITE axis, the only monotonic one. Logline
-//! timestamps go backwards — an entry written now can be stamped an hour
-//! ago — so resuming from the highest logline stamp seen would SKIP such
-//! an entry permanently, while resuming from a write time can only
-//! re-deliver. Both are failure modes; only one is acceptable.
+//! The position is a CHUNK NUMBER, the only axis that cannot move
+//! backwards. Logline timestamps go backwards by nature — an entry
+//! written now can be stamped an hour ago — and the write axis does too,
+//! `now_ms()` being a wall clock that an NTP step or a `date -s` can push
+//! back, and an intake stamping the sender's event time on purpose. A
+//! range or a prefix survives that; a single point does not, which is
+//! what a cursor is.
 //!
-//! A position is `(wf, wl, n)`: the write window of the chunk an entry
-//! arrived in, plus how many entries carrying that exact window were
-//! already delivered. `query --records --follow --from <wl>` positions at
-//! the chunk the cursor sits in (chunk granularity is all the rings
-//! offer) and `n` skips what was already delivered inside it. Two
-//! distinct chunks sharing both ends of their window re-deliver rather
-//! than skip.
+//! A position is `(seq, n)`: the number of the chunk an entry arrived in,
+//! plus how many entries of that chunk were already delivered.
+//! `query --records --follow --from-chunk <seq>` seeks to exactly that
+//! chunk and `n` skips what was already delivered inside it.
+//!
+//! An entry from the LIVE EDGE carries no chunk number, because its chunk
+//! does not exist yet. It is delivered and counted, but the position does
+//! not move: there is nowhere inside a chunk that has not been written to
+//! resume from. The cost is re-reading from the last chunk boundary after
+//! a restart, which chunk-granular resume already does.
 //!
 //! Delivery is therefore at-least-once — which is all OTLP and the
 //! Forward protocol offer anyway: neither carries a deduplication key.
@@ -35,7 +40,7 @@ use serde_json::{Map, Value};
 use crate::format::ChunkRecord;
 
 /// One consumer's position, as persisted. The file is a flat JSON object
-/// so an operator can rewind by editing `wl` (the supported edit) — but
+/// so an operator can rewind by editing `seq` (the supported edit) — but
 /// it is machine-owned state: unknown keys are ignored, not preserved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cursor {
@@ -49,10 +54,17 @@ pub struct Cursor {
     pub store: String,
     /// The store's path when last written — informational only.
     pub path: String,
-    pub wf: u64,
-    pub wl: u64,
-    /// Entries already delivered from the window `(wf, wl)`.
+    /// The chunk this consumer stands in. `None` on a cursor written
+    /// before chunk numbers existed, which `resolve` converts on the next
+    /// save, and on one that has never delivered anything.
+    pub seq: Option<u64>,
+    /// Entries already delivered from chunk `seq`.
     pub n: u64,
+    /// The write time of the newest entry delivered — INFORMATIONAL, so a
+    /// human reading the file can see roughly where the position is. It
+    /// decides nothing; `seq` is the position. On a pre-numbering cursor
+    /// it is the only position there is, and `resolve` reads it once.
+    pub wl: u64,
     /// Total entries delivered by this consumer, for observability.
     pub delivered: u64,
 }
@@ -63,9 +75,9 @@ impl Cursor {
             consumer: consumer.to_string(),
             store: store.to_string(),
             path: path.to_string(),
-            wf: 0,
-            wl: 0,
+            seq: None,
             n: 0,
+            wl: 0,
             delivered: 0,
         }
     }
@@ -103,9 +115,9 @@ impl Cursor {
             consumer: str_at("consumer"),
             store,
             path: str_at("path"),
-            wf: u64_at("wf"),
-            wl: u64_at("wl"),
+            seq: map.get("seq").and_then(Value::as_u64),
             n: u64_at("n"),
+            wl: u64_at("wl"),
             delivered: u64_at("delivered"),
         }))
     }
@@ -127,22 +139,53 @@ impl Cursor {
         Ok(())
     }
 
-    /// Count one delivered entry. `n` counts within a write window, so it
-    /// restarts whenever the window does.
-    pub fn advance(&mut self, wf: u64, wl: u64) {
-        if (self.wf, self.wl) != (wf, wl) {
-            self.wf = wf;
-            self.wl = wl;
+    /// Count one delivered entry. `chunk` is `None` for an entry read from
+    /// the live edge: it is counted, and `wl` follows it so the file still
+    /// shows where the consumer is in time, but the POSITION does not move
+    /// — a chunk that does not exist yet has no inside to resume from. The
+    /// next run therefore re-reads from the last chunk boundary, which
+    /// chunk-granular resume already does anyway.
+    pub fn advance(&mut self, chunk: Option<u64>, wl: u64) {
+        self.delivered += 1;
+        self.wl = wl;
+        let Some(seq) = chunk else {
+            return;
+        };
+        if self.seq != Some(seq) {
+            self.seq = Some(seq);
             self.n = 0;
         }
         self.n += 1;
-        self.delivered += 1;
     }
 
-    /// What to hand `query --from`: the window END, since that is what
-    /// chunk positioning compares against (`last_write_ms >= from`).
-    pub fn from_ms(&self) -> u64 {
-        self.wl
+    /// Convert a pre-numbering cursor: resolve its write-time position to a
+    /// chunk the way `query --from` does — the first chunk whose window
+    /// reaches it — and start at that chunk's BEGINNING.
+    ///
+    /// `n` is deliberately RESET. It counted entries within a write
+    /// WINDOW, so carrying it over would skip entries nobody received
+    /// whenever the resolved chunk is not the one the old cursor sat in
+    /// (its chunk dropped, or two chunks sharing a window). Resetting costs
+    /// at most one re-delivered chunk, which at-least-once already permits:
+    /// wrong twice is recoverable, wrong once and skipped is not.
+    ///
+    /// A pure function of `(wl, records)`, so re-running it is harmless —
+    /// which is what lets the result be persisted only on the first save
+    /// AFTER a delivery, keeping the rule that a cursor is never written
+    /// ahead of a durability proof.
+    pub fn resolve(&mut self, records: &[ChunkRecord]) -> Option<u64> {
+        if self.seq.is_some() {
+            return self.seq;
+        }
+        let seq = match records.iter().find(|c| c.last_write_ms >= self.wl) {
+            Some(c) => c.seq,
+            // Past everything the store holds: start after the newest, so
+            // nothing already delivered is re-sent.
+            None => records.last()?.seq + 1,
+        };
+        self.seq = Some(seq);
+        self.n = 0;
+        Some(seq)
     }
 
     /// Atomic and durable: a torn or empty cursor after a crash would be
@@ -154,9 +197,12 @@ impl Cursor {
         map.insert("consumer".into(), Value::String(self.consumer.clone()));
         map.insert("store".into(), Value::String(self.store.clone()));
         map.insert("path".into(), Value::String(self.path.clone()));
-        map.insert("wf".into(), Value::from(self.wf));
-        map.insert("wl".into(), Value::from(self.wl));
+        match self.seq {
+            Some(seq) => map.insert("seq".into(), Value::from(seq)),
+            None => map.insert("seq".into(), Value::Null),
+        };
         map.insert("n".into(), Value::from(self.n));
+        map.insert("wl".into(), Value::from(self.wl));
         map.insert("delivered".into(), Value::from(self.delivered));
         map.insert(
             "updated".into(),
@@ -182,13 +228,13 @@ impl Cursor {
     }
 }
 
-/// Skips what a resumed stream re-delivers. `query --from` positions at
-/// chunk granularity, so the first chunk of a resumed stream is re-read
-/// from its start; this drops the entries inside it that the cursor says
-/// were already delivered, and then gets out of the way for good.
+/// Skips what a resumed stream re-delivers. `--from-chunk` seeks to a whole
+/// chunk, so the first chunk of a resumed stream is re-read from its start;
+/// this drops the entries inside it the cursor says were already delivered,
+/// and then gets out of the way for good.
 pub struct Resume {
-    at: Option<(u64, u64, u64)>,
-    seen_in_window: u64,
+    at: Option<(u64, u64)>,
+    seen_in_chunk: u64,
     skipped: u64,
     done: bool,
 }
@@ -196,33 +242,38 @@ pub struct Resume {
 impl Resume {
     pub fn new(cursor: Option<&Cursor>) -> Resume {
         Resume {
-            at: cursor.map(|c| (c.wf, c.wl, c.n)),
-            seen_in_window: 0,
+            at: cursor.and_then(|c| c.seq.map(|seq| (seq, c.n))),
+            seen_in_chunk: 0,
             skipped: 0,
             done: false,
         }
     }
 
-    /// Should this entry be delivered? Windows are ordered by `(wl, wf)`
-    /// — the appender stamps `now()`, so a live store's chunk windows
-    /// only move forward. A store written by an INTAKE is the exception:
-    /// those stamp the sender's event time, so a sender replaying old
-    /// events moves the windows backwards and a cursor over such a store
-    /// can skip rather than re-deliver.
-    pub fn deliver(&mut self, wf: u64, wl: u64) -> bool {
+    /// Should this entry be delivered? Chunk numbers only move forward, so
+    /// this is an ordinary comparison — no window ordering, and none of the
+    /// intake/clock-step caveats the write axis carried, where a position
+    /// could move backwards and a resume could SKIP.
+    ///
+    /// `None` is the live edge, which is by construction newer than every
+    /// chunk: always delivered.
+    pub fn deliver(&mut self, chunk: Option<u64>) -> bool {
         if self.done {
             return true;
         }
-        let Some((cwf, cwl, n)) = self.at else {
+        let Some((cseq, n)) = self.at else {
             self.done = true;
             return true;
         };
-        if (wl, wf) < (cwl, cwf) {
+        let Some(seq) = chunk else {
+            self.done = true;
+            return true;
+        };
+        if seq < cseq {
             self.skipped += 1;
             return false;
         }
-        if (wl, wf) == (cwl, cwf) && self.seen_in_window < n {
-            self.seen_in_window += 1;
+        if seq == cseq && self.seen_in_chunk < n {
+            self.seen_in_chunk += 1;
             self.skipped += 1;
             return false;
         }
@@ -272,25 +323,21 @@ pub fn declared_dir(bark: Option<&Map<String, Value>>) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// How many head chunks a cursor has FULLY consumed. This is the exact
-/// complement of what `Resume` would deliver — anything it would hand
-/// over must still exist — so the two orderings must stay identical:
-/// windows compare as `(last, first)`, and EQUALITY HOLDS the chunk. The
-/// cursor sits inside that one, `n` counts within it, and `query --from`
-/// re-positions to its start; dropping it would make `n` skip live
-/// entries instead of already-delivered ones.
+/// How many head chunks a cursor has FULLY consumed: the exact complement
+/// of what `Resume` would deliver, since anything it would hand over must
+/// still exist. The cursor's OWN chunk is not counted — `n` counts inside
+/// it and a resume re-reads it from the start, so dropping it would make
+/// `n` skip live entries instead of already-delivered ones.
 ///
-/// A prefix scan, not a binary search, for the same reason
-/// `rotation_split` is: an intake-written store stamps the sender's
-/// event time, so its windows can move backwards, and a partition over
-/// an unsorted array would return a count covering chunks the cursor has
-/// never reached. A scan simply stops early — it holds too much, never
-/// too little.
-pub fn consumed_prefix(records: &[ChunkRecord], wf: u64, wl: u64) -> usize {
-    records
-        .iter()
-        .take_while(|c| (c.last_write_ms, c.first_write_ms) < (wl, wf))
-        .count()
+/// A binary search, which the write axis could not support: chunk numbers
+/// are dense and only increase, so a partition is exact where a partition
+/// over write windows would have counted chunks the cursor never reached.
+/// A cursor with no position yet has consumed nothing.
+pub fn consumed_prefix(records: &[ChunkRecord], seq: Option<u64>) -> usize {
+    let Some(seq) = seq else {
+        return 0;
+    };
+    records.partition_point(|c| c.seq < seq)
 }
 
 /// Where one consumer stands in a store: what it has consumed, what it
@@ -308,14 +355,14 @@ pub struct Standing {
     pub behind_bytes: u64,
     /// Write-axis distance from the cursor to the store's newest write.
     pub behind_ms: u64,
-    /// The store's oldest write, when it is NEWER than the cursor's
-    /// position: what the cursor would resume at has been dropped, so
-    /// everything between the two is gone. Retention acts on the head
+    /// How many chunks were dropped between this cursor's position and the
+    /// oldest the store still holds — an EXACT count, where comparing
+    /// timestamps could only infer a duration. Retention acts on the head
     /// and nothing coordinates it with a consumer's progress, so this is
-    /// reachable today — and silent, because resuming just reads from
-    /// whatever is now oldest. Only a cursor that has delivered
-    /// something can gap; a fresh one has no position to lose.
-    pub gap_to_ms: Option<u64>,
+    /// reachable today, and silent unless reported: a resume just starts
+    /// from whatever is now oldest. Only a cursor with a position can gap;
+    /// one that has never delivered has nothing to lose.
+    pub gap_chunks: Option<u64>,
 }
 
 impl Standing {
@@ -336,7 +383,7 @@ impl Standing {
     /// consumer differently. A gap outranks a distance: once the position
     /// is gone, how far behind it was is no longer the fact that matters.
     pub fn lag_text(&self) -> String {
-        if self.gap_to_ms.is_some() {
+        if self.gap_chunks.is_some() {
             "GAP".to_string()
         } else if self.caught_up() {
             "caught up".to_string()
@@ -351,19 +398,23 @@ impl Standing {
 /// Windows are mostly-sorted, so both extremes are found by scanning
 /// (48 B per chunk) — the same choice `summarize_store` makes.
 pub fn standing(c: &Cursor, records: &[ChunkRecord]) -> Standing {
-    let consumed_chunks = consumed_prefix(records, c.wf, c.wl);
+    let consumed_chunks = consumed_prefix(records, c.seq);
     let behind_bytes = match (records.get(consumed_chunks), records.last()) {
         (Some(next), Some(last)) => last.comp_end().saturating_sub(next.comp_start),
         _ => 0,
     };
+    // Windows are only mostly sorted, so both extremes are scanned for
+    // (48 B per chunk) — the same choice `summarize_store` makes.
     let newest = records.iter().map(|r| r.last_write_ms).max().unwrap_or(0);
-    let oldest = records.iter().map(|r| r.first_write_ms).min();
     Standing {
         consumed_chunks,
         behind_chunks: records.len() - consumed_chunks,
         behind_bytes,
         behind_ms: newest.saturating_sub(c.wl),
-        gap_to_ms: oldest.filter(|o| c.delivered > 0 && c.wl < *o),
+        gap_chunks: match (c.seq, records.first()) {
+            (Some(seq), Some(first)) if seq < first.seq => Some(first.seq - seq),
+            _ => None,
+        },
     }
 }
 
@@ -412,7 +463,7 @@ impl Survey {
     pub fn gapped(&self) -> impl Iterator<Item = &Consumer> {
         self.consumers
             .iter()
-            .filter(|c| c.standing.gap_to_ms.is_some())
+            .filter(|c| c.standing.gap_chunks.is_some())
     }
 }
 
@@ -490,26 +541,24 @@ pub fn survey(
         },
     ))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cur(wf: u64, wl: u64, n: u64) -> Cursor {
+    /// A cursor standing in chunk `seq`, `n` entries into it.
+    fn cur(seq: u64, n: u64) -> Cursor {
         Cursor {
             consumer: "test".into(),
             store: "id".into(),
             path: "p".into(),
-            wf,
-            wl,
+            seq: Some(seq),
             n,
-            delivered: n,
+            wl: 100 + seq,
+            delivered: n.max(1),
         }
     }
 
-    fn chunk(comp_start: u64, comp_len: u64, first: u64, last: u64) -> ChunkRecord {
-        // seq is derived from the trunk position here purely so these
-        // fixtures are numbered in write order like a real store's.
+    fn chunk(seq: u64, comp_start: u64, comp_len: u64, first: u64, last: u64) -> ChunkRecord {
         ChunkRecord {
             uncomp_start: 0,
             uncomp_len: 0,
@@ -517,41 +566,45 @@ mod tests {
             comp_len,
             first_write_ms: first,
             last_write_ms: last,
-            seq: comp_start / comp_len.max(1),
+            seq,
         }
     }
 
-    /// Three 10-byte chunks covering 100..400, contiguous in the trunk.
+    /// Three 10-byte chunks numbered 0..2, covering 100..400.
     fn three() -> Vec<ChunkRecord> {
         vec![
-            chunk(0, 10, 100, 200),
-            chunk(10, 10, 200, 300),
-            chunk(20, 10, 300, 400),
+            chunk(0, 0, 10, 100, 200),
+            chunk(1, 10, 10, 200, 300),
+            chunk(2, 20, 10, 300, 400),
         ]
     }
 
     #[test]
     fn consumed_prefix_holds_the_chunk_the_cursor_sits_in() {
-        // At (200, 300) the cursor is inside the middle chunk: only the
-        // first is fully consumed, because `n` counts inside the middle
-        // one and `query --from` re-reads it from its start.
-        assert_eq!(consumed_prefix(&three(), 200, 300), 1);
-        assert_eq!(consumed_prefix(&three(), 0, 0), 0);
-        // Past the end of the store: everything is consumed.
-        assert_eq!(consumed_prefix(&three(), 400, 500), 3);
+        // `n` counts inside the cursor's own chunk and a resume re-reads it
+        // from the start, so that chunk is not consumed.
+        assert_eq!(consumed_prefix(&three(), Some(1)), 1);
+        assert_eq!(consumed_prefix(&three(), Some(0)), 0);
+        assert_eq!(consumed_prefix(&three(), Some(3)), 3);
+        // A cursor with no position has consumed nothing.
+        assert_eq!(consumed_prefix(&three(), None), 0);
     }
 
     #[test]
-    fn consumed_prefix_stops_at_a_backwards_window() {
-        // An intake-written store can stamp a chunk with an older window
-        // than its predecessor. A scan stops there; a binary search
-        // would have counted the third chunk as consumed too.
-        let records = vec![
-            chunk(0, 10, 10, 20),
-            chunk(10, 10, 500, 600),
-            chunk(20, 10, 30, 40),
+    fn consumed_prefix_counts_numbers_not_positions() {
+        // After a head-drop the survivors keep their numbers, so the record
+        // at index 0 is chunk 2. A cursor at 3 has consumed exactly one of
+        // what is left — not three, which is what counting positions would
+        // have said, and which would have dropped live data under stage 3.
+        let dropped = vec![
+            chunk(2, 0, 10, 300, 400),
+            chunk(3, 10, 10, 400, 500),
+            chunk(4, 20, 10, 500, 600),
         ];
-        assert_eq!(consumed_prefix(&records, 30, 45), 1);
+        assert_eq!(consumed_prefix(&dropped, Some(3)), 1);
+        assert_eq!(consumed_prefix(&dropped, Some(2)), 0);
+        // A position older than anything left consumes nothing of it.
+        assert_eq!(consumed_prefix(&dropped, Some(1)), 0);
     }
 
     #[test]
@@ -560,68 +613,103 @@ mod tests {
         // resume rule. Every chunk `consumed_prefix` calls droppable must
         // be one a fresh `Resume` for that cursor would skip entirely.
         let records = three();
-        for (wf, wl) in [(0, 0), (150, 200), (200, 300), (300, 400), (400, 500)] {
-            let c = cur(wf, wl, 1);
-            let k = consumed_prefix(&records, wf, wl);
+        for seq in 0..=3 {
+            let c = cur(seq, 1);
+            let k = consumed_prefix(&records, Some(seq));
             for r in &records[..k] {
                 let mut resume = Resume::new(Some(&c));
                 assert!(
-                    !resume.deliver(r.first_write_ms, r.last_write_ms),
-                    "cursor at ({wf}, {wl}) would still be delivered chunk {}..{}",
-                    r.first_write_ms,
-                    r.last_write_ms
+                    !resume.deliver(Some(r.seq)),
+                    "cursor at {seq} would still be delivered chunk {}",
+                    r.seq
                 );
-            }
-            // And the first chunk NOT called droppable is one it would.
-            if let Some(r) = records.get(k) {
-                let mut resume = Resume::new(Some(&c));
-                assert!(resume.deliver(r.first_write_ms, r.last_write_ms) || c.n > 0);
             }
         }
     }
 
     #[test]
-    fn standing_reports_the_backlog_it_is_holding() {
-        let records = three();
-        let st = standing(&cur(200, 300, 2), &records);
-        assert_eq!(st.consumed_chunks, 1);
-        assert_eq!(st.behind_chunks, 2);
-        assert_eq!(st.behind_bytes, 20); // from chunk 1's start to the end
-        assert_eq!(st.behind_ms, 100); // newest write is 400
-        assert_eq!(st.gap_to_ms, None);
-        assert!(!st.caught_up());
-        assert_eq!(st.lag_text(), "0.100s behind");
-
-        let done = standing(&cur(400, 500, 1), &records);
-        assert!(done.caught_up());
-        assert_eq!(done.behind_bytes, 0);
-        assert_eq!(done.lag_text(), "caught up");
-
-        // Inside the newest chunk: nothing newer exists, so this is a
-        // shipper keeping up, not one 0.000s behind.
-        let edge = standing(&cur(300, 400, 2), &records);
-        assert!(!edge.caught_up());
-        assert!(edge.at_live_edge());
-        assert_eq!(edge.behind_chunks, 1);
-        assert_eq!(edge.lag_text(), "at the live edge");
+    fn a_live_edge_entry_is_delivered_but_moves_nothing() {
+        let mut c = cur(2, 3);
+        let before = (c.seq, c.n);
+        c.advance(None, 999);
+        assert_eq!((c.seq, c.n), before, "no chunk to stand in, so no move");
+        assert_eq!(c.delivered, 4, "still counted as delivered");
+        assert_eq!(c.wl, 999, "and the informational time follows it");
+        // A resumed stream always delivers the live edge: it is newer than
+        // every chunk by construction.
+        let mut resume = Resume::new(Some(&c));
+        assert!(resume.deliver(None));
     }
 
     #[test]
-    fn a_dropped_position_is_a_gap_but_a_fresh_cursor_is_not() {
+    fn standing_reports_the_backlog_it_is_holding() {
         let records = three();
-        // Delivered something, and its position now predates the store:
-        // retention outran it and the entries between are gone.
-        let mut behind = cur(40, 50, 1);
-        behind.delivered = 7;
-        let st = standing(&behind, &records);
-        assert_eq!(st.gap_to_ms, Some(100));
-        assert_eq!(st.lag_text(), "GAP");
+        let st = standing(&cur(1, 2), &records);
+        assert_eq!(st.consumed_chunks, 1);
+        assert_eq!(st.behind_chunks, 2);
+        assert_eq!(st.behind_bytes, 20); // from chunk 1's start to the end
+        assert_eq!(st.gap_chunks, None);
+        assert!(!st.caught_up());
 
-        // A cursor that has never delivered is at (0, 0) because it has
-        // not started, not because it lost its place.
-        let mut fresh = cur(0, 0, 0);
-        fresh.delivered = 0;
-        assert_eq!(standing(&fresh, &records).gap_to_ms, None);
+        let done = standing(&cur(3, 1), &records);
+        assert!(done.caught_up());
+        assert_eq!(done.behind_bytes, 0);
+        assert_eq!(done.lag_text(), "caught up");
+    }
+
+    #[test]
+    fn a_gap_is_counted_in_chunks_not_inferred_from_time() {
+        // Retention dropped chunks 0 and 1; a cursor still at 0 has lost
+        // exactly two, which the numbers state rather than imply.
+        let records = vec![chunk(2, 0, 10, 300, 400), chunk(3, 10, 10, 400, 500)];
+        let st = standing(&cur(0, 1), &records);
+        assert_eq!(st.gap_chunks, Some(2));
+        assert_eq!(st.lag_text(), "GAP");
+        // A cursor that has never delivered has no position to lose.
+        let fresh = Cursor::new("c", "id", "p");
+        assert_eq!(standing(&fresh, &records).gap_chunks, None);
+    }
+
+    #[test]
+    fn resolving_an_old_cursor_lands_on_a_chunk_and_resets_n() {
+        // Pre-numbering cursors hold a write time. Resolution is the same
+        // rule `query --from` uses: the first chunk whose window reaches it.
+        let records = three();
+        let mut c = Cursor::new("c", "id", "p");
+        c.wl = 250;
+        c.n = 7;
+        c.delivered = 7;
+        assert_eq!(c.resolve(&records), Some(1));
+        assert_eq!(c.seq, Some(1));
+        // `n` counted entries in a WINDOW, so keeping it could skip entries
+        // nobody received; at most one chunk is re-delivered instead.
+        assert_eq!(c.n, 0);
+        // Idempotent, which is what lets it be persisted only after a
+        // delivery rather than at startup.
+        assert_eq!(c.resolve(&records), Some(1));
+    }
+
+    #[test]
+    fn resolving_clamps_to_the_ends_of_the_store() {
+        let records = three();
+        // Older than anything held: start at the oldest survivor, the same
+        // place a timestamp resume would have landed.
+        let mut old = Cursor::new("c", "id", "p");
+        old.wl = 1;
+        old.delivered = 5;
+        assert_eq!(old.resolve(&records), Some(0));
+        // Past the newest: start after it, so nothing already sent is
+        // re-sent.
+        let mut ahead = Cursor::new("c", "id", "p");
+        ahead.wl = 9_999;
+        ahead.delivered = 5;
+        assert_eq!(ahead.resolve(&records), Some(3));
+        // Nothing to resolve against yet: leave it unresolved rather than
+        // inventing a position.
+        let mut empty = Cursor::new("c", "id", "p");
+        empty.wl = 500;
+        assert_eq!(empty.resolve(&[]), None);
+        assert_eq!(empty.seq, None);
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -635,22 +723,21 @@ mod tests {
     #[test]
     fn consumers_in_matches_by_store_identity() {
         let dir = scratch("survey");
-        let mine = |name: &str, wl: u64| {
-            let mut c = cur(wl, wl, 1);
+        let mine = |name: &str, seq: u64| {
+            let mut c = cur(seq, 1);
             c.consumer = name.to_string();
             c.store = "id-a".into();
-            c.delivered = 1;
             c.save(&dir.join(format!("{name}.cursor"))).unwrap();
         };
-        mine("otlp", 400);
-        mine("splitter", 200);
+        mine("otlp", 2);
+        mine("splitter", 1);
         // Another store's consumer, in the same shared directory.
-        let mut other = cur(400, 400, 1);
+        let mut other = cur(2, 1);
         other.consumer = "elsewhere".into();
         other.store = "id-b".into();
         other.save(&dir.join("elsewhere.cursor")).unwrap();
         // An in-flight save, and something that is not a cursor at all.
-        let mut pending = cur(400, 400, 1);
+        let mut pending = cur(2, 1);
         pending.store = "id-a".into();
         pending.save(&dir.join("pending.tmp")).unwrap();
         fs::write(dir.join("notes.txt"), "hello").unwrap();
@@ -667,15 +754,14 @@ mod tests {
     #[test]
     fn survey_needs_a_declaration_and_ranks_the_worst_first() {
         let dir = scratch("declared");
-        let save = |name: &str, wl: u64| {
-            let mut c = cur(wl, wl, 1);
+        let save = |name: &str, seq: u64| {
+            let mut c = cur(seq, 1);
             c.consumer = name.to_string();
             c.store = "id-a".into();
-            c.delivered = 1;
             c.save(&dir.join(format!("{name}.cursor"))).unwrap();
         };
-        save("ahead", 400);
-        save("behind", 150);
+        save("ahead", 3);
+        save("behind", 0);
 
         let records = three();
         let mut bark = Map::new();
@@ -718,67 +804,82 @@ mod tests {
     #[test]
     fn no_cursor_delivers_everything() {
         let mut r = Resume::new(None);
-        assert!(r.deliver(1, 2));
-        assert!(r.deliver(1, 2));
+        assert!(r.deliver(Some(0)));
+        assert!(r.deliver(Some(0)));
         assert_eq!(r.skipped(), 0);
+        // And a cursor with no position yet behaves the same.
+        let fresh = Cursor::new("c", "id", "p");
+        let mut r = Resume::new(Some(&fresh));
+        assert!(r.deliver(Some(0)));
     }
 
     #[test]
     fn skips_the_delivered_prefix_of_the_boundary_chunk() {
-        let c = cur(100, 200, 2);
+        let c = cur(2, 2);
         let mut r = Resume::new(Some(&c));
-        assert!(!r.deliver(100, 200));
-        assert!(!r.deliver(100, 200));
-        assert!(r.deliver(100, 200)); // the third is new
-        assert!(r.deliver(100, 200));
+        assert!(!r.deliver(Some(2)));
+        assert!(!r.deliver(Some(2)));
+        assert!(r.deliver(Some(2))); // the third is new
+        assert!(r.deliver(Some(2)));
         assert_eq!(r.skipped(), 2);
     }
 
     #[test]
     fn skips_whole_chunks_before_the_cursor() {
-        let c = cur(100, 200, 1);
+        let c = cur(2, 1);
         let mut r = Resume::new(Some(&c));
-        assert!(!r.deliver(1, 50));
-        assert!(!r.deliver(60, 199));
-        assert!(!r.deliver(100, 200)); // the one already delivered
-        assert!(r.deliver(100, 200));
+        assert!(!r.deliver(Some(0)));
+        assert!(!r.deliver(Some(1)));
+        assert!(!r.deliver(Some(2))); // the one already delivered
+        assert!(r.deliver(Some(2)));
         assert_eq!(r.skipped(), 3);
     }
 
     #[test]
-    fn a_later_chunk_ends_the_skipping_even_mid_window() {
-        let c = cur(100, 200, 5);
+    fn a_later_chunk_ends_the_skipping_for_good() {
+        let c = cur(2, 5);
         let mut r = Resume::new(Some(&c));
-        assert!(!r.deliver(100, 200));
-        assert!(r.deliver(201, 300));
-        // Once past the cursor, nothing is ever dropped again — including
-        // a repeated window, which would otherwise re-skip live entries.
-        assert!(r.deliver(100, 200));
+        assert!(!r.deliver(Some(2)));
+        assert!(r.deliver(Some(3)));
+        // Once past the cursor, nothing is ever dropped again — including a
+        // repeated number, which would otherwise re-skip live entries.
+        assert!(r.deliver(Some(2)));
         assert_eq!(r.skipped(), 1);
     }
 
     #[test]
-    fn advance_restarts_n_on_a_new_window() {
-        let mut c = cur(0, 0, 0);
-        c.delivered = 0;
-        c.advance(10, 20);
-        c.advance(10, 20);
-        assert_eq!((c.wf, c.wl, c.n, c.delivered), (10, 20, 2, 2));
-        c.advance(21, 30);
-        assert_eq!((c.wf, c.wl, c.n, c.delivered), (21, 30, 1, 3));
+    fn advance_restarts_n_on_a_new_chunk() {
+        let mut c = Cursor::new("c", "id", "p");
+        c.advance(Some(10), 500);
+        c.advance(Some(10), 501);
+        assert_eq!((c.seq, c.n, c.delivered), (Some(10), 2, 2));
+        c.advance(Some(11), 502);
+        assert_eq!((c.seq, c.n, c.delivered), (Some(11), 1, 3));
     }
 
     #[test]
     fn roundtrip_through_a_file() {
-        let dir = std::env::temp_dir().join(format!("timberfs-cursor-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("roundtrip");
         let path = dir.join("app.cursor");
-        let c = cur(10, 20, 3);
+        let c = cur(10, 3);
         c.save(&path).unwrap();
         let back = Cursor::load(&path).unwrap().unwrap();
         assert_eq!(back, c);
         assert!(back.check_store("id", &path).is_ok());
         assert!(back.check_store("other", &path).is_err());
+        // A pre-numbering file has no `seq`, which is how `resolve` knows
+        // to convert it.
+        let old = dir.join("old.cursor");
+        fs::write(
+            &old,
+            "{\"consumer\":\"c\",\"store\":\"id\",\"wf\":1,\"wl\":250,\"n\":4,\"delivered\":9}",
+        )
+        .unwrap();
+        let back = Cursor::load(&old).unwrap().unwrap();
+        assert_eq!(
+            (back.seq, back.wl, back.n, back.delivered),
+            (None, 250, 4, 9)
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -1865,6 +1865,11 @@ timber_otlp_cursor_resumes_without_duplicates() {
     exec 8>&-; kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null
     rm -f /tmp/cur.fifo
 
+    # The position is a chunk NUMBER, not a timestamp: the cursor names one
+    # and `wl` is only there to orient a human.
+    jq -e '.seq != null and (.seq | type) == "number"' /tmp/cur.cursor >/dev/null \
+        || { cat /tmp/cur.cursor; return 1; }
+
     otlp_wait_for "$(otlp_store cur)" "cur-six" || return 1
     timberfs query "$(otlp_store cur)" > /tmp/cur.out 2>/dev/null
     # Every entry exactly once: six lines, none repeated.
@@ -1872,6 +1877,47 @@ timber_otlp_cursor_resumes_without_duplicates() {
     [ "$(sort /tmp/cur.out | uniq -d | wc -l)" = 0 ] || { cat /tmp/cur.out; return 1; }
     grep -q cur-one /tmp/cur.out && grep -q cur-six /tmp/cur.out || return 1
     [ "$(jq -r .delivered /tmp/cur.cursor)" = 6 ]
+}
+
+cursor_converts_from_a_write_time_position() {
+    # A cursor written before chunk numbers existed holds a write time. It
+    # is resolved to a chunk on first use, that chunk is re-read from its
+    # start (bounded re-delivery, never a skip), and the converted file is
+    # persisted only by the first save AFTER a successful send.
+    local store cur
+    store="$PIPE_BACKING/conv.log"
+    cur=/tmp/conv.cursor
+    rm -f "$store".* "$OTLP_ROOT"/conv/conv.log.* "$cur"
+    local i
+    for i in 1 2 3; do
+        printf '2026-06-21T09:1%s:00Z conv line %s\n' "$i" "$i" \
+            | timberfs append --into "$store" --quiet || return 1
+        sleep 1.1
+    done
+
+    # Hand-write the pre-numbering shape: a write time, no `seq`.
+    python3 - "$store" "$cur" << 'PYEOF' || return 1
+import json, struct, sys
+store, cur = sys.argv[1], sys.argv[2]
+raw = open(store + ".rings", "rb").read()
+# the middle chunk's last_write_ms, i.e. a position inside chunk 1
+rec = struct.unpack("<7Q", raw[64 + 56:64 + 112])
+json.dump({"consumer": "timber-otlp", "store": "path:" + store, "path": store,
+           "wf": rec[4], "wl": rec[5], "n": 2, "delivered": 2},
+          open(cur, "w"))
+PYEOF
+
+    timeout 20 timber-otlp --follow --cursor "$cur" \
+        --endpoint http://127.0.0.1:4318 "$store" > /tmp/conv.ship 2>/tmp/conv.err
+    grep -q 'converting a pre-numbering cursor' /tmp/conv.err \
+        || { cat /tmp/conv.err >&2; return 1; }
+    grep -q 'resolves to chunk 1' /tmp/conv.err || { cat /tmp/conv.err >&2; return 1; }
+    # Converted in place, and `n` reset rather than carried across axes.
+    jq -e '.seq == 1' "$cur" >/dev/null || { cat "$cur"; return 1; }
+    # Nothing was skipped: the entry from the chunk it resolved into arrives.
+    otlp_wait_for "$(otlp_store conv)" "conv line 2" || return 1
+    rm -f "$cur" /tmp/conv.ship /tmp/conv.err
+    return 0
 }
 
 records_carry_the_chunk_number() {
@@ -2220,6 +2266,7 @@ run_test "otlp: store shipped out and received back is byte for byte" otlp_round
 run_test "otlp: the same roundtrip over json + gzip" otlp_roundtrip_over_json_and_gzip
 run_test "timber-otlp: --dry-run renders one LogRecord per entry" timber_otlp_dry_run_shape
 run_test "timber-otlp: cursor resumes after a kill, no duplicates" timber_otlp_cursor_resumes_without_duplicates
+run_test "timber-otlp: a pre-numbering cursor converts to a chunk position" cursor_converts_from_a_write_time_position
 run_test "chunk numbers: dense, survive a head-drop, v1 index migrates on open" chunk_numbers_and_v1_migration
 run_test "records: entries carry chunk=, --from-chunk resumes at one" records_carry_the_chunk_number
 run_test "consumers: list/info show lag and held bytes; a dropped position is a GAP" consumer_view_and_gap
