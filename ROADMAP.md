@@ -176,37 +176,100 @@ works is in [docs/design.md](docs/design.md).
   over unchanged — a cursor is only sound on the write axis, so it still
   requires `--follow` and still refuses a stdin stream.
 - **Interest-based retention (a third axis)**: retention drops by age and
-  by size; a store that exists to be DRAINED — a spool shipped onward, not
-  an archive — wants to drop by CONSUMPTION, so a drained spool sits near
-  zero instead of holding a week of already-shipped bytes, and its size
-  stops being guessed as volume × downtime. This is NATS's Interest
-  retention, and it makes timberfs a log with interest-based truncation,
-  not a work queue: still position-based and at-least-once, with no
-  per-entry ack, redelivery or dead-letter. The mechanism is nearly free —
-  `cursor::consumed_prefix` already computes the drop-eligible chunk prefix
-  for a cursor (the exact complement of what `Resume` would deliver),
-  `enforce_retention` already reduces every axis to such a prefix, and
-  head-drop is already a prefix operation. Four decisions define it.
+  by size. A frontend box wants a third rule — drop what is CONFIRMED
+  DELIVERED — because two requirements hold at once there: keep as little
+  log data on the box as possible (a breach then reaches less of it, and
+  "shipped off the edge promptly" is a statement that can be made and
+  shown rather than asserted), yet never erase what has not landed
+  elsewhere, including across a network outage. No time window satisfies
+  both at any setting: `retain` is a bet on how long the link stays down,
+  and the safe bet is the month of hoarding the requirement exists to
+  avoid. Only delivery can decide, which is what a cursor already knows.
+  This is NATS's Interest retention, and it makes timberfs a log with
+  interest-based truncation, not a work queue: still position-based and
+  at-least-once, with no per-entry ack, redelivery or dead-letter.
+  **The classic problem, minus the quantum.**
+  Ship-then-delete is as old as log rotation, and its exposure quantum has
+  always been the ROTATION INTERVAL — because rotation couples erasure
+  granularity to the producer's file handle. Every shortening buys
+  exposure with a coordination event: SIGHUP and reopen, or `copytruncate`
+  and its race that loses whatever was written between the copy and the
+  truncate. The prior art gets closer than it is given credit for.
+  `rsync --remove-source-files` unlinks only after a confirmed transfer —
+  delivery-gated deletion, decades old. A shipper's registry (filebeat,
+  fluentd's `pos_file`) is a cursor by another name, computed locally from
+  acks. Neither can delete the delivered PREFIX. rsync derives its hold by
+  COMPARING AGAINST THE DESTINATION, so the edge needs read access to the
+  archive — trust pointing the wrong way for this threat model, since a
+  breached frontend then holds a key to wherever the data went — and it
+  unlinks whole files, which drags rotation back in through the side door.
+  A registry avoids both of those, but a plain file has no prefix-removal:
+  `FALLOC_FL_COLLAPSE_RANGE` is available to anyone, and what a plain log
+  lacks is a FORMAT THAT SURVIVES LOSING ITS HEAD, since every reader's
+  byte offsets shift and nothing rebases them.
+  So what is new here is neither the cursor nor the erasure but their
+  composability on top of design.md's fourth property, "delete from the
+  front": chunk framing plus the rings index IS that format, and this is
+  the second classic file problem that primitive makes easy rather than
+  hard. Two consequences worth stating. Delivery is entry-granular
+  (sub-second with `wal=true`, via the `.sap` live edge) while erasure is
+  chunk-granular, so what remains on the box after a successful ship is
+  ONE CHUNK — tunable with `--chunk-size`/`--flush-age`, with the producer
+  uninvolved — against one rotation interval. And the edge needs
+  PUSH-ONLY credentials, which is exactly what rsync-with-hold cannot
+  offer.
+  **The decisions.**
+  The mechanism is nearly free — `cursor::consumed_prefix` already
+  computes the drop-eligible chunk prefix for a cursor (the exact
+  complement of what `Resume` would deliver), `enforce_retention` already
+  reduces every axis to such a prefix, and head-drop is already a prefix
+  operation.
   (1) Interest is **additive**: `k = max(age, size, interest)`, never
   `min`. Letting interest CAP the drop would let one stalled consumer pin
-  the spool until the disk fills, which kills the PRODUCER — losing the
+  the store until the disk fills, which kills the PRODUCER — losing the
   newest data to protect the oldest, strictly the worse trade. So
-  `retain_size` stays a hard budget, a store declaring interest must
-  declare one too, and a consumer truncated out from under becomes a
-  reported event instead of a silent one. (2) **Fail closed** everywhere:
-  no cursor found, an unreadable one, or one anchored to another store all
-  drop nothing by interest — the minimum over an empty set is 0, not
-  infinity. (3) A declared consumer **roster** is what protects a consumer
-  that has never run: with discovery alone, one consumer's progress drains
-  the spool before a second one, deployed later, ever starts. (4) Refuse
-  it on an intake-written store until "Arrival time on a received store"
-  lands: a replaying sender moves chunk windows — and a cursor — backwards,
-  which under a prefix scan makes the spool stop draining rather than lose
-  data, but "the queue silently never empties" is its own failure. Also
-  wanted: a one-shot `timberfs trim`, since retention only runs inside a
-  live writer and a drain-and-ship store may have none — and NOT the
-  tempting shortcut of letting the shipper collapse the head itself, which
-  would make a reader a writer and put two of them on one head.
+  `retain_size` stays a hard budget and a store declaring interest must
+  declare one too. ⚠ Which means the cap, not the consumption rule, is
+  what decides an outage: it has to be sized as ingest-rate × the outage
+  worth surviving. Interest retention does NOT remove that sizing — it
+  removes the STEADY-STATE hoarding, i.e. the weeks of already-shipped
+  bytes kept just in case, which is the actual win.
+  (2) When the cap overrides consumption, the loss is **recorded exactly**,
+  and this is a requirement rather than a nicety. With finite disk,
+  bounded loss is a choice already made — the alternative is blocking the
+  producer, which for telemetry is a worse outcome than losing an hour of
+  access logs — so what is owed is precise accounting at the moment it
+  happens, and the writer holds both halves of the comparison right
+  there: `retain_size (50G) reached with consumer otlp 6d 2h behind —
+  dropped 4831 chunks covering <from> .. <to> that it had not read`. The
+  shipper's GAP warning is the same fact inferred later, from the other
+  side, bounded only by timestamps; this one is exact.
+  (3) **Fail closed** everywhere: no cursor found, an unreadable one, or
+  one anchored to another store all drop nothing by interest — the minimum
+  over an empty set is 0, not infinity.
+  (4) Refuse it on an intake-written store until "Arrival time on a
+  received store" lands: a replaying sender moves chunk windows — and a
+  cursor — backwards, so a cursor can mark undelivered data consumed. A
+  PRODUCING store (append/mount/follow, wall-clock stamps) is the safe
+  case and the one that wants this; the exclusion is for received stores.
+  Two things the guarantee rests on, neither of them ours: the receiver's
+  `200` must mean PERSISTED, not merely accepted — a Collector with an
+  in-memory queue acks and then loses the batch on restart, which silently
+  voids the whole chain since erasure follows the cursor and the cursor
+  follows that ack; and the cursor directory must not be writable by
+  anything but the shipper, or an attacker with that account (a read-only
+  role today) can fast-forward every cursor and have the next tick erase
+  the record of their own intrusion.
+  Also wanted: a one-shot `timberfs trim`, load-bearing rather than
+  convenient, since retention only runs inside a live writer and a store
+  whose producer went quiet would otherwise keep delivered data
+  indefinitely — and NOT the tempting shortcut of letting the shipper
+  collapse the head itself, which would make a reader a writer and put two
+  of them on one head. Dropped on purpose: a declared consumer roster
+  (only earns its keep at two or more consumers, so it stays optional
+  until there are), and a "keep 15m even when consumed" floor for local
+  forensics (it competes for the same disk that buffers an outage, and
+  delivery wins).
 - **Splitting downstream of a spool (fan-out by cursor)**: one store as the
   intake spool — everything a web server writes, the vhost in the line — plus a
   cursor consumer that routes entries into per-stream stores, instead of routing
