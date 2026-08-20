@@ -175,11 +175,15 @@ It pairs with `timber-otlp` below: a store shipped out over OTLP and received
 back arrives byte for byte, which is the property their tests hold each other
 to.
 
-One nuance worth knowing: `import` stamps chunks with timestamps **parsed
-from the log lines** (right for historical data), while `append`/`mount`
-stamp with the **write-time wall clock** (right for live ingestion, where
-they coincide). Either way, `query --from/--to` asks about the time the
-log talks about.
+One nuance worth knowing: `import` (`--follow` included) stamps chunks with
+timestamps **parsed from the log lines**, while `append`/`mount` stamp with
+the **write-time wall clock**. Either way, `query --from/--to` asks about the
+time the log talks about: chunks are selected on the store's clock, then every
+entry is verified against its own logline stamp. Where a producer's two clocks
+diverge — Apache logs a request's start time and writes the line when the
+request completes — that selection leans on a one-minute widening, and past
+that a follower is the better route, its chunks carrying the logline clock.
+See [Two clocks](docs/deployment.md#two-clocks-and-when-they-diverge).
 
 ## Beyond the getting-started path
 
