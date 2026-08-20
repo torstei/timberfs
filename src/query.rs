@@ -419,6 +419,7 @@ pub fn cmd_query(
     tail: Option<u64>,
     max: Option<u64>,
     poll: Option<f64>,
+    from_chunk: Option<u64>,
 ) -> anyhow::Result<()> {
     let from_ms = from.unwrap_or(0);
     let to_ms = to.unwrap_or(u64::MAX);
@@ -430,6 +431,12 @@ pub fn cmd_query(
     // chunks via the offline .grain index, which neither composes with a live
     // stream (there is nothing to skip — every new chunk must be read) nor
     // filters at line granularity; filter a follow with a pipe instead.
+    if from_chunk.is_some() && !(follow || tail.is_some()) {
+        bail!(
+            "--from-chunk is a resume position, and only --follow reads forward from one \
+             (a windowed query selects by the timestamps the lines carry)"
+        );
+    }
     if follow || tail.is_some() {
         if !has.is_empty() || !any.is_empty() {
             bail!(
@@ -441,6 +448,7 @@ pub fn cmd_query(
         return query_follow(
             files,
             from,
+            from_chunk,
             no_filename,
             show_write_time,
             null_sep,
@@ -647,8 +655,12 @@ fn query_entries(
         let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
             continue; // retained away by a race between selection and read
         };
-        s.sink
-            .push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?;
+        s.sink.push_chunk(
+            &data,
+            Some(c.seq),
+            (c.first_write_ms, c.last_write_ms),
+            &mut out,
+        )?;
         // --max reached: stop decompressing further chunks.
         if let Some((count, m)) = &limit {
             if count.get() >= *m {
@@ -801,6 +813,7 @@ fn resume_at(records: &[ChunkRecord], anchor: &Option<(ChunkKey, usize)>) -> Opt
 fn query_follow(
     files: &[std::path::PathBuf],
     from: Option<u64>,
+    from_chunk: Option<u64>,
     no_filename: bool,
     show_write_time: bool,
     null_sep: bool,
@@ -865,7 +878,7 @@ fn query_follow(
     ) -> anyhow::Result<()> {
         for e in entries {
             match sink {
-                Some(s) => s.push_chunk(&e.payload, (e.wf, e.wl), out)?,
+                Some(s) => s.push_chunk(&e.payload, None, (e.wf, e.wl), out)?,
                 None => emit_raw(out, &e.payload, label)?,
             }
         }
@@ -977,6 +990,16 @@ fn query_follow(
             }
             let by_line = !parseable;
             tail_start(f, &guard, &mut source, &chunks, &extractor, by_line, n)?
+        } else if let Some(seq) = from_chunk {
+            // Exact: a chunk number identifies one chunk, so there is no
+            // window to widen and no ambiguity between two chunks that share
+            // a boundary millisecond. A number below everything the store
+            // still holds starts at the oldest survivor — the caller's
+            // position was dropped, which only it can report.
+            chunks
+                .iter()
+                .position(|c| c.seq >= seq)
+                .unwrap_or(chunks.len())
         } else if let Some(fr) = from {
             chunks
                 .iter()
@@ -1009,9 +1032,12 @@ fn query_follow(
         for c in &chunks[start..] {
             if let Some(data) = read_chunk(f, &guard, &mut source, *c)? {
                 match &mut sink {
-                    Some(s) => {
-                        s.push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?
-                    }
+                    Some(s) => s.push_chunk(
+                        &data,
+                        Some(c.seq),
+                        (c.first_write_ms, c.last_write_ms),
+                        &mut out,
+                    )?,
                     None => emit_raw(&mut out, &data, label.as_deref())?,
                 }
             }
@@ -1106,6 +1132,7 @@ fn query_follow(
                             match &mut s.sink {
                                 Some(sink) => sink.push_chunk(
                                     fresh,
+                                    Some(c.seq),
                                     (c.first_write_ms, c.last_write_ms),
                                     &mut out,
                                 )?,

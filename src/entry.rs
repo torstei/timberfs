@@ -59,6 +59,12 @@ pub struct EntrySink {
     entry_ts: Option<u64>,
     entry_write_win: (u64, u64),
     cur_write_win: (u64, u64),
+    /// The number of the chunk being pushed, and the one the open entry
+    /// started in. `None` for the live edge: those entries are in no chunk
+    /// yet, so there is no resumable position to name — a consumer counts
+    /// them as delivered but cannot durably stand inside them.
+    entry_chunk: Option<u64>,
+    cur_chunk: Option<u64>,
 
     pub emitted: u64,
     pub filtered_out: u64,
@@ -86,6 +92,8 @@ impl EntrySink {
             entry_ts: None,
             entry_write_win: (0, 0),
             cur_write_win: (0, 0),
+            entry_chunk: None,
+            cur_chunk: None,
             emitted: 0,
             filtered_out: 0,
             stamped: 0,
@@ -97,13 +105,17 @@ impl EntrySink {
     /// Feed one chunk's decompressed bytes with the chunk's write window
     /// (entries are annotated with the chunk they START in — per-chunk
     /// granularity, tight for live data).
+    /// `chunk` is the number of the chunk `data` came from, or `None` for
+    /// the live edge (see `cur_chunk`).
     pub fn push_chunk(
         &mut self,
         data: &[u8],
+        chunk: Option<u64>,
         write_win: (u64, u64),
         out: &mut dyn Write,
     ) -> io::Result<()> {
         self.cur_write_win = write_win;
+        self.cur_chunk = chunk;
         let mut start = 0;
         for (i, &b) in data.iter().enumerate() {
             if b == b'\n' {
@@ -124,6 +136,7 @@ impl EntrySink {
                 self.close_entry(out)?;
                 self.entry_ts = Some(ts);
                 self.entry_write_win = self.cur_write_win;
+                self.entry_chunk = self.cur_chunk;
                 self.entry = line;
                 self.stamped += 1;
                 // Divergence = distance OUTSIDE the chunk's write window;
@@ -142,10 +155,12 @@ impl EntrySink {
             None => {
                 if self.entry.is_empty() {
                     self.entry_write_win = self.cur_write_win;
+                    self.entry_chunk = self.cur_chunk;
                 }
                 if self.entry.len() + line.len() > ENTRY_CAP {
                     self.close_entry(out)?;
                     self.entry_write_win = self.cur_write_win;
+                    self.entry_chunk = self.cur_chunk;
                 }
                 self.entry.extend_from_slice(&line);
             }
@@ -217,6 +232,12 @@ impl EntrySink {
             }
             let (wf, wl) = self.entry_write_win;
             write!(out, "\x1fwf={wf}\x1fwl={wl}")?;
+            // Present only for an entry that is already in a chunk: its
+            // ABSENCE is how a consumer knows this one came from the live
+            // edge and cannot be resumed from yet.
+            if let Some(seq) = self.entry_chunk {
+                write!(out, "\x1fchunk={seq}")?;
+            }
             if let Some(label) = &self.framing.label {
                 out.write_all(b"\x1fsrc=")?;
                 out.write_all(label)?;
@@ -312,4 +333,106 @@ pub fn probe_stamps(extractor: &Extractor, data: &[u8]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn records_sink() -> EntrySink {
+        EntrySink::new(
+            crate::import::Extractor::new(None, None, false).unwrap(),
+            None,
+            Framing {
+                null_sep: false,
+                records: true,
+                show_write: false,
+                label: None,
+            },
+            None,
+            "test",
+        )
+    }
+
+    /// Field heads only, one per emitted entry record.
+    fn heads(buf: &[u8]) -> Vec<String> {
+        buf.split(|&b| b == 0x1e)
+            .filter(|r| r.starts_with(b"entry"))
+            .map(|r| {
+                let head = r.split(|&b| b == 0).next().unwrap_or_default();
+                String::from_utf8_lossy(head).replace('\x1f', " ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_entry_from_a_chunk_carries_its_number() {
+        let mut sink = records_sink();
+        let mut out = Vec::new();
+        sink.push_chunk(
+            b"2026-08-21T10:00:00Z first\n2026-08-21T10:00:01Z second\n",
+            Some(41),
+            (100, 200),
+            &mut out,
+        )
+        .unwrap();
+        sink.finish(&mut out).unwrap();
+        let h = heads(&out);
+        assert_eq!(h.len(), 2, "{h:?}");
+        assert!(h[0].contains("chunk=41"), "{}", h[0]);
+        assert!(h[1].contains("chunk=41"), "{}", h[1]);
+    }
+
+    #[test]
+    fn a_live_edge_entry_carries_no_chunk_at_all() {
+        // Absence is the signal: the entry is in no chunk yet, so there is
+        // no position a consumer could durably resume from inside it. A
+        // zero would be a lie — chunk 0 is a real chunk.
+        let mut sink = records_sink();
+        let mut out = Vec::new();
+        sink.push_chunk(b"2026-08-21T10:00:00Z live\n", None, (100, 200), &mut out)
+            .unwrap();
+        sink.finish(&mut out).unwrap();
+        let h = heads(&out);
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(!h[0].contains("chunk="), "{}", h[0]);
+        // The write window is still there — that is a fact about the entry,
+        // unlike its position.
+        assert!(h[0].contains("wf=100"), "{}", h[0]);
+    }
+
+    #[test]
+    fn a_split_entry_is_attributed_where_it_completed_like_its_window() {
+        // An entry whose line spans two chunks is attributed to the chunk
+        // it COMPLETED in, because that is already what `wf`/`wl` report —
+        // an entry becomes an entry when its stamped line closes. The
+        // number must AGREE with the window rather than be cleverer than
+        // it, or a consumer reading both gets two contradictory positions.
+        //
+        // The consequence is pre-existing and bounded: resuming there
+        // re-reads that chunk from its start, without the leading bytes
+        // that live in the previous one. Chunk-granular resume already
+        // re-delivers the boundary chunk, which is why at-least-once is
+        // the contract.
+        let mut sink = records_sink();
+        let mut out = Vec::new();
+        sink.push_chunk(
+            b"2026-08-21T10:00:00Z split ",
+            Some(7),
+            (100, 200),
+            &mut out,
+        )
+        .unwrap();
+        sink.push_chunk(b"continues here\n", Some(8), (200, 300), &mut out)
+            .unwrap();
+        sink.finish(&mut out).unwrap();
+        let h = heads(&out);
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(h[0].contains("chunk=8"), "{}", h[0]);
+        assert!(
+            h[0].contains("wf=200"),
+            "the number agrees with the window: {}",
+            h[0]
+        );
+    }
 }

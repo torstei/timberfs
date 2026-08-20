@@ -377,6 +377,15 @@ enum Command {
         /// where the writer's --flush-age decides instead
         #[arg(long, value_name = "SECS", requires = "follow")]
         poll: Option<f64>,
+        /// Resume at this chunk NUMBER (see `timberfs index`), the position
+        /// a consumer's cursor holds. Exact, unlike --from: a number names
+        /// one chunk, where a timestamp can match two that share a boundary
+        /// millisecond — and chunk numbers only move forward, where the
+        /// write axis is a wall clock that an NTP step can push backwards.
+        /// A number older than anything the store still holds starts at the
+        /// oldest chunk it has
+        #[arg(long, value_name = "N", requires = "follow", conflicts_with_all = ["from", "tail"])]
+        from_chunk: Option<u64>,
     },
     /// Show a store's vital signs on one screen: identity, lineage,
     /// data and compression, time covered, index sizes and coverage,
@@ -815,6 +824,7 @@ fn main() -> anyhow::Result<()> {
             tail,
             max,
             poll,
+            from_chunk,
         } => {
             let files = files
                 .iter()
@@ -835,6 +845,7 @@ fn main() -> anyhow::Result<()> {
                 tail,
                 max,
                 poll,
+                from_chunk,
             )?;
         }
         Command::Info { file, json } => {

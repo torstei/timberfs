@@ -274,6 +274,14 @@ pub fn cmd_records_sink(
                 if let Some(t) = e.ts {
                     last_ts = Some(t);
                 }
+                // ⚠ `e.chunk` is deliberately NOT read here, and that is
+                // not an omission. `wf`/`wl` are facts about the entry —
+                // when it was written upstream — so the stream's word is
+                // law for them. A chunk number is a POSITION in the source
+                // store; honouring it here would let two fan-in sources
+                // interleave their numbering into a sequence that is
+                // neither dense nor monotone, so the destination assigns
+                // its own (store.rs's `append_frames` does the same).
                 let (wf, wl) = match (e.wf, e.wl) {
                     // The stream's word is law.
                     (Some(a), Some(b)) => {

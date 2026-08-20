@@ -1874,6 +1874,62 @@ timber_otlp_cursor_resumes_without_duplicates() {
     [ "$(jq -r .delivered /tmp/cur.cursor)" = 6 ]
 }
 
+records_carry_the_chunk_number() {
+    # The records stream labels each entry with the chunk it came from, and
+    # --from-chunk resumes at one exactly. The ABSENCE of the field is the
+    # live-edge signal, so a consumer can tell "no resumable position yet"
+    # from "chunk 0".
+    local d=/var/log/timberfs/recchunk store
+    d=/var/log/timberfs/recchunk
+    store="$d/recchunk.log"
+    rm -rf "$d"
+    local i
+    for i in 0 1 2; do
+        printf '2026-08-21T10:0%s:00Z record chunk %s\n' "$i" "$i" \
+            | timberfs append --into "$store" --quiet || return 1
+        sleep 1.1
+    done
+
+    # One entry per chunk, each carrying its own number.
+    timberfs query --records "$store" 2>/dev/null > /tmp/rc.bin || return 1
+    python3 - /tmp/rc.bin << 'PYEOF' || return 1
+import sys
+raw = open(sys.argv[1], "rb").read()
+got = []
+for rec in raw.split(b"\x1e"):
+    if not rec.startswith(b"entry"):
+        continue
+    head = rec.split(b"\x00", 1)[0].split(b"\x1f")
+    kv = dict(f.split(b"=", 1) for f in head[1:] if b"=" in f)
+    got.append(kv.get(b"chunk", b"-").decode())
+assert got == ["0", "1", "2"], got
+PYEOF
+
+    # --from-chunk positions exactly. The framed follow path holds the last
+    # entry open until a following stamped line closes it (a pre-existing
+    # one-entry lag), so chunk 1 is what a run started at 1 emits here.
+    timeout 4 timberfs query --records --follow --from-chunk 1 "$store" \
+        > /tmp/rc1.bin 2>/dev/null
+    python3 - /tmp/rc1.bin << 'PYEOF' || return 1
+import sys
+raw = open(sys.argv[1], "rb").read()
+got = []
+for rec in raw.split(b"\x1e"):
+    if not rec.startswith(b"entry"):
+        continue
+    head = rec.split(b"\x00", 1)[0].split(b"\x1f")
+    kv = dict(f.split(b"=", 1) for f in head[1:] if b"=" in f)
+    got.append(kv.get(b"chunk", b"-").decode())
+assert got and all(int(c) >= 1 for c in got), got
+PYEOF
+
+    # Requires --follow: a windowed read selects by the timestamps the lines
+    # carry, which is a different axis.
+    ! timberfs query --records --from-chunk 1 "$store" >/dev/null 2>&1 || return 1
+    rm -rf "$d" /tmp/rc.bin /tmp/rc1.bin
+    return 0
+}
+
 chunk_numbers_and_v1_migration() {
     # Chunk numbers: dense from 0, preserved verbatim by a head-drop (they
     # are what a cursor holds, so sliding them down would silently re-point
@@ -2165,6 +2221,7 @@ run_test "otlp: the same roundtrip over json + gzip" otlp_roundtrip_over_json_an
 run_test "timber-otlp: --dry-run renders one LogRecord per entry" timber_otlp_dry_run_shape
 run_test "timber-otlp: cursor resumes after a kill, no duplicates" timber_otlp_cursor_resumes_without_duplicates
 run_test "chunk numbers: dense, survive a head-drop, v1 index migrates on open" chunk_numbers_and_v1_migration
+run_test "records: entries carry chunk=, --from-chunk resumes at one" records_carry_the_chunk_number
 run_test "consumers: list/info show lag and held bytes; a dropped position is a GAP" consumer_view_and_gap
 
 forest_handle_resolution() {
