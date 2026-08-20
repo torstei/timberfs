@@ -44,9 +44,10 @@ Each logical file `<name>` is backed by two files in the backing directory:
 
 ```
 <name>.trunk   concatenated zstd frames, one per chunk, no wrapper bytes
-<name>.rings   8-byte magic "RING0001", then 48-byte records (all u64 LE):
+<name>.rings   16-byte header (magic "RING0002" | next_seq), then 56-byte
+              records (all u64 LE):
               uncomp_start | uncomp_len | comp_start | comp_len
-              | first_write_ms | last_write_ms
+              | first_write_ms | last_write_ms | seq
 ```
 
 (The names take the timber metaphor seriously: the data is the trunk, and
@@ -339,8 +340,16 @@ Consequences worth knowing: chunk size is an index-selectivity knob
 (smaller chunks → sharper lookups, more overhead), the grain trails a live
 writer by at most its once-a-second maintenance tick (lagging entries just
 mean scanning those chunks), and `.timber` bundles carry no grain yet. A
-chunk-sequence-number field in the rings header was considered to let
-sidecars survive head-drops, and rejected: rule 3's prefix trim needs no
-identity per chunk, so the on-disk format stays `RING0001`. (Logged-timestamp
+chunk-sequence number was once rejected here, for sidecar survival, and
+that reasoning still holds: rule 3's prefix trim needs no identity per
+chunk, so the grain is rebased positionally rather than keyed by one. What
+it did not weigh is a durable EXTERNAL reference — a consumer's cursor —
+which does need identity and cannot get it from a timestamp, `now_ms()`
+being the wall clock that an NTP step or a `date -s` moves backwards. So
+`seq` exists as of `RING0002`, per RECORD and not in the header: a header
+base plus the record's index is a positional key, and any future path
+removing a record mid-file would silently re-point every cursor. The
+header's `next_seq` is only a high-water mark, so numbering cannot restart
+at 0 after retention drops every chunk. (Logged-timestamp
 zone maps, the other planned index family, became largely moot: import
 already writes logged time into the rings.)

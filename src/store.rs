@@ -162,6 +162,53 @@ fn parse_trim_marker(text: &str) -> Option<(u64, u64, u64)> {
 /// Best-effort by design: a read-only caller without write access to the
 /// directory (a non-root `query`/`info`) just leaves the marker for the
 /// next writer to reconcile, rather than erroring out of a read.
+/// Rings v1 -> v2: the same records, each gaining its chunk number, plus a
+/// header carrying the high-water mark. Numbering starts at 0 for the oldest
+/// SURVIVING record — a definition of where this store's numbering begins,
+/// not an attempt to recover how many it dropped before anyone counted.
+///
+/// Lazy and idempotent: it runs when a writer opens the store, so no
+/// operator step exists, and temp + rename means a crash leaves the v1 file
+/// intact and the migration simply runs again. Readers need no migration at
+/// all — they synthesize the same numbers when parsing v1.
+fn migrate_rings(dir: &Path, name: &str) -> io::Result<()> {
+    let p = format::rings_path(dir, name);
+    let buf = match fs::read(&p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // Absent, empty, already v2, or something else entirely: not ours to
+    // touch. A bad magic is left for `open` to report as it always has.
+    if buf.len() < 8 || &buf[..8] != format::RINGS_MAGIC_V1 {
+        return Ok(());
+    }
+    let (records, _) = format::parse_index_versioned(&buf)?;
+    let next_seq = records.last().map(|c| c.seq + 1).unwrap_or(0);
+    let mut idx =
+        Vec::with_capacity(format::RINGS_HEADER_LEN as usize + records.len() * format::RECORD_LEN);
+    idx.extend_from_slice(&format::rings_header(next_seq));
+    for c in &records {
+        idx.extend_from_slice(&c.to_bytes());
+    }
+    let tmp = dir.join(format!("{name}.{}.migrate", format::RINGS_EXT));
+    {
+        let f = File::create(&tmp)?;
+        f.write_all_at(&idx, 0)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &p)?;
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+    eprintln!(
+        "timberfs: {name}: rings migrated to {} — {} chunk(s) numbered from 0",
+        String::from_utf8_lossy(format::RINGS_MAGIC),
+        records.len()
+    );
+    Ok(())
+}
+
 pub fn reconcile_trim(dir: &Path, name: &str) -> io::Result<()> {
     let trim_p = format::trim_path(dir, name);
     let text = match fs::read_to_string(&trim_p) {
@@ -355,6 +402,14 @@ pub struct FileStore {
     /// store today. Its content always equals `buffer` by construction;
     /// see `append_windowed` and `flush_chunk`'s seal-and-swap.
     wal: Option<sap::Sap>,
+    /// The number the next chunk gets. Monotone for the life of the store,
+    /// never derived from `chunks.len()`: a head-drop removes records
+    /// without moving the numbering down, and retention can remove ALL of
+    /// them — a store that renumbered from 0 there would hand a fresh chunk
+    /// a number a cursor already counts as consumed. Recovered at open as
+    /// the greater of the header's high-water mark and one past the newest
+    /// surviving record.
+    next_seq: u64,
 }
 
 impl FileStore {
@@ -382,6 +437,10 @@ impl FileStore {
         // reconcile it before anything below reads the trunk/rings, so
         // neither the truncation check nor a caller sees a half-landed cut.
         reconcile_trim(dir, name)?;
+        // Before the rings are opened for writing: a v1 file cannot take a
+        // v2 record (two strides in one file), and migrating in place after
+        // the handle exists would leave that handle on the pre-rename inode.
+        migrate_rings(dir, name)?;
         let trunk_p = format::trunk_path(dir, name);
         let trunk = OpenOptions::new()
             .read(true)
@@ -400,10 +459,13 @@ impl FileStore {
             .map_err(|e| io::Error::new(e.kind(), format!("opening {}: {e}", rings_p.display())))?;
 
         let mut chunks = Vec::new();
+        let mut next_seq = 0u64;
         if rings.metadata()?.len() == 0 {
-            rings.write_all_at(format::RINGS_MAGIC, 0)?;
+            rings.write_all_at(&format::rings_header(0), 0)?;
         } else {
             chunks = format::read_index_file(&rings)?;
+            next_seq = format::read_header_next_seq(&rings)?
+                .max(chunks.last().map(|c| c.seq + 1).unwrap_or(0));
         }
 
         let trunk_len = trunk.metadata()?.len();
@@ -479,7 +541,9 @@ impl FileStore {
                         comp_len: comp.len() as u64,
                         first_write_ms: buffer_first_ms.unwrap_or(buffer_last_ms),
                         last_write_ms: buffer_last_ms,
+                        seq: next_seq,
                     };
+                    next_seq += 1;
                     let rec_off = RINGS_HEADER_LEN + (chunks.len() * RECORD_LEN) as u64;
                     rings.write_all_at(&rec.to_bytes(), rec_off)?;
                     trunk.sync_all()?;
@@ -544,6 +608,7 @@ impl FileStore {
             cache: None,
             staged: None,
             wal,
+            next_seq,
         })
     }
 
@@ -685,7 +750,9 @@ impl FileStore {
             comp_len: comp.len() as u64,
             first_write_ms: self.buffer_first_ms.unwrap_or(self.buffer_last_ms),
             last_write_ms: self.buffer_last_ms,
+            seq: self.next_seq,
         };
+        self.next_seq += 1;
         if self.staged.is_none() {
             let rec_off = RINGS_HEADER_LEN + (self.chunks.len() * RECORD_LEN) as u64;
             self.rings
@@ -937,11 +1004,17 @@ impl FileStore {
             comp_base,
         )?;
         for c in records {
+            // The incoming number is the SOURCE's position and is dropped:
+            // it says where the chunk sat there, not what it is, and two
+            // sources fanning in would interleave into a sequence that is
+            // neither dense nor monotone.
             let rec = ChunkRecord {
                 uncomp_start: uncomp_base + (c.uncomp_start - src_uncomp_start),
                 comp_start: comp_base + (c.comp_start - src_comp_start),
+                seq: self.next_seq,
                 ..*c
             };
+            self.next_seq += 1;
             let off = RINGS_HEADER_LEN + (self.chunks.len() * RECORD_LEN) as u64;
             self.rings.write_all_at(&rec.to_bytes(), off)?;
             self.chunks.push(rec);
@@ -995,7 +1068,7 @@ impl FileStore {
             let mut idx = Vec::with_capacity(
                 RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN,
             );
-            idx.extend_from_slice(format::RINGS_MAGIC);
+            idx.extend_from_slice(&format::rings_header(self.next_seq));
             for c in &self.chunks[k..] {
                 let rec = ChunkRecord {
                     uncomp_start: c.uncomp_start - uncomp_cut,
@@ -1089,7 +1162,7 @@ impl FileStore {
             let mut idx = Vec::with_capacity(
                 RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN,
             );
-            idx.extend_from_slice(format::RINGS_MAGIC);
+            idx.extend_from_slice(&format::rings_header(self.next_seq));
             for c in &self.chunks[k..] {
                 let rec = ChunkRecord {
                     uncomp_start: c.uncomp_start - uncomp_cut,
@@ -2125,16 +2198,17 @@ mod tests {
             comp_len: comp.len() as u64,
             first_write_ms: first_ms,
             last_write_ms: last_ms,
+            seq: 0,
         };
         let mut idx = Vec::new();
-        idx.extend_from_slice(format::RINGS_MAGIC);
+        idx.extend_from_slice(&format::rings_header(1));
         idx.extend_from_slice(&rec.to_bytes());
         fs::write(format::rings_path(dir, name), &idx).unwrap();
         rec
     }
 
     fn write_empty_pair(dir: &Path, name: &str) {
-        fs::write(format::rings_path(dir, name), format::RINGS_MAGIC).unwrap();
+        fs::write(format::rings_path(dir, name), format::rings_header(0)).unwrap();
         fs::write(format::trunk_path(dir, name), []).unwrap();
     }
 
@@ -2377,6 +2451,184 @@ mod tests {
         assert_eq!(f.wal.as_ref().unwrap().base(), f.comp_size);
         assert_eq!(f.wal.as_ref().unwrap().uncomp_base(), f.buffer_start);
         assert!(f.comp_size > 0);
+    }
+
+    /// Rewrite a store's rings in the pre-chunk-number layout, so the
+    /// migration can be tested against a file it did not write. Works by
+    /// truncation because `seq` is the LAST field of a record — which is
+    /// also what makes the real migration a per-record append of 8 bytes.
+    fn downgrade_rings_to_v1(dir: &Path, name: &str) {
+        let recs = format::read_index(&format::rings_path(dir, name)).unwrap();
+        let mut idx = Vec::new();
+        idx.extend_from_slice(format::RINGS_MAGIC_V1);
+        for c in &recs {
+            idx.extend_from_slice(&c.to_bytes()[..format::RECORD_LEN_V1]);
+        }
+        fs::write(format::rings_path(dir, name), &idx).unwrap();
+    }
+
+    fn write_n_chunks(f: &mut FileStore, cfg: &Config, n: u64) {
+        for i in 0..n {
+            f.append_windowed(format!("line {i}\n").as_bytes(), 100 + i, 100 + i, cfg)
+                .unwrap();
+            f.flush_chunk(cfg).unwrap();
+        }
+    }
+
+    #[test]
+    fn chunk_numbers_are_dense_and_start_at_zero() {
+        let dir = TempDir::new();
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), "app", &cfg).unwrap();
+        write_n_chunks(&mut f, &cfg, 4);
+        assert_eq!(
+            f.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn chunk_numbers_survive_a_head_drop() {
+        let dir = TempDir::new();
+        let name = "app";
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        write_n_chunks(&mut f, &cfg, 4);
+
+        f.remove_head(2, dir.path(), name).unwrap();
+
+        // The numbering does not slide down: the survivors keep the names a
+        // cursor already holds. This is the whole reason the number is
+        // stored rather than derived from the record's position.
+        assert_eq!(f.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(), [2, 3]);
+        // And it is durable, not just in memory.
+        drop(f);
+        let f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        assert_eq!(f.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(f.next_seq, 4, "the next chunk continues past the survivors");
+    }
+
+    #[test]
+    fn numbering_does_not_restart_when_retention_empties_the_store() {
+        let dir = TempDir::new();
+        let name = "app";
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        write_n_chunks(&mut f, &cfg, 3);
+
+        // Retention is allowed to drop every chunk. With no record left to
+        // read the next number from, a store that renumbered from 0 here
+        // would hand a fresh chunk a number some cursor counts as consumed
+        // — which is silent data loss, so the header carries a high-water
+        // mark for exactly this case.
+        f.remove_head(3, dir.path(), name).unwrap();
+        assert!(f.chunks.is_empty());
+        drop(f);
+
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        assert!(f.chunks.is_empty(), "reopened empty");
+        assert_eq!(f.next_seq, 3, "recovered from the header, not from records");
+        write_n_chunks(&mut f, &cfg, 1);
+        assert_eq!(f.chunks[0].seq, 3, "continues rather than reusing 0");
+    }
+
+    #[test]
+    fn a_v1_index_reads_with_synthesized_numbers() {
+        let dir = TempDir::new();
+        let name = "app";
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        write_n_chunks(&mut f, &cfg, 3);
+        drop(f);
+        downgrade_rings_to_v1(dir.path(), name);
+
+        let buf = fs::read(format::rings_path(dir.path(), name)).unwrap();
+        let (recs, ver) = format::parse_index_versioned(&buf).unwrap();
+        assert_eq!(ver, format::RingsVersion::V1);
+        assert_eq!(recs.len(), 3);
+        // A reader needs no migration: the oldest surviving record is 0 by
+        // definition, which is what the migration will write too.
+        assert_eq!(recs.iter().map(|c| c.seq).collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_writer_migrates_a_v1_index_on_open() {
+        let dir = TempDir::new();
+        let name = "app";
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        write_n_chunks(&mut f, &cfg, 3);
+        let before: Vec<(u64, u64)> = f
+            .chunks
+            .iter()
+            .map(|c| (c.uncomp_start, c.comp_start))
+            .collect();
+        drop(f);
+        downgrade_rings_to_v1(dir.path(), name);
+
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        let buf = fs::read(format::rings_path(dir.path(), name)).unwrap();
+        assert_eq!(&buf[..8], format::RINGS_MAGIC, "migrated in place");
+        assert_eq!(format::header_next_seq(&buf), 3);
+        assert_eq!(
+            f.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        // Everything else about the records is untouched — the migration
+        // adds a field, it does not recompute the index.
+        let after: Vec<(u64, u64)> = f
+            .chunks
+            .iter()
+            .map(|c| (c.uncomp_start, c.comp_start))
+            .collect();
+        assert_eq!(before, after);
+        // And the store keeps working: appending continues the numbering
+        // rather than colliding with a migrated record.
+        write_n_chunks(&mut f, &cfg, 1);
+        assert_eq!(f.chunks.last().unwrap().seq, 3);
+    }
+
+    #[test]
+    fn migrating_is_idempotent_and_leaves_v2_alone() {
+        let dir = TempDir::new();
+        let name = "app";
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        write_n_chunks(&mut f, &cfg, 2);
+        f.remove_head(1, dir.path(), name).unwrap();
+        drop(f);
+        let before = fs::read(format::rings_path(dir.path(), name)).unwrap();
+
+        migrate_rings(dir.path(), name).unwrap();
+        migrate_rings(dir.path(), name).unwrap();
+
+        let after = fs::read(format::rings_path(dir.path(), name)).unwrap();
+        assert_eq!(before, after, "a v2 index is not rewritten");
+        // Crucially the high-water mark of a store that HAS dropped its
+        // head is not reset by a migration pass over it.
+        assert_eq!(format::header_next_seq(&after), 2);
+    }
+
+    #[test]
+    fn appended_frames_are_renumbered_by_the_destination() {
+        let dir = TempDir::new();
+        let cfg = test_cfg();
+        let mut src = FileStore::open(dir.path(), "src", &cfg).unwrap();
+        write_n_chunks(&mut src, &cfg, 3);
+        src.remove_head(2, dir.path(), "src").unwrap();
+        assert_eq!(src.chunks[0].seq, 2, "the source's own numbering");
+
+        let mut dst = FileStore::open(dir.path(), "dst", &cfg).unwrap();
+        dst.append_windowed(b"local\n", 1, 1, &cfg).unwrap();
+        dst.flush_chunk(&cfg).unwrap();
+        let src_trunk = fs::File::open(format::trunk_path(dir.path(), "src")).unwrap();
+        let records = src.chunks.clone();
+        dst.append_frames(&src_trunk, &records, &cfg).unwrap();
+
+        // The incoming number said where the chunk sat in `src`; here it
+        // gets this store's next number. Otherwise a fan-in would produce a
+        // sequence that is neither dense nor monotone.
+        assert_eq!(dst.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(), [0, 1]);
     }
 
     #[test]

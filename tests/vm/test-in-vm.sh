@@ -1874,6 +1874,58 @@ timber_otlp_cursor_resumes_without_duplicates() {
     [ "$(jq -r .delivered /tmp/cur.cursor)" = 6 ]
 }
 
+chunk_numbers_and_v1_migration() {
+    # Chunk numbers: dense from 0, preserved verbatim by a head-drop (they
+    # are what a cursor holds, so sliding them down would silently re-point
+    # it), and synthesized when reading the pre-numbering layout, which a
+    # writer migrates in place on open.
+    local d=/var/log/timberfs/chunknum store nums cut
+    d=/var/log/timberfs/chunknum
+    store="$d/chunknum.log"
+    rm -rf "$d"
+    local i
+    for i in 1 2 3 4; do
+        printf 'chunknum line %s\n' "$i" | timberfs append --into "$store" --quiet || return 1
+        sleep 1.1
+    done
+    nums=$(timberfs index "$store" | awk '$1 ~ /^[0-9]+$/ {printf "%s ", $1}')
+    [ "$nums" = "0 1 2 3 " ] || { echo "dense-from-0 failed: $nums" >&2; return 1; }
+
+    # Drop the two oldest chunks. The survivors keep 2 and 3.
+    cut=$(timberfs index "$store" | awk 'NR==4 {print $6" "substr($7,1,8)}')
+    timberfs rotate "$store" --cutoff "$cut" --delete --quiet >/dev/null 2>&1 || return 1
+    nums=$(timberfs index "$store" | awk '$1 ~ /^[0-9]+$/ {printf "%s ", $1}')
+    [ "$nums" = "2 3 " ] || { echo "numbers slid after a head-drop: $nums" >&2; return 1; }
+    # A new chunk continues past the survivors rather than reusing a number.
+    printf 'chunknum after drop\n' | timberfs append --into "$store" --quiet || return 1
+    nums=$(timberfs index "$store" | awk '$1 ~ /^[0-9]+$/ {printf "%s ", $1}')
+    [ "$nums" = "2 3 4 " ] || { echo "numbering did not continue: $nums" >&2; return 1; }
+
+    # Downgrade the index to the pre-numbering layout (8-byte header,
+    # 48-byte records) and confirm a reader copes and a writer migrates.
+    python3 - "$store.rings" << 'PYEOF' || return 1
+import sys
+p = sys.argv[1]
+raw = open(p, "rb").read()
+assert raw[:8] == b"RING0002", raw[:8]
+n = (len(raw) - 16) // 56
+open(p, "wb").write(b"RING0001" + b"".join(raw[16 + i * 56:16 + i * 56 + 48] for i in range(n)))
+PYEOF
+    # A reader needs no migration: it numbers the oldest survivor 0.
+    nums=$(timberfs index "$store" | awk '$1 ~ /^[0-9]+$/ {printf "%s ", $1}')
+    [ "$nums" = "0 1 2 " ] || { echo "v1 read failed: $nums" >&2; return 1; }
+    timberfs query "$store" 2>/dev/null | grep -q 'chunknum after drop' || return 1
+    # A writer migrates in place, says so, and keeps appending.
+    printf 'chunknum after migration\n' | timberfs append --into "$store" 2>/tmp/chunknum.err || return 1
+    grep -q 'rings migrated to RING0002' /tmp/chunknum.err \
+        || { cat /tmp/chunknum.err >&2; return 1; }
+    head -c 8 "$store.rings" | grep -q 'RING0002' || return 1
+    nums=$(timberfs index "$store" | awk '$1 ~ /^[0-9]+$/ {printf "%s ", $1}')
+    [ "$nums" = "0 1 2 3 " ] || { echo "post-migration numbering: $nums" >&2; return 1; }
+    rm -rf "$d" /tmp/chunknum.err
+    return 0
+}
+
 consumer_view_and_gap() {
     # The consumer view, both halves. A store declares WHERE its consumers
     # keep their cursors and `list`/`info` then say who is reading it and
@@ -1900,7 +1952,7 @@ import json, struct, sys
 store, cdir = sys.argv[1], sys.argv[2]
 sid = json.load(open(store + ".bark"))["id"]
 raw = open(store + ".rings", "rb").read()
-recs = [struct.unpack("<6Q", raw[8 + i * 48:56 + i * 48]) for i in range((len(raw) - 8) // 48)]
+recs = [struct.unpack("<7Q", raw[16 + i * 56:72 + i * 56]) for i in range((len(raw) - 16) // 56)]
 assert len(recs) >= 3, recs
 def cursor(name, wf, wl, delivered):
     json.dump({"consumer": name, "store": sid, "path": store,
@@ -1947,7 +1999,7 @@ import json, struct, sys
 store, cdir = sys.argv[1], sys.argv[2]
 sid = json.load(open(store + ".bark"))["id"]
 raw = open(store + ".rings", "rb").read()
-first = struct.unpack("<6Q", raw[8:56])[4]
+first = struct.unpack("<7Q", raw[16:72])[4]
 json.dump({"consumer": "dropped", "store": sid, "path": store,
            "wf": first - 600000, "wl": first - 600000, "n": 0, "delivered": 5000},
           open(cdir + "/dropped.cursor", "w"))
@@ -2112,6 +2164,7 @@ run_test "otlp: store shipped out and received back is byte for byte" otlp_round
 run_test "otlp: the same roundtrip over json + gzip" otlp_roundtrip_over_json_and_gzip
 run_test "timber-otlp: --dry-run renders one LogRecord per entry" timber_otlp_dry_run_shape
 run_test "timber-otlp: cursor resumes after a kill, no duplicates" timber_otlp_cursor_resumes_without_duplicates
+run_test "chunk numbers: dense, survive a head-drop, v1 index migrates on open" chunk_numbers_and_v1_migration
 run_test "consumers: list/info show lag and held bytes; a dropped position is a GAP" consumer_view_and_gap
 
 forest_handle_resolution() {
@@ -2579,9 +2632,18 @@ collapse_space_win() {
     size=$(stat -c %s "$backing/app.log.trunk")
     [ "$size" -le $((40 * 1024 * 1024)) ] || return 1
     # the tail (most recent data) is intact across the collapse(s)
-    local lastline
+    local lastline firstnum
     lastline=$(tail -1 "$COLLAPSE_SRC")
-    timberfs query "$backing/app.log" | tail -1 | grep -qxF "$lastline"
+    timberfs query "$backing/app.log" | tail -1 | grep -qxF "$lastline" || return 1
+    # Chunk numbers are identities, not positions: after a real
+    # COLLAPSE_RANGE head-drop the oldest survivor keeps the number a cursor
+    # already holds, so it must NOT have slid back to 0.
+    firstnum=$(timberfs index "$backing/app.log" | awk '$1 ~ /^[0-9]+$/ {print $1; exit}')
+    [ -n "$firstnum" ] && [ "$firstnum" -gt 0 ] || {
+        echo "chunk numbering slid to $firstnum across the collapse" >&2
+        timberfs index "$backing/app.log" | head -3 >&2
+        return 1
+    }
 }
 
 collapse_recovery_survives() {

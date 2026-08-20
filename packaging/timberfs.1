@@ -1409,11 +1409,19 @@ recoverable with stock tools:
 .IB name .trunk
 .TP
 .IB name .rings
-The index: an 8-byte magic
+The index: a 16-byte header (the magic
+.RB \(lq RING0002 \(rq
+and the chunk-number high-water mark) followed by fixed-size 56-byte
+records (little-endian u64 fields: uncompressed start/length, compressed
+start/length, first/last write time in unix milliseconds, and the chunk
+NUMBER), appended in write order. The number is assigned at append, never
+reused, and preserved verbatim by a head-drop, so it is NOT the record's
+position \(em it is what a consumer's cursor holds, the write axis being
+only mostly sorted (see THE TWO CLOCKS). It is local to one store: a chunk
+copied into another is renumbered there. The previous layout
 .RB \(lq RING0001 \(rq
-followed by fixed-size 48-byte records (little-endian u64 fields:
-uncompressed start/length, compressed start/length, first/last write time
-in unix milliseconds), appended in write order.
+(8-byte header, 48-byte records, no number) is still read, and a writer
+migrates a store to the current layout when it opens it.
 .PP
 Chunks are written data-first, index-second; on open, index records
 pointing past the end of the data are dropped and orphaned data bytes are

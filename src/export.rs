@@ -231,17 +231,24 @@ pub fn cmd_export(
     let mut out_records = Vec::with_capacity(selected.len());
     let mut uncomp_off = 0u64;
     let mut comp_off = 0u64;
-    for c in &selected {
+    for (i, c) in selected.iter().enumerate() {
         out_records.push(ChunkRecord {
             uncomp_start: uncomp_off,
             comp_start: comp_off,
+            // A bundle is a new store with its own lineage, so it numbers
+            // its own chunks from 0 rather than carrying the source's
+            // positions — which would be neither dense nor meaningful here,
+            // an export selecting a window out of the middle.
+            seq: i as u64,
             ..*c
         });
         uncomp_off += c.uncomp_len;
         comp_off += c.comp_len;
     }
-    let mut rings_bytes = Vec::with_capacity(8 + out_records.len() * 48);
-    rings_bytes.extend_from_slice(format::RINGS_MAGIC);
+    let mut rings_bytes = Vec::with_capacity(
+        format::RINGS_HEADER_LEN as usize + out_records.len() * format::RECORD_LEN,
+    );
+    rings_bytes.extend_from_slice(&format::rings_header(out_records.len() as u64));
     for r in &out_records {
         rings_bytes.extend_from_slice(&r.to_bytes());
     }

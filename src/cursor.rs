@@ -508,6 +508,8 @@ mod tests {
     }
 
     fn chunk(comp_start: u64, comp_len: u64, first: u64, last: u64) -> ChunkRecord {
+        // seq is derived from the trunk position here purely so these
+        // fixtures are numbered in write order like a real store's.
         ChunkRecord {
             uncomp_start: 0,
             uncomp_len: 0,
@@ -515,6 +517,7 @@ mod tests {
             comp_len,
             first_write_ms: first,
             last_write_ms: last,
+            seq: comp_start / comp_len.max(1),
         }
     }
 
