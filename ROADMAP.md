@@ -165,16 +165,96 @@ works is in [docs/design.md](docs/design.md).
   belongs to whoever can prove durability**, and it wants two primitives,
   not one: `--cursor` on the producer (advance on write-out — correct
   whenever the consumer is idempotent, which `import --records` is, so
-  store-to-store replication is safe under it), and `--start-after WF:WL`
+  store-to-store replication is safe under it), and `--start-after <chunk>`
   so a consumer that fsyncs can own the position and drive the producer
-  from it, with no protocol at all. `--start-after` is also exactly the
-  resume primitive a remote live tail needs once read-only serve exists.
+  from it, with no protocol at all — a chunk NUMBER once those exist (see
+  below), which is what makes it a resume key a script can hold rather
+  than a window pair it has to compare. `--start-after` is also exactly
+  the resume primitive a remote live tail needs once read-only serve
+  exists.
   Note the records path is the cursor-FRIENDLY one: `append --records`
   keeps the source's `wf`/`wl`, so the write axis survives the hop and
   stays meaningful across chained replication, where the OTLP path
-  restamps (see "Arrival time on a received store"). The axis rule carries
-  over unchanged — a cursor is only sound on the write axis, so it still
-  requires `--follow` and still refuses a stdin stream.
+  restamps (see "Arrival time on a received store"). What carries over is
+  the SHAPE of the axis rule, not the axis: a cursor is sound on the
+  chunk-number axis (below), so it still requires `--follow` — only that
+  path streams continuously — and still refuses a stdin stream, which has
+  no chunks to number.
+- **Chunk numbers: a local, monotone position for cursors (rings v2)**:
+  `cursor.rs` puts a consumer's position on the write axis and calls it
+  "the only monotonic one". That is FALSE, and everything above that
+  depends on it inherits the bug: `now_ms()` is `SystemTime`, so an NTP
+  step, a `date -s` or a VM restore inverts the axis on ANY store, and an
+  intake stamping the sender's event time inverts it by design. Every
+  other consumer of the axis already hedges — `summarize_store` scans for
+  the extremes instead of reading first and last, `rotation_split` walks a
+  prefix instead of binary-searching — because ranges and prefixes survive
+  a mostly-sorted axis. A cursor cannot: it is a single point, and a
+  single point can move backwards.
+  So number the chunks. A per-store counter, assigned at append, dense and
+  monotone BY CONSTRUCTION rather than by trusting a clock, never reused.
+  `RECORD_LEN` 48 → 56 and the magic to `RING0002`. ⚠ NOT a base in the
+  header plus index arithmetic (8 bytes per store instead of per chunk):
+  that is a positional key wearing an identity costume, and any future
+  path that drops or reorders a record in the middle would silently
+  re-point every cursor with nothing on disk able to detect it — the same
+  reason the replication entry forbids a byte offset as a resume key. The
+  honest version costs 8 bytes per chunk, ~0.003% of a 256 KiB one, and a
+  cursor's reference becomes verifiable: number 4831 is present, or
+  provably gone.
+  What it removes, rather than mitigates: the clock-step hazard (no
+  clamping the write axis, so no frozen axis and no `retain` silently
+  stalling while the clamp holds); the event-time hazard (a replaying
+  sender cannot move a counter backwards, so interest-based retention
+  stops depending on "arrival time on a received store", and needs no test
+  of how a store was written — which would have violated identity-not-
+  mechanism anyway); chunk-granular resume widening (seek to a number
+  instead of binary-searching a timestamp, which also retires the "two
+  chunks sharing a window re-deliver" case); and the GAP report becomes
+  EXACT — `cursor.seq < first_record.seq` says "chunks 4200..4830 were
+  dropped unread", a count, where today's timestamp comparison can only
+  infer a duration.
+  **Local, and therefore ignored on ingest.** The number is a position in
+  ONE store, not a fact about the entry — which is precisely why `wf`/`wl`
+  legitimately travel and this does not. It still has to appear on the
+  records stream, because a consumer's cursor needs it (an entry shipped
+  from the `.sap` live edge lands in a chunk whose number only the reader
+  knows), so it travels as the READER's position and `import`/`append
+  --records` must let the destination assign its own: honouring an
+  incoming number would interleave two fan-in sources into a sequence that
+  is neither dense nor monotone. ⚠ Name that asymmetry at the code —
+  `sink.rs` honours the stream's `wf`/`wl` under an explicit "the stream's
+  word is law", so a neighbouring field that is silently dropped reads as
+  a bug someone will helpfully fix.
+  **Two lazy migrations, no operator step.** Rings: on first open by a v2
+  writer, iterate the records, assign from 0 for the oldest survivor —
+  a definition, not an attempt to recover how many were dropped before —
+  then temp-write, fsync and rename under the writer's existing lock.
+  Cursors: resolve the old `wl` to a chunk the way `query --from` does,
+  with `n` RESET TO 0 (carrying it would skip entries nobody received if
+  the match lands on a different chunk than the original; resetting costs
+  at most one re-delivered chunk, which at-least-once already permits),
+  and persist only on the first save AFTER a delivery — the cursor is
+  written after the receiver accepts and never before, and resolution is a
+  pure function of `(wl, rings)`, so a crash before the first delivery
+  simply resolves again. An inverted store may resolve earlier than the
+  consumer truly reached and re-deliver more, ONCE; after that first save
+  the cursor is immune to the clock permanently.
+  **v1 reads are not supported forever.** Keep them for a stated grace
+  period, then move that code into a standalone converter and drop it from
+  mainline. Two details decide whether that lands: after removal a v1
+  rings must fail with a message NAMING the converter, not "bad magic";
+  and the long tail is not live stores (a v2 writer migrates those on
+  first open) but `.timber` BUNDLES and archives nothing has written to
+  since — a bundle is read-only by design and cannot self-migrate, so the
+  converter has to handle bundles, while `import` of an old bundle is free
+  because it is writing a new store anyway.
+  Only a durable EXTERNAL reference needs identity, so derived data stays
+  positional: the `.grain` is rebuildable and keeps being aligned by chunk
+  index and rebased on head-drop, untouched by this. Also fix `format.rs`'s
+  module doc, which claims records are "sorted both by uncompressed offset
+  and by write time" — the second half is the false invariant this entry
+  exists to remove.
 - **Interest-based retention (a third axis)**: retention drops by age and
   by size. A frontend box wants a third rule — drop what is CONFIRMED
   DELIVERED — because two requirements hold at once there: keep as little
@@ -247,11 +327,13 @@ works is in [docs/design.md](docs/design.md).
   (3) **Fail closed** everywhere: no cursor found, an unreadable one, or
   one anchored to another store all drop nothing by interest — the minimum
   over an empty set is 0, not infinity.
-  (4) Refuse it on an intake-written store until "Arrival time on a
-  received store" lands: a replaying sender moves chunk windows — and a
-  cursor — backwards, so a cursor can mark undelivered data consumed. A
-  PRODUCING store (append/mount/follow, wall-clock stamps) is the safe
-  case and the one that wants this; the exclusion is for received stores.
+  (4) Depends on **chunk numbers** (above), not on arrival time and not on
+  any test of how the store was written. A cursor on the write axis can
+  mark undelivered data consumed wherever that axis moves backwards — a
+  replaying sender, but equally an NTP step on the producer itself — and
+  no provenance test separates those, besides typing a store by the
+  mechanism that wrote it. A counter cannot move backwards, so the hazard
+  disappears instead of being excluded. Build that first.
   Two things the guarantee rests on, neither of them ours: the receiver's
   `200` must mean PERSISTED, not merely accepted — a Collector with an
   in-memory queue acks and then loses the batch on restart, which silently
