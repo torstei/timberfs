@@ -1908,8 +1908,8 @@ import sys
 p = sys.argv[1]
 raw = open(p, "rb").read()
 assert raw[:8] == b"RING0002", raw[:8]
-n = (len(raw) - 16) // 56
-open(p, "wb").write(b"RING0001" + b"".join(raw[16 + i * 56:16 + i * 56 + 48] for i in range(n)))
+n = (len(raw) - 64) // 56
+open(p, "wb").write(b"RING0001" + b"".join(raw[64 + i * 56:64 + i * 56 + 48] for i in range(n)))
 PYEOF
     # A reader needs no migration: it numbers the oldest survivor 0.
     nums=$(timberfs index "$store" | awk '$1 ~ /^[0-9]+$/ {printf "%s ", $1}')
@@ -1952,7 +1952,7 @@ import json, struct, sys
 store, cdir = sys.argv[1], sys.argv[2]
 sid = json.load(open(store + ".bark"))["id"]
 raw = open(store + ".rings", "rb").read()
-recs = [struct.unpack("<7Q", raw[16 + i * 56:72 + i * 56]) for i in range((len(raw) - 16) // 56)]
+recs = [struct.unpack("<7Q", raw[64 + i * 56:120 + i * 56]) for i in range((len(raw) - 64) // 56)]
 assert len(recs) >= 3, recs
 def cursor(name, wf, wl, delivered):
     json.dump({"consumer": name, "store": sid, "path": store,
@@ -1999,7 +1999,7 @@ import json, struct, sys
 store, cdir = sys.argv[1], sys.argv[2]
 sid = json.load(open(store + ".bark"))["id"]
 raw = open(store + ".rings", "rb").read()
-first = struct.unpack("<7Q", raw[16:72])[4]
+first = struct.unpack("<7Q", raw[64:120])[4]
 json.dump({"consumer": "dropped", "store": sid, "path": store,
            "wf": first - 600000, "wl": first - 600000, "n": 0, "delivered": 5000},
           open(cdir + "/dropped.cursor", "w"))

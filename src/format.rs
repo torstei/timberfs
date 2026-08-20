@@ -26,7 +26,12 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 pub const RINGS_MAGIC: &[u8; 8] = b"RING0002";
-pub const RINGS_HEADER_LEN: u64 = 16;
+/// The header length THIS version writes. A reader must use the length the
+/// file itself declares (`header_len` below), not this constant, or a later
+/// version's longer header would shift every record offset underneath it.
+pub const RINGS_HEADER_LEN: u64 = 64;
+/// Below this a v2 header cannot hold the fields every reader requires.
+pub const RINGS_HEADER_MIN: u64 = 32;
 pub const RECORD_LEN: usize = 56;
 /// The pre-chunk-number layout: an 8-byte header and 48-byte records. Read
 /// for compatibility and by the migration; never written. Support for it is
@@ -173,29 +178,49 @@ impl ChunkRecord {
     }
 }
 
-/// The 16-byte v2 header: magic, then the chunk-number high-water mark.
+/// The v2 header: 64 bytes, every field a little-endian u64 after the
+/// magic, and deliberately larger than it needs to be.
 ///
-/// The mark exists for one case: retention can drop EVERY chunk, and a
+/// ```text
+///  0..8   magic "RING0002"
+///  8..16  header_len      — where record 0 starts
+/// 16..24  incompat_flags  — refuse on a bit you do not know
+/// 24..32  next_seq        — the chunk-number high-water mark
+/// 32..64  reserved, zero
+/// ```
+///
+/// `header_len` is what makes the reserved space usable: without it a
+/// reader computes record offsets from a compiled-in constant, so a later
+/// version's longer header would shift every record underneath every binary
+/// already deployed — and reserving bytes nobody can safely grow into buys
+/// nothing. `incompat_flags` is the other half: reserved space is only safe
+/// for OPTIONAL fields (0 reads as absent), and a field that changes how
+/// records must be interpreted sets a bit instead, so an older reader stops
+/// rather than guessing. The cost of both is 64 bytes per store, once.
+///
+/// `next_seq` exists for one case: retention can drop EVERY chunk, and a
 /// store whose record set is empty would otherwise restart numbering at 0
 /// and hand a fresh chunk a number some cursor already considers consumed.
 /// It is not a base for index arithmetic — records carry their own numbers —
 /// so it only ever forbids reuse, and only the paths that rewrite the whole
-/// file (head-drop) need to keep it current. On the append path the last
-/// record is the better source, so nothing extra is written there.
+/// file (head-drop) keep it current. On the append path the last record is
+/// the better source, so nothing extra is written there.
 pub fn rings_header(next_seq: u64) -> [u8; RINGS_HEADER_LEN as usize] {
     let mut h = [0u8; RINGS_HEADER_LEN as usize];
     h[0..8].copy_from_slice(RINGS_MAGIC);
-    h[8..16].copy_from_slice(&next_seq.to_le_bytes());
+    h[8..16].copy_from_slice(&RINGS_HEADER_LEN.to_le_bytes());
+    h[16..24].copy_from_slice(&0u64.to_le_bytes());
+    h[24..32].copy_from_slice(&next_seq.to_le_bytes());
     h
 }
 
 /// The high-water mark a v2 header carries. A v1 header has none, and a
 /// truncated one reads as 0 — both mean "trust the records".
 pub fn header_next_seq(buf: &[u8]) -> u64 {
-    if buf.len() < RINGS_HEADER_LEN as usize || &buf[..8] != RINGS_MAGIC {
+    if buf.len() < RINGS_HEADER_MIN as usize || &buf[..8] != RINGS_MAGIC {
         return 0;
     }
-    u64::from_le_bytes(buf[8..16].try_into().unwrap())
+    u64::from_le_bytes(buf[24..32].try_into().unwrap())
 }
 
 pub fn read_index(path: &Path) -> io::Result<Vec<ChunkRecord>> {
@@ -246,7 +271,38 @@ pub fn parse_index_versioned(buf: &[u8]) -> io::Result<(Vec<ChunkRecord>, RingsV
         return Err(bad());
     }
     let (version, header, rec_len) = match &buf[..8] {
-        m if m == RINGS_MAGIC => (RingsVersion::V2, RINGS_HEADER_LEN as usize, RECORD_LEN),
+        // The FILE's header length, not ours: a longer header from a later
+        // version must shift record offsets for this reader too, which is
+        // the whole point of declaring it.
+        m if m == RINGS_MAGIC => {
+            if buf.len() < RINGS_HEADER_MIN as usize {
+                return Err(bad());
+            }
+            let declared = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            if declared < RINGS_HEADER_MIN || declared > buf.len() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "timberfs index declares a {declared}-byte header, which is impossible"
+                    ),
+                ));
+            }
+            // A bit set here changes how the records must be read, so an
+            // older reader has to stop rather than answer from a layout it
+            // does not know. Optional additions live in the reserved bytes
+            // and set nothing, precisely so this stays rare.
+            let incompat = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+            if incompat != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "timberfs index requires unsupported features (incompat 0x{incompat:016x}) \
+                         — it was written by a newer timberfs"
+                    ),
+                ));
+            }
+            (RingsVersion::V2, declared as usize, RECORD_LEN)
+        }
         m if m == RINGS_MAGIC_V1 => (
             RingsVersion::V1,
             RINGS_HEADER_LEN_V1 as usize,
@@ -254,11 +310,6 @@ pub fn parse_index_versioned(buf: &[u8]) -> io::Result<(Vec<ChunkRecord>, RingsV
         ),
         _ => return Err(bad()),
     };
-    // A v2 header that is present but truncated is not a valid index; a v1
-    // one is exactly the magic, so the check above already covered it.
-    if buf.len() < header {
-        return Err(bad());
-    }
     let n = (buf.len() - header) / rec_len;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -270,4 +321,100 @@ pub fn parse_index_versioned(buf: &[u8]) -> io::Result<(Vec<ChunkRecord>, RingsV
         });
     }
     Ok((out, version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(seq: u64) -> ChunkRecord {
+        ChunkRecord {
+            uncomp_start: seq * 10,
+            uncomp_len: 10,
+            comp_start: seq * 4,
+            comp_len: 4,
+            first_write_ms: 100 + seq,
+            last_write_ms: 100 + seq,
+            seq,
+        }
+    }
+
+    /// Build a rings image with an arbitrary header length and flags, i.e.
+    /// what a LATER version of timberfs would write.
+    fn image(header_len: u64, incompat: u64, n: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; header_len as usize];
+        buf[0..8].copy_from_slice(RINGS_MAGIC);
+        buf[8..16].copy_from_slice(&header_len.to_le_bytes());
+        buf[16..24].copy_from_slice(&incompat.to_le_bytes());
+        buf[24..32].copy_from_slice(&n.to_le_bytes());
+        for i in 0..n {
+            buf.extend_from_slice(&rec(i).to_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn a_longer_header_from_a_later_version_still_parses() {
+        // The reserved bytes are only worth having if a reader finds record
+        // 0 where the FILE says it is rather than where this build's
+        // constant says — otherwise a later, longer header shifts every
+        // record underneath every binary already deployed.
+        let buf = image(128, 0, 3);
+        let (recs, ver) = parse_index_versioned(&buf).unwrap();
+        assert_eq!(ver, RingsVersion::V2);
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs.iter().map(|c| c.seq).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(header_next_seq(&buf), 3);
+    }
+
+    #[test]
+    fn an_unknown_incompat_bit_is_refused_not_guessed_at() {
+        let buf = image(RINGS_HEADER_LEN, 0b10, 2);
+        let e = parse_index_versioned(&buf).unwrap_err();
+        assert!(e.to_string().contains("unsupported features"), "{e}");
+        // Whereas no flags is the ordinary case.
+        assert!(parse_index_versioned(&image(RINGS_HEADER_LEN, 0, 2)).is_ok());
+    }
+
+    #[test]
+    fn an_impossible_header_length_is_refused() {
+        // Too small to hold the fields every reader requires...
+        let mut buf = image(RINGS_HEADER_LEN, 0, 1);
+        buf[8..16].copy_from_slice(&8u64.to_le_bytes());
+        assert!(parse_index_versioned(&buf).is_err());
+        // ...and longer than the file itself.
+        let mut buf = image(RINGS_HEADER_LEN, 0, 1);
+        buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(parse_index_versioned(&buf).is_err());
+    }
+
+    #[test]
+    fn the_header_this_version_writes_round_trips() {
+        let h = rings_header(42);
+        assert_eq!(&h[..8], RINGS_MAGIC);
+        assert_eq!(
+            u64::from_le_bytes(h[8..16].try_into().unwrap()),
+            RINGS_HEADER_LEN
+        );
+        assert_eq!(u64::from_le_bytes(h[16..24].try_into().unwrap()), 0);
+        assert_eq!(header_next_seq(&h), 42);
+        // The reserved tail is zero, so a later version can tell "absent"
+        // from "set" without a flag for every optional addition.
+        assert!(h[32..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_record_round_trips_including_its_number() {
+        let r = rec(7);
+        let back = ChunkRecord::from_bytes(&r.to_bytes());
+        assert_eq!(
+            (back.seq, back.uncomp_start, back.last_write_ms),
+            (7, 70, 107)
+        );
+        // A v1 record is the same bytes minus the number, which is what
+        // makes the migration a per-record append rather than a rewrite.
+        let v1 = &r.to_bytes()[..RECORD_LEN_V1];
+        let back = ChunkRecord::from_bytes_v1(v1, 99);
+        assert_eq!((back.seq, back.uncomp_start), (99, 70));
+    }
 }
