@@ -15,6 +15,14 @@ pub struct EntryRec {
     /// The original write window, when the stream carries one.
     pub wf: Option<u64>,
     pub wl: Option<u64>,
+    /// The number of the chunk this entry came from IN THE SOURCE STORE.
+    /// `None` means the producer read it from the live edge, where no chunk
+    /// exists yet — so a consumer may deliver it but cannot record a
+    /// resumable position inside it.
+    ///
+    /// ⚠ A position, not a fact about the entry: unlike `wf`/`wl` it is
+    /// NOT carried into a destination store (see `sink.rs`).
+    pub chunk: Option<u64>,
     pub payload: Vec<u8>,
 }
 
@@ -91,6 +99,7 @@ impl<R: BufRead> Reader<R> {
                     let ts = get("ts").and_then(|v| v.parse().ok());
                     let wf = get("wf").and_then(|v| v.parse().ok());
                     let wl = get("wl").and_then(|v| v.parse().ok());
+                    let chunk = get("chunk").and_then(|v| v.parse().ok());
                     let mut payload = vec![0u8; len];
                     self.r.read_exact(&mut payload).context(
                         "record stream truncated mid-entry (producer died or pipe broke)",
@@ -104,6 +113,7 @@ impl<R: BufRead> Reader<R> {
                         ts,
                         wf,
                         wl,
+                        chunk,
                         payload,
                     })));
                 }

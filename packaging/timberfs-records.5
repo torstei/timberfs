@@ -88,9 +88,20 @@ carries no parseable stamp),
 .B wf
 /
 .B wl
-(first/last write time of the chunk the entry started in \(em the
-write-time window; present when known \(em a stream converted from raw
-text has none),
+(first/last write time of the chunk the entry COMPLETED in \(em an entry
+becomes one when its stamped line closes, so a line split across two
+chunks reports the second; present when known \(em a stream converted from
+raw text has none),
+.B chunk
+(the number of that same chunk, in the SOURCE store \(em what a consumer's
+cursor holds, and exact where a timestamp is not, chunk numbers only moving
+forward. ABSENT means the producer read the entry from the live edge, where
+no chunk exists yet: it may be delivered, but no resumable position inside
+it can be recorded. It is a POSITION, not a fact about the entry, so unlike
+.BR wf / wl
+it is not carried into a destination store \(em an ingesting writer numbers
+its own chunks, or two fan-in sources would interleave into a sequence that
+is neither dense nor monotone),
 .B src
 (source path; present only in multi-source streams \(em single-source
 streams name their source once, in

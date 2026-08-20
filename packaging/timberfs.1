@@ -678,6 +678,23 @@ so a producer mid-entry has committed the rest of it already. A
 longer than that can split a multiline entry that a chunk boundary
 split first.
 .TP
+.BI \-\-from\-chunk " N"
+Resume at chunk
+.I N
+(the numbers
+.B timberfs index
+prints), the position a consumer's cursor holds. Requires
+.BR \-\-follow ,
+and conflicts with
+.BR \-\-from / \-\-tail .
+Exact where a timestamp is not: a number names one chunk, where
+.B \-\-from
+can match two that share a boundary millisecond, and chunk numbers only
+move forward where the write axis is a wall clock an NTP step can push
+backwards (see THE TWO CLOCKS). A number older than anything the store
+still holds starts at the oldest chunk it has \(em only the caller knows
+its position was dropped, so only the caller can report it.
+.TP
 .BI \-\-poll " SECS"
 Seconds between looks for new data
 .RB ( \-\-follow
