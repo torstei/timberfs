@@ -254,17 +254,23 @@ costs I/O proportional to the compressed size. It runs against a live mount
 (auto-detected, routed through the daemon atomically) and is chunk-granular
 like queries. Details: `man timberfs`.
 
-## Durability (`--wal`)
+## Durability and the live edge (`--wal`)
 
 By default, a crash (SIGKILL, power loss) can lose up to `--flush-age`
-(5s) of buffered-but-unflushed data — chunking wants big, infrequent
-frames, which is at odds with flushing on every write. `--wal` decouples
-the two: `create --wal` / `append --wal` (or `timberfs set store wal=true`
-on an existing one) declares a write-ahead sidecar, `<name>.sap`, that
-every streaming writer fsyncs once a second — shrinking the crash window
-to that tick, independent of `--flush-age` and the chunk-size schedule.
-It's a property of the *store* (like `--index`), declared once in the
-manifest: any later writer honors it with no flag.
+(5s) of buffered-but-unflushed data, and a follower cannot see that data
+either — chunking wants big, infrequent frames, which is at odds with
+both. `--wal` decouples them: `create --wal` / `append --wal` (or
+`timberfs set store wal=true` on an existing one) declares a write-ahead
+sidecar, `<name>.sap`, holding every entry raw as it arrives. Every
+streaming writer fsyncs it once a second — shrinking the crash window to
+that tick, independent of `--flush-age` and the chunk-size schedule —
+and `query --follow` tails its live edge, so entries reach an operator as
+they are appended instead of a flushed chunk at a time (measured p50 0.5s
+against 36s on the same one-line-a-second store, with the chunking and
+its 8.7x compression unchanged). It's a property of the *store* (like
+`--index`), declared once in the manifest: any later writer honors it
+with no flag — including one already running, so a stream can be given a
+live edge mid-incident without restarting whatever produces it.
 
 ```sh
 timberfs create --wal --retain 90d backing/app.log
@@ -273,8 +279,11 @@ myapp 2>&1 | timberfs append --into backing/app.log
 
 The cost is explicit: a wal-enabled writer writes every appended byte
 twice — once raw to the sap, once compressed into its eventual chunk — so
-turn it on for streams where a few seconds of loss actually matters, not
-by default. `timberfs info` shows whether it's declared and how many
+turn it on for streams where a few seconds of loss, or a minute of
+waiting, actually matters, not by default. The alternative — a short
+`--flush-age` — buys the same visibility by making chunks small, which
+costs compression on a quiet stream (1.9x against 8.7x at one line a
+second) and multiplies the `.rings`/`.grain` index over it. `timberfs info` shows whether it's declared and how many
 bytes are currently sitting in the sap, unflushed. Design and the crash
 matrix: [docs/design.md](docs/design.md#the-sap-write-ahead-sidecar).
 

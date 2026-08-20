@@ -765,6 +765,126 @@ query_follow_idle_flush() {
 
 run_test "query --follow emits a quiet store's last entry (idle flush)" query_follow_idle_flush
 
+query_follow_live_edge() {
+    # The point of the live tail: an entry is visible BEFORE the chunk
+    # holding it exists. The writer's flush age is a minute, so anything
+    # the follower shows here came out of the .sap — and the trunk being
+    # still empty when it does is what proves it.
+    mkfifo /tmp/le.fifo
+    timberfs append --into "$PIPE_BACKING/le.log" --wal --flush-age 60 < /tmp/le.fifo &
+    local ap=$!
+    exec 8>/tmp/le.fifo
+    printf '2026-06-08T10:00:00 INFO seed-line\n' >&8
+    local i
+    for i in $(seq 1 20); do
+        [ -e "$PIPE_BACKING/le.log.rings" ] && break
+        sleep 0.5
+    done
+    sleep 1
+    timberfs query "$PIPE_BACKING/le.log" --follow > /tmp/le.out 2>/dev/null &
+    local fp=$!
+    sleep 1
+    printf '2026-06-08T10:00:01 ERROR unflushed-and-visible\n' >&8
+    local got="" trunk=""
+    for i in $(seq 1 10); do
+        sleep 1
+        if grep -q unflushed-and-visible /tmp/le.out; then
+            got=yes
+            trunk=$(stat -c%s "$PIPE_BACKING/le.log.trunk")
+            break
+        fi
+    done
+    kill "$fp" 2>/dev/null; wait "$fp" 2>/dev/null
+    exec 8>&-; kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null
+    rm -f /tmp/le.fifo
+    [ "$got" = yes ] || { echo "the entry never surfaced; follower emitted:"; cat /tmp/le.out; return 1; }
+    [ "$trunk" = 0 ] || { echo "trunk was $trunk bytes: a chunk was flushed, so this proves nothing"; return 1; }
+    # …and from-now still means from now.
+    ! grep -q seed-line /tmp/le.out
+}
+
+run_test "query --follow shows entries still unflushed (.sap live tail)" query_follow_live_edge
+
+query_follow_no_gap_across_flushes() {
+    # The handoff: every line the live tail served is repeated by the
+    # chunk its segment becomes. Small chunks force many handoffs; the
+    # follower must show each line exactly once — no gap, no double.
+    mkfifo /tmp/hd.fifo
+    timberfs append --into "$PIPE_BACKING/hd.log" --wal --chunk-size 4096 --flush-age 60 \
+        < /tmp/hd.fifo &
+    local ap=$!
+    exec 9>/tmp/hd.fifo
+    printf '2026-06-08T11:00:00 INFO seed-line\n' >&9
+    local i
+    for i in $(seq 1 20); do
+        [ -e "$PIPE_BACKING/hd.log.rings" ] && break
+        sleep 0.5
+    done
+    sleep 1
+    timberfs query "$PIPE_BACKING/hd.log" --follow > /tmp/hd.out 2>/dev/null &
+    local fp=$!
+    sleep 1
+    for i in $(seq 1 300); do
+        printf '2026-06-08T11:00:01 INFO handoff id=%s padding-to-fill-a-chunk-quickly\n' "$i" >&9
+        [ $((i % 50)) = 0 ] && sleep 1
+    done
+    # Wait for the tail to arrive rather than for a fixed time.
+    for i in $(seq 1 20); do
+        sleep 1
+        grep -q "id=300 " /tmp/hd.out && break
+    done
+    kill "$fp" 2>/dev/null; wait "$fp" 2>/dev/null
+    exec 9>&-; kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null
+    rm -f /tmp/hd.fifo
+    local chunks lines uniq
+    chunks=$(timberfs index "$PIPE_BACKING/hd.log" | tail -1)
+    lines=$(grep -c 'id=' /tmp/hd.out)
+    uniq=$(grep -o 'id=[0-9]* ' /tmp/hd.out | sort -u | wc -l)
+    echo "$chunks; follower emitted $lines line(s), $uniq distinct"
+    [ "$lines" = 300 ] && [ "$uniq" = 300 ]
+}
+
+run_test "query --follow: no gap or duplicate across sap/chunk handoffs" query_follow_no_gap_across_flushes
+
+query_follow_wal_enabled_under_a_live_writer() {
+    # `set wal=true` is the mid-incident move: the producer cannot be
+    # restarted, so the writer must pick the declaration up on its own —
+    # and a follower already running must start seeing the live edge.
+    mkfifo /tmp/sw.fifo
+    timberfs append --into "$PIPE_BACKING/sw.log" --flush-age 60 < /tmp/sw.fifo &
+    local ap=$!
+    exec 3>/tmp/sw.fifo
+    printf '2026-06-08T12:00:00 INFO seed-line\n' >&3
+    local i
+    for i in $(seq 1 20); do
+        [ -e "$PIPE_BACKING/sw.log.rings" ] && break
+        sleep 0.5
+    done
+    sleep 1
+    timberfs query "$PIPE_BACKING/sw.log" --follow > /tmp/sw.out 2>/dev/null &
+    local fp=$!
+    sleep 1
+    timberfs set "$PIPE_BACKING/sw.log" wal=true > /dev/null
+    local live=""
+    for i in $(seq 1 10); do
+        sleep 1
+        [ -e "$PIPE_BACKING/sw.log.sap" ] && { live=yes; break; }
+    done
+    printf '2026-06-08T12:00:01 ERROR live-after-set\n' >&3
+    local got=""
+    for i in $(seq 1 10); do
+        sleep 1
+        grep -q live-after-set /tmp/sw.out && { got=yes; break; }
+    done
+    kill "$fp" 2>/dev/null; wait "$fp" 2>/dev/null
+    exec 3>&-; kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null
+    rm -f /tmp/sw.fifo
+    [ "$live" = yes ] || { echo "no .sap appeared: the running writer ignored the declaration"; return 1; }
+    [ "$got" = yes ] || { echo "the follower never saw the live edge; it emitted:"; cat /tmp/sw.out; return 1; }
+}
+
+run_test "set wal=true starts the live edge under a running writer" query_follow_wal_enabled_under_a_live_writer
+
 # The socket-activated log-intake units (timberfs-log@.socket/.service):
 # exercise the real thing — socket activation, records intake, the
 # drop-in override, and the robustness that is the whole point (a
@@ -1717,7 +1837,15 @@ timber_otlp_cursor_resumes_without_duplicates() {
     local sp=$!
     sleep 4
     printf '2026-06-20T09:10:03Z INFO cur-three\n2026-06-20T09:10:04Z INFO cur-four\n' >&8
-    sleep 14
+    # Wait for the cursor to record them rather than sleeping a fixed time.
+    # The last entry is closed by the follower's idle flush, ~10s after the
+    # chunk holding it, so end to end this needs ~13s on an idle laptop —
+    # a fixed wait is a race the VM loses whenever it is busy.
+    local i
+    for i in $(seq 1 40); do
+        [ "$(jq -r .delivered /tmp/cur.cursor 2>/dev/null)" = 4 ] && break
+        sleep 1
+    done
     kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
     local delivered
     delivered=$(jq -r .delivered /tmp/cur.cursor 2>/dev/null)
@@ -1729,7 +1857,10 @@ timber_otlp_cursor_resumes_without_duplicates() {
     timber-otlp --quiet --follow --cursor /tmp/cur.cursor \
         --endpoint http://127.0.0.1:4318 "$PIPE_BACKING/cur.log" > /tmp/cur.ship2 2>&1 &
     sp=$!
-    sleep 14
+    for i in $(seq 1 40); do
+        [ "$(jq -r .delivered /tmp/cur.cursor 2>/dev/null)" = 6 ] && break
+        sleep 1
+    done
     kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
     exec 8>&-; kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null
     rm -f /tmp/cur.fifo

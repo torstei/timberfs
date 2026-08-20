@@ -142,7 +142,11 @@ every streaming writer fsyncs it once a second, shrinking a crash's data
 loss from
 .B \-\-flush\-age
 down to that tick, at the cost of writing appended bytes twice (raw to
-the sidecar, compressed into the eventual chunk). A property of the
+the sidecar, compressed into the eventual chunk). It buys visibility with
+the same file:
+.B "query \-\-follow"
+tails its live edge, so entries reach a follower as they are appended
+rather than a flushed chunk at a time. A property of the
 store, like
 .BR \-\-index :
 declared once, every later writer honors it with no flag.
@@ -641,10 +645,19 @@ After the selected output, keep emitting entries as chunks are committed,
 until interrupted \(em like
 .BR tail (1)
 .BR \-f .
-A flushed chunk is the unit of visibility, so new data appears within the
-writer's
+When the store declares a
+.B wal
+.RB ( "timberfs set " \fIstore\fB " wal=true" ),
+new entries appear as the writer appends them \(em the follower tails the
+.B .sap
+sidecar's live edge, so visibility no longer waits for a chunk and
 .B \-\-flush\-age
-(default 5s), not per line. Read-only and lock-free, so it runs beside a live
+is free to stay long for compression. Without one, a flushed chunk is the
+unit of visibility and new data appears within the writer's
+.B \-\-flush\-age
+instead (5s for the appender, 60s for
+.BR "import \-\-follow" ).
+Read-only and lock-free either way, so it runs beside a live
 appender; plain text streams raw bytes, while
 .BR \-0 ", " \-\-records ", and " \-\-show\-write\-time
 run the entry pipeline. Filter a live follow with a pipe
@@ -662,6 +675,16 @@ so a producer mid-entry has committed the rest of it already. A
 .B \-\-flush\-age
 longer than that can split a multiline entry that a chunk boundary
 split first.
+.TP
+.BI \-\-poll " SECS"
+Seconds between looks for new data
+.RB ( \-\-follow
+only). Defaults to 0.2 when there is a live
+.B .sap
+to tail \(em where this interval IS the latency \(em and 1 otherwise, where
+the writer's
+.B \-\-flush\-age
+decides instead and a faster poll would only spend syscalls.
 .TP
 .BI \-\-tail " N"
 Show (about) the last
@@ -1304,14 +1327,17 @@ a third file,
 holds every appended entry raw (u32 length, u64 write-from, u64
 write-to, the payload, a trailing crc32), fsynced once a second \(em the
 durability point, independent of the chunk flush schedule. It holds the
-same bytes as the in-memory buffer by construction, is written but never
-read except once, by a writer reopening the store after a crash; a mid-
-flush crash is resolved by comparing the sidecar's recorded
+same bytes as the in-memory buffer by construction; a mid-flush crash is
+resolved by comparing the sidecar's recorded
 .I base
 (the trunk size when it was created) against the trunk's current size.
-Readers never see it; the still-buffered tail stays visible only through
-the mount, exactly as without
-.BR \-\-wal .
+A writer reopening the store after a crash replays it. A
+.B "query \-\-follow"
+reads it as it grows, which is what puts an entry in front of an operator
+before its chunk exists: a segment's content is exactly the next chunk's
+bytes, so a follower drops from that chunk the bytes it already served
+and can neither gap nor repeat. The seal is a rename, so a new inode
+marks the generation; only the CRC-valid prefix is ever read.
 .PP
 The daemon holds an exclusive
 .BR flock (2)

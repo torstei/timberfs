@@ -67,8 +67,10 @@ enum Command {
         index: bool,
         /// Declare the write-ahead sidecar (.sap): every streaming writer
         /// fsyncs it once a second, so an appender's crash window shrinks
-        /// from --flush-age down to that tick, at the cost of writing raw
-        /// bytes twice (once to the sap, once compressed into the chunk)
+        /// from --flush-age down to that tick, and query --follow tails
+        /// it, so entries reach a follower as they are appended rather
+        /// than a flushed chunk at a time. Costs writing raw bytes twice
+        /// (once to the sap, once compressed into the chunk)
         #[arg(long)]
         wal: bool,
         /// Declare retention: continuously drop data older than this
@@ -138,9 +140,11 @@ enum Command {
         flush_age: f64,
         /// Declare the write-ahead sidecar (.sap): entries are fsynced
         /// once a second (independent of --flush-age), so a crash loses
-        /// at most that tick instead of up to a full unflushed chunk. A
-        /// property of the store (like --index) — once declared, every
-        /// later writer honors it with no flag
+        /// at most that tick instead of up to a full unflushed chunk —
+        /// and query --follow tails it, so they are visible as they are
+        /// appended. A property of the store (like --index) — once
+        /// declared, every later writer honors it with no flag, running
+        /// ones included
         #[arg(long)]
         wal: bool,
         /// Continuously drop data older than this (e.g. 30d, 12h, 90m)
@@ -215,9 +219,11 @@ enum Command {
         /// import maintains the index automatically)
         #[arg(long)]
         index: bool,
-        /// Declare the write-ahead sidecar (.sap) for future writers of
-        /// this log (a batch import itself has no live "unflushed tail"
-        /// to protect); a property of the store, like --index
+        /// Declare the write-ahead sidecar (.sap): with --follow, what
+        /// makes each line visible to query --follow as it is read
+        /// instead of when its chunk is flushed (a batch import has no
+        /// live tail to serve or protect, and only declares it for later
+        /// writers); a property of the store, like --index
         #[arg(long)]
         wal: bool,
         /// Keep following the source instead of exiting at its end: the
@@ -237,8 +243,9 @@ enum Command {
         #[arg(long, value_name = "PATH", requires = "follow")]
         rotated: Vec<PathBuf>,
         /// Seconds between looks for new data and for a replaced file
-        /// (--follow only). Nothing observable improves below --flush-age,
-        /// which bounds when a chunk becomes visible
+        /// (--follow only). With a wal declared this also bounds how soon
+        /// a line reaches a live reader; without one, --flush-age does,
+        /// and nothing observable improves below it
         #[arg(long, default_value_t = 1.0, value_name = "SECS", requires = "follow")]
         poll: f64,
         /// Max seconds followed data may sit unflushed (--follow only) —
@@ -248,8 +255,9 @@ enum Command {
         /// the minute rather than the appender's 5s, whose input is a pipe
         /// with nowhere else to hold the data: a short age on a quiet log
         /// closes chunks too small to compress (measured 3.1x against 7.7x
-        /// at one line a second). Lower it only to make new lines
-        /// queryable sooner
+        /// at one line a second). To make new lines visible sooner,
+        /// declare --wal instead: query --follow tails the sap, so
+        /// visibility stops depending on this at all
         #[arg(long, default_value_t = 60.0, value_name = "SECS", requires = "follow")]
         flush_age: f64,
         /// Continuously drop data older than this (e.g. 90d) — declared in
@@ -345,10 +353,12 @@ enum Command {
             conflicts_with_all = ["null_sep", "show_write_time", "by_write_time", "no_filename"]
         )]
         records: bool,
-        /// Follow the store: after the selected output, keep emitting entries
-        /// as they are committed, until interrupted (like tail -f). A flushed
-        /// chunk is the unit of visibility, so new data surfaces within the
-        /// writer's --flush-age (default 5s), not instantly.
+        /// Follow the store: after the selected output, keep emitting
+        /// entries as they arrive, until interrupted (like tail -f). A
+        /// store with a wal declared is tailed at its live edge, so
+        /// entries surface as the writer appends them; without one, a
+        /// flushed chunk is the unit of visibility and they surface
+        /// within the writer's --flush-age.
         #[arg(short = 'f', long, conflicts_with_all = ["by_write_time", "to"])]
         follow: bool,
         /// Start from (about) the last N entries: with --follow, show them
@@ -361,6 +371,12 @@ enum Command {
         /// and --by-write-time (raw chunks have no entry count).
         #[arg(long, value_name = "N", conflicts_with_all = ["tail", "by_write_time"])]
         max: Option<u64>,
+        /// Seconds between looks for new data (--follow only). Default:
+        /// 0.2 when the store has a live write-ahead sidecar to tail
+        /// (`wal=true`), where the poll IS the latency, and 1 otherwise,
+        /// where the writer's --flush-age decides instead
+        #[arg(long, value_name = "SECS", requires = "follow")]
+        poll: Option<f64>,
     },
     /// Show a store's vital signs on one screen: identity, lineage,
     /// data and compression, time covered, index sizes and coverage,
@@ -798,6 +814,7 @@ fn main() -> anyhow::Result<()> {
             follow,
             tail,
             max,
+            poll,
         } => {
             let files = files
                 .iter()
@@ -817,6 +834,7 @@ fn main() -> anyhow::Result<()> {
                 follow,
                 tail,
                 max,
+                poll,
             )?;
         }
         Command::Info { file, json } => {

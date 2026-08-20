@@ -28,7 +28,7 @@ _timberfs() {
     # A flag that takes a value: the word after it is never a handle.
     case "$prev" in
     --into | --into-dir | --from | --to | --has | --any | --cutoff | --set | --unset | \
-        --tail | --max | --chunk-size | --level | --flush-age | --retain | \
+        --tail | --max | --poll | --chunk-size | --level | --flush-age | --retain | \
         --retain-size | --timestamp-regex | --timestamp-format | --listen | \
         --payload-key | --route | --max-body)
         COMPREPLY=($(compgen -f -- "$cur"))

@@ -418,6 +418,7 @@ pub fn cmd_query(
     follow: bool,
     tail: Option<u64>,
     max: Option<u64>,
+    poll: Option<f64>,
 ) -> anyhow::Result<()> {
     let from_ms = from.unwrap_or(0);
     let to_ms = to.unwrap_or(u64::MAX);
@@ -447,6 +448,7 @@ pub fn cmd_query(
             tail,
             follow,
             max,
+            poll,
         );
     }
     let windowed = from.is_some() || to.is_some();
@@ -739,10 +741,57 @@ fn tail_start(
     Ok(start)
 }
 
+/// Where a follower left off: the LAST CHUNK IT HAS SEEN, identified
+/// the way `read_chunk` re-locates one after a collapse — by its
+/// write window and its lengths, which a head trim does not change
+/// (offsets and logical positions, which it rebases, would). NOT a
+/// timestamp: chunk windows come from the entries' own loglines on an
+/// imported or followed store, so two chunks routinely share a
+/// boundary millisecond, and "later than the last one" then skips
+/// every second chunk for good.
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct ChunkKey {
+    uncomp_len: u64,
+    comp_len: u64,
+    first_write_ms: u64,
+    last_write_ms: u64,
+}
+
+fn key(c: &ChunkRecord) -> ChunkKey {
+    ChunkKey {
+        uncomp_len: c.uncomp_len,
+        comp_len: c.comp_len,
+        first_write_ms: c.first_write_ms,
+        last_write_ms: c.last_write_ms,
+    }
+}
+
+/// Index of the first chunk this follower has NOT seen. The hint is
+/// the position the anchor had last time — right whenever retention
+/// did not trim in between, which is nearly always — and the scan
+/// below it covers the case where it did. An anchor that is gone
+/// entirely means retention overtook the follower.
+fn resume_at(records: &[ChunkRecord], anchor: &Option<(ChunkKey, usize)>) -> Option<usize> {
+    let Some((k, hint)) = anchor else {
+        return Some(0); // nothing seen yet: everything is new
+    };
+    if records.get(*hint).map(key) == Some(*k) {
+        return Some(hint + 1);
+    }
+    let from = (*hint).min(records.len().saturating_sub(1));
+    (0..=from)
+        .rev()
+        .find(|&i| key(&records[i]) == *k)
+        .map(|i| i + 1)
+}
+
 /// Follow / tail: emit (about) the last N units, then — with --follow — new
-/// data as chunks are committed, until interrupted. Read-only and lock-free,
-/// so it runs beside a live appender; a flushed chunk is the unit of
-/// visibility, so latency tracks the writer's --flush-age.
+/// data as it arrives, until interrupted. Read-only and lock-free, so it runs
+/// beside a live appender. Two sources feed it: flushed chunks from the ring,
+/// and — when the store declares a wal — the live edge of the sap (live.rs),
+/// which is what makes an entry visible before its chunk exists. A chunk
+/// repeats what its segment already served, so each is emitted minus that
+/// prefix.
 ///
 /// Plain text follows RAW chunk bytes (line-oriented, no buffering — the
 /// snappy tail -f). Only the framed modes (-0, --records, --show-write-time)
@@ -759,6 +808,7 @@ fn query_follow(
     tail: Option<u64>,
     follow: bool,
     max: Option<u64>,
+    poll: Option<f64>,
 ) -> anyhow::Result<()> {
     let multi = files.len() > 1 && !no_filename;
     // Framing needs entries; plain text streams raw bytes (no one-entry lag).
@@ -787,25 +837,67 @@ fn query_follow(
         }
     }
 
+    /// How long to wait before looking again. A store with a live
+    /// segment is tailed several times a second: its new entries are
+    /// already on disk, so this sleep is all that stands between a
+    /// written line and a shown one. Without one, the writer's
+    /// --flush-age decides that instead and a faster poll would only
+    /// spend syscalls.
+    fn poll_interval(srcs: &[FollowSrc], requested: Option<f64>) -> std::time::Duration {
+        if let Some(secs) = requested {
+            return std::time::Duration::from_millis((secs * 1000.0).max(10.0) as u64);
+        }
+        if srcs.iter().any(|s| s.live.live()) {
+            std::time::Duration::from_millis(200)
+        } else {
+            std::time::Duration::from_millis(1000)
+        }
+    }
+
+    /// Entries read from the live segment. Each carries its own write
+    /// window, so the framed modes get finer stamps here than a chunk can
+    /// give them.
+    fn emit_live(
+        out: &mut dyn Write,
+        entries: &[crate::sap::SapEntry],
+        sink: &mut Option<crate::entry::EntrySink>,
+        label: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        for e in entries {
+            match sink {
+                Some(s) => s.push_chunk(&e.payload, (e.wf, e.wl), out)?,
+                None => emit_raw(out, &e.payload, label)?,
+            }
+        }
+        Ok(())
+    }
+
     struct FollowSrc {
         path: std::path::PathBuf,
         label: Option<Vec<u8>>,
         sink: Option<crate::entry::EntrySink>,
-        // Last emitted chunk's last_write_ms; new chunks arrive later (the
-        // appender stamps now()), so this is a monotonic follow cursor.
-        cursor_ms: u64,
-        // Consecutive polls that found nothing new.
-        idle_polls: u32,
+        // The last chunk seen, and where it sat in the ring last time.
+        anchor: Option<(ChunkKey, usize)>,
+        // The store's live write-ahead segment, when it declares one:
+        // entries become visible here as they are appended, instead of a
+        // flushed chunk at a time.
+        live: crate::live::LiveTail,
+        // Announced once, not once a second.
+        noted_overtaken: bool,
+        // When this source last had something to show, and whether the
+        // pending entry has already been closed for this quiet streak.
+        last_data: std::time::Instant,
+        flushed_idle: bool,
     }
 
     // An entry is only closed by the NEXT stamped line, so the newest
     // entry of a store that falls quiet would otherwise never be emitted
-    // — exactly the entry an incident cares about. After this many idle
-    // polls (seconds, one poll each) the pending entry is closed: past
-    // any writer's --flush-age, so a producer mid-entry has committed the
-    // rest of it already. A longer --flush-age than this can therefore
-    // split a multiline entry that a chunk boundary split first.
-    const IDLE_FLUSH_POLLS: u32 = 10;
+    // — exactly the entry an incident cares about. After this long
+    // without new data the pending entry is closed. A wall-clock
+    // duration, not a poll count: --poll (and the live tail's faster
+    // default) must not change when a producer is judged to have stopped
+    // mid-entry.
+    const IDLE_FLUSH: std::time::Duration = std::time::Duration::from_secs(10);
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -831,8 +923,34 @@ fn query_follow(
 
     let mut srcs: Vec<FollowSrc> = Vec::new();
     for f in files {
+        // Before the ring is read, so that a flush landing between the two
+        // cannot leave a sealed segment this reader has already taken
+        // entries from. From-now (no --from/--tail) passes over what the
+        // segment already holds; --tail/--from want it — unflushed entries
+        // are the newest ones there are.
+        let backing = seq_guard(f);
+        let mut live = match &backing {
+            Some((dir, name)) => {
+                crate::live::LiveTail::open(dir, name, from.is_none() && tail.is_none())
+            }
+            // A .timber bundle is a finished artifact: no writer, no tail.
+            None => crate::live::LiveTail::none(),
+        };
+        if follow && !live.live() && backing.is_some() {
+            // Not a warning — a store without one is a legitimate
+            // configuration. But an operator waiting on a live log should
+            // know which knob decides how long they wait, and that the
+            // faster one costs no restart.
+            crate::note!(
+                "timberfs: {}: no live write-ahead sidecar, so new entries appear a \
+                 flushed chunk at a time (the writer's --flush-age). `timberfs set {} \
+                 wal=true` starts one within a second, without restarting the writer",
+                f.display(),
+                f.display()
+            );
+        }
         let mut source = open_source(f)?;
-        let guard = seq_guard(f);
+        let guard = backing;
         let tf = crate::bark::time_format(source.bark.as_ref());
         let extractor =
             crate::import::Extractor::new(tf.regex.as_deref(), tf.format.as_deref(), tf.utc)?;
@@ -888,7 +1006,6 @@ fn query_follow(
         } else {
             None
         };
-        let mut cursor_ms = 0u64;
         for c in &chunks[start..] {
             if let Some(data) = read_chunk(f, &guard, &mut source, *c)? {
                 match &mut sink {
@@ -898,22 +1015,34 @@ fn query_follow(
                     None => emit_raw(&mut out, &data, label.as_deref())?,
                 }
             }
-            cursor_ms = cursor_ms.max(c.last_write_ms);
             if capped(&limit) {
                 break;
             }
         }
+        // Then the live edge: entries the writer has appended but not yet
+        // flushed into a chunk. Empty for a from-now follow (opening the
+        // tail passed over them) — and this is the only place a BOUNDED
+        // --tail can see them, since it never enters the poll loop.
+        if !capped(&limit) {
+            emit_live(&mut out, &live.poll()?, &mut sink, label.as_deref())?;
+        }
         // Anchor to the latest committed chunk even when nothing was emitted
         // (from-now), so only new chunks are followed.
-        if let Some(last) = chunks.last() {
-            cursor_ms = cursor_ms.max(last.last_write_ms);
-        }
+        let anchor = chunks.last().map(|c| (key(c), chunks.len() - 1));
+        // The live tail's first read happens BEFORE the entries above are
+        // emitted (`live` was opened first), so a flush landing in between
+        // seals a segment this reader has taken nothing from: its chunk is
+        // emitted in ring order rather than after the entries that follow
+        // it.
         srcs.push(FollowSrc {
             path: f.clone(),
             label,
             sink,
-            cursor_ms,
-            idle_polls: 0,
+            anchor,
+            live,
+            noted_overtaken: false,
+            last_data: std::time::Instant::now(),
+            flushed_idle: false,
         });
     }
     out.flush()?;
@@ -926,44 +1055,92 @@ fn query_follow(
     // (the appender appends), and re-opening picks up a fresh trunk fd too.
     // Flush every pass so an interrupt never drops already-emitted output.
     while !done {
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(poll_interval(&srcs, poll));
         for s in &mut srcs {
             let mut source = match open_source(&s.path) {
                 Ok(x) => x,
                 Err(_) => continue, // transient (mid-rename by retention): retry
             };
             let guard = seq_guard(&s.path);
+            // BEFORE the chunks below are emitted: a flush that landed
+            // since this ring snapshot was taken sealed a segment whose
+            // entries may already have gone out live, and its chunk
+            // repeats them.
+            s.live.reconcile()?;
             // Owned: read_chunk needs `&mut source` on a race, which a
             // live borrow of source.records would forbid.
-            let pending: Vec<ChunkRecord> = source
-                .records
-                .iter()
-                .filter(|c| c.first_write_ms > s.cursor_ms)
-                .copied()
-                .collect();
-            let got = !pending.is_empty();
+            let at = resume_at(&source.records, &s.anchor);
+            if at.is_some() {
+                // Following normally again: a later loss is a new
+                // incident and gets its own line.
+                s.noted_overtaken = false;
+            } else if !s.noted_overtaken {
+                // The chunk this follower was anchored to is no longer in
+                // the store: retention dropped it, and with it whatever
+                // came after. Say so and rejoin at the live end — a
+                // follower that silently resumed somewhere else would be
+                // reporting a hole as continuity.
+                crate::note!(
+                    "timberfs: {}: retention overtook this follower; rejoining at the \
+                     current end",
+                    s.path.display()
+                );
+                s.noted_overtaken = true;
+            }
+            let pending: Vec<ChunkRecord> = match at {
+                Some(i) => source.records[i..].to_vec(),
+                None => Vec::new(),
+            };
+            if let Some(last) = source.records.last() {
+                s.anchor = Some((key(last), source.records.len() - 1));
+            }
+            let mut got = !pending.is_empty();
             for c in pending {
-                if let Some(data) = read_chunk(&s.path, &guard, &mut source, c)? {
-                    match &mut s.sink {
-                        Some(sink) => {
-                            sink.push_chunk(&data, (c.first_write_ms, c.last_write_ms), &mut out)?
+                match read_chunk(&s.path, &guard, &mut source, c)? {
+                    Some(data) => {
+                        // Whatever of this chunk already went out live is
+                        // dropped from its front; the rest is new.
+                        let skip = s.live.skip_for_chunk(data.len() as u64) as usize;
+                        let fresh = &data[skip..];
+                        if !fresh.is_empty() {
+                            match &mut s.sink {
+                                Some(sink) => sink.push_chunk(
+                                    fresh,
+                                    (c.first_write_ms, c.last_write_ms),
+                                    &mut out,
+                                )?,
+                                None => emit_raw(&mut out, fresh, s.label.as_deref())?,
+                            }
                         }
-                        None => emit_raw(&mut out, &data, s.label.as_deref())?,
                     }
+                    // Retained away between selection and read: the skip
+                    // it carried has nothing left to apply to.
+                    None => s.live.forget_skip(),
                 }
-                s.cursor_ms = c.last_write_ms.max(s.cursor_ms);
                 if capped(&limit) {
                     done = true;
                     break;
                 }
             }
+            // The live edge last: it is always newer than any chunk.
+            if !done {
+                let entries = s.live.poll()?;
+                got |= !entries.is_empty();
+                emit_live(&mut out, &entries, &mut s.sink, s.label.as_deref())?;
+                done = capped(&limit);
+            }
             // Fires once per idle streak, and only after new data has
             // reset it — a quiet store is not re-flushed every second.
-            s.idle_polls = if got { 0 } else { s.idle_polls + 1 };
-            if s.idle_polls == IDLE_FLUSH_POLLS {
+            // Timed from the last data, not from the first idle poll, so
+            // the wait is IDLE_FLUSH however long a poll takes.
+            if got {
+                s.last_data = std::time::Instant::now();
+                s.flushed_idle = false;
+            } else if !s.flushed_idle && s.last_data.elapsed() >= IDLE_FLUSH {
                 if let Some(sink) = &mut s.sink {
                     sink.flush_pending(&mut out)?;
                 }
+                s.flushed_idle = true;
             }
             if done {
                 break;
@@ -1641,4 +1818,88 @@ pub fn cmd_index(file: &Path) -> anyhow::Result<()> {
         total_uncomp as f64 / total_comp.max(1) as f64
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(uncomp_start: u64, len: u64, first: u64, last: u64) -> ChunkRecord {
+        ChunkRecord {
+            uncomp_start,
+            uncomp_len: len,
+            comp_start: 0,
+            comp_len: len / 2,
+            first_write_ms: first,
+            last_write_ms: last,
+        }
+    }
+
+    /// The regression that made this a key rather than a timestamp: chunk
+    /// windows come from the entries' own loglines on an imported or
+    /// followed store, so adjacent chunks routinely share a boundary
+    /// millisecond (a log stamped to the second, or four flushes a second
+    /// at a megabyte a second). "Later than the last one" silently drops
+    /// every second chunk — measured 10 of 27 in one 45-second run.
+    #[test]
+    fn a_shared_boundary_millisecond_does_not_skip_a_chunk() {
+        let records = vec![
+            chunk(0, 100, 1000, 2000),
+            chunk(100, 100, 2000, 3000),
+            chunk(200, 100, 3000, 3000),
+        ];
+        let mut anchor = Some((key(&records[0]), 0));
+        assert_eq!(resume_at(&records, &anchor), Some(1));
+        anchor = Some((key(&records[1]), 1));
+        assert_eq!(resume_at(&records, &anchor), Some(2));
+        anchor = Some((key(&records[2]), 2));
+        assert_eq!(
+            resume_at(&records, &anchor),
+            Some(3),
+            "caught up, not behind"
+        );
+    }
+
+    #[test]
+    fn nothing_seen_yet_means_everything_is_new() {
+        let records = vec![chunk(0, 100, 1000, 2000)];
+        assert_eq!(resume_at(&records, &None), Some(0));
+        assert_eq!(resume_at(&[], &None), Some(0));
+    }
+
+    /// A retention head trim renumbers every chunk (and rebases every
+    /// logical offset), so the anchor's INDEX goes stale while its
+    /// identity does not.
+    #[test]
+    fn a_head_trim_shifts_the_anchor_without_losing_it() {
+        let before = [
+            chunk(0, 100, 1000, 2000),
+            chunk(100, 100, 2000, 3000),
+            chunk(200, 100, 3000, 4000),
+        ];
+        let anchor = Some((key(&before[1]), 1));
+        // The two oldest chunks are dropped and the rest rebased to 0.
+        let after = vec![chunk(0, 100, 2000, 3000), chunk(100, 100, 3000, 4000)];
+        assert_eq!(resume_at(&after, &anchor), Some(1), "the anchor moved to 0");
+    }
+
+    #[test]
+    fn an_anchor_retention_dropped_is_reported_not_guessed() {
+        let anchor = Some((key(&chunk(0, 100, 1000, 2000)), 0));
+        let after = vec![chunk(0, 100, 5000, 6000)];
+        assert_eq!(resume_at(&after, &anchor), None);
+    }
+
+    /// Identical adjacent chunks (a heartbeat log flushing the same bytes
+    /// in the same millisecond) are told apart by position, not content.
+    #[test]
+    fn identical_neighbours_resume_at_the_right_one() {
+        let records = vec![
+            chunk(0, 100, 1000, 1000),
+            chunk(100, 100, 1000, 1000),
+            chunk(200, 100, 1000, 1000),
+        ];
+        assert_eq!(resume_at(&records, &Some((key(&records[0]), 0))), Some(1));
+        assert_eq!(resume_at(&records, &Some((key(&records[1]), 1))), Some(2));
+    }
 }
