@@ -8,20 +8,42 @@
 //!                    `zstd -dc <name>.trunk` recovers the full uncompressed
 //!                    content with stock tools, even without timberfs.
 //!
-//!   `<name>.rings`  — the index: an 8-byte magic followed by fixed-size
-//!                    48-byte records, one per chunk, appended in write
-//!                    order. Records are therefore sorted both by
-//!                    uncompressed offset and by write time, so byte-offset
-//!                    reads and time-range queries are both a binary search.
+//!   `<name>.rings`  — the index: a 16-byte header (magic + the chunk-number
+//!                    high-water mark) followed by fixed-size 56-byte
+//!                    records, one per chunk, appended in write order.
+//!                    Records are therefore sorted by uncompressed offset,
+//!                    and by chunk number, so a byte-offset read is a binary
+//!                    search. They are only MOSTLY sorted by write time —
+//!                    `now_ms()` is the wall clock, so an NTP step or a
+//!                    `date -s` can move a window backwards, and an intake
+//!                    stamps the sender's event time on purpose. Time-range
+//!                    reads cope with that by widening; anything needing a
+//!                    single monotonic position uses the chunk number.
 
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-pub const RINGS_MAGIC: &[u8; 8] = b"RING0001";
-pub const RINGS_HEADER_LEN: u64 = 8;
-pub const RECORD_LEN: usize = 48;
+pub const RINGS_MAGIC: &[u8; 8] = b"RING0002";
+pub const RINGS_HEADER_LEN: u64 = 16;
+pub const RECORD_LEN: usize = 56;
+/// The pre-chunk-number layout: an 8-byte header and 48-byte records. Read
+/// for compatibility and by the migration; never written. Support for it is
+/// meant to be dropped after a grace period, at which point the reader that
+/// stays behind is a standalone converter.
+pub const RINGS_MAGIC_V1: &[u8; 8] = b"RING0001";
+pub const RINGS_HEADER_LEN_V1: u64 = 8;
+pub const RECORD_LEN_V1: usize = 48;
+
+/// Which layout a `.rings` file is in. A reader handles both; a writer
+/// migrates v1 before it appends, since the two strides cannot be mixed in
+/// one file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingsVersion {
+    V1,
+    V2,
+}
 pub const TRUNK_EXT: &str = "trunk";
 pub const RINGS_EXT: &str = "rings";
 pub const GRAIN_EXT: &str = "grain";
@@ -89,6 +111,14 @@ pub struct ChunkRecord {
     pub first_write_ms: u64,
     /// Wall clock (unix ms) of the last write buffered into this chunk.
     pub last_write_ms: u64,
+    /// This chunk's number in ITS OWN store: assigned at append, dense,
+    /// never reused, and monotone by construction rather than by trusting a
+    /// clock — which is what makes it the only axis a cursor can safely
+    /// hold. Preserved verbatim by a head-drop (the numbering does not slide
+    /// down when the oldest chunks go), and therefore NOT the record's index.
+    /// Local to one store: a chunk shipped into another store is renumbered
+    /// there, because the number says where it sits, not what it is.
+    pub seq: u64,
 }
 
 impl ChunkRecord {
@@ -108,6 +138,7 @@ impl ChunkRecord {
         b[24..32].copy_from_slice(&self.comp_len.to_le_bytes());
         b[32..40].copy_from_slice(&self.first_write_ms.to_le_bytes());
         b[40..48].copy_from_slice(&self.last_write_ms.to_le_bytes());
+        b[48..56].copy_from_slice(&self.seq.to_le_bytes());
         b
     }
 
@@ -120,8 +151,51 @@ impl ChunkRecord {
             comp_len: u64_at(24),
             first_write_ms: u64_at(32),
             last_write_ms: u64_at(40),
+            seq: u64_at(48),
         }
     }
+
+    /// A v1 record, which carries no number. `seq` is supplied by the
+    /// caller: the oldest surviving record is 0, which is a DEFINITION of
+    /// where this store's numbering begins, not an attempt to recover how
+    /// many chunks it dropped before anyone was counting.
+    pub fn from_bytes_v1(b: &[u8], seq: u64) -> ChunkRecord {
+        let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        ChunkRecord {
+            uncomp_start: u64_at(0),
+            uncomp_len: u64_at(8),
+            comp_start: u64_at(16),
+            comp_len: u64_at(24),
+            first_write_ms: u64_at(32),
+            last_write_ms: u64_at(40),
+            seq,
+        }
+    }
+}
+
+/// The 16-byte v2 header: magic, then the chunk-number high-water mark.
+///
+/// The mark exists for one case: retention can drop EVERY chunk, and a
+/// store whose record set is empty would otherwise restart numbering at 0
+/// and hand a fresh chunk a number some cursor already considers consumed.
+/// It is not a base for index arithmetic — records carry their own numbers —
+/// so it only ever forbids reuse, and only the paths that rewrite the whole
+/// file (head-drop) need to keep it current. On the append path the last
+/// record is the better source, so nothing extra is written there.
+pub fn rings_header(next_seq: u64) -> [u8; RINGS_HEADER_LEN as usize] {
+    let mut h = [0u8; RINGS_HEADER_LEN as usize];
+    h[0..8].copy_from_slice(RINGS_MAGIC);
+    h[8..16].copy_from_slice(&next_seq.to_le_bytes());
+    h
+}
+
+/// The high-water mark a v2 header carries. A v1 header has none, and a
+/// truncated one reads as 0 — both mean "trust the records".
+pub fn header_next_seq(buf: &[u8]) -> u64 {
+    if buf.len() < RINGS_HEADER_LEN as usize || &buf[..8] != RINGS_MAGIC {
+        return 0;
+    }
+    u64::from_le_bytes(buf[8..16].try_into().unwrap())
 }
 
 pub fn read_index(path: &Path) -> io::Result<Vec<ChunkRecord>> {
@@ -141,19 +215,59 @@ pub fn read_index_file(f: &File) -> io::Result<Vec<ChunkRecord>> {
     parse_index_bytes(&buf)
 }
 
+/// The high-water mark from a rings file's header, without parsing records.
+pub fn read_header_next_seq(f: &File) -> io::Result<u64> {
+    let mut h = [0u8; RINGS_HEADER_LEN as usize];
+    match f.read_exact_at(&mut h, 0) {
+        Ok(()) => Ok(header_next_seq(&h)),
+        // Shorter than a v2 header: a v1 file, or an empty one. Either way
+        // the records are the only source, and the caller falls back to them.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 /// Parse rings content wherever it came from (a file, a bundle member).
 pub fn parse_index_bytes(buf: &[u8]) -> io::Result<Vec<ChunkRecord>> {
-    if buf.len() < RINGS_HEADER_LEN as usize || &buf[..8] != RINGS_MAGIC {
-        return Err(io::Error::new(
+    parse_index_versioned(buf).map(|(recs, _)| recs)
+}
+
+/// As `parse_index_bytes`, plus which layout it found — what a WRITER needs,
+/// since it must migrate a v1 file before appending rather than mixing two
+/// record strides in one file.
+pub fn parse_index_versioned(buf: &[u8]) -> io::Result<(Vec<ChunkRecord>, RingsVersion)> {
+    let bad = || {
+        io::Error::new(
             io::ErrorKind::InvalidData,
             "not a timberfs index (bad magic)",
-        ));
+        )
+    };
+    if buf.len() < RINGS_HEADER_LEN_V1 as usize {
+        return Err(bad());
     }
-    let n = (buf.len() - RINGS_HEADER_LEN as usize) / RECORD_LEN;
+    let (version, header, rec_len) = match &buf[..8] {
+        m if m == RINGS_MAGIC => (RingsVersion::V2, RINGS_HEADER_LEN as usize, RECORD_LEN),
+        m if m == RINGS_MAGIC_V1 => (
+            RingsVersion::V1,
+            RINGS_HEADER_LEN_V1 as usize,
+            RECORD_LEN_V1,
+        ),
+        _ => return Err(bad()),
+    };
+    // A v2 header that is present but truncated is not a valid index; a v1
+    // one is exactly the magic, so the check above already covered it.
+    if buf.len() < header {
+        return Err(bad());
+    }
+    let n = (buf.len() - header) / rec_len;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let off = RINGS_HEADER_LEN as usize + i * RECORD_LEN;
-        out.push(ChunkRecord::from_bytes(&buf[off..off + RECORD_LEN]));
+        let off = header + i * rec_len;
+        let b = &buf[off..off + rec_len];
+        out.push(match version {
+            RingsVersion::V2 => ChunkRecord::from_bytes(b),
+            RingsVersion::V1 => ChunkRecord::from_bytes_v1(b, i as u64),
+        });
     }
-    Ok(out)
+    Ok((out, version))
 }

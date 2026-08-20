@@ -1929,10 +1929,12 @@ pub fn cmd_index(file: &Path) -> anyhow::Result<()> {
     );
     let mut total_uncomp = 0u64;
     let mut total_comp = 0u64;
-    for (i, c) in chunks.iter().enumerate() {
+    // The chunk's NUMBER, not its row: after a head-drop the two differ,
+    // and the number is the one a cursor holds and a drop record names.
+    for c in chunks.iter() {
         println!(
             "{:>5}  {:>12}  {:>10}  {:>10}  {:>5.1}x  {:<23}  {:<23}",
-            i,
+            c.seq,
             c.uncomp_start,
             c.uncomp_len,
             c.comp_len,
@@ -1965,6 +1967,7 @@ mod tests {
             comp_len: len / 2,
             first_write_ms: first,
             last_write_ms: last,
+            seq: uncomp_start / len.max(1),
         }
     }
 
