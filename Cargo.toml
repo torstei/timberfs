@@ -2,7 +2,7 @@
 name = "timberfs"
 version = "0.17.0"
 edition = "2021"
-description = "Experimental append-only, transparently compressed, write-time-indexed filesystem for log files"
+description = "Append-only, transparently compressed, write-time-indexed filesystem for log files"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/torstei/timberfs"
 
@@ -55,7 +55,7 @@ priority = "optional"
 # shared-library deps of the binary itself.
 depends = ["$auto", "fuse3"]
 extended-description = """\
-Experimental FUSE filesystem purpose-built for log files. Files in the \
+A FUSE filesystem purpose-built for log files. Files in the \
 mount are append-only and stored as chunked zstd frames with a per-chunk \
 write-time index, so "give me what was written between 13:42 and 13:43" \
 is a binary search plus a few frame decompressions regardless of file \
