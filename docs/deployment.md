@@ -312,7 +312,8 @@ DECLARE=index=true retain=90d
 ```
 
 A `text-<instance>.conf` overrides it key by key. `DECLARE` takes any manifest
-property — `retain`, `retain_size`, `index`, `wal`, or free-form provenance —
+property — `retain`, `retain_size`, `index`, `wal`, `cursors`, or free-form
+provenance —
 but not a value containing spaces: systemd splits variables at whitespace, so
 set such a property once with `timberfs set` and the manifest keeps it.
 
@@ -794,6 +795,27 @@ be gone thirty days). The cursor is written only after the receiver accepts a
 batch, so an interrupted send is re-delivered rather than skipped
 (at-least-once); `Restart=always` is therefore safe. Details: `man timber-otlp`.
 
+Declare the state directory on the store and the shipper's progress becomes
+visible from the store's side, where an operator is already looking:
+
+```sh
+timberfs set /var/log/timberfs-backing/applogs/app.log cursors=/var/lib/timberfs
+```
+
+`timberfs list` then carries a CONSUMERS column (how many, and the worst) and
+`timberfs info` names every consumer, how far behind it is, and how much of the
+store it alone is holding. Cursors are matched to stores by the identity they
+carry, so the one `StateDirectory=` serves every instance on the host — no
+per-store cursor directory, and no writing back into it.
+
+The number to watch is the held bytes: **retention is the disconnection budget,
+and nothing enforces that a consumer stays inside it**. A shipper down longer
+than `retain` comes back to a cursor pointing at a dropped chunk; it warns on
+resume (`GAP — … of entries were dropped before it read them`) and continues
+from the oldest chunk, because the loss is already in the past and a shipper
+that refuses to start ships nothing. Alert on that warning, and on a consumer
+whose lag approaches the retention window.
+
 ## Ownership and permissions
 
 - **The store directory** is created by `LogsDirectory=timberfs/%i` in the
@@ -893,7 +915,9 @@ make systemd restart it onto the new binary regardless of `Restart=`.
   network blip would cause anyway.
 - **The OTLP shipper** is a reader, so a restart cannot hurt the store: it
   resumes from its cursor, which only advances after the receiver accepted a
-  batch, so an interrupted send is re-delivered rather than skipped.
+  batch, so an interrupted send is re-delivered rather than skipped. A restart
+  long enough for retention to pass the cursor is the one lossy case, and it
+  warns about it by name (GAP) instead of resuming silently.
 
 ## Reliability model (both intakes)
 

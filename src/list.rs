@@ -109,10 +109,35 @@ const COLUMNS: [&str; 7] = [
     "HANDLE", "FOREST", "SIZE", "SPAN", "WRITER", "INDEX", "RETAIN",
 ];
 
-/// One row's cells, in `COLUMNS` order — a pure function of a `Row`, so it
-/// (and the table it feeds) is unit-testable without touching disk.
-fn row_cells(r: &Row) -> [String; 7] {
-    [
+/// The CONSUMERS column: how many consumers hold a position in this
+/// store, and the worst of them — the one that decides how much of the
+/// store is unread. `-` when the store declares no `cursors` directory,
+/// which is not the same as `0` (declared, and nothing is reading).
+fn consumers_text(s: &StoreSummary) -> String {
+    match &s.consumers {
+        None => "-".to_string(),
+        Some(sv) => match sv.worst() {
+            None => "0".to_string(),
+            Some(w) => format!("{}, {}", sv.consumers.len(), w.standing.lag_text()),
+        },
+    }
+}
+
+/// Only stores that declare a cursor directory have anything to say
+/// here, and most don't — so the column appears when at least one row
+/// fills it, rather than taxing every table with a column of dashes.
+fn columns(rows: &[Row]) -> Vec<&'static str> {
+    let mut cols = COLUMNS.to_vec();
+    if rows.iter().any(|r| r.summary.consumers.is_some()) {
+        cols.push("CONSUMERS");
+    }
+    cols
+}
+
+/// One row's cells, in `columns` order — a pure function of a `Row`, so
+/// it (and the table it feeds) is unit-testable without touching disk.
+fn row_cells(r: &Row, with_consumers: bool) -> Vec<String> {
+    let mut cells = vec![
         r.handle.clone(),
         r.forest.clone(),
         crate::rotate::human_bytes(r.summary.compressed_bytes),
@@ -125,13 +150,17 @@ fn row_cells(r: &Row) -> [String; 7] {
         .to_string(),
         if r.summary.indexed() { "grain" } else { "-" }.to_string(),
         retain_text(&r.summary),
-    ]
+    ];
+    if with_consumers {
+        cells.push(consumers_text(&r.summary));
+    }
+    cells
 }
 
 /// Render an aligned table: a header plus one row per store, columns
 /// left-aligned and sized to the widest cell (handles/forest names have no
 /// fixed width, unlike `info`'s fixed-width tables).
-fn format_table(header: &[&str], rows: &[[String; 7]]) -> String {
+fn format_table(header: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -158,8 +187,10 @@ fn format_table(header: &[&str], rows: &[[String; 7]]) -> String {
 }
 
 fn print_table(rows: &[Row]) {
-    let data: Vec<[String; 7]> = rows.iter().map(row_cells).collect();
-    println!("{}", format_table(&COLUMNS, &data));
+    let cols = columns(rows);
+    let with_consumers = cols.len() > COLUMNS.len();
+    let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, with_consumers)).collect();
+    println!("{}", format_table(&cols, &data));
 }
 
 fn rows_to_json(rows: &[Row]) -> serde_json::Value {
@@ -201,6 +232,22 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
                         .map(Into::into)
                         .unwrap_or(serde_json::Value::Null),
                 );
+                match &s.consumers {
+                    // Null distinguishes "no cursor directory declared"
+                    // from an empty array: "declared, nobody reading".
+                    None => {
+                        o.insert("cursors_dir".to_string(), serde_json::Value::Null);
+                        o.insert("consumers".to_string(), serde_json::Value::Null);
+                    }
+                    Some(sv) => {
+                        o.insert(
+                            "cursors_dir".to_string(),
+                            sv.dir.display().to_string().into(),
+                        );
+                        o.insert("consumers".to_string(), crate::query::consumers_json(sv));
+                        o.insert("held_bytes".to_string(), sv.held_bytes().into());
+                    }
+                }
                 serde_json::Value::Object(o)
             })
             .collect(),
@@ -233,6 +280,7 @@ mod tests {
             sap_pending_bytes: None,
             retain: retain.map(str::to_string),
             retain_size: retain_size.map(str::to_string),
+            consumers: None,
             writer,
         }
     }
@@ -245,6 +293,76 @@ mod tests {
             path: PathBuf::from(format!("/var/log/timberfs/{handle}.log")),
             summary,
         }
+    }
+
+    fn survey(consumers: Vec<(&str, u64, u64, Option<u64>)>) -> crate::cursor::Survey {
+        crate::cursor::Survey {
+            dir: PathBuf::from("/var/lib/timberfs"),
+            consumers: consumers
+                .into_iter()
+                .map(
+                    |(name, behind_bytes, behind_ms, gap_to_ms)| crate::cursor::Consumer {
+                        name: name.to_string(),
+                        path: PathBuf::from(format!("/var/lib/timberfs/{name}.cursor")),
+                        cursor: crate::cursor::Cursor::new(name, "id", "/p"),
+                        standing: crate::cursor::Standing {
+                            consumed_chunks: 1,
+                            behind_chunks: if behind_bytes > 0 { 1 } else { 0 },
+                            behind_bytes,
+                            behind_ms,
+                            gap_to_ms,
+                        },
+                    },
+                )
+                .collect(),
+            unreadable: 0,
+        }
+    }
+
+    #[test]
+    fn consumers_text_separates_undeclared_from_nobody_reading() {
+        let mut s = summary(0, None, WriterState::Idle, false, None, None);
+        assert_eq!(consumers_text(&s), "-");
+        s.consumers = Some(survey(vec![]));
+        assert_eq!(consumers_text(&s), "0");
+        s.consumers = Some(survey(vec![("otlp", 0, 0, None)]));
+        assert_eq!(consumers_text(&s), "1, caught up");
+        s.consumers = Some(survey(vec![
+            ("splitter", 4096, 90_000, None),
+            ("otlp", 0, 0, None),
+        ]));
+        assert_eq!(consumers_text(&s), "2, 1m 30s behind");
+        s.consumers = Some(survey(vec![("splitter", 4096, 90_000, Some(9))]));
+        assert_eq!(consumers_text(&s), "1, GAP");
+    }
+
+    #[test]
+    fn the_consumers_column_appears_only_where_something_declares_one() {
+        let plain = [row(
+            "nginx",
+            "default",
+            summary(2048, Some((0, 1000)), WriterState::Idle, false, None, None),
+        )];
+        assert_eq!(columns(&plain), COLUMNS.to_vec());
+
+        let mut declared = summary(2048, Some((0, 1000)), WriterState::Idle, false, None, None);
+        declared.consumers = Some(survey(vec![("otlp", 0, 0, None)]));
+        let rows = [
+            row("nginx", "default", declared),
+            row(
+                "db",
+                "default",
+                summary(0, None, WriterState::Idle, false, None, None),
+            ),
+        ];
+        let cols = columns(&rows);
+        assert_eq!(cols.last(), Some(&"CONSUMERS"));
+        let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, true)).collect();
+        assert_eq!(data[0][7], "1, caught up");
+        // A store with no declaration keeps a dash in the shared column.
+        assert_eq!(data[1][7], "-");
+        let table = format_table(&cols, &data);
+        assert!(table.lines().next().unwrap().contains("CONSUMERS"));
     }
 
     #[test]
@@ -312,7 +430,7 @@ mod tests {
                 None,
             ),
         );
-        let cells = row_cells(&live);
+        let cells = row_cells(&live, false);
         assert_eq!(cells[0], "nginx");
         assert_eq!(cells[1], "default");
         assert_eq!(cells[4], "live");
@@ -323,7 +441,7 @@ mod tests {
             "default",
             summary(0, None, WriterState::Idle, false, None, None),
         );
-        let cells = row_cells(&idle);
+        let cells = row_cells(&idle, false);
         assert_eq!(cells[3], "empty");
         assert_eq!(cells[4], "-");
         assert_eq!(cells[5], "-");
@@ -350,7 +468,7 @@ mod tests {
                 summary(0, None, WriterState::Idle, false, None, None),
             ),
         ];
-        let data: Vec<[String; 7]> = rows.iter().map(row_cells).collect();
+        let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, false)).collect();
         let table = format_table(&COLUMNS, &data);
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), 3); // header + 2 rows

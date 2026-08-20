@@ -86,6 +86,28 @@ id when it declares one (identity, not address: a moved store still
 matches), else by its canonical path. Declare an identity with
 .B timberfs set
 to make a cursor survive a move.
+.PP
+On every resume the backlog still ahead of the cursor is reported. The
+exception is a
+.BR GAP :
+retention acts on the head of a store and nothing coordinates it with
+this shipper's progress, so a shipper down longer than the store's
+.B retain
+window comes back to find the chunk its cursor points at already
+dropped. That is a WARNING naming how much was dropped unread, and then
+the run continues from the oldest chunk \(em the loss is already in the
+past, and a shipper that refuses to start ships nothing. Declare
+.B cursors
+on the store
+.RB ( timberfs\  set\  ...\  cursors=/var/lib/timberfs )
+and the same lag is visible from the store's side, in
+.B timberfs list
+and
+.BR "timberfs info" ,
+before it becomes loss \(em see
+.B CONSUMERS
+in
+.BR timberfs (1).
 .SH MAPPING
 .TP
 .B time

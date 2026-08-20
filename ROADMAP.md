@@ -148,10 +148,11 @@ works is in [docs/design.md](docs/design.md).
   sidecar, or a second ring) is what closes it.
 - **Cursors beyond one consumer**: `cursor.rs` is a general "consumer's
   position in a store's entry stream", not an OTLP thing — a Kafka or Loki
-  shipper would reuse it verbatim. Open: a `list`-style view of who is
-  reading a store and how far behind they are (the state directory knows,
-  nothing surfaces it), and whether a cursor should ever hold retention
-  back so a disconnected consumer cannot be truncated out from under.
+  shipper would reuse it verbatim. Who is reading a store and how far
+  behind is now surfaced (a store declares a `cursors` directory; `list`
+  gains a CONSUMERS column, `info` the per-consumer detail, and the
+  shipper warns on a GAP), so what remains open is acting on it — see
+  interest-based retention below.
   The larger step is putting a cursor on the RECORDS stream
   (`query --follow --records --cursor`, a flag rather than a new binary —
   the tool boundary is destination-shaped, not format-shaped), because it
@@ -174,6 +175,38 @@ works is in [docs/design.md](docs/design.md).
   restamps (see "Arrival time on a received store"). The axis rule carries
   over unchanged — a cursor is only sound on the write axis, so it still
   requires `--follow` and still refuses a stdin stream.
+- **Interest-based retention (a third axis)**: retention drops by age and
+  by size; a store that exists to be DRAINED — a spool shipped onward, not
+  an archive — wants to drop by CONSUMPTION, so a drained spool sits near
+  zero instead of holding a week of already-shipped bytes, and its size
+  stops being guessed as volume × downtime. This is NATS's Interest
+  retention, and it makes timberfs a log with interest-based truncation,
+  not a work queue: still position-based and at-least-once, with no
+  per-entry ack, redelivery or dead-letter. The mechanism is nearly free —
+  `cursor::consumed_prefix` already computes the drop-eligible chunk prefix
+  for a cursor (the exact complement of what `Resume` would deliver),
+  `enforce_retention` already reduces every axis to such a prefix, and
+  head-drop is already a prefix operation. Four decisions define it.
+  (1) Interest is **additive**: `k = max(age, size, interest)`, never
+  `min`. Letting interest CAP the drop would let one stalled consumer pin
+  the spool until the disk fills, which kills the PRODUCER — losing the
+  newest data to protect the oldest, strictly the worse trade. So
+  `retain_size` stays a hard budget, a store declaring interest must
+  declare one too, and a consumer truncated out from under becomes a
+  reported event instead of a silent one. (2) **Fail closed** everywhere:
+  no cursor found, an unreadable one, or one anchored to another store all
+  drop nothing by interest — the minimum over an empty set is 0, not
+  infinity. (3) A declared consumer **roster** is what protects a consumer
+  that has never run: with discovery alone, one consumer's progress drains
+  the spool before a second one, deployed later, ever starts. (4) Refuse
+  it on an intake-written store until "Arrival time on a received store"
+  lands: a replaying sender moves chunk windows — and a cursor — backwards,
+  which under a prefix scan makes the spool stop draining rather than lose
+  data, but "the queue silently never empties" is its own failure. Also
+  wanted: a one-shot `timberfs trim`, since retention only runs inside a
+  live writer and a drain-and-ship store may have none — and NOT the
+  tempting shortcut of letting the shipper collapse the head itself, which
+  would make a reader a writer and put two of them on one head.
 - **Splitting downstream of a spool (fan-out by cursor)**: one store as the
   intake spool — everything a web server writes, the vhost in the line — plus a
   cursor consumer that routes entries into per-stream stores, instead of routing
@@ -198,8 +231,8 @@ works is in [docs/design.md](docs/design.md).
   consumer that re-carves. It also makes the spool's retention the consumer's
   downtime budget, exactly as it already is for `timber-otlp`, with the same
   hazard the cursor entry raises from the other side: retention that outruns an
-  unconsumed cursor drops data silently, which is the strongest argument for
-  either a cursor-aware retention floor or, at minimum, a visible lag. Costs
+  unconsumed cursor drops data, which the consumer view now makes visible and
+  interest-based retention above would act on. Costs
   are honest ones: every entry is written twice for the spool's retention
   window, there is one more thing to supervise, and per-stream stores compress
   WORSE than the spool they came from (~1.8x on a three-vhost sample, because
