@@ -15,7 +15,13 @@ works is in [docs/design.md](docs/design.md).
   windows as a derived sidecar, making BOTH time axes queryable (arrival
   for "what came in during the incident", logline for history) and
   giving the sawmill lag observability. The read path already treats the
-  trunk as its own timestamp index; this would only accelerate it.
+  trunk as its own timestamp index; this would only accelerate it. The
+  concrete case asking for it: an arrival-stamped store (`append`, so the
+  FIFO pair and piped logs) fed by a producer whose line stamps are not
+  its write times — Apache logs a request's start and writes at completion
+  — where a logline-time query today leans on the one-minute selection
+  widening and misses a request slower than that. The sidecar would answer
+  such a query exactly, without asking the producer to change its format.
 - **Record-length index**: entry boundaries within a chunk are known when
   records are appended and currently discarded. An optional per-chunk sidecar —
   independent zstd frames plus a fixed-stride directory, the same shape as

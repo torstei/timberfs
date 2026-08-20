@@ -329,6 +329,40 @@ records pair — with the node in place, a stopped socket costs lines while it i
 down and self-heals when it returns. Restarting the *service*, or upgrading the
 package, is always safe.
 
+#### Two clocks, and when they diverge
+
+`append` — what this pair runs, and what a piped `CustomLog` runs too — stamps
+a chunk with the wall clock as it reads the line, while the line's own
+timestamp is whatever the producer wrote into it. `query --from/--to` selects
+chunks by the first clock and then verifies every entry against the second, so
+the two tracking each other is what keeps that selection honest.
+
+Apache's `%t` is the time the request was **received**, and the line is written
+when the request **completes**. A slow request therefore diverges by its own
+duration, and the access log is out of order by up to the slowest one. Chunk
+selection absorbs a minute of that (the requested window is widened at both
+ends); past that, a logline-time query can miss the line altogether, because
+the chunk holding it lies outside the widened window. The same five-minute
+request, queried by the minute it started:
+
+```
+piped / FIFO store   chunk window 09:13:59 .. 09:13:59   ->  0 lines
+followed store       chunk window 09:08:59 .. 09:08:59   ->  1 line
+```
+
+Two ways to close it, if your requests can outlive that margin:
+
+- **Log the completion time**, keeping the CLF shape so the built-in extractor
+  still reads it: `[%{end:%d/%b/%Y:%T %z}t]` in place of `%t`, plus `%D` for
+  the duration you have just made explicit. The `begin:`/`end:` prefixes need
+  httpd 2.4.13 or later.
+- **Follow the file instead** (below): a follower stamps chunks from the
+  loglines themselves, so there is only one clock. Slow requests then merely
+  make chunk windows overlap, which readers handle by design.
+
+Neither clock affects `--has` or `timber-filter`'s predicates: the token index
+is content, not time.
+
 #### Exim, and anything else that dies when logging fails
 
 Exim can be pointed at a FIFO — it opens its logs
@@ -418,6 +452,12 @@ exchange is that the plain file still exists and still needs rotating.
 | `timberfs-text@` (FIFO) | flush age | the producer's write blocks on it (Exim: the process ends) | nothing lost — the kernel pipe buffers |
 | `timberfs-follow@` (follower) | poll + flush age | none — it is a reader | nothing lost — the store is the checkpoint |
 | `import` on a timer | the tick | none | nothing lost — same checkpoint |
+
+A third axis the table leaves out: a follower stamps chunks from the loglines,
+the FIFO pair from the wall clock at the time it reads them. For a producer
+whose line timestamp is not its write time, that decides whether a
+logline-time query is exact or leans on the selection widening — see [Two
+clocks, and when they diverge](#two-clocks-and-when-they-diverge).
 
 Rotation of the plain file stays the producer's business, and its retention is
 no longer your archive — only the follower's safety margin. That frees you to
