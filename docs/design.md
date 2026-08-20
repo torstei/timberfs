@@ -44,7 +44,8 @@ Each logical file `<name>` is backed by two files in the backing directory:
 
 ```
 <name>.trunk   concatenated zstd frames, one per chunk, no wrapper bytes
-<name>.rings   16-byte header (magic "RING0002" | next_seq), then 56-byte
+<name>.rings   64-byte header (magic "RING0002" | header_len |
+              incompat_flags | next_seq | reserved), then 56-byte
               records (all u64 LE):
               uncomp_start | uncomp_len | comp_start | comp_len
               | first_write_ms | last_write_ms | seq
@@ -350,6 +351,13 @@ being the wall clock that an NTP step or a `date -s` moves backwards. So
 base plus the record's index is a positional key, and any future path
 removing a record mid-file would silently re-point every cursor. The
 header's `next_seq` is only a high-water mark, so numbering cannot restart
-at 0 after retention drops every chunk. (Logged-timestamp
+at 0 after retention drops every chunk. The header is 64 bytes because a
+reader takes the record offset from the `header_len` the FILE declares
+rather than from a compiled-in constant: without that, a later version's
+longer header shifts every record underneath every deployed binary, and
+reserved bytes nobody can grow into buy nothing. `incompat_flags` is the
+other half — reserved space is safe for optional fields (0 reads as
+absent), while a field that changes how records must be read sets a bit and
+an older reader refuses instead of guessing. (Logged-timestamp
 zone maps, the other planned index family, became largely moot: import
 already writes logged time into the rings.)
