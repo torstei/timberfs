@@ -1,7 +1,9 @@
 # timberfs
 
-Experiment: a purpose-built home for log files — stored compressed,
-searchable in milliseconds.
+*The only filesystem where `head -f` would make sense.*
+
+A purpose-built home for log files — stored compressed, searchable in
+milliseconds.
 
 `timberfs` keeps logs compressed (zstd) as they are written, and still
 answers *"what happened between 13:42 and 13:43?"* or *"who logged req-8f3a?"*
