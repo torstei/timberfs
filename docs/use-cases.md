@@ -207,12 +207,15 @@ Plaintext HTTP only: loopback or a private network, or terminate TLS in a
 collector beside it.
 
 The edge store's retention is the link's disconnection budget, and nothing
-enforces that the shipper stays inside it. Declare where the cursor lives and
-the budget becomes observable from the store's side:
+enforces that the shipper stays inside it. Register the shipper as a follower
+and the budget becomes observable from the store's side — and the shipper gets
+run by name, with no flags of its own:
 
 ```sh
-timberfs set backing/app.log cursors=/var/lib/timberfs
-timberfs info backing/app.log     # how far behind, and how much it is holding
+timberfs follower create central --store backing/app.log \
+    --endpoint http://central:4318 --enable --start -- --compress gzip
+timberfs follower list            # position, lag, and whether it is running
+timberfs info backing/app.log     # the same, from the store's side
 ```
 
 A shipper that fell outside the window says so on resume (`GAP — N chunk(s)

@@ -202,8 +202,9 @@ human-editable JSON object — the label on the timber:
   "wal": true,                    //   write-ahead .sap — crash loss shrinks to ~1s
   "retain": "90d",                //   keep at least this long — enforced by EVERY writer
   "retain_size": "50G",           //   compressed-size budget, oldest dropped first
-  "cursors": "/var/lib/timberfs", //   where this store's consumers keep their
-                                  //   positions — read-only: it is where to LOOK
+  "cursors": "/var/lib/timberfs", //   SUPERSEDED by the follower registry: a
+                                  //   follower declares its store, so a store
+                                  //   declares nothing. Honoured, reported so
   "timestamp_regex": "^(...)",    // content: exotic line-timestamp format, declared once
   "timestamp_format": "%m/%d/%Y %H:%M:%S", //   (import flags persist these; inherits)
   "timestamp_utc": true,          //   zoneless line stamps are UTC, not local time

@@ -2087,6 +2087,11 @@ PYEOF
     # The furthest behind leads, and is what the store is held by.
     grep -q "held by lagging" /tmp/consumers.info || { cat /tmp/consumers.info; return 1; }
     grep -q "not readable as cursors" /tmp/consumers.info || { cat /tmp/consumers.info; return 1; }
+    # The key shipped in 0.18.0, so it is honoured -- and reported as
+    # superseded wherever it is found, rather than silently removed.
+    grep -q "SUPERSEDED by the follower registry" /tmp/consumers.info \
+        || { cat /tmp/consumers.info; return 1; }
+    timberfs info --json "$store" | jq -e '.cursors_superseded == true' >/dev/null || return 1
 
     timberfs info --json "$store" > /tmp/consumers.json || return 1
     jq -e '.consumers | length == 2' /tmp/consumers.json >/dev/null || return 1
@@ -2098,7 +2103,7 @@ PYEOF
 
     # `list` grows the column because a listed store declares a directory.
     timberfs list /var/log/timberfs > /tmp/consumers.list 2>/dev/null || return 1
-    head -1 /tmp/consumers.list | grep -q 'CONSUMERS' || { cat /tmp/consumers.list; return 1; }
+    head -1 /tmp/consumers.list | grep -q 'FOLLOWERS' || { cat /tmp/consumers.list; return 1; }
     grep -E '^consumed[[:space:]]' /tmp/consumers.list | grep -q '2, ' \
         || { cat /tmp/consumers.list; return 1; }
     # A store that declares nothing keeps a dash in the shared column.
@@ -2269,6 +2274,188 @@ otlp_roundtrip_over_json_and_gzip() {
     diff -u /tmp/rtj.a /tmp/rtj.b
 }
 
+# P6: the follower registry. A follower is a REGISTERED reader of a store --
+# a name, a type, a `retaining` flag and a durable position -- and
+# timberfs-follower@.service runs it by name, `timberfs follower run %i`
+# reading the declaration and EXEC'ing the shipper. These tests use the OTLP
+# intake above as the receiver, so a real store really is shipped.
+FOLLOWER_REG=/var/lib/timberfs/followers
+FOLLOWER_SRC="$PIPE_BACKING/vmsrc.log"
+
+follower_registry_declares_and_refuses() {
+    rm -rf "$FOLLOWER_REG"/vmfollow "$FOLLOWER_SRC".* "$OTLP_ROOT"/vmfollowed
+    timberfs create --wal "$FOLLOWER_SRC" >/dev/null 2>&1 || return 1
+    printf '2026-08-01T10:00:01Z INFO followed one\n2026-08-01T10:00:02Z INFO followed two\n' \
+        | timberfs append --into "$FOLLOWER_SRC" --quiet --flush-age 1 || return 1
+
+    timberfs follower create vmfollow --store "$FOLLOWER_SRC" --type otlp \
+        --endpoint http://127.0.0.1:4318 --retaining \
+        -- --service vmfollowed > /tmp/f.create 2>&1 || { cat /tmp/f.create; return 1; }
+
+    # The store is recorded by IDENTITY, minted by create when it had none --
+    # a path would not do, a store being movable.
+    local sid
+    sid=$(jq -r .id "$FOLLOWER_SRC.bark")
+    [ -n "$sid" ] && [ "$sid" != null ] || return 1
+    jq -e --arg id "$sid" '.store == $id and .type == "otlp" and .retaining == true
+                           and .args == ["--service", "vmfollowed"]' \
+        "$FOLLOWER_REG/vmfollow/follower.json" >/dev/null \
+        || { cat "$FOLLOWER_REG/vmfollow/follower.json"; return 1; }
+    # The footgun is stated where it is created, not discovered later.
+    grep -q 'holds the whole store until it first runs' /tmp/f.create \
+        || { cat /tmp/f.create; return 1; }
+
+    # A taken name is a REGISTRATION error -- never two processes overwriting
+    # one position, which is the whole reason the registry exists.
+    timberfs follower create vmfollow --store "$FOLLOWER_SRC" > /tmp/f.dup 2>&1 && return 1
+    grep -q 'already exists' /tmp/f.dup || { cat /tmp/f.dup; return 1; }
+    # A name that would need systemd-escape is refused, not escaped: the name
+    # in `systemctl status` must be the name that was typed.
+    timberfs follower create 'vm@follow' --store "$FOLLOWER_SRC" > /tmp/f.bad 2>&1 && return 1
+    grep -q 'systemd-escape' /tmp/f.bad || { cat /tmp/f.bad; return 1; }
+    # An unrunnable type fails at registration, not at the first start.
+    timberfs follower create vmkafka --store "$FOLLOWER_SRC" --type kafka > /tmp/f.type 2>&1 && return 1
+    grep -q 'unknown follower type' /tmp/f.type || { cat /tmp/f.type; return 1; }
+    [ ! -d "$FOLLOWER_REG/vmkafka" ] || return 1
+
+    # status says what retaining currently DOES, rather than letting a
+    # declared interest read as an enforced one.
+    timberfs follower status vmfollow > /tmp/f.status 2>&1 || return 1
+    grep -q 'no writer honours it yet' /tmp/f.status || { cat /tmp/f.status; return 1; }
+    grep -q 'never delivered' /tmp/f.status || { cat /tmp/f.status; return 1; }
+    grep -q 'running   no' /tmp/f.status || { cat /tmp/f.status; return 1; }
+
+    # And it refuses to be deleted while retaining, naming the two-step.
+    timberfs follower delete vmfollow > /tmp/f.del 2>&1 && return 1
+    grep -q 'retaining=false' /tmp/f.del || { cat /tmp/f.del; return 1; }
+    [ -d "$FOLLOWER_REG/vmfollow" ]
+}
+
+follower_unit_execs_the_shipper() {
+    # The headline: systemd runs `timberfs follower run vmfollow`, which
+    # reads the declaration and EXECs timber-otlp with --follow, the
+    # registry's own cursor, and --start begin derived from `retaining` --
+    # so the backlog the follower was registered to protect is shipped
+    # rather than skipped.
+    systemctl enable --now timberfs-follower@vmfollow || return 1
+    # Generous, and deliberately so: end to end this is the shipper's own
+    # reader starting, a batch timeout, the POST, and the receiver's
+    # flush-and-fsync before its ack -- ~13s on an idle laptop for the
+    # cursor test next door, and more on a busy VM. A fixed short wait is
+    # a race the VM loses whenever it is busy.
+    local i
+    for i in $(seq 1 40); do
+        timberfs query "$(otlp_store vmfollowed)" 2>/dev/null | grep -q 'followed two' && break
+        sleep 1
+    done
+    timberfs query "$(otlp_store vmfollowed)" 2>/dev/null | grep -q 'followed two' || {
+        journalctl -u timberfs-follower@vmfollow --no-pager | tail -30
+        cat "$FOLLOWER_REG/vmfollow/cursor.json" 2>&1
+        return 1
+    }
+    # Both entries, from the beginning: --start end would have shipped none.
+    timberfs query "$(otlp_store vmfollowed)" > /tmp/f.recv 2>/dev/null
+    grep -q 'followed one' /tmp/f.recv || { cat /tmp/f.recv; return 1; }
+
+    # The unit's main process IS the shipper: exec, not fork -- a
+    # dispatcher, not a supervisor.
+    local main
+    main=$(systemctl show -p MainPID --value timberfs-follower@vmfollow)
+    tr '\0' ' ' < "/proc/$main/cmdline" | grep -q 'timber-otlp' \
+        || { tr '\0' ' ' < "/proc/$main/cmdline"; return 1; }
+    tr '\0' ' ' < "/proc/$main/cmdline" | grep -q -- '--start begin' \
+        || { tr '\0' ' ' < "/proc/$main/cmdline"; return 1; }
+
+    # StateDirectory= made the registry directory, and the position landed
+    # in it, anchored to the same store the declaration names.
+    jq -e --arg id "$(jq -r .id "$FOLLOWER_SRC.bark")" \
+        '.store == $id and .delivered >= 2' \
+        "$FOLLOWER_REG/vmfollow/cursor.json" >/dev/null \
+        || { cat "$FOLLOWER_REG/vmfollow/cursor.json"; return 1; }
+}
+
+follower_liveness_and_collision() {
+    # Liveness comes from the lock, which `run` takes and the exec inherits
+    # -- so the shipper needs no lock code and a second run of one follower
+    # is refused rather than allowed to overwrite its position.
+    timberfs follower list > /tmp/f.list 2>&1 || return 1
+    head -1 /tmp/f.list | grep -q 'RUNNING' || { cat /tmp/f.list; return 1; }
+    grep -E '^vmfollow[[:space:]]' /tmp/f.list | grep -q 'yes$' || { cat /tmp/f.list; return 1; }
+    timberfs follower list --json | jq -e '.[0].running == true' >/dev/null || return 1
+
+    timberfs follower run vmfollow > /tmp/f.race 2>&1 && return 1
+    grep -q 'already running' /tmp/f.race || { cat /tmp/f.race; return 1; }
+    # And it named the live holder, from the lock file's own record.
+    grep -q 'timber-otlp' /tmp/f.race || { cat /tmp/f.race; return 1; }
+
+    # A running follower cannot be deleted out from under itself: it would
+    # be left writing an unlinked position file, doing nothing at all.
+    timberfs follower update vmfollow retaining=false >/dev/null 2>&1 || return 1
+    timberfs follower delete vmfollow > /tmp/f.delrun 2>&1 && return 1
+    grep -q 'is running' /tmp/f.delrun || { cat /tmp/f.delrun; return 1; }
+    timberfs follower update vmfollow retaining=true >/dev/null 2>&1
+}
+
+follower_store_side_view() {
+    # From the store's side: `info` grows a followers block and `list` a
+    # FOLLOWERS column, with the registered follower named.
+    timberfs info "$FOLLOWER_SRC" > /tmp/f.info 2>&1 || return 1
+    grep -q 'followers 1 registered, 1 retaining' /tmp/f.info || { cat /tmp/f.info; return 1; }
+    grep -qE '^ +vmfollow +retaining,' /tmp/f.info || { cat /tmp/f.info; return 1; }
+    # Always an array for a pair, never null: the registry knows every
+    # follower of every store, so empty would mean empty.
+    timberfs info --json "$FOLLOWER_SRC" \
+        | jq -e '.followers | length == 1 and .[0].name == "vmfollow"' >/dev/null || return 1
+    # A .timber bundle is a snapshot, so the question does not arise there.
+    timberfs export "$FOLLOWER_SRC" --into /tmp/f.timber >/dev/null 2>&1 || return 1
+    timberfs info --json /tmp/f.timber | jq -e 'has("followers") == false' >/dev/null || return 1
+
+    timberfs list "$PIPE_BACKING" > /tmp/f.slist 2>/dev/null || return 1
+    head -1 /tmp/f.slist | grep -q 'FOLLOWERS' || { cat /tmp/f.slist; return 1; }
+    grep -E '^vmsrc[[:space:]]' /tmp/f.slist | grep -q '1, ' || { cat /tmp/f.slist; return 1; }
+}
+
+follower_retirement_is_two_commands() {
+    # Retiring one is two commands because the destructive act deserves its
+    # own. `update retaining=false` releases the head and says the part that
+    # is easy to miss: the FLAG toggles, its EFFECT does not.
+    timberfs follower update vmfollow retaining=false > /tmp/f.release 2>&1 || return 1
+    grep -q 'releases the head' /tmp/f.release || { cat /tmp/f.release; return 1; }
+    grep -q 'does not undo' /tmp/f.release || { cat /tmp/f.release; return 1; }
+    # A running follower keeps the OLD declaration until it restarts, and is
+    # told so rather than left to assume otherwise.
+    grep -q 'running with the OLD declaration' /tmp/f.release \
+        || { cat /tmp/f.release; return 1; }
+    jq -e '.retaining == false' "$FOLLOWER_REG/vmfollow/follower.json" >/dev/null || return 1
+
+    # An update that changes nothing writes nothing.
+    timberfs follower update vmfollow retaining=false > /tmp/f.noop 2>&1 || return 1
+    grep -q 'already declares that' /tmp/f.noop || { cat /tmp/f.noop; return 1; }
+
+    # Then delete is bookkeeping -- and takes the unit down with it.
+    timberfs follower delete vmfollow --stop --disable > /tmp/f.gone 2>&1 || {
+        cat /tmp/f.gone; return 1; }
+    [ ! -d "$FOLLOWER_REG/vmfollow" ] || return 1
+    systemctl --quiet is-active timberfs-follower@vmfollow && return 1
+    systemctl --quiet is-enabled timberfs-follower@vmfollow && return 1
+    # An empty registry is a note, not an error, and --json stays an array.
+    timberfs follower list --json | jq -e 'length == 0' >/dev/null || return 1
+    timberfs follower list --names | grep -q . && return 1
+    # A name nobody registered is an error that says how to look.
+    timberfs follower status vmfollow > /tmp/f.absent 2>&1 && return 1
+    grep -q 'follower list' /tmp/f.absent || { cat /tmp/f.absent; return 1; }
+    return 0
+}
+
+follower_unit_installed() {
+    test -f /lib/systemd/system/timberfs-follower@.service \
+        && grep -q 'timberfs follower run %i' /lib/systemd/system/timberfs-follower@.service \
+        && grep -q 'StateDirectory=timberfs/followers/%i' \
+            /lib/systemd/system/timberfs-follower@.service \
+        && test -f /usr/share/doc/timberfs/examples/timberfs-follower.conf.example \
+        && zcat /usr/share/man/man1/timberfs.1.gz | grep -q 'follower create NAME'
+}
+
 run_test "otlp-intake: enable socket, unit activates" otlp_intake_setup
 run_test "otlp-intake: undeclared stream 503s until the operator creates it" otlp_intake_undeclared_refused_until_created
 run_test "otlp-intake: non-OTLP encodings, signals and methods refused by name" otlp_intake_refuses_the_right_things
@@ -2288,6 +2475,12 @@ run_test "timber-otlp: a pre-numbering cursor converts to a chunk position" curs
 run_test "chunk numbers: dense, survive a head-drop, v1 index migrates on open" chunk_numbers_and_v1_migration
 run_test "records: entries carry chunk=, --from-chunk resumes at one" records_carry_the_chunk_number
 run_test "consumers: list/info show lag and held bytes; a dropped position is a GAP" consumer_view_and_gap
+run_test "follower: create records the store by identity, and refuses the rest" follower_registry_declares_and_refuses
+run_test "follower: the unit execs the shipper and ships from the beginning" follower_unit_execs_the_shipper
+run_test "follower: liveness from the inherited lock; a second run is refused" follower_liveness_and_collision
+run_test "follower: info grows a followers block, list a FOLLOWERS column" follower_store_side_view
+run_test "follower: retiring one is update-then-delete, and says what it frees" follower_retirement_is_two_commands
+run_test "follower: unit, conf example and man page installed" follower_unit_installed
 
 forest_handle_resolution() {
     # The package ships /etc/timberfs/forests.d/default.conf with

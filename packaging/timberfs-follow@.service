@@ -2,12 +2,16 @@
 # --follow`, for a producer that cannot be pointed at a FIFO — or must not be.
 #
 # The producer keeps writing its own file and timberfs reads it, so nothing in
-# the producer's write path depends on this unit. A follower that stalls, dies
-# or is upgraded badly cannot slow or stop the producer; the worst it can do is
+# the producer's write path depends on this unit. A tail that stalls, dies or
+# is upgraded badly cannot slow or stop the producer; the worst it can do is
 # fall behind. That is the difference from the timberfs-text@ FIFO pair, where
 # the producer's write goes into a pipe this side has to keep draining — and it
 # is why this is the safer default for a mail server, where Exim ends the
 # process whose log write fails.
+#
+# WARNING: not timberfs-follower@ — one letter, opposite direction. That one
+# runs a registered FOLLOWER, reading a store OUT to somewhere else. This unit
+# is an intake, reading a file IN.
 #
 # Each instance reads /etc/timberfs/follow-<instance>.conf, which must define
 # SOURCE (there is no sane default) and may override the rest:
@@ -24,14 +28,14 @@
 #
 # Rotation of the source needs no configuration while this runs — the
 # descriptor already held is the file that moved, and it is drained before the
-# new one is opened. --rotated only matters for data written while the follower
+# new one is opened. --rotated only matters for data written while the tail
 # was NOT running; it defaults to <SOURCE>.1 and <SOURCE>.0.
 #
-# The follower reads the producer's file, so if you set User= in a drop-in,
+# This unit reads the producer's file, so if you set User= in a drop-in,
 # that user needs read access to it (group adm on a Debian /var/log, say).
 
 [Unit]
-Description=timberfs log follower (%i)
+Description=timberfs log tail (%i)
 Documentation=https://github.com/torstei/timberfs
 After=local-fs.target
 
@@ -61,7 +65,7 @@ StandardError=journal
 # write to. A glob still spans the fleet — /var/log/timberfs/*/*.trunk.
 LogsDirectory=timberfs/%i
 
-# Restarting is cheap and safe: the store is the follower's checkpoint, so a
+# Restarting is cheap and safe: the store is this tail's checkpoint, so a
 # restart re-syncs against the store's own lines rather than a position file,
 # and can neither lose nor duplicate.
 Restart=always

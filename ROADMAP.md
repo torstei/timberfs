@@ -149,10 +149,11 @@ works is in [docs/design.md](docs/design.md).
 - **Cursors beyond one consumer**: `cursor.rs` is a general "consumer's
   position in a store's entry stream", not an OTLP thing — a Kafka or Loki
   shipper would reuse it verbatim. Who is reading a store and how far
-  behind is now surfaced (a store declares a `cursors` directory; `list`
-  gains a CONSUMERS column, `info` the per-consumer detail, and the
-  shipper warns on a GAP), so what remains open is acting on it — see
-  followers below, which supersede the `cursors` key with a registry.
+  behind is now surfaced — the FOLLOWER REGISTRY (below) shipped, so `list`
+  carries a FOLLOWERS column, `info` the per-follower detail, and the
+  shipper warns on a GAP; the deprecated `cursors` key is still honoured
+  and reported as superseded. What remains open is ACTING on it —
+  `retain_unconsumed`, in the same entry.
   The larger step is putting a cursor on the RECORDS stream
   (`query --follow --records --cursor`, a flag rather than a new binary —
   the tool boundary is destination-shaped, not format-shaped), because it
@@ -208,7 +209,8 @@ works is in [docs/design.md](docs/design.md).
   Cheap when wanted: the sap is recreated on every seal-and-swap, so a
   format bump there needs no converter and no grace period, unlike the
   rings.
-- **Followers, and retaining what they have not consumed**: retention drops
+- **Retaining what a follower has not consumed** (the registry half SHIPPED;
+  the retention rule is what is left): retention drops
   by age and by size. A frontend box wants a third rule — drop what is
   CONFIRMED DELIVERED — because two requirements hold at once there: keep
   as little log data on the box as possible (a breach reaches less of it,
@@ -228,17 +230,32 @@ works is in [docs/design.md](docs/design.md).
   convention, and it remains a log with interest-based truncation, not a
   work queue: still position-based and at-least-once, no per-entry ack, no
   redelivery, no dead-letter.
-  **The registry.** One directory per follower, named by the follower:
+  **The registry** (built): one directory per follower, named by the
+  follower:
   ```
   /var/lib/timberfs/followers/<name>/
       follower.json    store, type, retaining, config   (operator writes)
       cursor.json      seq, n, delivered                (follower writes)
+      follower.lock    held while it runs               (`run` acquires)
   ```
-  The two files have different OWNERS and that is why they are two: the
-  declaration is the operator's, the position is the follower's, and a
-  cursor save is a whole-file tmp+rename that deliberately drops keys it
-  does not own. One file would make every position write preserve operator
-  fields, and would race `update`.
+  The declaration and the position have different OWNERS and that is why
+  they are two: the declaration is the operator's, the position is the
+  follower's, and a cursor save is a whole-file tmp+rename that
+  deliberately drops keys it does not own. One file would make every
+  position write preserve operator fields, and would race `update`.
+  The LOCK is a third file for the reason the store's writer lock is never
+  its `.rings`: a cursor save replaces the inode by rename, and a lock on
+  a renamed-over inode silently stops excluding anyone.
+  Two things building it settled that this note did not have. `retaining`
+  IMPLIES `--start begin`, because the shipper defaults to `end` and a
+  retaining follower's first run would otherwise skip exactly the backlog
+  it was registered to protect, which retention would then drop — derived,
+  so an explicit `--start` still wins. And liveness cannot come from the
+  lock alone: `run` clears FD_CLOEXEC so the lock survives the exec, but
+  the shipper spawns its own reader, that child inherits the descriptor,
+  and it can outlive its parent — so the lock says somebody holds it and
+  the recorded pid says whether that somebody is the follower (exec
+  preserves the pid, which makes it a proof rather than a pid file).
   `<name>` is host-unique and constrained to `[A-Za-z0-9_.-]`, so it needs
   no `systemd-escape` and is a legal directory name as-is — a UUID was the
   first instinct and is unusable in `systemctl status
@@ -348,14 +365,15 @@ works is in [docs/design.md](docs/design.md).
   indefinitely — and NOT the tempting shortcut of letting a follower
   collapse the head itself, which would make a reader a writer and put two
   of them on one head.
-  ⚠ **This supersedes something already released.** 0.18.0 ships the
-  read-only half against a `cursors=<dir>` key on the store, and the
-  registry replaces it: a follower declares its store, so the store
-  declares nothing. `list`'s CONSUMERS column and `info`'s block would read
-  the registry instead. Since `cursors=` is documented in a release, it is
-  owed a deprecation rather than a silent removal — honour it for a stated
-  period, report it as superseded when found, and keep it as the way to
-  register a NON-retaining tap if that turns out to be worth having.
+  ⚠ **This superseded something already released**, and did so without
+  removing it. 0.18.0 shipped the read-only half against a `cursors=<dir>`
+  key on the store; the registry replaces it, since a follower declares its
+  store and so the store declares nothing. `list`'s column became
+  FOLLOWERS and `info` renders each source in its own block — declared and
+  found-lying-in-a-directory are not the same claim. The key is honoured
+  and reported as superseded wherever it is found, which is what a
+  documented release is owed; it stays the way to register a NON-retaining
+  tap for as long as that is worth having.
   Deliberately absent: a staleness rule expiring a ghost follower's
   interest (the registry makes a ghost discoverable by `list` and removable
   by `delete`, which beats a heuristic that cannot tell a dead follower

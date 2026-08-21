@@ -148,8 +148,11 @@ An instance that needs more than one stream in one directory just sets a custom
 
 ## systemd units
 
-Five independent families ship with the package: one mount, three intakes
-(FIFO, Forward, OTLP) and one shipper.
+Six independent families ship with the package: one mount, three intakes
+(FIFO, Forward, OTLP) and two shippers — `timberfs-otlp@`, configured per
+instance in `/etc/timberfs`, and `timberfs-follower@`, which takes its
+configuration from the follower registry instead. Prefer the latter for
+anything long-lived.
 
 ### Mounting a store — `timberfs@.service`
 
@@ -312,7 +315,7 @@ DECLARE=index=true retain=90d
 ```
 
 A `text-<instance>.conf` overrides it key by key. `DECLARE` takes any manifest
-property — `retain`, `retain_size`, `index`, `wal`, `cursors`, or free-form
+property — `retain`, `retain_size`, `index`, `wal`, or free-form
 provenance —
 but not a value containing spaces: systemd splits variables at whitespace, so
 set such a property once with `timberfs set` and the manifest keeps it.
@@ -795,26 +798,76 @@ be gone thirty days). The cursor is written only after the receiver accepts a
 batch, so an interrupted send is re-delivered rather than skipped
 (at-least-once); `Restart=always` is therefore safe. Details: `man timber-otlp`.
 
-Declare the state directory on the store and the shipper's progress becomes
-visible from the store's side, where an operator is already looking:
+### `timberfs-follower@.service` — a shipper declared once, run by name
+
+Prefer this to `timberfs-otlp@` for anything long-lived. Same shipper, but the
+store, the type and the endpoint live in a **declaration** rather than in a
+per-instance `.conf`, so there is one place that answers "what follows this
+store", validated when it is written instead of at the next restart:
 
 ```sh
-timberfs set /var/log/timberfs-backing/applogs/app.log cursors=/var/lib/timberfs
+timberfs follower create applogs \
+    --store /var/log/timberfs-backing/applogs/app.log \
+    --type otlp --endpoint http://127.0.0.1:4318 \
+    --retaining --enable --start \
+    -- --service checkout --resource deployment.environment=prod
 ```
 
-`timberfs list` then carries a CONSUMERS column (how many, and the worst) and
-`timberfs info` names every consumer, how far behind it is, and how much of the
-store it alone is holding. Cursors are matched to stores by the identity they
-carry, so the one `StateDirectory=` serves every instance on the host — no
-per-store cursor directory, and no writing back into it.
+`ExecStart` is `timberfs follower run %i`, which reads that declaration and
+**execs** `timber-otlp` — a dispatcher, not a supervisor, so systemd keeps the
+lifecycle, the restarts and the journal, and timberfs adds no daemon. The
+`--follow`, `--cursor` and `--endpoint` flags come from the registry; `--start`
+is derived from `retaining` (`begin`, so a retaining follower's first run does
+not skip the backlog it exists to protect). Anything after `--` reaches the
+shipper verbatim.
+
+The unit's `StateDirectory=` is `/var/lib/timberfs/followers/%i`, holding the
+declaration, the position and the lock. **Those permissions are load-bearing**:
+a position in there decides what a store's retention may drop, so once
+`retain_unconsumed` is honoured, anything that can write one can destroy data.
+0755 keeps it observable by anyone and writable only by the follower — so a
+`User=` drop-in gives one follower its own unprivileged identity without every
+follower being able to write every position.
+
+Secrets do **not** go in the declaration. The registry is world-readable on
+purpose, so that `timberfs follower list` and `timberfs info` work as read-only
+observations without write access anywhere; a bearer token belongs in
+`/etc/timberfs/follower-<instance>.conf`, mode 0600, which the unit reads as an
+`EnvironmentFile` (`timber-otlp` picks up `$OTEL_EXPORTER_OTLP_HEADERS`, the
+spelling every OTel SDK uses).
+
+> Not to be confused with `timberfs-follow@` — one letter, opposite direction.
+> That one is an *intake* (`timberfs import --follow`), reading a producer's file
+> **into** a store. This one reads a store **out**.
+
+### Watching the disconnection budget
+
+`timberfs follower list` shows each follower's position, lag and whether it is
+running; `timberfs list` carries a FOLLOWERS column (how many, and the worst)
+and `timberfs info` names each one, how far behind it is, and how much of the
+store it alone is holding.
+
+Liveness is read from the follower's **lock**, not from systemd: a lock is
+released by the kernel on process death so it cannot go stale, while a unit's
+state answers about the unit. (The lock is taken by `run` and inherited across
+the exec, which is why the shipper needs no lock code — and why liveness also
+checks the recorded pid: the shipper spawns its own reader, that child inherits
+the descriptor, and such a child can outlive its parent.)
 
 The number to watch is the held bytes: **retention is the disconnection budget,
-and nothing enforces that a consumer stays inside it**. A shipper down longer
-than `retain` comes back to a cursor pointing at a dropped chunk; it warns on
+and nothing enforces that a follower stays inside it**. A shipper down longer
+than `retain` comes back to a position pointing at a dropped chunk; it warns on
 resume (`GAP — N chunk(s) were dropped before it read them`) and continues
 from the oldest chunk, because the loss is already in the past and a shipper
-that refuses to start ships nothing. Alert on that warning, and on a consumer
+that refuses to start ships nothing. Alert on that warning, and on a follower
 whose lag approaches the retention window.
+
+⚠ In this release `retaining` is **declared and reported, not enforced** — no
+writer acts on it yet. The store-side rule (`retain_unconsumed`, requiring a
+`retain_size` alongside it as the backstop) comes next; `timberfs follower
+status` says so per follower rather than letting a declared interest read as an
+enforced one. The older `cursors=<dir>` key still works and is reported as
+superseded wherever it is found.
 
 ## Ownership and permissions
 
