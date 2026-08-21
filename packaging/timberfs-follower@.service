@@ -1,0 +1,69 @@
+# Systemd template for one registered follower of a store: a consumer with a
+# name, a type, a `retaining` flag and a durable position, declared once with
+#
+#   timberfs follower create central --store applogs --type otlp \
+#       --endpoint http://collector.internal:4318 --retaining --enable --start
+#
+# and then run by this unit. `%i` is the follower's name, which is why those
+# names are constrained to [A-Za-z0-9_.-]: no systemd-escape, so the name in
+# `systemctl status` is the name that was typed.
+#
+# There is no per-instance .conf holding a store and an endpoint, unlike every
+# other timberfs unit — that is the point of the registry. `timberfs follower
+# run %i` reads the declaration and EXECs the right shipper for its type,
+# replacing its own process, so this unit supervises the shipper directly. A
+# dispatcher, not a supervisor: timberfs runs no daemon of its own here.
+#
+# ⚠ Not to be confused with timberfs-follow@ — one letter, opposite direction.
+# That one is an INTAKE (`timberfs import --follow`): it reads a producer's file
+# INTO a store. This one reads a store OUT to somewhere else.
+#
+#   systemctl status timberfs-follower@central     # is my shipper running?
+#   timberfs follower status central               # ...and where is it?
+
+[Unit]
+Description=timberfs follower (%i)
+Documentation=https://github.com/torstei/timberfs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Secrets go here, NOT into the declaration. The registry is world-readable on
+# purpose (`timberfs follower list` and `info` are read-only observations and
+# must work without write access), so a bearer token has no business in
+# follower.json. timber-otlp reads $OTEL_EXPORTER_OTLP_HEADERS, the same
+# spelling every OTel SDK does:
+#
+#   /etc/timberfs/follower-central.conf   (chmod 0600)
+#     OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer sekrit
+EnvironmentFile=-/etc/timberfs/follower.conf
+EnvironmentFile=-/etc/timberfs/follower-%i.conf
+
+ExecStart=/usr/bin/timberfs follower run %i
+
+# Creates and owns this follower's own registry directory,
+# /var/lib/timberfs/followers/%i, holding its declaration, its position and its
+# lock. Per instance, not one directory for all of them, because a directory is
+# what a writer needs permission on: each follower can then run under its own
+# User= drop-in without every follower being able to write every position.
+#
+# ⚠ Those permissions are load-bearing. A position in here decides what a
+# store's retention may drop, so anything that can write one can, once
+# retain_unconsumed is honoured, destroy data. 0755 keeps it observable by
+# anyone and writable only by the follower.
+StateDirectory=timberfs/followers/%i
+StateDirectoryMode=0755
+
+StandardOutput=journal
+StandardError=journal
+
+# A reader, so a restart cannot hurt the store: the position is written only
+# after the receiver accepts a batch, so an interrupted send is re-delivered
+# rather than skipped (at-least-once, as OTLP itself is).
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1389,15 +1389,69 @@ pub struct StoreSummary {
     pub sap_pending_bytes: Option<u64>,
     pub retain: Option<String>,
     pub retain_size: Option<String>,
+    /// The store's REGISTERED followers, furthest behind first. Empty is
+    /// a real and complete answer here — the registry names every
+    /// follower of every store, so "none" means none, where an absent
+    /// `cursors` directory only ever meant "nowhere to look".
+    pub followers: Vec<crate::follower::Registered>,
     /// Who is reading this store and how far behind, when it declares a
     /// `cursors` directory to look in. `None` means no declaration —
     /// which is not the same as nothing reading it, and a view must not
     /// render the two alike.
+    ///
+    /// ⚠ Superseded by `followers`: a follower declares its store, so a
+    /// store declares nothing. Honoured for now (`cursors` shipped in a
+    /// release), reported as superseded where it is found.
     pub consumers: Option<crate::cursor::Survey>,
     pub writer: WriterState,
 }
 
 impl StoreSummary {
+    /// Everyone holding a position in this store, however they were
+    /// found: registered followers plus any cursors in a declared
+    /// (deprecated) `cursors` directory. The column's question is "is
+    /// anyone reading this", which both sources answer.
+    pub fn reader_count(&self) -> usize {
+        self.followers.len() + self.consumers.as_ref().map_or(0, |sv| sv.consumers.len())
+    }
+
+    /// Whether anything at all has a claim to be rendered — so the
+    /// column can appear for a store that declares `cursors` and has
+    /// nothing in it (declared-and-empty is a state, and a dangerous
+    /// one), not only for a store with readers.
+    pub fn has_readers(&self) -> bool {
+        !self.followers.is_empty() || self.consumers.is_some()
+    }
+
+    /// The furthest-behind reader's lag, from whichever source it came —
+    /// the number an operator acts on, since a store is large because
+    /// somebody is behind.
+    ///
+    /// Ranked as `follower::rank` does, and for the same reason: a
+    /// retaining follower with no position holds the WHOLE store, so it
+    /// outranks any measured backlog even though nothing has been
+    /// measured for it. Legacy cursors can never be in that state (a
+    /// cursor found in a directory declares no interest at all), so they
+    /// compare on bytes alone.
+    pub fn worst_lag(&self) -> Option<String> {
+        let followers = self.followers.iter().map(|r| {
+            (
+                r.holds_everything(),
+                r.standing.map_or(0, |s| s.behind_bytes),
+                r.lag_text(),
+            )
+        });
+        let legacy = self
+            .consumers
+            .iter()
+            .flat_map(|sv| sv.consumers.iter())
+            .map(|c| (false, c.standing.behind_bytes, c.standing.lag_text()));
+        followers
+            .chain(legacy)
+            .max_by_key(|(everything, bytes, _)| (*everything, *bytes))
+            .map(|(_, _, lag)| lag)
+    }
+
     /// `list`'s INDEX column: a `.grain` token index that is present, or
     /// declared (and due to be rebuilt on the next import if actually
     /// missing) — either way, `--has` queries are meant to work here.
@@ -1406,11 +1460,15 @@ impl StoreSummary {
     }
 }
 
+/// `followers` is passed IN rather than looked up here, so a command
+/// summarising many stores reads the registry once (see
+/// `follower::by_store`) instead of once per store.
 pub fn summarize_store(
     dir: &Path,
     name: &str,
     records: &[ChunkRecord],
     bark: Option<&serde_json::Map<String, serde_json::Value>>,
+    followers: Vec<crate::follower::Registered>,
 ) -> StoreSummary {
     let (chunks, logical_bytes, compressed_bytes) = match (records.first(), records.last()) {
         (Some(f), Some(l)) => (
@@ -1487,6 +1545,7 @@ pub fn summarize_store(
         sap_pending_bytes,
         retain: get("retain"),
         retain_size: get("retain_size"),
+        followers,
         consumers: crate::cursor::survey(dir, name, bark, records),
         writer,
     }
@@ -1564,9 +1623,10 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         .unwrap_or_default();
     let mut location = String::new();
     let mut bundle_bytes: Option<u64> = None;
-    // A pair-only fact, like the writer state: a bundle is a snapshot,
+    // Pair-only facts, like the writer state: a bundle is a snapshot,
     // and nothing holds a position in a snapshot.
     let mut consumers: Option<crate::cursor::Survey> = None;
+    let mut followers: Vec<crate::follower::Registered> = Vec::new();
     let (
         chunks,
         logical,
@@ -1600,8 +1660,11 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         let (dir, base) = resolve_backing(input)?;
         name = base.clone();
         location = dir.display().to_string();
-        let s = summarize_store(&dir, &base, records, handle.bark.as_ref());
+        let anchor = crate::cursor::store_anchor(&dir, &base, handle.bark.as_ref());
+        let declared = crate::follower::for_store(&crate::follower::registry_dir(), &anchor);
+        let s = summarize_store(&dir, &base, records, handle.bark.as_ref(), declared);
         consumers = s.consumers;
+        followers = s.followers;
         (
             s.chunks,
             s.logical_bytes,
@@ -1693,10 +1756,20 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         if let Some(w) = &writer {
             put("writer", w.clone().into());
         }
+        if !bundled {
+            // Always an array for a pair, never null: the registry knows
+            // every follower of every store, so empty means empty. Absent
+            // for a bundle, where the question does not arise.
+            put(
+                "followers",
+                serde_json::Value::Array(followers.iter().map(crate::follower::to_json).collect()),
+            );
+        }
         if let Some(sv) = &consumers {
             put("cursors_dir", sv.dir.display().to_string().into());
             put("consumers", consumers_json(sv));
             put("held_bytes", sv.held_bytes().into());
+            put("cursors_superseded", true.into());
             if sv.unreadable > 0 {
                 put("cursors_unreadable", sv.unreadable.into());
             }
@@ -1813,6 +1886,9 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                 }
             );
         }
+        if !bundled {
+            print_followers(&followers, compressed);
+        }
         if let Some(sv) = &consumers {
             print_consumers(sv, compressed);
         }
@@ -1823,6 +1899,78 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `info`'s follower block: who is registered against this store, what
+/// they hold, and where each stands. Silent when the registry names none
+/// — an unused feature must not put a line on every `info`.
+///
+/// The retaining ones are what an operator is looking for, so the header
+/// leads with them: they are the reason a store is large, and until
+/// PR-next's `retain_unconsumed` lands they are also the reason it is
+/// NOT, which is worth being honest about in one place.
+fn print_followers(followers: &[crate::follower::Registered], compressed: u64) {
+    if followers.is_empty() {
+        return;
+    }
+    let retaining: Vec<&crate::follower::Registered> =
+        followers.iter().filter(|r| r.decl.retaining).collect();
+    // What no retention honouring these followers could drop: the
+    // furthest-behind retaining one's backlog — or the whole store, when
+    // one of them has never run, since it holds everything.
+    let held = if retaining.iter().any(|r| r.holds_everything()) {
+        compressed
+    } else {
+        retaining
+            .iter()
+            .map(|r| r.standing.map_or(0, |s| s.behind_bytes))
+            .max()
+            .unwrap_or(0)
+    };
+    if retaining.is_empty() {
+        println!(
+            "  followers {} registered, none retaining — nothing holds the head back",
+            followers.len()
+        );
+    } else {
+        println!(
+            "  followers {} registered, {} retaining; {} of {} held",
+            followers.len(),
+            retaining.len(),
+            crate::rotate::human_bytes(held),
+            crate::rotate::human_bytes(compressed)
+        );
+    }
+    let width = followers
+        .iter()
+        .map(|r| r.name().len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    for r in followers {
+        let mut detail = r.lag_text();
+        if let Some(st) = &r.standing {
+            if st.gap_chunks.is_none() && st.behind_chunks > 0 && !st.at_live_edge() {
+                detail = format!(
+                    "{detail}, {} unread in {} chunk(s)",
+                    crate::rotate::human_bytes(st.behind_bytes),
+                    st.behind_chunks
+                );
+            }
+        }
+        println!(
+            "            {:<width$}  {}{}{}  [{}]",
+            r.name(),
+            if r.decl.retaining { "retaining, " } else { "" },
+            detail,
+            match &r.cursor {
+                Some(c) if c.delivered > 0 => format!("; {} delivered", c.delivered),
+                _ => String::new(),
+            },
+            r.live.word(),
+            width = width
+        );
+    }
+}
+
 /// `info`'s consumer block: a header saying what the whole store's
 /// backlog is, then one line per consumer, furthest-behind first. The
 /// header leads with the held bytes because that is the number an
@@ -1830,6 +1978,14 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
 /// this names who.
 fn print_consumers(sv: &crate::cursor::Survey, compressed: u64) {
     let dir = sv.dir.display();
+    // Reported as superseded wherever it is found. `cursors` shipped in
+    // a release, so it is owed a deprecation rather than a silent
+    // removal — but a store no longer declares its readers, a follower
+    // declares its store, and only one of the two can be the truth.
+    println!(
+        "  cursors   {dir}/ — SUPERSEDED by the follower registry \
+         (`timberfs follower create`); still honoured"
+    );
     if sv.consumers.is_empty() {
         // Declared but empty is a real state, and a dangerous-looking
         // one: nothing holds a position, so nothing is protected.

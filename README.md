@@ -241,7 +241,7 @@ posted. Protobuf by default (`--encoding json` for a readable wire,
 `--compress gzip` over a network); plaintext HTTP only — terminate TLS in a
 collector beside it. Details: `man timber-otlp`.
 
-### Who is reading, and how far behind
+### Followers: who is reading, and how far behind
 
 Retention acts on the head of a store and nothing coordinates it with a
 consumer's progress, so a shipper down longer than the retention window comes
@@ -249,32 +249,79 @@ back to find the chunk its cursor points at already dropped. That is reported
 rather than absorbed: the shipper warns on resume with the size of the hole,
 instead of quietly restarting from whatever is now oldest.
 
-The same fact is visible from the store's side — *before* it becomes loss — once
-the store declares where its consumers keep their cursors. A cursor stays
-consumer state at a path the operator names; the declaration only says where to
-look, and cursors are matched to stores by the identity they carry, so one
-directory serves a whole host:
+The same fact is visible from the store's side — *before* it becomes loss — for
+every **registered follower**. A follower is a declared object: a name, a type,
+a `retaining` flag and a durable position.
 
 ```sh
-timberfs set backing/app.log cursors=/var/lib/timberfs
+timberfs follower create central --store app --type otlp \
+    --endpoint http://collector.internal:4318 --retaining --enable --start
 ```
 
 ```
-$ timberfs list
-HANDLE  FOREST   SIZE     SPAN                    WRITER  INDEX  RETAIN  CONSUMERS
-app     default  1.4 GiB  2026-08-13 .. 08-20     live    grain  30d     2, 6d 2h behind
+$ timberfs follower list
+NAME     STORE  TYPE  RETAINING  POSITION     LAG            RUNNING
+central  app    otlp  yes        chunk 4831   6d 2h behind   yes
+audit    app    otlp  yes        -            never run      no
 
-$ timberfs info backing/app.log
+$ timberfs info app
   …
-  consumers 2 in /var/lib/timberfs/; 1.2 GiB of 1.4 GiB held by splitter (6d 2h behind)
-            splitter  6d 2h behind, 1.2 GiB unread in 4831 chunk(s); 41.2k delivered
-            otlp      at the live edge; 12.4M delivered
+  followers 2 registered, 2 retaining; 1.4 GiB of 1.4 GiB held
+            audit     retaining, never run  [no]
+            central   retaining, 6d 2h behind, 1.2 GiB unread in 4831 chunk(s); 41.2k delivered  [yes]
 ```
 
-`1.2 GiB of 1.4 GiB held by splitter` is the number to act on: the store is
-large because one consumer is behind, and this names which. A store that
-declares no directory shows `-`, which is not the same as `0` — declared, and
-nothing is reading it.
+The held figure is the number to act on: a store is large because somebody is
+behind, and this names which. `audit` leads it because a retaining follower with
+**no position holds everything** — which is the point (it is what protects a
+follower deployed before it first runs) and equally the footgun, the same one an
+unused Postgres replication slot has.
+
+That parallel is not decoration. A follower *is* a replication slot: an
+operator-chosen name unique per host, the registration recording which store it
+belongs to, and an unused one pinning data forever with a size budget as the
+backstop. timberfs stays a log with interest-based truncation, not a work queue
+— position-based and at-least-once, no per-entry ack, no redelivery, no
+dead-letter.
+
+The registry is one directory per follower, and the file split follows
+ownership:
+
+```
+/var/lib/timberfs/followers/central/
+    follower.json   store, type, retaining, config   (the operator writes)
+    cursor.json     seq, n, delivered                (the follower writes)
+    follower.lock   held while it runs               (`run` acquires)
+```
+
+The follower records **its** store, by identity (the `.bark` id, minted on
+`create`) — so a store keeps no follower list, and there is no reverse index to
+fall out of sync. Nor is a path enough: a store can move, and a path can come to
+hold a different store.
+
+systemd runs them, and timberfs only dispatches: `timberfs-follower@central`'s
+`ExecStart` is `timberfs follower run central`, which reads the declaration and
+**execs** the right shipper, replacing its own process. No per-instance `.conf`
+holding a store and an endpoint — that is what the registry is for — and no
+daemon of ours in the middle. Retiring one is deliberately two commands, because
+the destructive act deserves its own:
+
+```sh
+timberfs follower update central retaining=false   # releases the head, and says what
+timberfs follower delete central --stop --disable  # bookkeeping
+```
+
+`update retaining=false` quantifies what it frees and says the part that is easy
+to miss — the *flag* toggles but its *effect* does not: setting it back will not
+bring dropped data back. `delete` refuses while a follower is retaining or
+running; both refusals are about deliberateness rather than prevention, so there
+is no `--force` — the two-step *is* the force.
+
+> **In this release `retaining` is declared and reported, not enforced.** The
+> store-side rule (`retain_unconsumed`, which will require a `retain_size`
+> alongside it as the backstop) comes next; `timberfs follower status` says so
+> per follower rather than letting a declared interest read as an enforced one.
+> The older `cursors=<dir>` key still works and is reported as superseded.
 
 ## Rotation & retention
 
@@ -397,7 +444,7 @@ sudo dpkg -i target/debian/timberfs_*.deb
 ```
 
 The package installs `/usr/bin/timberfs`, `timber-filter`, `timber-otlp` and
-seven systemd unit families: `timberfs@<instance>` (a template) to mount a
+eight systemd unit families: `timberfs@<instance>` (a template) to mount a
 store at boot, a socket-activated `timberfs-log@<instance>` (also a template)
 to stream a records producer into a store without a mount, its plain-text
 sibling `timberfs-text@<instance>` for a producer that can only log to a path
@@ -406,9 +453,12 @@ to read a file a producer keeps writing (no coupling to that producer at all),
 socket-activated
 `timberfs-forward` and `timberfs-otlp` (not templated — both multiplex every
 stream over one listener) for the two network intakes above, and
-`timberfs-otlp@<instance>` (a template, one per store) to ship a store onward.
+`timberfs-otlp@<instance>` (a template, one per store) to ship a store onward —
+plus `timberfs-follower@<instance>`, which is the one to prefer for that last
+job: it runs a *registered* follower, so the store, the type and the endpoint
+come from the declaration rather than from a per-instance `.conf`.
 See **[Deploying timberfs](docs/deployment.md)** for the directory layout, all
-seven unit families, the ownership/permission model, and
+eight unit families, the ownership/permission model, and
 self-restart-on-upgrade.
 
 ## Roadmap

@@ -1,5 +1,12 @@
 //! `import --follow`: consume a log file that someone else writes.
 //!
+//! ⚠ Direction. This is an INTAKE: it reads a producer's file INTO a store.
+//! A FOLLOWER (follower.rs) is the opposite — a registered reader of a
+//! store, shipping it OUT. Both run `--follow`, so the verb is honestly
+//! shared, but `timberfs-follow@` and `timberfs-follower@` are one letter
+//! apart and point opposite ways. The prose below therefore calls this
+//! side a TAIL, and reserves "follower" for the registered object.
+//!
 //! The reason this belongs in timberfs rather than in a `tail -F |` pipeline
 //! is that position and rotation ARE the problem, and only the side that owns
 //! the store can solve them. Three invariants say how:
@@ -12,7 +19,7 @@
 //!     replaced, the file we still hold is drained first, so rotation cannot
 //!     strand the lines written between the last read and the rename.
 //!   * **Every position decision is announced.** Which file, how much, and
-//!     why — a follower that silently reads the wrong thing is worse than one
+//!     why — a tail that silently reads the wrong thing is worse than one
 //!     that stops.
 //!
 //! Entries are stamped from their own timestamps, exactly as `import` does.
@@ -29,7 +36,7 @@
 //! `--flush-age` means something different here than it does for the appender,
 //! which is why the default is a minute rather than five seconds. The
 //! appender's input is a pipe, so unflushed data exists only in memory and the
-//! flush age bounds what a crash loses. A follower's input is a file that
+//! flush age bounds what a crash loses. A tail's input is a file that
 //! stays on disk, and the store is the checkpoint — a partial chunk lost to a
 //! crash is simply re-read — so the age only decides how soon new lines become
 //! queryable. Setting it low costs compression instead: a chunk holds whatever
@@ -37,7 +44,7 @@
 //! with (3.1x at five seconds against 7.7x at sixty, one line a second).
 //!
 //! Which is why `--wal` is the better answer to "I need to see it now": a
-//! follower with one appends every line to the sap as it reads it, and
+//! tail with one appends every line to the sap as it reads it, and
 //! `query --follow` tails that, so the store keeps its long flush age and its
 //! compression while a reader sees lines within a poll.
 
@@ -142,10 +149,7 @@ fn drain(
         if let Some(last) = open.pending.iter().rposition(|b| *b == b'\n') {
             let complete: Vec<u8> = open.pending.drain(..=last).collect();
             let mut s = store.lock().unwrap();
-            let f = s
-                .files
-                .get_mut(name)
-                .expect("the store this follower opened");
+            let f = s.files.get_mut(name).expect("the store this tail opened");
             for line in complete.split_inclusive(|b| *b == b'\n') {
                 let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
                 stamper.feed(f, line, ts, cfg)?;
@@ -181,10 +185,7 @@ fn commit_fragment(
     );
     let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
     let mut s = store.lock().unwrap();
-    let f = s
-        .files
-        .get_mut(name)
-        .expect("the store this follower opened");
+    let f = s.files.get_mut(name).expect("the store this tail opened");
     stamper.feed(f, &line, ts, cfg)
 }
 
@@ -211,10 +212,7 @@ fn catch_up(
     // What does the store already cover?
     let (store_first, store_last) = {
         let mut s = store.lock().unwrap();
-        let f = s
-            .files
-            .get_mut(name)
-            .expect("the store this follower opened");
+        let f = s.files.get_mut(name).expect("the store this tail opened");
         if f.size() > 0 {
             // Buffered lines must be on disk to be comparable.
             f.flush_chunk(cfg)?;
@@ -276,10 +274,7 @@ fn catch_up(
         };
         let complete: Vec<u8> = open.pending.drain(..=last_nl).collect();
         let mut s = store.lock().unwrap();
-        let f = s
-            .files
-            .get_mut(name)
-            .expect("the store this follower opened");
+        let f = s.files.get_mut(name).expect("the store this tail opened");
         for line in complete.split_inclusive(|b| *b == b'\n') {
             let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
             if let Some((counts, until)) = dedup.as_mut() {
@@ -358,10 +353,7 @@ pub fn cmd_follow(
         Some(f) => f,
         None => bail!(append::writer_conflict(&dir, &name, fopts.wait_for_writer)),
     };
-    store::write_lock_info(
-        &file_lock,
-        &format!("follower pid={}\n", std::process::id()),
-    )?;
+    store::write_lock_info(&file_lock, &format!("tail pid={}\n", std::process::id()))?;
 
     // Declared, exactly as import and the appender declare them: the manifest
     // is what every later writer reads.
@@ -417,7 +409,7 @@ pub fn cmd_follow(
         cfg.flush_age_ms
     );
 
-    // Wait for the file rather than failing: a supervised follower may well
+    // Wait for the file rather than failing: a supervised tail may well
     // start before the producer that writes its log.
     let mut waited = false;
     while !source.exists() {

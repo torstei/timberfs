@@ -68,7 +68,9 @@ intakes — timberfs-forward speaking the Fluentd Forward protocol (Docker's \
 fluentd log driver, Fluent Bit, Fluentd) and timberfs-otlp speaking \
 OTLP/HTTP (any OpenTelemetry SDK or Collector) — so those producers log \
 straight into a store. In the other direction, timberfs-otlp@.service ships \
-a store to an OTLP/HTTP receiver."""
+a store to an OTLP/HTTP receiver, and timberfs-follower@.service runs a \
+REGISTERED follower of a store: a named consumer with a durable position, \
+declared once with `timberfs follower create` and thereafter managed by name."""
 assets = [
     ["target/release/timberfs", "usr/bin/", "755"],
     ["target/release/timber-filter", "usr/bin/", "755"],
@@ -91,6 +93,7 @@ assets = [
     ["packaging/timberfs-text@.socket", "lib/systemd/system/timberfs-text@.socket", "644"],
     ["packaging/timberfs-text@.service", "lib/systemd/system/timberfs-text@.service", "644"],
     ["packaging/timberfs-follow@.service", "lib/systemd/system/timberfs-follow@.service", "644"],
+    ["packaging/timberfs-follower@.service", "lib/systemd/system/timberfs-follower@.service", "644"],
     ["packaging/timberfs-forward.socket", "lib/systemd/system/timberfs-forward.socket", "644"],
     ["packaging/timberfs-forward.service", "lib/systemd/system/timberfs-forward.service", "644"],
     ["packaging/timberfs-otlp@.service", "lib/systemd/system/timberfs-otlp@.service", "644"],
@@ -101,6 +104,7 @@ assets = [
     ["packaging/timberfs-otlp.conf.example", "usr/share/doc/timberfs/examples/timberfs-otlp.conf.example", "644"],
     ["packaging/timberfs-text.conf.example", "usr/share/doc/timberfs/examples/timberfs-text.conf.example", "644"],
     ["packaging/timberfs-follow.conf.example", "usr/share/doc/timberfs/examples/timberfs-follow.conf.example", "644"],
+    ["packaging/timberfs-follower.conf.example", "usr/share/doc/timberfs/examples/timberfs-follower.conf.example", "644"],
     ["packaging/etc-README", "etc/timberfs/README", "644"],
     ["packaging/forests-default.conf", "etc/timberfs/forests.d/default.conf", "644"],
 ]

@@ -56,6 +56,24 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .RB [ \-\-delete ]
 .RB [ \-\-dry\-run ]
 .br
+.B timberfs follower create
+.I NAME
+.B \-\-store
+.I STORE
+.RB [ \-\-type
+.IR TYPE ]
+.RB [ \-\-endpoint
+.IR URL ]
+.RB [ \-\-retaining ]
+.RB [ \-\-enable ]
+.RB [ \-\-start ]
+.RB [ \-\-
+.IR ARGS .\|.\|.]
+.br
+.B timberfs follower
+.BR list | status | update | delete | run
+.RI [ NAME ]
+.br
 .B timberfs forward\-intake
 .B \-\-into\-dir
 .I DIR
@@ -210,8 +228,9 @@ neither. Known settings are parse-checked
 .BR retain_size =50G,
 .BR index =true|false,
 .BR wal =true|false,
-.BR cursors =/var/lib/timberfs \(em an absolute directory, see
-.BR CONSUMERS );
+.BR cursors =/var/lib/timberfs
+.RI ( "an absolute directory, SUPERSEDED by the follower registry \(em see"
+.BR FOLLOWERS ));
 .BR timestamp_regex ,
 .B timestamp_format
 and
@@ -792,17 +811,22 @@ sidecar unflushed (a read-only stat \(em never replayed by
 .BR info ),
 and the writer state (none / active appender or import / mounted, probed
 from the actual flocks, never from stale lock-file contents). A store
-that declares a
+with registered followers also gets a
+.B followers
+block: each one furthest behind first, with how far behind it is, how
+much of the store it alone is holding, how much it has delivered, which
+of them are
+.B retaining
+and whether each is running (see
+.BR FOLLOWERS ).
+A store still declaring the superseded
 .B cursors
-directory also gets a
+key gets its
 .B consumers
-block: every consumer holding a position in it, furthest behind first,
-with how far behind it is, how much of the store it alone is holding,
-and how much it has delivered (see
-.BR CONSUMERS ).
+block too, under a line saying so.
 Works identically on backing pairs and read-only
 .B .timber
-bundles \(em a bundle is a snapshot, so it never has consumers.
+bundles \(em a bundle is a snapshot, so nothing holds a position in one.
 .B \-\-json
 prints the same facts as one JSON object for scripting. Read-only and
 safe against live writers.
@@ -855,17 +879,17 @@ and
 else
 .IR \- ).
 A
-.B CONSUMERS
-column is added when at least one listed store declares a
-.B cursors
-directory \(em how many consumers hold a position in it and the state of
-the worst of them
-.RI ( "2, 6d 2h behind" ", " "1, caught up" ", " "2, GAP" );
+.B FOLLOWERS
+column is added when at least one listed store has something to say
+there \(em how many readers hold a position in it and the state of the
+worst of them
+.RI ( "2, 6d 2h behind" ", " "1, caught up" ", " "2, GAP" ", " "1, never run" );
 .I \-
-means the store declares no directory, which is not the same as
+means nothing is registered and nothing declared, which is not the same
+as
 .IR 0 ,
-declared with nothing reading it (see
-.BR CONSUMERS ).
+something declared with nothing reading it (see
+.BR FOLLOWERS ).
 The same handle found in two forests shows up as two rows \(em
 .B list
 is how an ambiguity that handle resolution would refuse to guess at
@@ -879,14 +903,18 @@ completion consumes.
 A JSON array of objects
 .RI ( handle ", " forest ", " dir ", " path ", " size_bytes ", "
 .IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
-.IR retain_size ", " cursors_dir ", " consumers ", " held_bytes )
+.IR retain_size ", " followers ", " cursors_dir ", " consumers ", "
+.IR held_bytes )
 instead of the human table.
+.I followers
+is always an array \(em the registry knows every follower of every
+store, so empty means empty.
 .I cursors_dir
 and
 .I consumers
-are
+carry the superseded key, and are
 .B null
-when the store declares no directory, and
+when the store declares no directory, while
 .I consumers
 is an empty array when it declares one that holds no position in this
 store \(em the same distinction the table's
@@ -957,6 +985,158 @@ Show what would move without changing anything.
 .TP
 .B \-\-fail\-on\-empty
 Error when nothing rotates instead of attesting the empty result.
+.SS follower
+Manage a store's
+.IR followers :
+registered readers, each with a name, a type, a
+.B retaining
+flag and a durable position. See
+.B FOLLOWERS
+below for what a follower IS and why it is a declared object rather than
+a cursor found lying in a directory.
+.TP
+.B timberfs follower create NAME \-\-store STORE [options]
+Register a follower.
+.I NAME
+is host-unique and is also the systemd instance
+.RB ( timberfs\-follower@ NAME ),
+which is why it is constrained to
+.BR [A\-Za\-z0\-9_.\-] :
+no
+.BR systemd\-escape (1),
+so the name in
+.B systemctl status
+is the name that was typed. Refused if taken \(em a collision is a
+registration error, not two processes overwriting one position.
+.RS
+.TP
+.BI \-\-store " STORE"
+The store to follow: a path, or a forest handle. Recorded by IDENTITY
+(its
+.B .bark
+.IR id ,
+minted here when the store has none), never by path \(em a store can
+move, and a path can come to hold a different store.
+.TP
+.BI \-\-type " TYPE"
+What runs it.
+.B otlp
+(the default) execs
+.BR timber\-otlp (1).
+.TP
+.BI \-\-endpoint " URL"
+Where it ships to. Promoted out of
+.I ARGS
+because every follower type has a destination and it is the first thing
+an operator reads in
+.BR list .
+.TP
+.B \-\-retaining
+Declare that this follower's position holds the store's head back, so
+retention never drops what it has not read.
+.B A retaining follower with no position holds EVERYTHING
+\(em which is the point (it is what protects a follower deployed before
+it first runs) and equally the footgun, the same one an unused Postgres
+replication slot has. Start it.
+.TP
+.BR \-\-enable ", " \-\-start
+.BR systemctl (1)
+enable and/or start the unit. systemd's two verbs, kept distinct.
+.TP
+.B \-\-dry\-run
+Print the declaration and the command line it would run; register
+nothing.
+.TP
+.BI \-\- " ARGS" .\|.\|.
+Everything after
+.B \-\-
+is passed to the shipper verbatim, in the shipper's own spelling:
+.B \-\- \-\-service checkout \-\-compress gzip
+Deliberately NOT re-declared here \(em a second spelling of the same
+flags is a second thing to keep in step, and it would drift.
+.PP
+Two flags are DERIVED, and an explicit one in
+.I ARGS
+always wins over the derivation.
+.B \-\-cursor
+is the follower's own position file in the registry.
+.B \-\-start
+follows
+.BR retaining :
+.B begin
+for a retaining follower, since
+.B end
+would skip on the first run exactly the backlog it was registered to
+protect and let retention then drop it;
+.B end
+otherwise.
+.RE
+.TP
+.B timberfs follower list [\-\-store STORE] [\-\-names] [\-\-json]
+Every registered follower, by name: its store, type, whether it retains,
+its position, how far behind it is and whether it is
+.BR running .
+.B \-\-store
+narrows to one store's followers.
+.B \-\-names
+prints bare names, one per line \(em what shell completion consumes.
+.TP
+.B timberfs follower status NAME [\-\-json]
+One follower on one screen: what it declares, where its position stands
+in the store, whether anything is honouring its
+.B retaining
+flag, and whether it is running. That last line is read from the
+follower's
+.BR lock ,
+not from systemd: a lock is released by the kernel on process death, so
+it cannot go stale, while a unit's state answers about the unit.
+.TP
+.B timberfs follower update NAME [KEY=VALUE]... [\-\-unset KEY] [\-\- ARGS...]
+Change a declaration.
+.I KEY
+is
+.BR retaining ,
+.BR endpoint ,
+.B type
+or
+.BR store ;
+a
+.B \-\-
+tail replaces the shipper's arguments wholesale. Validated before it is
+written, so an update that would make a follower unrunnable fails now
+rather than at its next start. A running follower keeps the OLD
+declaration until it is restarted, and is told so.
+.IP
+.B update NAME retaining=false
+is the first half of retiring a follower. It quantifies what it frees,
+and says the part that is easy to miss: the FLAG toggles, its EFFECT
+does not \(em setting it back to
+.B true
+will not bring dropped data back, and the follower then resumes at a
+position that may be gapped.
+.TP
+.B timberfs follower delete NAME [\-\-stop] [\-\-disable]
+Unregister a follower: bookkeeping, once the head has been released.
+Refused while it is
+.B retaining
+(release it deliberately first, above) and while it is RUNNING \(em
+deleting it under a live process would leave that process writing an
+unlinked position file, silently doing nothing. Both refusals are about
+deliberateness rather than prevention, so there is no
+.BR \-\-force :
+the two-step IS the force. One escape: a follower whose store no longer
+exists deletes freely, there being nothing to release.
+.TP
+.B timberfs follower run NAME
+Read the declaration and EXEC its shipper \(em what
+.B timberfs\-follower@.service
+runs. A dispatcher, not a supervisor: the process is REPLACED, so
+systemd keeps the lifecycle, the restarts and the journal, and timberfs
+runs no daemon of its own. The follower's lock is taken here and
+inherited across the exec, so a shipper needs no lock code of its own
+and a second
+.B run
+of the same follower is refused.
 .SS forward\-intake
 .B timberfs forward\-intake \-\-into\-dir
 .I DIR
@@ -1185,77 +1365,133 @@ settings, is never inherited by derived stores.
 .B timberfs info
 shows the declared policy and calls out a store that is over budget
 with no writer running to enforce it.
-.SH CONSUMERS
+.SH FOLLOWERS
 A
-.I consumer
-is anything that reads a store's entry stream and remembers where it
-got to \(em
+.I follower
+is a registered reader of one store: a name, a type, a
+.B retaining
+flag and a durable position.
 .BR timber\-otlp (1)
-today, any shipper reusing the same cursor file tomorrow. The position
-lives in a
-.I cursor
-file at a path the OPERATOR names, outside the store: it is consumer
-state, not store state, so several consumers can read one store at
-different positions, a cursor never travels inside a
-.B .timber
-bundle as if it were provenance, and a retention head-drop cannot
-delete it.
+is the one type today; any shipper the registry learns to exec is one
+tomorrow. The registry is one directory per follower:
 .PP
-Which means a store does not know its readers unless it is told where to
-look. Declaring
-.B cursors
-names that directory \(em
-.B timberfs set backing/app.log cursors=/var/lib/timberfs
-\(em and nothing more: the store never writes there, and a reader never
-writes to the store. Cursors are matched to stores by the store
-IDENTITY each one carries (the
+.RS
+.nf
+/var/lib/timberfs/followers/<name>/
+    follower.json   store, type, retaining, config  (the operator writes)
+    cursor.json     seq, n, delivered               (the follower writes)
+    follower.lock   held while it runs              (`run` acquires)
+.fi
+.RE
+.PP
+The declaration and the position are separate files because they have
+separate OWNERS: a position save is a whole-file replace that
+deliberately drops keys it does not own, so one file would make every
+position write preserve operator fields, and would race
+.BR update .
+The lock is a third file because a position save replaces its inode by
+rename, and a lock on a renamed-over inode silently stops excluding
+anyone.
+.PP
+This is a Postgres replication slot, and the parallel holds all the way
+down: an operator-chosen name unique per host while the registration
+itself records which store it belongs to, and an unused registration
+pinning data forever \(em with a size budget as the backstop, exactly as
+.B max_slot_wal_keep_size
+is. timberfs remains a log with interest-based truncation, not a work
+queue: position-based and at-least-once, with no per-entry ack, no
+redelivery and no dead-letter.
+.PP
+.B The follower declares its store, by identity.
+Flat names mean the relation is recorded ONCE, by the party that knows
+it, so a store keeps no follower list and there is no reverse index to
+fall out of sync. The identity is the store's
 .B .bark
 .IR id ,
-or the canonical path for a store that declares none), so ONE directory
-serves every store on a host \(em typically the shipper units'
-.BR StateDirectory= .
-A cursor for another store is simply not this store's; files that are
-not readable as cursors are counted, not reported one by one, and an
-in-flight
-.I .tmp
-save is skipped.
+minted by
+.B follower create
+when the store has none: a path would not do, a store being movable, and
+a path can come to hold a different store.
+.PP
+.B Why a registered object and not a cursor found by convention.
+A directory of cursors cannot express INTENT \(em an ad-hoc
+.B \-\-cursor
+left behind in it would pin the store, so a reader would change
+retention by leaving a file around. It cannot tell
+.RI \(dq "nobody has ever read this" \(dq
+from
+.RI \(dq "the consumer's file was deleted" \(dq
+\(em both are zero cursors, and the first is exactly the follower
+deployed before it first runs. And deriving a cursor's path from a
+program name, which is what made the convention convenient, COLLIDES the
+moment two shippers of one type follow one store: last writer wins, one
+advances past data the other never sent.
 .PP
 .B timberfs list
-then carries a
-.B CONSUMERS
+carries a
+.B FOLLOWERS
 column and
 .B timberfs info
 a
-.B consumers
-block. Per consumer:
+.B followers
+block. Per follower:
 .B how far behind
 on the write axis
 .RI ( "at the live edge"
-when nothing newer than its position exists \(em a consumer keeping up
+when nothing newer than its position exists \(em a follower keeping up
 with a live store always sits INSIDE the newest chunk, never past it),
 .B how much it is holding
-(compressed bytes from its own chunk to the end of the store), and
+(compressed bytes from its own chunk to the end of the store),
 .B how much it has delivered
-in total. The store-level number is the
-.B furthest-behind
-consumer's backlog: a spool is large because one consumer is behind, and
-this names which.
+in total, and whether it is
+.BR running .
+The store-level number is the furthest-behind RETAINING follower's
+backlog \(em or the whole store, when one of them has never run, since
+that one holds everything.
 .PP
 .B GAP
-is the one alarming state. Retention acts on the head of a store and
-nothing coordinates it with a consumer's progress, so a consumer down
-longer than the store's
+is the one alarming state. Retention acts on the head of a store, so a
+follower down longer than the store's
 .B retain
 window has its position dropped out from under it; it then resumes at
-whatever is now oldest, and the chunks in between are gone \(em reported as
-an exact COUNT, the chunk numbers stating how many rather than a timestamp
-comparison implying a duration.
+whatever is now oldest, and the chunks in between are gone \(em reported
+as an exact COUNT, the chunk numbers stating how many rather than a
+timestamp comparison implying a duration.
 .BR timber\-otlp (1)
 warns by name on resume with the size of the hole, and this view shows
 the same fact from the store's side, before it becomes loss. What to
-watch is a consumer whose lag approaches the retention window \(em that
-is the disconnection budget being spent, and nothing enforces that a
-consumer stays inside it.
+watch is a follower whose lag approaches the retention window \(em that
+is the disconnection budget being spent.
+.PP
+.B The lock never gates retention.
+A follower that is temporarily down holds no lock and, once
+.B retaining
+is honoured, must still pin the head \(em that is the entire purpose of a
+spool. The lock detects collisions and reports liveness; it decides
+nothing about what may be dropped. Inverting that would turn
+.RI \(dq "the shipper is down" \(dq
+into
+.RI \(dq "drop everything it had not read" \(dq.
+.PP
+.B The cursors key is superseded.
+Before the registry a store could DECLARE a directory to look in \(em
+.B timberfs set backing/app.log cursors=/var/lib/timberfs
+\(em and every cursor there naming that store was reported as a
+consumer. A follower declares its store, so a store declares nothing;
+the key is still honoured, and reported as superseded wherever it is
+found. Keep it only for an unregistered read-only tap, and expect it to
+go.
+.PP
+.B What retaining does not do yet.
+The flag is declared and reported, and no writer acts on it in this
+release: the store-side rule
+.RB ( retain_unconsumed ,
+which will require a
+.B retain_size
+alongside it as the backstop) lands next.
+.B follower status
+says so per follower rather than letting a declared interest read as an
+enforced one.
 .SH FORESTS
 A
 .I forest
@@ -1631,7 +1867,40 @@ One instance per store \(em the cursor is a position in one store, and a
 stalled receiver must not hold up an unrelated one. Its cursor lives in
 .IR /var/lib/timberfs/ .
 .PP
-The full directory layout, all seven unit families, the ownership model and
+.B timberfs\-follower@.service
+is the registry's version of that, and the one to prefer: declare the
+follower once with
+.B timberfs follower create
+and the unit needs no per-instance
+.I .conf
+at all, because the store, the type and the endpoint are in the
+declaration.
+.B ExecStart
+is
+.BR "timberfs follower run %i" ,
+which reads that declaration and EXECs the right shipper \(em a
+dispatcher, not a supervisor, so systemd keeps the lifecycle. Its
+.B StateDirectory=
+is
+.IB /var/lib/timberfs/followers/ instance \fR,
+holding the declaration, the position and the lock;
+.I those permissions decide what a store's retention may drop,
+so treat the directory as privileged. An optional
+.IB /etc/timberfs/follower- instance .conf
+exists only for SECRETS \(em the registry is world-readable so that
+.B follower list
+and
+.B info
+work without write access, which is no place for a bearer token.
+.PP
+.B Not to be confused with
+.B timberfs\-follow@.service
+\(em one letter, opposite direction. That one is an INTAKE
+.RB ( "timberfs import \-\-follow" ):
+it reads a producer's file INTO a store. This one reads a store OUT to
+somewhere else.
+.PP
+The full directory layout, all eight unit families, the ownership model and
 self\-restart on upgrade are documented in
 .IR /usr/share/doc/timberfs/deployment.md .
 .SH EXAMPLES

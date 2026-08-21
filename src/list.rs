@@ -8,6 +8,7 @@
 //! how a user SEES the ambiguity: the same handle in two forests shows up
 //! as two rows, never deduped or merged.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -33,6 +34,9 @@ pub fn cmd_list(dirs: &[PathBuf], names_only: bool, json: bool) -> anyhow::Resul
         return Ok(());
     }
 
+    // Once per listing, not once per store: every scan of the registry
+    // reads each follower's rings to place its position.
+    let mut registry = crate::follower::by_store(&crate::follower::registry_dir());
     let mut rows: Vec<Row> = Vec::new();
     for forest in &forests {
         if !forest.dir.is_dir() {
@@ -44,7 +48,7 @@ pub fn cmd_list(dirs: &[PathBuf], names_only: bool, json: bool) -> anyhow::Resul
             continue;
         }
         for (handle, path) in crate::forest::scan_forest(&forest.dir) {
-            match open_summary(&path) {
+            match open_summary(&path, &mut registry) {
                 Ok((dir, summary)) => rows.push(Row {
                     handle,
                     forest: forest.name.clone(),
@@ -76,13 +80,20 @@ pub fn cmd_list(dirs: &[PathBuf], names_only: bool, json: bool) -> anyhow::Resul
 
 /// Read a store's index and manifest directly (no trunk file needed — list
 /// never reads data), and summarize it.
-fn open_summary(logical: &Path) -> anyhow::Result<(PathBuf, StoreSummary)> {
+fn open_summary(
+    logical: &Path,
+    registry: &mut HashMap<String, Vec<crate::follower::Registered>>,
+) -> anyhow::Result<(PathBuf, StoreSummary)> {
     let (dir, name) = crate::query::resolve_backing(logical)?;
     let rings = crate::format::rings_path(&dir, &name);
     let records = crate::format::read_index(&rings)
         .with_context(|| format!("reading index {}", rings.display()))?;
     let bark = crate::bark::load(&dir, &name);
-    let summary = crate::query::summarize_store(&dir, &name, &records, bark.as_ref());
+    // Taken, not cloned: a store is summarised once per listing, and its
+    // followers belong to nobody else.
+    let anchor = crate::cursor::store_anchor(&dir, &name, bark.as_ref());
+    let followers = registry.remove(&anchor).unwrap_or_default();
+    let summary = crate::query::summarize_store(&dir, &name, &records, bark.as_ref(), followers);
     Ok((dir, summary))
 }
 
@@ -109,34 +120,35 @@ const COLUMNS: [&str; 7] = [
     "HANDLE", "FOREST", "SIZE", "SPAN", "WRITER", "INDEX", "RETAIN",
 ];
 
-/// The CONSUMERS column: how many consumers hold a position in this
-/// store, and the worst of them — the one that decides how much of the
-/// store is unread. `-` when the store declares no `cursors` directory,
-/// which is not the same as `0` (declared, and nothing is reading).
-fn consumers_text(s: &StoreSummary) -> String {
-    match &s.consumers {
-        None => "-".to_string(),
-        Some(sv) => match sv.worst() {
-            None => "0".to_string(),
-            Some(w) => format!("{}, {}", sv.consumers.len(), w.standing.lag_text()),
-        },
+/// The FOLLOWERS column: how many readers hold a position in this store,
+/// and the worst of them — the one that decides how much of the store is
+/// unread. `0` where something is declared and nothing is reading, which
+/// is a real state and a dangerous-looking one; `-` only where there is
+/// nothing to say at all.
+fn followers_text(s: &StoreSummary) -> String {
+    if !s.has_readers() {
+        return "-".to_string();
+    }
+    match (s.reader_count(), s.worst_lag()) {
+        (0, _) | (_, None) => "0".to_string(),
+        (n, Some(lag)) => format!("{n}, {lag}"),
     }
 }
 
-/// Only stores that declare a cursor directory have anything to say
-/// here, and most don't — so the column appears when at least one row
-/// fills it, rather than taxing every table with a column of dashes.
+/// Most stores have no followers, so the column appears when at least
+/// one row fills it rather than taxing every table with a column of
+/// dashes.
 fn columns(rows: &[Row]) -> Vec<&'static str> {
     let mut cols = COLUMNS.to_vec();
-    if rows.iter().any(|r| r.summary.consumers.is_some()) {
-        cols.push("CONSUMERS");
+    if rows.iter().any(|r| r.summary.has_readers()) {
+        cols.push("FOLLOWERS");
     }
     cols
 }
 
 /// One row's cells, in `columns` order — a pure function of a `Row`, so
 /// it (and the table it feeds) is unit-testable without touching disk.
-fn row_cells(r: &Row, with_consumers: bool) -> Vec<String> {
+fn row_cells(r: &Row, with_followers: bool) -> Vec<String> {
     let mut cells = vec![
         r.handle.clone(),
         r.forest.clone(),
@@ -151,8 +163,8 @@ fn row_cells(r: &Row, with_consumers: bool) -> Vec<String> {
         if r.summary.indexed() { "grain" } else { "-" }.to_string(),
         retain_text(&r.summary),
     ];
-    if with_consumers {
-        cells.push(consumers_text(&r.summary));
+    if with_followers {
+        cells.push(followers_text(&r.summary));
     }
     cells
 }
@@ -160,7 +172,7 @@ fn row_cells(r: &Row, with_consumers: bool) -> Vec<String> {
 /// Render an aligned table: a header plus one row per store, columns
 /// left-aligned and sized to the widest cell (handles/forest names have no
 /// fixed width, unlike `info`'s fixed-width tables).
-fn format_table(header: &[&str], rows: &[Vec<String>]) -> String {
+pub(crate) fn format_table(header: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -188,8 +200,8 @@ fn format_table(header: &[&str], rows: &[Vec<String>]) -> String {
 
 fn print_table(rows: &[Row]) {
     let cols = columns(rows);
-    let with_consumers = cols.len() > COLUMNS.len();
-    let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, with_consumers)).collect();
+    let with_followers = cols.len() > COLUMNS.len();
+    let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, with_followers)).collect();
     println!("{}", format_table(&cols, &data));
 }
 
@@ -232,9 +244,19 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
                         .map(Into::into)
                         .unwrap_or(serde_json::Value::Null),
                 );
+                // Always an array, never null: the registry knows every
+                // follower of every store, so empty means empty.
+                o.insert(
+                    "followers".to_string(),
+                    serde_json::Value::Array(
+                        s.followers.iter().map(crate::follower::to_json).collect(),
+                    ),
+                );
                 match &s.consumers {
                     // Null distinguishes "no cursor directory declared"
                     // from an empty array: "declared, nobody reading".
+                    // Superseded by `followers`, still reported while the
+                    // key is honoured.
                     None => {
                         o.insert("cursors_dir".to_string(), serde_json::Value::Null);
                         o.insert("consumers".to_string(), serde_json::Value::Null);
@@ -280,6 +302,7 @@ mod tests {
             sap_pending_bytes: None,
             retain: retain.map(str::to_string),
             retain_size: retain_size.map(str::to_string),
+            followers: Vec::new(),
             consumers: None,
             writer,
         }
@@ -320,24 +343,27 @@ mod tests {
     }
 
     #[test]
-    fn consumers_text_separates_undeclared_from_nobody_reading() {
+    fn followers_text_separates_nothing_to_say_from_nobody_reading() {
         let mut s = summary(0, None, WriterState::Idle, false, None, None);
-        assert_eq!(consumers_text(&s), "-");
+        // Nothing registered and nothing declared: no claim on the column.
+        assert_eq!(followers_text(&s), "-");
+        // A declared-but-empty cursors directory is a real state, and the
+        // dangerous one — nothing holds anything back.
         s.consumers = Some(survey(vec![]));
-        assert_eq!(consumers_text(&s), "0");
+        assert_eq!(followers_text(&s), "0");
         s.consumers = Some(survey(vec![("otlp", 0, 0, None)]));
-        assert_eq!(consumers_text(&s), "1, caught up");
+        assert_eq!(followers_text(&s), "1, caught up");
         s.consumers = Some(survey(vec![
             ("splitter", 4096, 90_000, None),
             ("otlp", 0, 0, None),
         ]));
-        assert_eq!(consumers_text(&s), "2, 1m 30s behind");
+        assert_eq!(followers_text(&s), "2, 1m 30s behind");
         s.consumers = Some(survey(vec![("splitter", 4096, 90_000, Some(9))]));
-        assert_eq!(consumers_text(&s), "1, GAP");
+        assert_eq!(followers_text(&s), "1, GAP");
     }
 
     #[test]
-    fn the_consumers_column_appears_only_where_something_declares_one() {
+    fn the_followers_column_appears_only_where_something_fills_it() {
         let plain = [row(
             "nginx",
             "default",
@@ -356,13 +382,14 @@ mod tests {
             ),
         ];
         let cols = columns(&rows);
-        assert_eq!(cols.last(), Some(&"CONSUMERS"));
+        assert_eq!(cols.last(), Some(&"FOLLOWERS"));
         let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, true)).collect();
         assert_eq!(data[0][7], "1, caught up");
-        // A store with no declaration keeps a dash in the shared column.
+        // A store with nothing reading it keeps a dash in the shared
+        // column.
         assert_eq!(data[1][7], "-");
         let table = format_table(&cols, &data);
-        assert!(table.lines().next().unwrap().contains("CONSUMERS"));
+        assert!(table.lines().next().unwrap().contains("FOLLOWERS"));
     }
 
     #[test]
