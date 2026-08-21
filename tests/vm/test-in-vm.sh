@@ -1895,16 +1895,23 @@ cursor_converts_from_a_write_time_position() {
         sleep 1.1
     done
 
-    # Hand-write the pre-numbering shape: a write time, no `seq`.
+    # Let the shipper mint a real cursor first — the store anchor is its
+    # `.bark` id or a CANONICAL path, and hand-writing it would only test
+    # whether this test can guess that. Then downgrade the file to the
+    # pre-numbering shape: a write time, no `seq`.
+    timeout 20 timber-otlp --follow --cursor "$cur" --start begin \
+        --endpoint http://127.0.0.1:4318 "$store" >/dev/null 2>&1
+    jq -e '.seq != null' "$cur" >/dev/null || { cat "$cur" 2>&1; return 1; }
     python3 - "$store" "$cur" << 'PYEOF' || return 1
 import json, struct, sys
 store, cur = sys.argv[1], sys.argv[2]
+c = json.load(open(cur))
 raw = open(store + ".rings", "rb").read()
-# the middle chunk's last_write_ms, i.e. a position inside chunk 1
+# the middle chunk's window, i.e. a position inside chunk 1
 rec = struct.unpack("<7Q", raw[64 + 56:64 + 112])
-json.dump({"consumer": "timber-otlp", "store": "path:" + store, "path": store,
-           "wf": rec[4], "wl": rec[5], "n": 2, "delivered": 2},
-          open(cur, "w"))
+del c["seq"]
+c["wf"], c["wl"], c["n"] = rec[4], rec[5], 2
+json.dump(c, open(cur, "w"))
 PYEOF
 
     timeout 20 timber-otlp --follow --cursor "$cur" \
@@ -2056,13 +2063,14 @@ sid = json.load(open(store + ".bark"))["id"]
 raw = open(store + ".rings", "rb").read()
 recs = [struct.unpack("<7Q", raw[64 + i * 56:120 + i * 56]) for i in range((len(raw) - 64) // 56)]
 assert len(recs) >= 3, recs
-def cursor(name, wf, wl, delivered):
+def cursor(name, seq, wl, delivered):
     json.dump({"consumer": name, "store": sid, "path": store,
-               "wf": wf, "wl": wl, "n": 1, "delivered": delivered},
+               "seq": seq, "n": 1, "wl": wl, "delivered": delivered},
               open("%s/%s.cursor" % (cdir, name), "w"))
-cursor("edge", recs[-1][4], recs[-1][5], 100)   # in the newest chunk: keeping up
-cursor("lagging", recs[0][4], recs[0][5], 10)   # still in the oldest: behind
-json.dump({"consumer": "other", "store": "not-this-store", "wl": 1},
+# The position is a chunk NUMBER; wl is informational only.
+cursor("edge", recs[-1][6], recs[-1][5], 100)   # in the newest chunk: keeping up
+cursor("lagging", recs[0][6], recs[0][5], 10)   # still in the oldest: behind
+json.dump({"consumer": "other", "store": "not-this-store", "seq": 1, "wl": 1},
           open(cdir + "/other.cursor", "w"))
 open(cdir + "/README", "w").write("not a cursor\n")
 PYEOF
@@ -2095,15 +2103,22 @@ PYEOF
     jq -e '[.[] | select(.handle != "consumed") | .consumers] | all(. == null)' \
         /tmp/consumers.ljson >/dev/null || return 1
 
-    # A position older than anything the store holds: retention outran it.
+    # A GAP now REQUIRES chunks to be gone, which is the point: the number
+    # states it rather than a timestamp implying it. So drop the head, then
+    # leave a cursor standing at a chunk that no longer exists.
+    local cut
+    cut=$(timberfs index "$store" | awk 'NR==3 {print $6" "substr($7,1,8)}')
+    timberfs rotate "$store" --cutoff "$cut" --delete --quiet >/dev/null 2>&1 || return 1
+    timberfs index "$store" | awk '$1 ~ /^[0-9]+$/ {print $1; exit}' | grep -qv '^0$' \
+        || { echo "expected the surviving chunks to start above 0" >&2; return 1; }
     python3 - "$store" "$cdir" << 'PYEOF' || return 1
 import json, struct, sys
 store, cdir = sys.argv[1], sys.argv[2]
 sid = json.load(open(store + ".bark"))["id"]
 raw = open(store + ".rings", "rb").read()
-first = struct.unpack("<7Q", raw[64:120])[4]
+oldest = struct.unpack("<7Q", raw[64:120])
 json.dump({"consumer": "dropped", "store": sid, "path": store,
-           "wf": first - 600000, "wl": first - 600000, "n": 0, "delivered": 5000},
+           "seq": 0, "n": 0, "wl": oldest[5], "delivered": 5000},
           open(cdir + "/dropped.cursor", "w"))
 PYEOF
     timberfs info "$store" | grep -qE '^ +dropped +GAP' || { timberfs info "$store"; return 1; }
