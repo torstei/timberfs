@@ -2490,6 +2490,20 @@ run_test "consumers: list/info show lag and held bytes; a dropped position is a 
 # when the size budget overrides it the loss is recorded exactly.
 RU_STORE="$PIPE_BACKING/vmunconsumed.log"
 
+declared_booleans_are_booleans() {
+    # `--set index=true` writing "index": "true" declares a key every
+    # reader evaluates as FALSE -- silently declared, silently ignored. The
+    # two spellings must agree, so both are checked here.
+    rm -f "$PIPE_BACKING"/vmbool.log.*
+    timberfs create --set index=true --set host=edge01 "$PIPE_BACKING/vmbool.log" >/dev/null 2>&1         || return 1
+    jq -e '.index == true and .host == "edge01"' "$PIPE_BACKING/vmbool.log.bark" >/dev/null         || { cat "$PIPE_BACKING/vmbool.log.bark"; return 1; }
+    timberfs set "$PIPE_BACKING/vmbool.log" wal=true >/dev/null 2>&1 || return 1
+    jq -e '.wal == true' "$PIPE_BACKING/vmbool.log.bark" >/dev/null || return 1
+    # And a value that is neither is refused rather than stored as truthy.
+    timberfs create --set index=yes "$PIPE_BACKING/vmbool2.log" > /tmp/bool.err 2>&1 && return 1
+    grep -q 'true or false' /tmp/bool.err || { cat /tmp/bool.err; return 1; }
+}
+
 retain_unconsumed_needs_its_backstop() {
     # Interest only ever holds MORE, so without a budget one stalled
     # follower fills the disk and kills the producer. Refused at the
@@ -2699,6 +2713,21 @@ PYEOF
     # what a cron entry over a whole forest needs.
     timberfs trim "$PIPE_BACKING/piped.log" > /tmp/tr.none 2>&1 || return 1
     grep -q 'declares no retention' /tmp/tr.none || { cat /tmp/tr.none; return 1; }
+
+    # A MOUNTED store is the other hands-off case, and a different lock:
+    # the mount daemon holds the whole directory, and its own tick is
+    # already enforcing this once a second.
+    timberfs set "$BACKING/app.log" retain_size=1G >/dev/null 2>&1 || return 1
+    timberfs trim "$BACKING/app.log" > /tmp/tr.mnt 2>&1 || { cat /tmp/tr.mnt; return 1; }
+    grep -q 'live timberfs mount' /tmp/tr.mnt || { cat /tmp/tr.mnt; return 1; }
+    grep -q "$MNT" /tmp/tr.mnt || { cat /tmp/tr.mnt; return 1; }
+    timberfs set "$BACKING/app.log" --unset retain_size >/dev/null 2>&1
+
+    # A bundle has no retention to enforce, and says so rather than
+    # pretending to try.
+    timberfs trim /tmp/f.timber > /tmp/tr.bundle 2>&1 && return 1
+    grep -q 'read-only' /tmp/tr.bundle || { cat /tmp/tr.bundle; return 1; }
+    return 0
 }
 
 retain_unconsumed_views_agree() {
@@ -2727,6 +2756,7 @@ run_test "follower: liveness from the inherited lock; a second run is refused" f
 run_test "follower: info grows a followers block, list a FOLLOWERS column" follower_store_side_view
 run_test "follower: retiring one is update-then-delete, and says what it frees" follower_retirement_is_two_commands
 run_test "follower: unit, conf example and man page installed" follower_unit_installed
+run_test "bark: create --set declares booleans as booleans, like set" declared_booleans_are_booleans
 run_test "retain_unconsumed: refused without the retain_size backstop" retain_unconsumed_needs_its_backstop
 run_test "retain_unconsumed: a never-run follower holds all; a position releases the prefix" retain_unconsumed_holds_then_releases
 run_test "retain_unconsumed: every way of not knowing drops nothing" retain_unconsumed_fails_closed

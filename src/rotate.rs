@@ -158,7 +158,16 @@ pub fn cmd_trim(store: &Path, dry_run: bool) -> anyhow::Result<()> {
     }
 
     let records = format::read_index(&rings)?;
-    let next_seq = records.last().map(|c| c.seq + 1).unwrap_or(0);
+    // From the rings HEADER, not from the last record: retention is allowed
+    // to drop every chunk, and the numbering must not restart when it does
+    // — so on an emptied store the records say 0 while the header says
+    // where the next chunk actually continues from. The writer reads the
+    // header, and a preview that disagreed with it would call a legitimate
+    // position impossible.
+    let next_seq = std::fs::File::open(&rings)
+        .and_then(|f| format::read_header_next_seq(&f))
+        .unwrap_or(0)
+        .max(records.last().map(|c| c.seq + 1).unwrap_or(0));
     let anchor = crate::follower::anchor_of(&dir, &name);
     let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
     if policy.unconsumed {

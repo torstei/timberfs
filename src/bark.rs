@@ -359,7 +359,7 @@ pub fn cmd_create(
         if k == "cursors" {
             validate_cursors_dir(v)?;
         }
-        map.insert(k.to_string(), Value::String(v.to_string()));
+        map.insert(k.to_string(), declared_value(k, v)?);
     }
     // Same check `set` makes, on the same whole manifest: a declaration
     // that no writer could act on must fail before the store exists.
@@ -452,6 +452,24 @@ fn warn_declaration_drift(dir: &Path, name: &str, declared: &Map<String, Value>)
 /// Identity and lineage are facts, not settings — never user-settable.
 const PROTECTED: &[&str] = &["id", "created", "derived_from", "derived_op"];
 
+/// Keys whose value is a JSON boolean, not a string. Shared by `create
+/// --set` and `set` so the two spell the same manifest: writing
+/// `"index": "true"` produces a key every reader evaluates as FALSE, which
+/// is the worst kind of wrong — silently declared and silently ignored.
+const BOOLEAN_KEYS: &[&str] = &["index", "wal", "timestamp_utc", "retain_unconsumed"];
+
+/// A `KEY=VALUE` from the command line, as the manifest should hold it.
+fn declared_value(k: &str, v: &str) -> anyhow::Result<Value> {
+    if !BOOLEAN_KEYS.contains(&k) {
+        return Ok(Value::String(v.to_string()));
+    }
+    match v {
+        "true" => Ok(Value::Bool(true)),
+        "false" => Ok(Value::Bool(false)),
+        _ => bail!("\"{k}\" is true or false"),
+    }
+}
+
 /// `cursors`: the directory this store's consumers keep their positions
 /// in. Validated at declaration time because a wrong value is SILENT —
 /// the store simply appears to have no consumers, which is also the
@@ -521,11 +539,7 @@ pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Resu
                 crate::append::parse_size_bytes(&v)?;
                 Value::String(v)
             }
-            "index" | "wal" | "timestamp_utc" | "retain_unconsumed" => match v.as_str() {
-                "true" => Value::Bool(true),
-                "false" => Value::Bool(false),
-                _ => bail!("\"{k}\" is true or false"),
-            },
+            _ if BOOLEAN_KEYS.contains(&k) => declared_value(k, &v)?,
             "timestamp_regex" => {
                 let re = regex::Regex::new(&v)
                     .with_context(|| "\"timestamp_regex\" does not compile".to_string())?;
@@ -625,6 +639,26 @@ mod tests {
         assert!(
             retention_from_map(&map(&[("retain_unconsumed", Value::String("yes".into()))]))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_declared_boolean_is_a_boolean_not_the_word() {
+        // `--set index=true` writing "index": "true" declares a key every
+        // reader evaluates as FALSE: silently declared, silently ignored.
+        // `create --set` and `set` share one rule so they cannot diverge.
+        for k in BOOLEAN_KEYS {
+            assert_eq!(declared_value(k, "true").unwrap(), Value::Bool(true));
+            assert_eq!(declared_value(k, "false").unwrap(), Value::Bool(false));
+            assert!(
+                declared_value(k, "yes").is_err(),
+                "{k}=yes must be refused, not stored as a truthy string"
+            );
+        }
+        // Everything else is free-form provenance and stays a string.
+        assert_eq!(
+            declared_value("host", "edge01").unwrap(),
+            Value::String("edge01".into())
         );
     }
 
