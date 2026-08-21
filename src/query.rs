@@ -1965,7 +1965,7 @@ fn print_followers(followers: &[crate::follower::Registered], compressed: u64) {
                 Some(c) if c.delivered > 0 => format!("; {} delivered", c.delivered),
                 _ => String::new(),
             },
-            r.live.text(),
+            r.live.word(),
             width = width
         );
     }

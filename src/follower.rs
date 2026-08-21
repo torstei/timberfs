@@ -458,11 +458,21 @@ pub enum Liveness {
 }
 
 impl Liveness {
+    /// For the RUNNING column, where the header supplies the question.
     pub fn text(&self) -> &'static str {
         match self {
             Liveness::Running => "yes",
             Liveness::Stopped => "no",
             Liveness::Unknown => "?",
+        }
+    }
+
+    /// For a line with no column header to lean on.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Liveness::Running => "running",
+            Liveness::Stopped => "stopped",
+            Liveness::Unknown => "liveness unknown",
         }
     }
 }
@@ -589,6 +599,10 @@ impl Registered {
 /// declaration — a follower whose store is gone is still a registration,
 /// and hiding it would hide the very thing an operator has to clean up.
 pub fn read(reg: &Path, name: &str) -> anyhow::Result<Registered> {
+    // One place guards every road into the registry: a name is a path
+    // component here, so anything that is not a legal follower name has no
+    // business being joined onto the registry directory.
+    validate_name(name)?;
     let decl = Declaration::load(reg, name)?;
     let cursor = Cursor::load(&cursor_path(reg, name)).unwrap_or(None);
     let live = liveness(reg, name);
@@ -911,11 +925,13 @@ pub fn to_json(r: &Registered) -> Value {
         },
     );
     o.insert("unit".into(), unit_name(r.name()).into());
+    // The same keys whether or not there is a position, so a consumer
+    // tests for a VALUE rather than for a key's presence.
     match &r.cursor {
         None => {
-            o.insert("seq".into(), Value::Null);
-            o.insert("n".into(), Value::Null);
-            o.insert("delivered".into(), Value::Null);
+            for k in ["seq", "n", "delivered", "wl"] {
+                o.insert(k.into(), Value::Null);
+            }
         }
         Some(c) => {
             o.insert("seq".into(), c.seq.map(Into::into).unwrap_or(Value::Null));
@@ -1140,6 +1156,16 @@ pub fn cmd_update(
             "store" => {
                 let store = crate::forest::resolve_source(Path::new(v))?;
                 let (sdir, sname) = resolve_backing(&store)?;
+                // Checked before minting: `ensure_identified` WRITES, so a
+                // typo would otherwise leave a stray manifest next to no
+                // store, and the follower would point at it.
+                if !format::rings_path(&sdir, &sname).exists() {
+                    bail!(
+                        "no timberfs store {sname} in {} — a follower is a position in a store \
+                         that exists",
+                        sdir.display()
+                    );
+                }
                 let bark = crate::bark::ensure_identified(&sdir, &sname)?;
                 let anchor = cursor::store_anchor(&sdir, &sname, Some(&bark));
                 // Re-pointing a follower at a DIFFERENT store leaves its
@@ -1257,12 +1283,10 @@ pub fn cmd_delete(name: &str, stop: bool, disable: bool) -> anyhow::Result<()> {
     // either, so it deletes — a ghost must be removable by the command
     // that finds it.
     let r = read(&reg, name).ok();
-    if stop {
-        systemctl("stop", name)?;
-    }
-    if disable {
-        systemctl("disable", name)?;
-    }
+    // Every refusal comes BEFORE anything is touched, `--stop`/`--disable`
+    // included: a command that declines must leave nothing behind, and
+    // stopping the unit of a follower we are about to refuse to delete
+    // would be exactly the silent release the refusal exists to prevent.
     if let Some(r) = &r {
         if r.decl.retaining && r.store_path.is_some() {
             bail!(
@@ -1272,21 +1296,31 @@ pub fn cmd_delete(name: &str, stop: bool, disable: bool) -> anyhow::Result<()> {
                  timberfs follower delete {name}"
             );
         }
-        match liveness(&reg, name) {
-            Liveness::Running => bail!(
-                "{name} is running{} — deleting it now would leave it writing an unlinked \
-                 cursor, doing nothing at all. Stop it first (`--stop`, or `systemctl stop {}`)",
-                store::describe_lock_holder(&lock_path(&reg, name))
-                    .map(|w| format!(" ({w})"))
-                    .unwrap_or_default(),
-                unit_name(name)
-            ),
-            Liveness::Unknown => bail!(
-                "cannot tell whether {name} is running: {} is not readable from here",
-                lock_path(&reg, name).display()
-            ),
-            Liveness::Stopped => {}
-        }
+    }
+    if stop {
+        systemctl("stop", name)?;
+    }
+    // Probed after the stop, since that is what a `--stop` is for, and it
+    // is the LIVE state that decides — a follower deleted from under its
+    // own process would leave it writing an unlinked position file,
+    // silently doing nothing at all.
+    match liveness(&reg, name) {
+        Liveness::Running => bail!(
+            "{name} is running{} — deleting it now would leave it writing an unlinked \
+             cursor, doing nothing at all. Stop it first (`--stop`, or `systemctl stop {}`)",
+            store::describe_lock_holder(&lock_path(&reg, name))
+                .map(|w| format!(" ({w})"))
+                .unwrap_or_default(),
+            unit_name(name)
+        ),
+        Liveness::Unknown => bail!(
+            "cannot tell whether {name} is running: {} is not readable from here",
+            lock_path(&reg, name).display()
+        ),
+        Liveness::Stopped => {}
+    }
+    if disable {
+        systemctl("disable", name)?;
     }
     fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     crate::note!("timberfs: deleted follower {name} ({})", dir.display());

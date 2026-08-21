@@ -2388,11 +2388,21 @@ follower_liveness_and_collision() {
     # And it named the live holder, from the lock file's own record.
     grep -q 'timber-otlp' /tmp/f.race || { cat /tmp/f.race; return 1; }
 
-    # A running follower cannot be deleted out from under itself: it would
-    # be left writing an unlinked position file, doing nothing at all.
+    # A refusal must leave NOTHING behind, --stop/--disable included:
+    # stopping the unit of a follower we then decline to delete would be
+    # exactly the silent release the refusal exists to prevent.
+    timberfs follower delete vmfollow --stop --disable > /tmp/f.delret 2>&1 && return 1
+    grep -q 'is retaining' /tmp/f.delret || { cat /tmp/f.delret; return 1; }
+    systemctl --quiet is-active timberfs-follower@vmfollow         || { echo "the refused delete stopped the unit anyway" >&2; return 1; }
+    systemctl --quiet is-enabled timberfs-follower@vmfollow         || { echo "the refused delete disabled the unit anyway" >&2; return 1; }
+
+    # And once released, a RUNNING follower still cannot be deleted out
+    # from under itself: it would be left writing an unlinked position
+    # file, doing nothing at all.
     timberfs follower update vmfollow retaining=false >/dev/null 2>&1 || return 1
     timberfs follower delete vmfollow > /tmp/f.delrun 2>&1 && return 1
     grep -q 'is running' /tmp/f.delrun || { cat /tmp/f.delrun; return 1; }
+    systemctl --quiet is-active timberfs-follower@vmfollow || return 1
     timberfs follower update vmfollow retaining=true >/dev/null 2>&1
 }
 
