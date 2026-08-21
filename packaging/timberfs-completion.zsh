@@ -44,6 +44,7 @@ _timberfs_commands() {
         'index:show a store'\''s write-time chunk index'
         'list:list every store across the configured forests'
         'reindex:rebuild a store'\''s token index'
+        'trim:enforce a store'\''s declared retention once, now'
         'rotate:move or drop chunks written before a cutoff'
         'follower:manage the registered followers of a store'
         'forward-intake:receive the Fluentd Forward protocol over TCP'
@@ -75,7 +76,7 @@ _timberfs() {
     fi
 
     case $cmd in
-    query | info | index | reindex | set | rotate | export)
+    query | info | index | reindex | set | trim | rotate | export)
         _alternative 'handles:store handle:_timberfs_handles' 'files:file:_files'
         ;;
     *)

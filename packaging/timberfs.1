@@ -56,6 +56,10 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .RB [ \-\-delete ]
 .RB [ \-\-dry\-run ]
 .br
+.B timberfs trim
+.I STORE
+.RB [ \-\-dry\-run ]
+.br
 .B timberfs follower create
 .I NAME
 .B \-\-store
@@ -217,6 +221,17 @@ derived
 bark survives head-drops, travels on rename, and ships inside
 .B .timber
 bundles.
+.TP
+.B \-\-retain\-unconsumed
+Declare the third retention axis: keep what this store's RETAINING
+followers have not read, on TOP of the age and size axes rather than
+instead of them. Requires
+.BR \-\-retain\-size ,
+since interest only ever holds MORE and one stalled follower would
+otherwise fill the disk. See
+.B RETENTION
+and
+.BR FOLLOWERS .
 .SS set
 .B timberfs set
 .I FILE KEY=VALUE\|.\|.\|.
@@ -594,7 +609,7 @@ operate on a
 file directly (tar stores its members contiguously and uncompressed, so
 the trunk member is simply a trunk at an offset), and
 .B import
-merges them — unpacking is only ever needed to append. Stock tools always
+merges them \(em unpacking is only ever needed to append. Stock tools always
 suffice to recover one:
 .B tar xf x.timber && zstd \-dc x.trunk
 (a pair tarred by hand follows the same convention). Export always
@@ -946,6 +961,36 @@ prefix the store was, without decompressing anything \(em but any other
 rewrite of the chunk numbering does, and this is how you get it back. A
 grain that lags a growing log is still correct \(em uncovered chunks are
 simply scanned.
+.SS trim
+.B timberfs trim
+.I STORE
+enforces the store's DECLARED retention once, now.
+.PP
+Load-bearing rather than convenient. Retention runs inside a live
+WRITER \(em every appender, mount and intake enforces it on its own tick \(em
+so a store whose producer went quiet keeps its data indefinitely, and
+under
+.B retain_unconsumed
+that means keeping data already shipped off the box. This is the cron-able
+answer to that, and deliberately NOT the tempting shortcut of letting a
+follower collapse the head itself, which would make a reader a writer and
+put two of them on one head.
+.PP
+A store somebody else is writing is left ALONE and said so: that writer's
+own tick is already doing this, once a second, and taking its lock away to
+repeat the work is the one thing this must not do. A store that declares
+no retention is a no-op, not an error \(em which is what a cron entry over a
+whole forest needs.
+.TP
+.B \\-\\-dry\\-run
+Report how many chunks INTEREST would drop, and change nothing. Age and
+size are deliberately not previewed: both carry hysteresis and are decided
+by the writer at the moment it acts, so a number here would be a guess.
+.PP
+Reports the chunk NUMBERS it took, not just a count \(em after a head-drop
+the survivors keep their numbers, so a count says nothing about which
+chunks went, and those numbers are what a follower's position is compared
+against.
 .SS rotate
 .B timberfs rotate \-\-cutoff
 .I TIME SOURCE
@@ -1339,12 +1384,21 @@ unit sets it.
 .PP
 The verb name is provisional.
 .SH RETENTION
-Retention is a property of the LOG, declared in its manifest
-.RB ( retain
+Retention is a property of the LOG, declared in its manifest, on THREE
+axes:
+.B retain
 = keep at least this long,
 .B retain_size
-= compressed-size budget, oldest dropped first, whichever bites first)
-and enforced by
+= a compressed-size budget with the oldest dropped first, and
+.B retain_unconsumed
+= keep what this store's retaining
+.B FOLLOWERS
+have not read. They combine with
+.BR max ,
+never
+.BR min :
+each names a head prefix it would be happy to see gone, and the largest
+wins, so no axis can hold data another one has released. Enforced by
 .B every
 writer while it holds the writer locks: the appender and the mount
 daemon on their once-a-second tick, and
@@ -1364,7 +1418,47 @@ has no business expiring, which is also why retention, like all
 settings, is never inherited by derived stores.
 .B timberfs info
 shows the declared policy and calls out a store that is over budget
-with no writer running to enforce it.
+with no writer running to enforce it \(em which
+.BR "timberfs trim" ,
+above, is the one-shot answer to.
+.PP
+.B The third axis needs the second.
+.B retain_unconsumed
+is refused without a
+.BR retain_size ,
+and that is a design constraint rather than a validation nicety: interest
+only ever holds MORE, so with no budget beside it one stalled follower
+pins the store until the disk fills, which kills the PRODUCER \(em losing
+the newest data to protect the oldest, strictly the worse trade. An age
+window is not a substitute: it is a bet on how long a link stays down,
+which is the very thing this axis exists to stop anyone making.
+.PP
+.B Note:
+the CAP, not the consumption rule, is what decides an outage: it has
+to be sized as ingest-rate times the outage worth surviving. Interest
+retention does not remove that sizing \(em it removes the STEADY-STATE
+hoarding, the weeks of already-shipped bytes kept just in case, which is
+the actual win.
+.PP
+When the budget does override a follower, the loss is recorded EXACTLY,
+by the writer, at the moment it happens:
+.PP
+.RS
+.nf
+retain_size (50.0 KiB) reached with follower central at chunk 4200
+  \(em dropped chunks 4200..4830 it had not read
+.fi
+.RE
+.PP
+That is owed rather than optional. With finite disk, bounded loss is a
+choice already made \(em the alternative is blocking the producer, which
+for telemetry is worse than losing an hour of access logs \(em so what is
+owed is precise accounting at the moment it happens, and the writer holds
+both halves of the comparison right there.
+.BR timber\-otlp (1)\'s
+.B GAP
+warning is the same fact inferred later, from the other side, bounded only
+by timestamps; this one is exact.
 .SH FOLLOWERS
 A
 .I follower
@@ -1482,16 +1576,16 @@ the key is still honoured, and reported as superseded wherever it is
 found. Keep it only for an unregistered read-only tap, and expect it to
 go.
 .PP
-.B What retaining does not do yet.
-The flag is declared and reported, and no writer acts on it in this
-release: the store-side rule
-.RB ( retain_unconsumed ,
-which will require a
-.B retain_size
-alongside it as the backstop) lands next.
+.B What retaining costs the store.
+Nothing, until the store asks for it. The flag is one half of a pair: a
+follower declares that it retains, and the STORE declares
+.B retain_unconsumed
+(see
+.BR RETENTION ).
+Either alone holds nothing back, and
 .B follower status
-says so per follower rather than letting a declared interest read as an
-enforced one.
+says which case it is looking at rather than letting a declared interest
+read as an enforced one.
 .SH FORESTS
 A
 .I forest

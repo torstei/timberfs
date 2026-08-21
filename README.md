@@ -317,10 +317,49 @@ bring dropped data back. `delete` refuses while a follower is retaining or
 running; both refusals are about deliberateness rather than prevention, so there
 is no `--force` — the two-step *is* the force.
 
-> **In this release `retaining` is declared and reported, not enforced.** The
-> store-side rule (`retain_unconsumed`, which will require a `retain_size`
-> alongside it as the backstop) comes next; `timberfs follower status` says so
-> per follower rather than letting a declared interest read as an enforced one.
+`retaining` is one half of a pair — the **store** declares the other half, and
+that is where retention actually changes:
+
+```sh
+timberfs set app retain_size=50G retain_unconsumed=true
+```
+
+Now the head follows delivery. `retain_unconsumed` is refused without a
+`retain_size`, and that is the design rather than a validation nicety: interest
+only ever holds **more**, so with no budget beside it one stalled follower pins
+the store until the disk fills — which kills the *producer*, losing the newest
+data to protect the oldest. Which means the cap, not the consumption rule, is
+what decides an outage: size it as ingest-rate × the outage worth surviving.
+Interest retention doesn't remove that sizing — it removes the *steady-state
+hoarding*, the weeks of already-shipped bytes kept just in case, which is the
+actual win.
+
+The three axes combine with `max`, never `min`: each names a head prefix it
+would be happy to see gone, and the largest wins, so no axis can hold data
+another has released. And when the budget does override a follower, the writer
+records the loss exactly, at the moment it happens:
+
+```
+app.log: retain_size (50.0 GiB) reached with follower central at chunk 4200
+         — dropped chunks 4200..4830 it had not read
+```
+
+That's owed, not optional. With finite disk, bounded loss is a choice already
+made — the alternative is blocking the producer — so what's owed is precise
+accounting, and the writer holds both halves of the comparison right there. The
+shipper's `GAP` warning is the same fact inferred later, from the other side,
+bounded only by timestamps; this one is exact.
+
+Retention only ever runs inside a live **writer**, so a store whose producer went
+quiet keeps its data — including data already shipped off the box. `timberfs
+trim` is the cron-able one-shot for that, and it leaves a store somebody else is
+writing alone, because that writer's own tick is already doing the job:
+
+```sh
+timberfs trim app --dry-run   # how many chunks interest would drop
+timberfs trim app
+```
+
 > The older `cursors=<dir>` key still works and is reported as superseded.
 
 ## Rotation & retention
@@ -341,6 +380,23 @@ compressed bytes verbatim (no re/decompression) and rebases the index, so it
 costs I/O proportional to the compressed size. It runs against a live mount
 (auto-detected, routed through the daemon atomically) and is chunk-granular
 like queries. Details: `man timberfs`.
+
+Continuous retention is declared on the store, on three axes, and enforced by
+every writer on its own tick:
+
+```sh
+timberfs set app retain=90d retain_size=50G retain_unconsumed=true
+```
+
+Keep at least 90 days, stay under 50 GiB compressed, and keep whatever this
+store's [retaining followers](#followers-who-is-reading-and-how-far-behind)
+have not read. They combine with `max`, never `min` — each names a head prefix
+it would be happy to see gone, and the largest wins, so no axis can hold data
+another has released.
+
+Retention runs *inside a writer*, so an idle store keeps its data; `timberfs
+trim` is the cron-able one-shot, and it leaves a store somebody else is writing
+alone because that writer's tick is already doing the job.
 
 ## Durability and the live edge (`--wal`)
 

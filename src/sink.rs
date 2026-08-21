@@ -221,12 +221,27 @@ pub fn cmd_records_sink(
                 st.lock().unwrap().sync_wal_declarations();
                 match crate::bark::declared_retention(&dir, &name) {
                     Ok(policy) if policy.is_some() => {
-                        if let Err(e) = st.lock().unwrap().enforce_retention(
+                        let anchor = crate::follower::anchor_of(&dir, &name);
+                        let next_seq = st.lock().unwrap().next_seq(&name).unwrap_or(0);
+                        let held = crate::follower::TickInterest::default()
+                            .floor(&policy, &anchor, next_seq);
+                        match st.lock().unwrap().enforce_retention(
                             &name,
                             policy.max_age_ms,
                             policy.max_comp_bytes,
+                            held.floor,
                         ) {
-                            eprintln!("timberfs: {name}: background retention failed: {e}");
+                            Err(e) => {
+                                eprintln!("timberfs: {name}: background retention failed: {e}")
+                            }
+                            Ok(Some(stats)) => {
+                                if let Some(record) =
+                                    crate::follower::override_record(&name, &policy, &stats, &held)
+                                {
+                                    eprintln!("{record}");
+                                }
+                            }
+                            Ok(None) => {}
                         }
                     }
                     _ => {}
@@ -401,16 +416,25 @@ pub fn cmd_records_sink(
     // as it ran; this is the final pass, and the only one for an import.)
     match crate::bark::declared_retention(&dir, &name) {
         Ok(policy) if policy.is_some() => {
+            let anchor = crate::follower::anchor_of(&dir, &name);
+            let next_seq = st.lock().unwrap().next_seq(&name).unwrap_or(0);
+            let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
             if let Some(stats) = st.lock().unwrap().enforce_retention(
                 &name,
                 policy.max_age_ms,
                 policy.max_comp_bytes,
+                held.floor,
             )? {
                 crate::note!(
                     "timberfs: {name}: retention dropped {} chunk(s), {} compressed bytes",
                     stats.chunks_moved,
                     stats.comp_bytes
                 );
+                if let Some(record) =
+                    crate::follower::override_record(&name, &policy, &stats, &held)
+                {
+                    eprintln!("{record}");
+                }
             }
         }
         Ok(_) => {}

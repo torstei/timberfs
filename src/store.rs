@@ -1315,6 +1315,13 @@ pub struct RotateStats {
     pub first_write_ms: u64,
     pub last_write_ms: u64,
     pub chunks_remaining: usize,
+    /// The chunk NUMBERS the range covered, first and last inclusive.
+    /// Reported rather than derived from the count: numbering survives a
+    /// head-drop, so a count says nothing about which chunks these were —
+    /// and a cursor holds exactly this axis, which is what lets a loss
+    /// record name a range a follower can be compared against.
+    pub first_seq: u64,
+    pub last_seq: u64,
 }
 
 pub struct Store {
@@ -1495,6 +1502,8 @@ impl Store {
                     first_write_ms: 0,
                     last_write_ms: 0,
                     chunks_remaining: src.chunks.len(),
+                    first_seq: 0,
+                    last_seq: 0,
                 });
             }
             src.chunks[..k].to_vec()
@@ -1518,7 +1527,17 @@ impl Store {
             first_write_ms: moved.first().unwrap().first_write_ms,
             last_write_ms: moved.last().unwrap().last_write_ms,
             chunks_remaining: src.chunks.len(),
+            first_seq: moved.first().unwrap().seq,
+            last_seq: moved.last().unwrap().seq,
         })
+    }
+
+    /// The number this store will give its NEXT chunk — so everything it
+    /// has ever written is strictly below it. What the interest axis needs
+    /// to call a follower's claimed position IMPOSSIBLE rather than merely
+    /// suspicious.
+    pub fn next_seq(&self, name: &str) -> Option<u64> {
+        self.files.get(name).map(|f| f.next_seq)
     }
 
     /// Final flush + sync of everything, used on unmount.
@@ -1531,19 +1550,34 @@ impl Store {
         }
     }
 
-    /// Continuous retention (the appender's --retain / --retain-size):
-    /// drop head chunks older than `max_age_ms`, and keep the compressed
-    /// size at or under `max_comp_bytes`. Dropping the head compacts the
-    /// backing pair by rewriting what remains, so it triggers with
-    /// hysteresis: age-expired data goes once it makes up at least a tenth
-    /// of the file, a size overrun drops down to 95% of the budget. The
-    /// unflushed buffer (newest data) is never touched. Returns stats when
-    /// something was dropped.
+    /// Continuous retention (the appender's --retain / --retain-size, plus
+    /// the interest axis): drop head chunks older than `max_age_ms`, keep
+    /// the compressed size at or under `max_comp_bytes`, and drop what
+    /// `interest_droppable` says every retaining follower has consumed.
+    ///
+    /// The three axes combine with `max`, never `min`: each one names a
+    /// prefix it would be happy to see gone, and the largest wins. For
+    /// interest that is the whole design — letting it CAP the drop would
+    /// let one stalled follower pin the store until the disk fills, which
+    /// kills the PRODUCER, losing the newest data to protect the oldest.
+    /// So a caller that cannot determine the interest floor passes `None`,
+    /// and the axis simply contributes nothing.
+    ///
+    /// Age and size trigger with hysteresis, because dropping the head
+    /// compacts the pair: age-expired data goes once it makes up at least
+    /// a tenth of the file, a size overrun drops down to 95% of the
+    /// budget. Interest has NONE, deliberately — promptness is the entire
+    /// point of it ("what remains on the box after a successful ship is
+    /// one chunk"), and the in-place collapse makes a per-chunk cut cheap.
+    ///
+    /// The unflushed buffer (newest data) is never touched. Returns stats
+    /// when something was dropped.
     pub fn enforce_retention(
         &mut self,
         name: &str,
         max_age_ms: Option<u64>,
         max_comp_bytes: Option<u64>,
+        interest_floor: Option<u64>,
     ) -> io::Result<Option<RotateStats>> {
         let f = self
             .files
@@ -1579,6 +1613,13 @@ impl Store {
                 k = k.max(ks);
             }
         }
+        // Additive, and last only for readability: `max` does not care.
+        // A partition over chunk NUMBERS, which is exact where a partition
+        // over write windows could not be: numbers are dense and only
+        // increase, and they survive a head-drop unchanged.
+        if let Some(floor) = interest_floor {
+            k = k.max(f.chunks.partition_point(|c| c.seq < floor));
+        }
         if k == 0 {
             return Ok(None);
         }
@@ -1590,6 +1631,8 @@ impl Store {
             first_write_ms: f.chunks[0].first_write_ms,
             last_write_ms: f.chunks[k - 1].last_write_ms,
             chunks_remaining: f.chunks.len() - k,
+            first_seq: f.chunks[0].seq,
+            last_seq: f.chunks[k - 1].seq,
         };
         // Prefer the in-place collapse (peak disk ~1x the store) and only
         // fall back to the rewrite (peak ~2x) when collapse doesn't apply
@@ -2502,6 +2545,131 @@ mod tests {
         assert_eq!(
             f.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
             [0, 1, 2, 3]
+        );
+    }
+
+    /// A Store holding one FileStore, for the whole-store retention API.
+    fn store_with(dir: &Path, name: &str, chunks: u64) -> Store {
+        let cfg = test_cfg();
+        let mut st = Store {
+            dir: dir.to_path_buf(),
+            cfg,
+            files: BTreeMap::new(),
+        };
+        st.create(name).unwrap();
+        let f = st.files.get_mut(name).unwrap();
+        write_n_chunks(f, &cfg, chunks);
+        st
+    }
+
+    #[test]
+    fn interest_is_additive_never_a_cap() {
+        // The rule the whole axis rests on. Letting interest CAP the drop
+        // would let one stalled follower pin the store until the disk
+        // fills, which kills the PRODUCER — losing the newest data to
+        // protect the oldest, strictly the worse trade.
+        let dir = TempDir::new();
+        let mut st = store_with(dir.path(), "app", 6);
+        let comp = st.files.get("app").unwrap().comp_size;
+
+        // A budget that demands more than the follower's position allows:
+        // the budget wins, because `max` and not `min`.
+        let stats = st
+            .enforce_retention("app", None, Some(comp / 6), Some(1))
+            .unwrap()
+            .expect("the budget forces a drop");
+        assert!(
+            stats.chunks_moved > 1,
+            "interest capped the size axis at 1 chunk: {} moved",
+            stats.chunks_moved
+        );
+        assert_eq!(stats.first_seq, 0, "and it names the range it took");
+    }
+
+    #[test]
+    fn interest_alone_drops_the_consumed_prefix() {
+        let dir = TempDir::new();
+        let mut st = store_with(dir.path(), "app", 5);
+
+        // No age, no budget: interest is the only axis with an opinion,
+        // and it drops exactly what is below the floor.
+        let stats = st
+            .enforce_retention("app", None, None, Some(3))
+            .unwrap()
+            .expect("chunks 0..2 are consumed");
+        assert_eq!(stats.chunks_moved, 3);
+        assert_eq!((stats.first_seq, stats.last_seq), (0, 2));
+        assert_eq!(
+            st.files
+                .get("app")
+                .unwrap()
+                .chunks
+                .iter()
+                .map(|c| c.seq)
+                .collect::<Vec<_>>(),
+            [3, 4],
+            "the follower's own chunk stays: `n` counts inside it"
+        );
+        // Idempotent — the floor has not moved, so neither does the head.
+        assert!(st
+            .enforce_retention("app", None, None, Some(3))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn no_floor_means_no_interest_drop_at_all() {
+        // Every fail-closed case arrives here as `None`, and it must be
+        // inert rather than clamping: age and size go on working.
+        let dir = TempDir::new();
+        let mut st = store_with(dir.path(), "app", 4);
+        assert!(st
+            .enforce_retention("app", None, None, None)
+            .unwrap()
+            .is_none());
+        // A floor of 0 is the same statement: nothing is below chunk 0.
+        assert!(st
+            .enforce_retention("app", None, None, Some(0))
+            .unwrap()
+            .is_none());
+        assert_eq!(st.files.get("app").unwrap().chunks.len(), 4);
+    }
+
+    #[test]
+    fn interest_has_no_hysteresis_where_age_does() {
+        // Promptness IS the point of this axis — "what remains on the box
+        // after a successful ship is one chunk" — so a single consumed
+        // chunk goes at once, where the age axis deliberately waits until
+        // expired data is a tenth of the file.
+        let dir = TempDir::new();
+        let mut st = store_with(dir.path(), "app", 20);
+        let stats = st
+            .enforce_retention("app", None, None, Some(1))
+            .unwrap()
+            .expect("one consumed chunk is enough");
+        assert_eq!(stats.chunks_moved, 1);
+        assert_eq!((stats.first_seq, stats.last_seq), (0, 0));
+    }
+
+    #[test]
+    fn dropped_chunk_numbers_are_reported_not_inferred() {
+        // A count says nothing about WHICH chunks went: numbering survives
+        // a head-drop, so after one the record at index 0 is not chunk 0.
+        // The loss record compares against a cursor, which holds numbers.
+        let dir = TempDir::new();
+        let mut st = store_with(dir.path(), "app", 6);
+        st.enforce_retention("app", None, None, Some(2))
+            .unwrap()
+            .unwrap();
+        let stats = st
+            .enforce_retention("app", None, None, Some(4))
+            .unwrap()
+            .expect("two more are consumed now");
+        assert_eq!(stats.chunks_moved, 2);
+        assert_eq!(
+            (stats.first_seq, stats.last_seq),
+            (2, 3),
+            "the numbers the survivors actually carry, not 0..1"
         );
     }
 

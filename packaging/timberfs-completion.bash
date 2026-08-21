@@ -20,7 +20,7 @@ _timberfs() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
-    local subcommands="mount create set append import export query info index list reindex rotate follower forward-intake otlp-intake"
+    local subcommands="mount create set append import export query info index list reindex trim rotate follower forward-intake otlp-intake"
     local follower_verbs="create list status update delete run"
 
     if [ "$COMP_CWORD" -le 1 ]; then
@@ -74,7 +74,7 @@ _timberfs() {
 
     local offer_handles=0
     case "$cmd" in
-    query | info | index | reindex | set)
+    query | info | index | reindex | set | trim)
         offer_handles=1
         ;;
     rotate | export)

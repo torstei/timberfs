@@ -2485,12 +2485,284 @@ run_test "timber-otlp: a pre-numbering cursor converts to a chunk position" curs
 run_test "chunk numbers: dense, survive a head-drop, v1 index migrates on open" chunk_numbers_and_v1_migration
 run_test "records: entries carry chunk=, --from-chunk resumes at one" records_carry_the_chunk_number
 run_test "consumers: list/info show lag and held bytes; a dropped position is a GAP" consumer_view_and_gap
+# P7: retain_unconsumed -- the third retention axis. A retaining follower's
+# position holds the store's head back, additively with age and size, and
+# when the size budget overrides it the loss is recorded exactly.
+RU_STORE="$PIPE_BACKING/vmunconsumed.log"
+
+declared_booleans_are_booleans() {
+    # `--set index=true` writing "index": "true" declares a key every
+    # reader evaluates as FALSE -- silently declared, silently ignored. The
+    # two spellings must agree, so both are checked here.
+    rm -f "$PIPE_BACKING"/vmbool.log.*
+    timberfs create --set index=true --set host=edge01 "$PIPE_BACKING/vmbool.log" >/dev/null 2>&1         || return 1
+    jq -e '.index == true and .host == "edge01"' "$PIPE_BACKING/vmbool.log.bark" >/dev/null         || { cat "$PIPE_BACKING/vmbool.log.bark"; return 1; }
+    timberfs set "$PIPE_BACKING/vmbool.log" wal=true >/dev/null 2>&1 || return 1
+    jq -e '.wal == true' "$PIPE_BACKING/vmbool.log.bark" >/dev/null || return 1
+    # And a value that is neither is refused rather than stored as truthy.
+    timberfs create --set index=yes "$PIPE_BACKING/vmbool2.log" > /tmp/bool.err 2>&1 && return 1
+    grep -q 'true or false' /tmp/bool.err || { cat /tmp/bool.err; return 1; }
+}
+
+retain_unconsumed_needs_its_backstop() {
+    # Interest only ever holds MORE, so without a budget one stalled
+    # follower fills the disk and kills the producer. Refused at the
+    # keyboard, both ways round, on the whole resulting manifest.
+    rm -f "$PIPE_BACKING"/vmbackstop.log.*
+    timberfs create "$PIPE_BACKING/vmbackstop.log" >/dev/null 2>&1 || return 1
+    timberfs set "$PIPE_BACKING/vmbackstop.log" retain_unconsumed=true > /tmp/ru.no 2>&1 && return 1
+    grep -q 'retain_size' /tmp/ru.no || { cat /tmp/ru.no; return 1; }
+    # An age window is not a backstop: it is a bet on how long the link
+    # stays down, which is what this axis exists to stop anyone making.
+    timberfs set "$PIPE_BACKING/vmbackstop.log" retain=90d retain_unconsumed=true \
+        > /tmp/ru.age 2>&1 && return 1
+    grep -q 'retain_size' /tmp/ru.age || { cat /tmp/ru.age; return 1; }
+    # With a budget it takes.
+    timberfs set "$PIPE_BACKING/vmbackstop.log" retain_size=50G retain_unconsumed=true \
+        >/dev/null 2>&1 || return 1
+    # And removing the budget out from under it is refused too, since the
+    # check is on the whole manifest rather than on what this call set.
+    timberfs set "$PIPE_BACKING/vmbackstop.log" --unset retain_size > /tmp/ru.unset 2>&1 && return 1
+    grep -q 'retain_size' /tmp/ru.unset || { cat /tmp/ru.unset; return 1; }
+    # create refuses the same combination before the store exists.
+    rm -f "$PIPE_BACKING"/vmbackstop2.log.*
+    timberfs create --retain-unconsumed "$PIPE_BACKING/vmbackstop2.log" > /tmp/ru.cr 2>&1 && return 1
+    [ ! -e "$PIPE_BACKING/vmbackstop2.log.rings" ] || return 1
+}
+
+retain_unconsumed_holds_then_releases() {
+    # The headline. A retaining follower with NO position holds
+    # EVERYTHING -- which is the point, since that is a follower deployed
+    # before it first runs -- and once it has a position the consumed
+    # prefix goes, promptly, with no hysteresis.
+    rm -rf "$FOLLOWER_REG"/vmru "$RU_STORE".*
+    timberfs create --wal --retain-size 1G --retain-unconsumed "$RU_STORE" >/dev/null 2>&1 \
+        || return 1
+    local i
+    for i in 1 2 3 4 5; do
+        printf '2026-08-02T09:00:0%s INFO unconsumed line %s\n' "$i" "$i" \
+            | timberfs append --into "$RU_STORE" --quiet 2>/dev/null || return 1
+    done
+    [ "$(timberfs index "$RU_STORE" | grep -cE '^ +[0-9]')" = 5 ] || return 1
+
+    timberfs follower create vmru --store "$RU_STORE" --type otlp \
+        --endpoint http://127.0.0.1:4318 --retaining >/dev/null 2>&1 || return 1
+    # Registered, never run: the store must not shrink by a single chunk.
+    printf '2026-08-02T09:00:06 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
+        > /tmp/ru.hold 2>&1
+    grep -q 'retention dropped' /tmp/ru.hold && { cat /tmp/ru.hold; return 1; }
+    [ "$(timberfs index "$RU_STORE" | grep -cE '^ +[0-9]')" = 6 ] || return 1
+    # And info says who is holding it, and how much.
+    timberfs info "$RU_STORE" | grep -q 'retaining, never run' || { timberfs info "$RU_STORE"; return 1; }
+
+    # A position at chunk 3, exactly as the shipper writes one.
+    local sid
+    sid=$(jq -r .id "$RU_STORE.bark")
+    python3 - "$sid" "$RU_STORE" "$FOLLOWER_REG/vmru/cursor.json" << 'PYEOF' || return 1
+import json, sys
+sid, store, out = sys.argv[1:4]
+json.dump({"consumer": "timber-otlp", "store": sid, "path": store,
+           "seq": 3, "n": 1, "wl": 1, "delivered": 4}, open(out, "w"))
+PYEOF
+    printf '2026-08-02T09:00:07 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
+        > /tmp/ru.drop 2>&1
+    grep -q 'retention dropped 3 chunk(s)' /tmp/ru.drop || { cat /tmp/ru.drop; return 1; }
+    # The follower's OWN chunk stays: `n` counts inside it, and a resume
+    # re-reads it from the start.
+    timberfs index "$RU_STORE" | awk '$1 ~ /^[0-9]+$/ {print $1; exit}' | grep -qx 3 \
+        || { timberfs index "$RU_STORE"; return 1; }
+    # No hysteresis: one more consumed chunk goes on the next tick, where
+    # the age axis would wait for a tenth of the file.
+    python3 - "$sid" "$RU_STORE" "$FOLLOWER_REG/vmru/cursor.json" << 'PYEOF' || return 1
+import json, sys
+sid, store, out = sys.argv[1:4]
+json.dump({"consumer": "timber-otlp", "store": sid, "path": store,
+           "seq": 4, "n": 1, "wl": 1, "delivered": 5}, open(out, "w"))
+PYEOF
+    printf '2026-08-02T09:00:08 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
+        > /tmp/ru.one 2>&1
+    grep -q 'retention dropped 1 chunk(s)' /tmp/ru.one || { cat /tmp/ru.one; return 1; }
+}
+
+retain_unconsumed_fails_closed() {
+    # Each of these is indistinguishable from "consumed" if read wrong, so
+    # each must drop nothing by interest -- while age and size go on
+    # working, since the axis is additive.
+    local sid
+    sid=$(jq -r .id "$RU_STORE.bark")
+    local before
+    before=$(timberfs index "$RU_STORE" | grep -cE '^ +[0-9]')
+
+    # A position past everything the store has ever written: provably a
+    # wrong anchor or a hand-edit, where a future TIMESTAMP could only
+    # ever have been suspicious.
+    python3 - "$sid" "$RU_STORE" "$FOLLOWER_REG/vmru/cursor.json" << 'PYEOF' || return 1
+import json, sys
+sid, store, out = sys.argv[1:4]
+json.dump({"consumer": "x", "store": sid, "path": store,
+           "seq": 99999, "n": 1, "wl": 1, "delivered": 9}, open(out, "w"))
+PYEOF
+    printf '2026-08-02T09:01:00 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
+        > /tmp/ru.fc1 2>&1
+    grep -q 'retention dropped' /tmp/ru.fc1 && { cat /tmp/ru.fc1; return 1; }
+
+    # A position that cannot be read is not a position.
+    echo '{ not json' > "$FOLLOWER_REG/vmru/cursor.json"
+    printf '2026-08-02T09:01:01 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
+        > /tmp/ru.fc2 2>&1
+    grep -q 'retention dropped' /tmp/ru.fc2 && { cat /tmp/ru.fc2; return 1; }
+
+    # An unreadable DECLARATION fails closed too, and is loud about it in
+    # the one command that can see it.
+    cp "$FOLLOWER_REG/vmru/follower.json" /tmp/ru.decl.bak
+    echo 'not json' > "$FOLLOWER_REG/vmru/follower.json"
+    printf '2026-08-02T09:01:02 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
+        > /tmp/ru.fc3 2>&1
+    grep -q 'retention dropped' /tmp/ru.fc3 && { cat /tmp/ru.fc3; return 1; }
+    timberfs follower list 2>&1 | grep -q 'not readable' || return 1
+    cp /tmp/ru.decl.bak "$FOLLOWER_REG/vmru/follower.json"
+
+    # Nothing was dropped through any of that.
+    [ "$(timberfs index "$RU_STORE" | grep -cE '^ +[0-9]')" -ge "$before" ]
+}
+
+retain_unconsumed_cap_overrides_and_records_it() {
+    # Interest is ADDITIVE, never a cap: letting it cap the drop would let
+    # one stalled follower pin the store until the disk fills, which kills
+    # the producer. So the budget wins -- and the loss is recorded exactly,
+    # by the writer, at the moment it happens.
+    local store="$PIPE_BACKING/vmoverride.log"
+    rm -rf "$FOLLOWER_REG"/vmover "$store".*
+    timberfs create --retain-size 1G --retain-unconsumed "$store" >/dev/null 2>&1 || return 1
+    timberfs follower create vmover --store "$store" --type otlp \
+        --endpoint http://127.0.0.1:4318 --retaining >/dev/null 2>&1 || return 1
+    seq 1 4000 | sed 's/^/2026-08-02T10:00:00 INFO padding /' \
+        | timberfs append --into "$store" --quiet --chunk-size 4096 2>/dev/null || return 1
+    local sid
+    sid=$(jq -r .id "$store.bark")
+    # Stuck at the very first chunk, holding everything after it.
+    python3 - "$sid" "$store" "$FOLLOWER_REG/vmover/cursor.json" << 'PYEOF' || return 1
+import json, sys
+sid, store, out = sys.argv[1:4]
+json.dump({"consumer": "timber-otlp", "store": sid, "path": store,
+           "seq": 0, "n": 1, "wl": 1, "delivered": 1}, open(out, "w"))
+PYEOF
+    # A budget below what is already on disk, so the cap has to bite.
+    timberfs set "$store" retain_size=3K >/dev/null 2>&1 || return 1
+    printf '2026-08-02T10:01:00 INFO tick\n' | timberfs append --into "$store" --quiet \
+        > /tmp/ru.over 2>&1
+    grep -q 'retention dropped' /tmp/ru.over || { cat /tmp/ru.over; return 1; }
+    # The record: the budget, the follower, its position, and the exact
+    # range of chunks it had not read. Not a count -- numbering survives a
+    # head-drop, and a position is compared against numbers.
+    grep -qE 'retain_size \(3\.0 KiB\) reached with follower vmover at chunk 0 — dropped chunks 0\.\.[0-9]+ it had not read' \
+        /tmp/ru.over || { cat /tmp/ru.over; return 1; }
+}
+
+trim_is_the_one_shot_for_an_idle_store() {
+    # Retention runs inside a live WRITER, so a store whose producer went
+    # quiet keeps data already shipped off the box. `trim` is the answer,
+    # and it must refuse to touch a store somebody else is writing.
+    local store="$PIPE_BACKING/vmtrim.log"
+    rm -rf "$FOLLOWER_REG"/vmtrim "$store".*
+    timberfs create --retain-size 1G --retain-unconsumed "$store" >/dev/null 2>&1 || return 1
+    local i
+    for i in 1 2 3 4 5; do
+        printf '2026-08-03T09:00:0%s INFO trim line %s\n' "$i" "$i" \
+            | timberfs append --into "$store" --quiet 2>/dev/null || return 1
+    done
+    timberfs follower create vmtrim --store "$store" --type otlp \
+        --endpoint http://127.0.0.1:4318 --retaining >/dev/null 2>&1 || return 1
+    local sid
+    sid=$(jq -r .id "$store.bark")
+    python3 - "$sid" "$store" "$FOLLOWER_REG/vmtrim/cursor.json" << 'PYEOF' || return 1
+import json, sys
+sid, store, out = sys.argv[1:4]
+json.dump({"consumer": "timber-otlp", "store": sid, "path": store,
+           "seq": 3, "n": 1, "wl": 1, "delivered": 4}, open(out, "w"))
+PYEOF
+    # The preview changes nothing and names what interest would take.
+    timberfs trim "$store" --dry-run > /tmp/tr.dry 2>&1 || return 1
+    grep -q 'interest would drop 3 of 5' /tmp/tr.dry || { cat /tmp/tr.dry; return 1; }
+    [ "$(timberfs index "$store" | grep -cE '^ +[0-9]')" = 5 ] || return 1
+
+    # Then the real thing, reporting the chunk NUMBERS it took.
+    timberfs trim "$store" > /tmp/tr.out 2>&1 || return 1
+    grep -q 'trimmed 3 chunk(s)' /tmp/tr.out || { cat /tmp/tr.out; return 1; }
+    grep -q 'chunks 0..2' /tmp/tr.out || { cat /tmp/tr.out; return 1; }
+    [ "$(timberfs index "$store" | grep -cE '^ +[0-9]')" = 2 ] || return 1
+    # Idempotent.
+    timberfs trim "$store" 2>&1 | grep -q 'nothing to trim' || return 1
+
+    # A store with a live writer is left ALONE and says so: that writer's
+    # own tick is already enforcing this.
+    mkfifo /tmp/trimlive.fifo
+    timberfs append --into "$store" --flush-age 60 < /tmp/trimlive.fifo &
+    local ap=$!
+    exec 9>/tmp/trimlive.fifo
+    sleep 1
+    timberfs trim "$store" > /tmp/tr.live 2>&1
+    local rc=$?
+    exec 9>&-
+    wait "$ap" 2>/dev/null
+    rm -f /tmp/trimlive.fifo
+    [ "$rc" = 0 ] || { cat /tmp/tr.live; return 1; }
+    grep -q 'has a live writer' /tmp/tr.live || { cat /tmp/tr.live; return 1; }
+
+    # And a store that declares no retention is a no-op, not an error --
+    # what a cron entry over a whole forest needs.
+    timberfs trim "$PIPE_BACKING/piped.log" > /tmp/tr.none 2>&1 || return 1
+    grep -q 'declares no retention' /tmp/tr.none || { cat /tmp/tr.none; return 1; }
+
+    # A MOUNTED store is the other hands-off case, and a different lock:
+    # the mount daemon holds the whole directory, and its own tick is
+    # already enforcing this once a second.
+    timberfs set "$BACKING/app.log" retain_size=1G >/dev/null 2>&1 || return 1
+    timberfs trim "$BACKING/app.log" > /tmp/tr.mnt 2>&1 || { cat /tmp/tr.mnt; return 1; }
+    grep -q 'live timberfs mount' /tmp/tr.mnt || { cat /tmp/tr.mnt; return 1; }
+    grep -q "$MNT" /tmp/tr.mnt || { cat /tmp/tr.mnt; return 1; }
+    timberfs set "$BACKING/app.log" --unset retain_size >/dev/null 2>&1
+
+    # A bundle has no retention to enforce, and says so rather than
+    # pretending to try.
+    timberfs trim /tmp/f.timber > /tmp/tr.bundle 2>&1 && return 1
+    grep -q 'read-only' /tmp/tr.bundle || { cat /tmp/tr.bundle; return 1; }
+    return 0
+}
+
+retain_unconsumed_views_agree() {
+    # The declared axis shows up wherever retention does, so an operator
+    # reading `list` or `info` sees the third axis rather than inferring it.
+    timberfs info "$RU_STORE" > /tmp/ru.info 2>&1 || return 1
+    grep -q 'keep what retaining followers have not read' /tmp/ru.info \
+        || { cat /tmp/ru.info; return 1; }
+    timberfs info --json "$RU_STORE" | jq -e '.retain_unconsumed == true' >/dev/null || return 1
+    timberfs list "$PIPE_BACKING" > /tmp/ru.list 2>/dev/null || return 1
+    grep -E '^vmunconsumed[[:space:]]' /tmp/ru.list | grep -q 'unconsumed' \
+        || { cat /tmp/ru.list; return 1; }
+    # And a rotated segment does NOT inherit it: an archive has no
+    # followers, so inheriting would make it wait on a consumer that reads
+    # the live store.
+    timberfs rotate "$RU_STORE" vmarchive.log --cutoff 2027-01-01 >/dev/null 2>&1 || return 1
+    [ -e "$PIPE_BACKING/vmarchive.log.bark" ] || return 1
+    jq -e 'has("retain_unconsumed") == false and has("retain_size") == false' \
+        "$PIPE_BACKING/vmarchive.log.bark" >/dev/null \
+        || { cat "$PIPE_BACKING/vmarchive.log.bark"; return 1; }
+}
+
 run_test "follower: create records the store by identity, and refuses the rest" follower_registry_declares_and_refuses
 run_test "follower: the unit execs the shipper and ships from the beginning" follower_unit_execs_the_shipper
 run_test "follower: liveness from the inherited lock; a second run is refused" follower_liveness_and_collision
 run_test "follower: info grows a followers block, list a FOLLOWERS column" follower_store_side_view
 run_test "follower: retiring one is update-then-delete, and says what it frees" follower_retirement_is_two_commands
 run_test "follower: unit, conf example and man page installed" follower_unit_installed
+run_test "bark: create --set declares booleans as booleans, like set" declared_booleans_are_booleans
+run_test "retain_unconsumed: refused without the retain_size backstop" retain_unconsumed_needs_its_backstop
+run_test "retain_unconsumed: a never-run follower holds all; a position releases the prefix" retain_unconsumed_holds_then_releases
+run_test "retain_unconsumed: every way of not knowing drops nothing" retain_unconsumed_fails_closed
+run_test "retain_unconsumed: the size cap overrides, and records the loss exactly" retain_unconsumed_cap_overrides_and_records_it
+run_test "trim: the one-shot for an idle store; a live writer is left alone" trim_is_the_one_shot_for_an_idle_store
+run_test "retain_unconsumed: list/info show the axis; a rotated segment does not inherit it" retain_unconsumed_views_agree
 
 forest_handle_resolution() {
     # The package ships /etc/timberfs/forests.d/default.conf with

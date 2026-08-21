@@ -123,6 +123,12 @@ pub struct LivePolicy {
     pub dir: std::path::PathBuf,
     pub name: String,
     pub last: crate::bark::Retention,
+    /// What this store's followers are matched by, re-derived on the same
+    /// reparse as the policy. Paired with it on purpose: the anchor can
+    /// change exactly once, when `follower create` mints an identity, and
+    /// that mint IS a manifest change — so the one stat already being
+    /// taken catches both.
+    pub anchor: String,
     pub warned: bool,
     /// (mtime, len) of the manifest at the last parse: the file almost
     /// never changes, so the once-a-second re-read is a stat until it does.
@@ -144,6 +150,7 @@ impl LivePolicy {
         }
         self.stamp = cur;
         self.reparsed = true;
+        self.anchor = crate::follower::anchor_of(&self.dir, &self.name);
         match crate::bark::declared_retention(&self.dir, &self.name) {
             Ok(p) => {
                 self.warned = false;
@@ -188,15 +195,29 @@ fn extend_declared_grain(dir: &Path, name: &str) {
     }
 }
 
-pub fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Retention) {
+/// One store's retention tick. `anchor` and `interest` carry the third
+/// axis; a caller with no registry to consult passes a default
+/// `TickInterest`, which reads nothing and contributes nothing.
+pub fn run_retention(
+    store: &Mutex<Store>,
+    name: &str,
+    policy: crate::bark::Retention,
+    anchor: &str,
+    interest: &mut crate::follower::TickInterest,
+) {
     if !policy.is_some() {
         return;
     }
-    let result =
-        store
-            .lock()
-            .unwrap()
-            .enforce_retention(name, policy.max_age_ms, policy.max_comp_bytes);
+    // Read before the drop, from the same lock the drop takes: the floor
+    // has to be a statement about the store as it is now.
+    let next_seq = store.lock().unwrap().next_seq(name).unwrap_or(0);
+    let held = interest.floor(&policy, anchor, next_seq);
+    let result = store.lock().unwrap().enforce_retention(
+        name,
+        policy.max_age_ms,
+        policy.max_comp_bytes,
+        held.floor,
+    );
     match result {
         Ok(Some(stats)) => {
             eprintln!(
@@ -206,6 +227,11 @@ pub fn run_retention(store: &Mutex<Store>, name: &str, policy: crate::bark::Rete
                 fmt_ms(stats.first_write_ms),
                 fmt_ms(stats.last_write_ms)
             );
+            // The one thing that is owed rather than nice: when the budget
+            // overrode a retaining follower, exactly what it cost.
+            if let Some(record) = crate::follower::override_record(name, &policy, &stats, &held) {
+                eprintln!("{record}");
+            }
         }
         Ok(None) => {}
         Err(e) => {
@@ -247,9 +273,9 @@ pub fn spawn_maintenance(
         }
         store.lock().unwrap().flush_aged();
         store.lock().unwrap().sap_sync_all();
-        let (p, reparsed) = {
+        let (p, reparsed, anchor) = {
             let mut pol = policy.lock().unwrap();
-            (pol.refresh(), pol.reparsed)
+            (pol.refresh(), pol.reparsed, pol.anchor.clone())
         };
         // `set wal=true|false` on a live store, applied within a second
         // like retention — only when the manifest actually changed, so a
@@ -257,7 +283,15 @@ pub fn spawn_maintenance(
         if reparsed {
             store.lock().unwrap().sync_wal_declarations();
         }
-        run_retention(&store, &name, p);
+        // One TickInterest per tick: it reads the registry at most once,
+        // and only if the policy actually declares the axis.
+        run_retention(
+            &store,
+            &name,
+            p,
+            &anchor,
+            &mut crate::follower::TickInterest::default(),
+        );
         // Keep the declared index current while streaming, exactly as
         // the records sink and the network intakes do: extend whenever
         // the flushed-chunk set changed (a flush added chunks, or
@@ -407,13 +441,26 @@ pub fn cmd_append(
         dir: dir.clone(),
         name: name.clone(),
         last: crate::bark::Retention::default(),
+        anchor: String::new(),
         warned: false,
         stamp: None,
         reparsed: false,
     }));
 
     // Catch up on retention from before this run, then keep enforcing.
-    run_retention(&store, &name, policy.lock().unwrap().refresh());
+    {
+        let (p, anchor) = {
+            let mut pol = policy.lock().unwrap();
+            (pol.refresh(), pol.anchor.clone())
+        };
+        run_retention(
+            &store,
+            &name,
+            p,
+            &anchor,
+            &mut crate::follower::TickInterest::default(),
+        );
+    }
 
     spawn_maintenance(
         Arc::clone(&store),
@@ -469,8 +516,17 @@ pub fn cmd_append(
     }
 
     store.lock().unwrap().flush_all();
-    let p = policy.lock().unwrap().refresh();
-    run_retention(&store, &name, p);
+    let (p, anchor) = {
+        let mut pol = policy.lock().unwrap();
+        (pol.refresh(), pol.anchor.clone())
+    };
+    run_retention(
+        &store,
+        &name,
+        p,
+        &anchor,
+        &mut crate::follower::TickInterest::default(),
+    );
     // Last: index everything this run flushed, retention included, so a
     // short-lived appender still leaves a complete index behind.
     extend_declared_grain(&dir, &name);

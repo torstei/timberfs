@@ -823,8 +823,8 @@ shipper verbatim.
 
 The unit's `StateDirectory=` is `/var/lib/timberfs/followers/%i`, holding the
 declaration, the position and the lock. **Those permissions are load-bearing**:
-a position in there decides what a store's retention may drop, so once
-`retain_unconsumed` is honoured, anything that can write one can destroy data.
+a position in there decides what a store's retention may drop, so on a store
+declaring `retain_unconsumed`, anything that can write one can destroy data.
 0755 keeps it observable by anyone and writable only by the follower — so a
 `User=` drop-in gives one follower its own unprivileged identity without every
 follower being able to write every position.
@@ -862,12 +862,58 @@ from the oldest chunk, because the loss is already in the past and a shipper
 that refuses to start ships nothing. Alert on that warning, and on a follower
 whose lag approaches the retention window.
 
-⚠ In this release `retaining` is **declared and reported, not enforced** — no
-writer acts on it yet. The store-side rule (`retain_unconsumed`, requiring a
-`retain_size` alongside it as the backstop) comes next; `timberfs follower
-status` says so per follower rather than letting a declared interest read as an
-enforced one. The older `cursors=<dir>` key still works and is reported as
-superseded wherever it is found.
+`retaining` is one half of a pair. The **store** declares the other half, and
+that is what actually moves the head:
+
+```sh
+timberfs set /var/log/timberfs-backing/applogs/app.log \
+    retain_size=50G retain_unconsumed=true
+```
+
+`retain_unconsumed` is refused without a `retain_size`, and that is the design
+rather than a validation nicety: interest only ever holds **more**, so with no
+budget beside it one stalled follower pins the store until the disk fills —
+which kills the *producer*, losing the newest data to protect the oldest.
+
+⚠ **So the cap, not the consumption rule, is what decides an outage.** Size
+`retain_size` as ingest-rate × the outage worth surviving. Interest retention
+does not remove that sizing; it removes the steady-state hoarding — the weeks of
+already-shipped bytes kept just in case — which is the actual win.
+
+When the budget does override a follower, the writer records the loss exactly,
+at the moment it happens, and this is the line to alert on:
+
+```
+app.log: retain_size (50.0 GiB) reached with follower central at chunk 4200
+         — dropped chunks 4200..4830 it had not read
+```
+
+Two dependencies the guarantee rests on, neither of them timberfs's:
+
+- **The receiver's `200` must mean PERSISTED, not merely accepted.** A collector
+  with an in-memory queue acks and then loses the batch on restart, which
+  silently voids the whole chain — erasure follows the position, and the position
+  follows that ack.
+- **The registry directory must not be writable by anything but the followers.**
+  An attacker with write access there can fast-forward a position and have the
+  next tick erase the record of their own intrusion.
+
+⚠ Retention only ever runs inside a live **writer**. A store whose producer went
+quiet keeps its data indefinitely — including data already shipped off the box,
+which is the opposite of what this axis is for. `timberfs trim` is the cron-able
+one-shot; it leaves a store somebody else is writing alone, because that
+writer's own tick is already doing the job, and a store that declares no
+retention is a no-op rather than an error:
+
+```ini
+# /etc/systemd/system/timberfs-trim.service  (pair with a daily .timer)
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'timberfs list --names | xargs -rn1 timberfs trim'
+```
+
+The older `cursors=<dir>` key still works and is reported as superseded wherever
+it is found.
 
 ## Ownership and permissions
 

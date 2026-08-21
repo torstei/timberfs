@@ -81,6 +81,13 @@ enum Command {
         /// data drops first — enforced by every writer
         #[arg(long)]
         retain_size: Option<String>,
+        /// Declare interest-based retention: keep what this store's
+        /// RETAINING followers have not read, on top of the age and size
+        /// axes — never instead of them. Requires --retain-size as the
+        /// backstop, since interest only ever holds MORE and one stalled
+        /// follower would otherwise fill the disk
+        #[arg(long, requires = "retain_size")]
+        retain_unconsumed: bool,
         /// Set a manifest property (key=value, e.g. host=foo.bar.com);
         /// repeatable, free-form
         #[arg(long = "set", value_name = "KEY=VALUE")]
@@ -438,6 +445,20 @@ enum Command {
         /// Backing file: logical name, .trunk or .rings path
         file: PathBuf,
     },
+    /// Enforce a store's declared retention once, now — the cron-able
+    /// complement to the continuous enforcement every writer already
+    /// does. Load-bearing rather than convenient: retention runs inside a
+    /// live WRITER, so a store whose producer went quiet keeps its data
+    /// indefinitely, and under retain_unconsumed that means keeping data
+    /// already shipped off the box. A store somebody else is writing is
+    /// left alone and said so: that writer's own tick is already doing it
+    Trim {
+        /// Backing file: logical name, .trunk or .rings path
+        store: PathBuf,
+        /// Report what interest would drop without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Time-based rotation: move every chunk written before --cutoff into
     /// DEST (or drop it with --delete), relocating compressed frames
     /// verbatim — no recompression. Auto-detects a live mount and routes
@@ -709,6 +730,7 @@ fn main() -> anyhow::Result<()> {
             wal,
             retain,
             retain_size,
+            retain_unconsumed,
             sets,
             if_not_exists,
         } => {
@@ -718,6 +740,7 @@ fn main() -> anyhow::Result<()> {
                 wal,
                 retain.as_deref(),
                 retain_size.as_deref(),
+                retain_unconsumed,
                 &sets,
                 if_not_exists,
             )?;
@@ -1031,6 +1054,10 @@ fn main() -> anyhow::Result<()> {
         Command::Reindex { file } => {
             let file = forest::resolve_source(&file)?;
             grain::cmd_reindex(&file)?;
+        }
+        Command::Trim { store, dry_run } => {
+            let store = forest::resolve_source(&store)?;
+            rotate::cmd_trim(&store, dry_run)?;
         }
         Command::Rotate {
             source,

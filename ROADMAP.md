@@ -209,8 +209,8 @@ works is in [docs/design.md](docs/design.md).
   Cheap when wanted: the sap is recreated on every seal-and-swap, so a
   format bump there needs no converter and no grace period, unlike the
   rings.
-- **Retaining what a follower has not consumed** (the registry half SHIPPED;
-  the retention rule is what is left): retention drops
+- **Retaining what a follower has not consumed** (SHIPPED: the registry,
+  `retain_unconsumed` and `trim`): retention drops
   by age and by size. A frontend box wants a third rule — drop what is
   CONFIRMED DELIVERED — because two requirements hold at once there: keep
   as little log data on the box as possible (a breach reaches less of it,
@@ -271,11 +271,20 @@ works is in [docs/design.md](docs/design.md).
   declared `.bark` id before its retention can depend on external state;
   `create` mints one, and a path would not do, a store being movable. The
   cost is that a writer's retention tick scans `followers/*/follower.json`
-  and filters by store id rather than reading one directory. Acceptable,
-  and cheaply mitigated: declarations change rarely, so gate the scan on
-  directory mtime — licensed by the asymmetry that DROPPING LATE IS
-  HARMLESS AND DROPPING EARLY IS NOT, which permits lazy evaluation of the
-  whole axis.
+  and filters by store id rather than reading one directory.
+  ⚠ **The mtime gate this entry proposed for that scan is WRONG, and wrong
+  in the unsafe direction.** A directory's mtime moves when an entry is
+  created, removed or renamed IN it — and both a position save and an
+  `update` are a tmp+rename inside `followers/<name>/`, which leaves
+  `followers/`'s own mtime untouched (measured). So the gate would miss
+  every position advance, freezing the floor and making the axis silently
+  do nothing; and it would miss an `update retaining=true`, leaving the
+  store dropping data a newly-retaining follower should hold — which is
+  the EARLY direction the "dropping late is harmless" licence does not
+  cover. Built without it: one `read_dir` plus two small reads per
+  follower, page-cached, once per tick FOR ALL STORES AT ONCE (which is
+  cheaper than the gated per-store version it replaced), and not read at
+  all unless some store declares the axis.
   **The rule.** `retain_unconsumed=true` on the store, and the name's
   polarity is deliberate: every `retain_*` key names what is KEPT
   (`retain=90d` keeps 90 days), so `retain_consumed` would have read as
@@ -308,7 +317,16 @@ works is in [docs/design.md](docs/design.md).
   next_seq` — all drop nothing by interest. The last is newly PROVABLE
   rather than merely suspicious: a chunk number beyond what the store has
   ever written is a wrong anchor or a hand-edit, where a future timestamp
-  was indistinguishable from clock skew.
+  was indistinguishable from clock skew. Built with one addition the note
+  did not anticipate: an unreadable DECLARATION fails closed for EVERY
+  store, not just its own, because it might have been a retaining follower
+  of any of them and there is no way to know which. Harsh, and bounded by
+  the additivity — age and size keep working, so the cost is dropping
+  late — and loud, since `follower list` reports the same declaration.
+  Also settled while building: the interest axis takes NO hysteresis where
+  age and size have it. Promptness is the whole point ("what remains on the
+  box after a successful ship is one chunk"), and the in-place collapse
+  makes a per-chunk cut cheap.
   (4) When the cap overrides consumption the loss is **recorded exactly**,
   and this is a requirement rather than a nicety. Bounded loss is a choice
   already made — the alternative is blocking the producer, which for
@@ -359,12 +377,14 @@ works is in [docs/design.md](docs/design.md).
   silently voids the chain, since erasure follows the position and the
   position follows that ack; and the registry directory must not be
   writable by anything but the followers.
-  Also wanted: a one-shot `timberfs trim`, load-bearing rather than
-  convenient, since retention only runs inside a live writer and a store
-  whose producer went quiet would otherwise keep delivered data
-  indefinitely — and NOT the tempting shortcut of letting a follower
-  collapse the head itself, which would make a reader a writer and put two
-  of them on one head.
+  `timberfs trim` shipped with it, load-bearing rather than convenient,
+  since retention only runs inside a live writer and a store whose producer
+  went quiet would otherwise keep delivered data indefinitely — and NOT the
+  tempting shortcut of letting a follower collapse the head itself, which
+  would make a reader a writer and put two of them on one head. It leaves a
+  store somebody else is writing alone and says so: that writer's own tick
+  is already doing this, and taking its lock away to repeat the work is the
+  one thing it must not do.
   ⚠ **This superseded something already released**, and did so without
   removing it. 0.18.0 shipped the read-only half against a `cursors=<dir>`
   key on the store; the registry replaces it, since a follower declares its

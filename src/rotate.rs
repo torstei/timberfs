@@ -116,6 +116,157 @@ fn report(stats: &RotateStats, target: Option<&str>) {
     println!("  source keeps {} chunk(s)", stats.chunks_remaining);
 }
 
+/// `timberfs trim`: enforce a store's declared retention once, now.
+///
+/// Load-bearing rather than convenient. Retention runs inside a live
+/// WRITER — every appender, mount and intake enforces it on its own tick —
+/// so a store whose producer went quiet keeps its data indefinitely, and
+/// under `retain_unconsumed` that means keeping data already shipped off
+/// the box. This is the cron-able answer to that, and deliberately NOT the
+/// tempting shortcut of letting a follower collapse the head itself, which
+/// would make a reader a writer and put two of them on one head.
+///
+/// A store somebody else is writing is left alone and said so: that
+/// writer's own tick is already doing this, once a second, and taking its
+/// lock away to repeat the work would be the one thing this must not do.
+pub fn cmd_trim(store: &Path, dry_run: bool) -> anyhow::Result<()> {
+    if crate::query::is_bundle(store) {
+        bail!(
+            "{} is a .timber transfer bundle — bundles are read-only, and a snapshot has no \
+             retention to enforce",
+            store.display()
+        );
+    }
+    let (dir, name) = resolve_backing(store)?;
+    let rings = format::rings_path(&dir, &name);
+    if !rings.exists() {
+        bail!("no timberfs log {name} in {}", dir.display());
+    }
+
+    // The policy first, so a store that declares nothing says so without
+    // taking a lock — `trim` on an undeclared store is a no-op, not an
+    // error, because that is what a cron entry over a whole forest needs.
+    let policy = crate::bark::declared_retention(&dir, &name).with_context(|| {
+        format!(
+            "reading {}'s declared retention (fix it with `timberfs set`)",
+            name
+        )
+    })?;
+    if !policy.is_some() {
+        crate::note!("timberfs: {name} declares no retention; nothing to enforce");
+        return Ok(());
+    }
+
+    let records = format::read_index(&rings)?;
+    // From the rings HEADER, not from the last record: retention is allowed
+    // to drop every chunk, and the numbering must not restart when it does
+    // — so on an emptied store the records say 0 while the header says
+    // where the next chunk actually continues from. The writer reads the
+    // header, and a preview that disagreed with it would call a legitimate
+    // position impossible.
+    let next_seq = std::fs::File::open(&rings)
+        .and_then(|f| format::read_header_next_seq(&f))
+        .unwrap_or(0)
+        .max(records.last().map(|c| c.seq + 1).unwrap_or(0));
+    let anchor = crate::follower::anchor_of(&dir, &name);
+    let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+    if policy.unconsumed {
+        match (&held.holder, held.floor) {
+            (Some(h), Some(f)) => crate::note!(
+                "timberfs: {name}: {} retaining follower(s); {h} is furthest behind, at chunk {f}",
+                held.retaining
+            ),
+            (Some(h), None) => crate::note!(
+                "timberfs: {name}: {h} retains everything (it has no usable position), so \
+                 interest drops nothing"
+            ),
+            (None, _) => crate::note!(
+                "timberfs: {name}: nothing retains this store, so interest drops nothing"
+            ),
+        }
+    }
+
+    if dry_run {
+        // A preview, computed the same way the writer will compute it —
+        // interest by the same partition over chunk numbers, age and size
+        // left to the writer, which owns the hysteresis.
+        let by_interest = held.droppable(&records);
+        println!(
+            "dry run: interest would drop {by_interest} of {} chunk(s); age and size are \
+             decided by the writer at the moment it acts",
+            records.len()
+        );
+        return Ok(());
+    }
+
+    // Offline only, and by DESIGN. A live writer enforces this on its own
+    // tick; taking its lock away to do the same work is the one thing that
+    // could hurt it, and reporting "nothing to do" is the honest answer.
+    let Some(_dir_guard) = store::lock_backing_shared(&dir)? else {
+        let where_ = store::read_lock_mountpoint(&dir)
+            .map(|mp| format!(" (mounted at {})", mp.display()))
+            .unwrap_or_default();
+        crate::note!(
+            "timberfs: {name} is served by a live timberfs mount{where_}, which enforces \
+             retention on its own tick; nothing to do here"
+        );
+        return Ok(());
+    };
+    let Some(_file_lock) = store::lock_file_exclusive(&dir, &name)? else {
+        let who = store::describe_file_writer(&dir, &name)
+            .map(|w| format!(" ({w})"))
+            .unwrap_or_default();
+        crate::note!(
+            "timberfs: {name} has a live writer{who}, which enforces retention on its own \
+             tick; nothing to do here"
+        );
+        return Ok(());
+    };
+
+    let cfg = Config {
+        chunk_size: 256 * 1024,
+        level: 3,
+        flush_age_ms: 5000,
+    };
+    let mut st = Store {
+        dir: dir.clone(),
+        cfg,
+        files: BTreeMap::new(),
+    };
+    st.create(&name)?;
+    // Re-resolved under the lock: the preview above was lock-free, and a
+    // floor is only a statement about the store as it is at the moment of
+    // the drop.
+    let next_seq = st.next_seq(&name).unwrap_or(next_seq);
+    let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+    match st.enforce_retention(&name, policy.max_age_ms, policy.max_comp_bytes, held.floor)? {
+        None => println!("nothing to trim: every chunk is within the declared policy"),
+        Some(stats) => {
+            println!(
+                "trimmed {} chunk(s) ({} on disk), chunks {}..{}, written {} .. {}",
+                stats.chunks_moved,
+                human_bytes(stats.comp_bytes),
+                stats.first_seq,
+                stats.last_seq,
+                fmt_ms(stats.first_write_ms),
+                fmt_ms(stats.last_write_ms)
+            );
+            println!("  {} chunk(s) remain", stats.chunks_remaining);
+            if let Some(record) = crate::follower::override_record(&name, &policy, &stats, &held) {
+                eprintln!("{record}");
+            }
+            // A head-drop deletes the grain, exactly as it does for a
+            // writer's tick; rebuild it if the store declares one.
+            if crate::bark::index_declared(&dir, &name) {
+                if let Err(e) = crate::grain::extend_grain(&dir, &name) {
+                    eprintln!("timberfs: {name}: grain rebuild after trim failed: {e}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn cmd_rotate(
     source: &Path,
     dest: Option<&str>,
