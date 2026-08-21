@@ -1919,8 +1919,11 @@ PYEOF
     grep -q 'converting a pre-numbering cursor' /tmp/conv.err \
         || { cat /tmp/conv.err >&2; return 1; }
     grep -q 'resolves to chunk 1' /tmp/conv.err || { cat /tmp/conv.err >&2; return 1; }
-    # Converted in place, and `n` reset rather than carried across axes.
-    jq -e '.seq == 1' "$cur" >/dev/null || { cat "$cur"; return 1; }
+    # Converted in place. NOT pinned to the resolved chunk: continuing
+    # past it is the whole point, and how far it gets inside the timeout is
+    # a race — only that it became a number and never went backwards.
+    jq -e '(.seq | type) == "number" and .seq >= 1' "$cur" >/dev/null \
+        || { cat "$cur"; return 1; }
     # Nothing was skipped: the entry from the chunk it resolved into arrives.
     otlp_wait_for "$(otlp_store conv)" "conv line 2" || return 1
     rm -f "$cur" /tmp/conv.ship /tmp/conv.err
