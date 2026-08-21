@@ -361,3 +361,36 @@ absent), while a field that changes how records must be read sets a bit and
 an older reader refuses instead of guessing. (Logged-timestamp
 zone maps, the other planned index family, became largely moot: import
 already writes logged time into the rings.)
+
+## The chunk number, and what it is not
+
+A chunk's number is a **position in one store**, not a fact about its
+contents. Three rules follow, and each is the answer to a way of getting it
+wrong.
+
+**It is local, so it is ignored on ingest.** The number rides the records
+stream, because a consumer's cursor has to be told which chunk an entry
+came from — but `import` and `append --records` let the destination assign
+its own. Honouring an incoming number would interleave two fan-in sources
+into a sequence that is neither dense nor monotone. This is the one place
+the stream's word is *not* law: `wf`/`wl` travel because they say when an
+entry was written upstream, which stays true anywhere; a position does not.
+
+**An entry from the live edge has no number**, its chunk not existing yet,
+and the ABSENCE is the signal — a zero would be a lie, chunk 0 being a real
+chunk. Such an entry is delivered and counted, but no position moves: there
+is nowhere inside an unwritten chunk to resume from. A restart re-reads from
+the last chunk boundary, which chunk-granular resume already does.
+
+**Both migrations are lazy, so no store needs an operator step.** A v1
+index is read with its numbers synthesized — the oldest surviving record is
+0, a definition rather than an attempt to recover how many were dropped
+before anyone counted — and a v2 *writer* rewrites it on open, before the
+rings are opened for writing (temp + rename, so a crash simply leaves the
+v1 file and it runs again). A pre-numbering cursor resolves its write time
+to a chunk the way `query --from` does, with `n` **reset**: `n` counted
+entries within a window, so carrying it across axes could skip entries
+nobody received, where resetting re-delivers at most one chunk. Wrong twice
+is recoverable; wrong once and skipped is not. Resolution is a pure function
+of `(wl, rings)`, which is what lets the converted cursor be persisted only
+after a successful send, never ahead of a durability proof.
