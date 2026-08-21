@@ -48,26 +48,65 @@ works is in [docs/design.md](docs/design.md).
   `.bark` are done. Make a forest readable over the network so an operator
   can search it without shell access on the log host: enumerate stores
   (`list`), report one (`info`), and select entries by time window and by
-  the existing predicates, grain-accelerated as locally. The protocol is
-  mostly already written — the control plane is what `--json` already
-  emits, and the data plane is a **timberfs-records(5) stream**, whose
-  stream-end totals prove the response arrived complete, which a bare HTTP
-  body cannot. HTTP, not gRPC, for the reason `otlp-intake` gives. The
-  client then stays thin and composable: a remote selection pipes into
-  `timber-filter` and `import --records` unchanged, so the
-  investigation-as-artifact workflow works across the network with the
-  tools that already exist. Two things to design in rather than bolt on:
-  a **cost preflight** (chunk selection precedes decompression, so the
-  server can state how many chunks and roughly how many bytes a query
-  would read *before* reading them — most log servers cannot answer that
-  without doing the work), and **fleet shape**: the client fans out to N
-  hosts and merges, exactly as multi-file `query` interleaves today. No
-  proxying server, no cluster, no leader. A Loki-compatible facade — the
-  compatibility bet worth taking for Grafana and its client ecosystem —
-  layers *over* this, never under it: LogQL's label model would flatten
-  the entry and two-clock semantics if it were the core. Concurrency needs
-  nothing new; a server is just another standalone reader, already covered
-  by the collapse seqlock and the grain/rings generation check.
+  the existing predicates, grain-accelerated as locally.
+  **The API is timberfs's own, not a compatibility layer.** A
+  Loki-compatible facade was the earlier bet and is dropped: LogQL cannot
+  express what this store is good at. It has no syntax for a
+  word-anchored token search, so the `.grain` index — 20x on a measured
+  34 MB store, one chunk decompressed against 136 — is simply unreachable
+  through it, and its single timestamp would flatten the two-clock
+  semantics. An API shaped by a foreign query language would have made
+  every distinctive property of the store either invisible or a lie.
+  A **Grafana datasource plugin then becomes one CONSUMER** of that API
+  rather than the reason for its shape (Grafana's plugin model asks for no
+  query language at all — a query is a JSON object the plugin defines),
+  and the CLI is another. Which is the ordering that keeps the API honest:
+  it answers to the store, and clients adapt.
+  Much is still open and should stay that way until there is code: the
+  wire format (the control plane looks like what `--json` already emits;
+  the data plane could be a **timberfs-records(5) stream**, whose
+  stream-end totals prove a response arrived complete where a bare HTTP
+  body cannot, but that is an argument for a property rather than a
+  settled choice), whether anything proxies or fans out, and how a client
+  addresses a fleet. HTTP, not gRPC, for the reason `otlp-intake` gives.
+  One thing worth designing in rather than bolting on: a **cost
+  preflight** — chunk selection precedes decompression, so the server can
+  state how many chunks and roughly how many bytes a query would read
+  *before* reading them, which most log servers cannot answer without
+  doing the work. That one has a working prototype already, arrived at
+  sideways: Grafana demands the same number, and the spike below computes
+  it from `.rings` alone.
+  Concurrency needs nothing new; a server is just another standalone
+  reader, already covered by the collapse seqlock and the grain/rings
+  generation check.
+- **What the LogQL spike measured** (branch `spike/logql-serve`, not for
+  merge — kept as evidence): enough of Loki's read API for a real Grafana
+  11.3.0 to point at a forest. It is the reason the facade above is
+  dropped, and it is worth keeping because a negative result that stops
+  the wrong build is worth more than an estimate.
+  Grafana asks for a CORNER of LogQL, not the language: four routes
+  (`/query` for the health check, `/labels` for autocomplete,
+  `/index/stats` for query sizing, `/query_range` for both panels) and
+  exactly ONE metric shape. Four things no amount of reading the docs
+  would have given: the datasource **health check is itself a metric
+  query** (`vector(1)+vector(1)` at a year-2096 instant), so log-query
+  support alone can never make a datasource go green; `/index/stats` is
+  the one route that is **not enveloped** and wrapping it renders "will
+  process approximately NaNundefined" in the UI; the volume query carries
+  `detected_level` (a per-entry derived label — `otlp::Severity::of()`
+  already computes exactly that) and a `| drop` stage that a metric
+  subset would have to ACCEPT as a no-op; and Grafana passes a 400's text
+  to the user verbatim, which is what makes refusing unsupported LogQL by
+  name the right call rather than pedantry.
+  Also settled, and load-bearing for why the facade is dead: **reusing
+  Loki's engine is blocked by a licence, not an architecture.** Loki is
+  AGPLv3 (verified) against timberfs's MIT/Apache, so linking it in makes
+  an unshippable binary; and inverting it — teach Loki to read timberfs —
+  dissolves that (an AGPL fork is permitted) only to hit the fact that
+  Loki has no storage plugin seam at all, every backend being Go compiled
+  in. Its actually-pluggable layer is an object store, where timberfs
+  would hold Loki's own opaque chunks and none of its own indexes would
+  apply.
 - **Scoped, audited read access**: what a serve API makes possible and
   shell access cannot — a grant of *subject × store or forest × data
   window × grant lifetime*, the last two being different clocks ("this
