@@ -202,6 +202,8 @@ human-editable JSON object — the label on the timber:
   "wal": true,                    //   write-ahead .sap — crash loss shrinks to ~1s
   "retain": "90d",                //   keep at least this long — enforced by EVERY writer
   "retain_size": "50G",           //   compressed-size budget, oldest dropped first
+  "retain_unconsumed": true,      //   keep what retaining FOLLOWERS have not read;
+                                  //   additive, and needs the budget above as its backstop
   "cursors": "/var/lib/timberfs", //   SUPERSEDED by the follower registry: a
                                   //   follower declares its store, so a store
                                   //   declares nothing. Honoured, reported so

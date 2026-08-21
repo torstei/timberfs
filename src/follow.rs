@@ -438,11 +438,24 @@ pub fn cmd_follow(
         dir: dir.clone(),
         name: name.clone(),
         last: crate::bark::Retention::default(),
+        anchor: String::new(),
         warned: false,
         stamp: None,
         reparsed: false,
     }));
-    append::run_retention(&store, &name, policy.lock().unwrap().refresh());
+    {
+        let (p, anchor) = {
+            let mut pol = policy.lock().unwrap();
+            (pol.refresh(), pol.anchor.clone())
+        };
+        append::run_retention(
+            &store,
+            &name,
+            p,
+            &anchor,
+            &mut crate::follower::TickInterest::default(),
+        );
+    }
     append::spawn_maintenance(
         Arc::clone(&store),
         dir.clone(),

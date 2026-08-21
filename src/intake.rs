@@ -119,11 +119,18 @@ impl<X> Intake<X> {
         name: &str,
         max_age_ms: Option<u64>,
         max_comp_bytes: Option<u64>,
+        interest_floor: Option<u64>,
     ) -> std::io::Result<Option<store::RotateStats>> {
         match self.stores.get_mut(name) {
-            Some(s) => s.enforce_retention(name, max_age_ms, max_comp_bytes),
+            Some(s) => s.enforce_retention(name, max_age_ms, max_comp_bytes, interest_floor),
             None => Ok(None),
         }
+    }
+
+    /// The next chunk number of one of the receiver's stores — what the
+    /// interest axis needs to call a claimed position impossible.
+    pub fn next_seq(&self, name: &str) -> Option<u64> {
+        self.stores.get(name).and_then(|s| s.next_seq(name))
     }
 }
 
@@ -277,17 +284,35 @@ where
                 g.sync_wal_declarations();
                 g.names()
             };
+            // One per tick, however many tags this receiver has fanned
+            // out to: the registry is read at most once, and only if some
+            // store declares the axis.
+            let mut interest = crate::follower::TickInterest::default();
             for name in &names {
                 let dir = store_dir(&root, name);
                 match crate::bark::declared_retention(&dir, name) {
                     Ok(policy) if policy.is_some() => {
+                        let anchor = crate::follower::anchor_of(&dir, name);
+                        let next_seq = intake.lock().unwrap().next_seq(name).unwrap_or(0);
+                        let held = interest.floor(&policy, &anchor, next_seq);
                         let res = intake.lock().unwrap().enforce_retention(
                             name,
                             policy.max_age_ms,
                             policy.max_comp_bytes,
+                            held.floor,
                         );
-                        if let Err(e) = res {
-                            eprintln!("timberfs: {name}: background retention failed: {e}");
+                        match res {
+                            Err(e) => {
+                                eprintln!("timberfs: {name}: background retention failed: {e}")
+                            }
+                            Ok(Some(stats)) => {
+                                if let Some(record) =
+                                    crate::follower::override_record(name, &policy, &stats, &held)
+                                {
+                                    eprintln!("{record}");
+                                }
+                            }
+                            Ok(None) => {}
                         }
                     }
                     _ => {}

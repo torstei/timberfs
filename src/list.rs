@@ -99,12 +99,23 @@ fn open_summary(
 
 /// The RETAIN column: the declared policy, or `-` when none is declared.
 fn retain_text(s: &StoreSummary) -> String {
-    match (&s.retain, &s.retain_size) {
-        (None, None) => "-".to_string(),
-        (Some(r), None) => r.clone(),
-        (None, Some(r)) => r.clone(),
-        (Some(r), Some(rs)) => format!("{r}, {rs}"),
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(r) = &s.retain {
+        parts.push(r.clone());
     }
+    if let Some(r) = &s.retain_size {
+        parts.push(r.clone());
+    }
+    // The third axis is a flag, not a quantity, so the column names it
+    // rather than measuring it: how much it holds is a per-follower fact
+    // and lives in the FOLLOWERS column beside it.
+    if s.retain_unconsumed {
+        parts.push("unconsumed".to_string());
+    }
+    if parts.is_empty() {
+        return "-".to_string();
+    }
+    parts.join(", ")
 }
 
 /// The SPAN column: the write-time window covered, or `empty` for a store
@@ -302,6 +313,7 @@ mod tests {
             sap_pending_bytes: None,
             retain: retain.map(str::to_string),
             retain_size: retain_size.map(str::to_string),
+            retain_unconsumed: false,
             followers: Vec::new(),
             consumers: None,
             writer,

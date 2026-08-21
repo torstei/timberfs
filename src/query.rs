@@ -1389,6 +1389,9 @@ pub struct StoreSummary {
     pub sap_pending_bytes: Option<u64>,
     pub retain: Option<String>,
     pub retain_size: Option<String>,
+    /// `retain_unconsumed`: the third axis is declared on this store, so
+    /// its retaining followers' positions hold the head back.
+    pub retain_unconsumed: bool,
     /// The store's REGISTERED followers, furthest behind first. Empty is
     /// a real and complete answer here — the registry names every
     /// follower of every store, so "none" means none, where an absent
@@ -1545,6 +1548,10 @@ pub fn summarize_store(
         sap_pending_bytes,
         retain: get("retain"),
         retain_size: get("retain_size"),
+        retain_unconsumed: bark
+            .and_then(|b| b.get("retain_unconsumed"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         followers,
         consumers: crate::cursor::survey(dir, name, bark, records),
         writer,
@@ -1587,6 +1594,10 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     let pattern = get("pattern");
     let retain = get("retain");
     let retain_size = get("retain_size");
+    let retain_unconsumed = bark
+        .get("retain_unconsumed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     const RESERVED: &[&str] = &[
         "id",
         "created",
@@ -1599,6 +1610,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         "pattern",
         "retain",
         "retain_size",
+        "retain_unconsumed",
         "cursors",
     ];
     let provenance: Vec<(String, String)> = bark
@@ -1715,6 +1727,9 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         }
         if let Some(r) = &retain_size {
             put("retain_size", r.clone().into());
+        }
+        if retain_unconsumed {
+            put("retain_unconsumed", true.into());
         }
         put("index_declared", index_declared.into());
         put("wal_declared", wal_declared.into());
@@ -1861,7 +1876,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                 ),
             }
         }
-        if retain.is_some() || retain_size.is_some() {
+        if retain.is_some() || retain_size.is_some() || retain_unconsumed {
             let mut parts: Vec<String> = Vec::new();
             if let Some(r) = &retain {
                 parts.push(format!("keep {r}"));
@@ -1869,8 +1884,16 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             if let Some(r) = &retain_size {
                 parts.push(format!("disk <= {r}"));
             }
+            if retain_unconsumed {
+                // Named as what it KEEPS, like the other two, and the
+                // asymmetry stated: this axis only ever holds more, which
+                // is why the budget beside it is required rather than
+                // optional.
+                parts.push("keep what retaining followers have not read".to_string());
+            }
             // Retention only acts while a writer runs: an idle store with
-            // a policy doesn't shrink — say so instead of surprising.
+            // a policy doesn't shrink — say so instead of surprising, and
+            // point at the one-shot that does it without one.
             let over = retain_size
                 .as_deref()
                 .and_then(|r| crate::append::parse_size_bytes(r).ok())
@@ -1880,7 +1903,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                 "  retention {} — enforced by writers{}",
                 parts.join(", "),
                 if over {
-                    " (currently OVER budget, and none is running)"
+                    " (currently OVER budget, and none is running — `timberfs trim`)"
                 } else {
                     ""
                 }

@@ -713,6 +713,275 @@ fn rank(followers: &mut [Registered]) {
 }
 
 // ---------------------------------------------------------------------------
+// the interest axis
+// ---------------------------------------------------------------------------
+
+/// What a store's RETAINING followers hold back, as a retention tick needs
+/// it. Read from the registry alone: the caller is the store, so nothing
+/// here resolves a store or reads a rings file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Interest {
+    /// Chunks numbered strictly below this are consumed by EVERY retaining
+    /// follower, and may be dropped.
+    ///
+    /// `None` means none may — and that is the value every fail-closed
+    /// case lands on, together with the healthy-but-holding case of a
+    /// follower that has never run. They are one value because they are
+    /// one instruction: drop nothing by interest. Note what that does NOT
+    /// mean — interest is additive, so age and size still apply, and a
+    /// `None` here is a hold on this axis only, never a hold on the store.
+    pub floor: Option<u64>,
+    /// The retaining follower whose position IS the floor: the one to name
+    /// when a size budget overrides it. `None` when no retaining follower
+    /// was found at all, so there is nobody to name and no loss to record.
+    pub holder: Option<String>,
+    /// That follower's position — `None` when it has never run, and
+    /// therefore holds everything.
+    pub holder_at: Option<u64>,
+    /// How many retaining followers were considered, for reporting.
+    pub retaining: usize,
+}
+
+impl Interest {
+    /// How many head chunks may be dropped by interest alone — for a
+    /// PREVIEW (`trim --dry-run`, `info`) computed outside a writer. The
+    /// writer itself is handed `floor` and partitions its own chunks, so
+    /// this is never the thing that decides a drop.
+    pub fn droppable(&self, records: &[crate::format::ChunkRecord]) -> usize {
+        match self.floor {
+            Some(floor) => records.partition_point(|c| c.seq < floor),
+            None => 0,
+        }
+    }
+}
+
+/// One retaining follower, as the interest axis sees it: a name and a
+/// position, and nothing else.
+type Retaining = (String, Option<u64>);
+
+/// The interest axis for every store, from ONE read of the registry — for
+/// a writer that then asks about each store it holds.
+///
+/// ⚠ Read afresh every tick, deliberately NOT gated on the registry
+/// directory's mtime. That gate is the obvious optimisation and it is
+/// wrong: a position save and an `update` are both a tmp+rename INSIDE
+/// `followers/<name>/`, which leaves `followers/`'s own mtime untouched
+/// (measured). So the gate would miss every position advance — the floor
+/// would never move, and the axis would silently do nothing — and, worse,
+/// it would miss an `update retaining=true`, leaving the store dropping
+/// data a newly-retaining follower should be holding. That is the EARLY
+/// direction, which the "dropping late is harmless" licence does not
+/// cover. The scan it saves is one `read_dir` plus two small reads per
+/// follower, page-cached, once per tick for all stores at once.
+pub struct InterestIndex {
+    /// Store anchor -> its retaining followers. `None` means fail closed
+    /// for EVERY store: see `read`.
+    per_store: Option<HashMap<String, Vec<Retaining>>>,
+}
+
+impl InterestIndex {
+    /// Fail closed for every store, without reading anything — what a
+    /// caller uses when it has no registry to consult.
+    pub fn closed() -> InterestIndex {
+        InterestIndex { per_store: None }
+    }
+
+    /// Read the registry.
+    ///
+    /// A declaration that cannot be read fails closed for ALL stores, not
+    /// just its own: an unreadable declaration might have been a retaining
+    /// follower of any store, and there is no way to know which. Harsh,
+    /// and bounded by design — interest is additive, so age and size keep
+    /// working and the only cost is dropping late, which is the harmless
+    /// direction. It is also loud: `timberfs follower list` reports the
+    /// same declaration as unreadable.
+    pub fn read(reg: &Path) -> InterestIndex {
+        let entries = match fs::read_dir(reg) {
+            Ok(e) => e,
+            // No registry at all: nothing is registered, so nothing is
+            // held. Distinct from unreadable — this is a fact, not a gap.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return InterestIndex {
+                    per_store: Some(HashMap::new()),
+                }
+            }
+            Err(_) => return InterestIndex::closed(),
+        };
+        let mut per_store: HashMap<String, Vec<Retaining>> = HashMap::new();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return InterestIndex::closed();
+            };
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                return InterestIndex::closed();
+            };
+            if validate_name(&name).is_err() {
+                // Not a name a follower can have, so not a follower —
+                // some other directory somebody put here.
+                continue;
+            }
+            let decl = match Declaration::load(reg, &name) {
+                Ok(d) => d,
+                Err(_) => return InterestIndex::closed(),
+            };
+            if !decl.retaining {
+                continue;
+            }
+            // A position that cannot be read is not a position: the
+            // follower holds everything until it can be read again.
+            let at = match Cursor::load(&cursor_path(reg, &name)) {
+                Ok(c) => c.and_then(|c| c.seq),
+                Err(_) => None,
+            };
+            per_store.entry(decl.store).or_default().push((name, at));
+        }
+        InterestIndex {
+            per_store: Some(per_store),
+        }
+    }
+
+    /// What the store `anchor` may drop by interest. `next_seq` is the
+    /// number the store will give its NEXT chunk — everything it has ever
+    /// written is below it.
+    pub fn for_store(&self, anchor: &str, next_seq: u64) -> Interest {
+        let Some(per_store) = &self.per_store else {
+            return Interest::default();
+        };
+        let Some(followers) = per_store.get(anchor) else {
+            // Nothing retains this store: the axis holds nothing, and
+            // there is nobody to name in a loss record.
+            return Interest::default();
+        };
+        let retaining = followers.len();
+        // The minimum over the set, with two ways to be zero. A follower
+        // that has never run holds everything, and one claiming a chunk
+        // the store has never written is a wrong anchor or a hand-edit --
+        // newly PROVABLE, where a future timestamp was indistinguishable
+        // from clock skew. Both mean: drop nothing, and name that one.
+        let mut floor: Option<u64> = None;
+        for (name, at) in followers {
+            match at {
+                None => {
+                    return Interest {
+                        floor: None,
+                        holder: Some(name.clone()),
+                        holder_at: None,
+                        retaining,
+                    }
+                }
+                Some(seq) if *seq >= next_seq => {
+                    return Interest {
+                        floor: None,
+                        holder: Some(name.clone()),
+                        holder_at: Some(*seq),
+                        retaining,
+                    }
+                }
+                Some(seq) => {
+                    if floor.is_none_or(|f| *seq < f) {
+                        floor = Some(*seq);
+                    }
+                }
+            }
+        }
+        let holder = floor.and_then(|f| {
+            followers
+                .iter()
+                .find(|(_, at)| *at == Some(f))
+                .map(|(n, _)| n.clone())
+        });
+        Interest {
+            floor,
+            holder,
+            holder_at: floor,
+            retaining,
+        }
+    }
+}
+
+/// The anchor a store's followers are matched by. Derived, not cached
+/// here: it can change exactly once, when `follower create` mints an
+/// identity for a store that had none, and a tick that cached the
+/// pre-minting value would then find no followers — the harmless
+/// direction, but the axis would silently never start working. Callers
+/// pair it with the policy, which is re-read on the same manifest change.
+pub fn anchor_of(dir: &Path, name: &str) -> String {
+    cursor::store_anchor(dir, name, crate::bark::load(dir, name).as_ref())
+}
+
+/// The interest axis for ONE retention tick: the registry is read at most
+/// once, and only if some store actually declares the axis — so a host
+/// where nothing declares `retain_unconsumed` never touches it, and a
+/// writer holding many stores reads it once rather than once per store.
+#[derive(Default)]
+pub struct TickInterest {
+    index: Option<InterestIndex>,
+}
+
+impl TickInterest {
+    /// What the store `anchor` may drop by interest on this tick.
+    /// `next_seq` is the number its next chunk will get.
+    pub fn floor(
+        &mut self,
+        policy: &crate::bark::Retention,
+        anchor: &str,
+        next_seq: u64,
+    ) -> Interest {
+        if !policy.unconsumed {
+            return Interest::default();
+        }
+        self.index
+            .get_or_insert_with(|| InterestIndex::read(&registry_dir()))
+            .for_store(anchor, next_seq)
+    }
+}
+
+/// The exact loss, when a declared budget dropped chunks a retaining
+/// follower had not read.
+///
+/// This is a REQUIREMENT rather than a nicety. With finite disk, bounded
+/// loss is a choice already made — the alternative is blocking the
+/// producer, which for telemetry is worse than losing an hour of access
+/// logs — so what is owed is precise accounting at the moment it happens,
+/// and the writer holds both halves of the comparison right there. The
+/// shipper's GAP warning is the same fact inferred later, from the other
+/// side; this one is exact.
+///
+/// `None` when nothing unconsumed was dropped (the healthy case) or when
+/// no retaining follower was found (nothing to account to).
+pub fn override_record(
+    store: &str,
+    policy: &crate::bark::Retention,
+    stats: &crate::store::RotateStats,
+    interest: &Interest,
+) -> Option<String> {
+    let holder = interest.holder.as_ref()?;
+    let first = match interest.floor {
+        // It held everything, so everything dropped was unread.
+        None => stats.first_seq,
+        // Chunks at or past the floor were dropped despite being unread.
+        Some(floor) if stats.last_seq >= floor => floor.max(stats.first_seq),
+        Some(_) => return None,
+    };
+    let budget = policy
+        .max_comp_bytes
+        .map(crate::rotate::human_bytes)
+        .unwrap_or_else(|| "the size budget".to_string());
+    let position = match interest.holder_at {
+        Some(seq) => format!("at chunk {seq}"),
+        None => "which has never run".to_string(),
+    };
+    Some(format!(
+        "timberfs: {store}: retain_size ({budget}) reached with follower {holder} {position} — \
+         dropped chunks {first}..{} it had not read",
+        stats.last_seq
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // systemd
 // ---------------------------------------------------------------------------
 
@@ -1678,6 +1947,228 @@ mod tests {
         assert_eq!(r.position_text(), "-");
         assert!(r.cursor.is_none());
         fs::remove_dir_all(&reg).ok();
+    }
+
+    /// A retaining follower of `store`, standing at `at`.
+    fn retaining(reg: &Path, name: &str, store: &str, at: Option<u64>) {
+        let mut d = decl(name, true);
+        d.store = store.to_string();
+        d.save(reg).unwrap();
+        if let Some(seq) = at {
+            Cursor {
+                seq: Some(seq),
+                ..Cursor::new(name, store, "/p")
+            }
+            .save(&cursor_path(reg, name))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_floor_is_the_minimum_over_retaining_followers() {
+        let reg = scratch("floor");
+        retaining(&reg, "ahead", "id", Some(9));
+        retaining(&reg, "behind", "id", Some(4));
+        // A non-retaining follower of the same store decides nothing: the
+        // flag is what expresses interest, not the presence of a position.
+        let mut tap = decl("tap", false);
+        tap.store = "id".into();
+        tap.save(&reg).unwrap();
+        Cursor {
+            seq: Some(0),
+            ..Cursor::new("tap", "id", "/p")
+        }
+        .save(&cursor_path(&reg, "tap"))
+        .unwrap();
+
+        let held = InterestIndex::read(&reg).for_store("id", 100);
+        assert_eq!(held.floor, Some(4));
+        assert_eq!(held.holder.as_deref(), Some("behind"));
+        assert_eq!(held.retaining, 2, "the tap is not one of them");
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    #[test]
+    fn a_follower_that_never_ran_holds_everything_and_is_named() {
+        // The point of the whole design: "nobody has ever read this" is
+        // expressible, and it holds the store rather than releasing it.
+        let reg = scratch("neverran");
+        retaining(&reg, "ahead", "id", Some(9));
+        retaining(&reg, "fresh", "id", None);
+        let held = InterestIndex::read(&reg).for_store("id", 100);
+        assert_eq!(held.floor, None, "one of them holds everything");
+        assert_eq!(held.holder.as_deref(), Some("fresh"));
+        assert_eq!(held.holder_at, None);
+        // And a floor of None drops nothing, whatever the store holds.
+        assert_eq!(held.droppable(&three()), 0);
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    #[test]
+    fn a_position_past_everything_written_is_impossible_not_merely_odd() {
+        // Newly PROVABLE, where a future timestamp was indistinguishable
+        // from clock skew: a chunk number beyond what the store has ever
+        // written is a wrong anchor or a hand-edit. Fail closed and say
+        // whose it is.
+        let reg = scratch("impossible");
+        retaining(&reg, "bogus", "id", Some(500));
+        let held = InterestIndex::read(&reg).for_store("id", 10);
+        assert_eq!(held.floor, None);
+        assert_eq!(held.holder.as_deref(), Some("bogus"));
+        assert_eq!(held.holder_at, Some(500));
+        // One below next_seq is a legal position, and drops accordingly.
+        let ok = InterestIndex::read(&reg).for_store("id", 501);
+        assert_eq!(ok.floor, Some(500));
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    #[test]
+    fn every_way_of_not_knowing_drops_nothing() {
+        // Each of these is indistinguishable from "consumed" if read
+        // wrong, so each has to land on the same instruction: drop nothing
+        // by interest. Note what that is NOT — interest is additive, so
+        // age and size keep working throughout.
+        let reg = scratch("failclosed");
+
+        // No registry at all.
+        let absent = InterestIndex::read(Path::new("/nonexistent/timberfs-followers"));
+        assert_eq!(absent.for_store("id", 100).floor, None);
+
+        // A registry with nothing in it, and one with nothing for us.
+        retaining(&reg, "elsewhere", "other-store", Some(3));
+        let held = InterestIndex::read(&reg).for_store("id", 100);
+        assert_eq!(held.floor, None);
+        assert_eq!(held.holder, None, "nobody to name, so no loss record");
+
+        // A follower of ours whose position cannot be read holds
+        // everything: an unreadable position is not a position.
+        retaining(&reg, "torn", "id", None);
+        fs::write(cursor_path(&reg, "torn"), "{ not json").unwrap();
+        assert_eq!(InterestIndex::read(&reg).for_store("id", 100).floor, None);
+
+        // An unreadable DECLARATION fails closed for every store, not just
+        // its own: it might have been a retaining follower of any of them,
+        // and there is no way to know which.
+        fs::write(decl_path(&reg, "torn"), "{ not json").unwrap();
+        let broken = InterestIndex::read(&reg);
+        assert_eq!(broken.for_store("id", 100).floor, None);
+        assert_eq!(broken.for_store("other-store", 100).floor, None);
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    #[test]
+    fn the_axis_is_not_consulted_unless_the_store_declares_it() {
+        // A host where nothing declares `retain_unconsumed` must never
+        // touch the registry — which is also what makes reading it afresh
+        // every tick affordable.
+        let mut tick = TickInterest::default();
+        let off = crate::bark::Retention {
+            max_comp_bytes: Some(1024),
+            ..Default::default()
+        };
+        assert_eq!(tick.floor(&off, "id", 100), Interest::default());
+        assert!(tick.index.is_none(), "nothing declared it, so nothing read");
+
+        let on = crate::bark::Retention {
+            max_comp_bytes: Some(1024),
+            unconsumed: true,
+            ..Default::default()
+        };
+        tick.floor(&on, "id", 100);
+        assert!(tick.index.is_some(), "declared, so read once");
+    }
+
+    #[test]
+    fn the_loss_record_names_the_follower_and_the_exact_range() {
+        let policy = crate::bark::Retention {
+            max_comp_bytes: Some(50 * 1024),
+            unconsumed: true,
+            ..Default::default()
+        };
+        let stats = |first: u64, last: u64| crate::store::RotateStats {
+            chunks_moved: (last - first + 1) as usize,
+            uncomp_bytes: 0,
+            comp_bytes: 0,
+            first_write_ms: 0,
+            last_write_ms: 0,
+            chunks_remaining: 0,
+            first_seq: first,
+            last_seq: last,
+        };
+        let held = Interest {
+            floor: Some(4200),
+            holder: Some("central".into()),
+            holder_at: Some(4200),
+            retaining: 1,
+        };
+        // The budget went past the floor: the overrun is recorded from the
+        // floor, not from the start of the drop — chunks below it were
+        // consumed and their loss is the healthy case.
+        let record = override_record("app.log", &policy, &stats(4000, 4830), &held).unwrap();
+        assert!(
+            record.contains("follower central at chunk 4200"),
+            "{record}"
+        );
+        assert!(record.contains("dropped chunks 4200..4830"), "{record}");
+        assert!(record.contains("50.0 KiB"), "{record}");
+
+        // A drop entirely below the floor is consumed data going, which is
+        // the whole point of the feature and not a loss at all.
+        assert!(override_record("app.log", &policy, &stats(4000, 4199), &held).is_none());
+
+        // A follower that never ran held everything, so everything dropped
+        // was unread — and the record says so rather than naming a chunk.
+        let fresh = Interest {
+            floor: None,
+            holder: Some("fresh".into()),
+            holder_at: None,
+            retaining: 1,
+        };
+        let record = override_record("app.log", &policy, &stats(0, 12), &fresh).unwrap();
+        assert!(
+            record.contains("follower fresh which has never run"),
+            "{record}"
+        );
+        assert!(record.contains("dropped chunks 0..12"), "{record}");
+
+        // Nobody registered: nothing to account to, so no record.
+        assert!(override_record("app.log", &policy, &stats(0, 12), &Interest::default()).is_none());
+    }
+
+    #[test]
+    fn droppable_is_the_same_prefix_a_cursor_calls_consumed() {
+        // The invariant tying the two halves together: what interest lets
+        // retention drop must be exactly what a resume would never
+        // deliver. `cursor::consumed_prefix` is the other side of it.
+        let records = three();
+        for seq in 0..=3u64 {
+            let held = Interest {
+                floor: Some(seq),
+                holder: Some("c".into()),
+                holder_at: Some(seq),
+                retaining: 1,
+            };
+            assert_eq!(
+                held.droppable(&records),
+                cursor::consumed_prefix(&records, Some(seq)),
+                "interest and the cursor disagree at chunk {seq}"
+            );
+        }
+    }
+
+    /// Three chunks numbered 0..2, as cursor.rs's own tests use.
+    fn three() -> Vec<crate::format::ChunkRecord> {
+        (0..3)
+            .map(|i| crate::format::ChunkRecord {
+                uncomp_start: i * 10,
+                uncomp_len: 10,
+                comp_start: i * 10,
+                comp_len: 10,
+                first_write_ms: 100 + i * 100,
+                last_write_ms: 200 + i * 100,
+                seq: i,
+            })
+            .collect()
     }
 
     #[test]

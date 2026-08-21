@@ -113,15 +113,24 @@ pub fn try_load(dir: &Path, name: &str) -> anyhow::Result<Option<Map<String, Val
 /// A declared retention policy, parsed and validated. Absent keys mean
 /// no limit on that axis; an entirely absent manifest means no limits at
 /// all (a case file carved by grep has no business expiring).
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Retention {
     pub max_age_ms: Option<u64>,
     pub max_comp_bytes: Option<u64>,
+    /// `retain_unconsumed`: keep what this store's RETAINING followers
+    /// have not read, on top of the other two axes. The polarity is
+    /// deliberate — every `retain_*` key names what is KEPT, so
+    /// `retain_consumed` would have read as exactly the opposite.
+    ///
+    /// Never a cap: it only ever holds MORE than age and size would, and
+    /// `max_comp_bytes` is required alongside as the backstop. See
+    /// `Store::enforce_retention`.
+    pub unconsumed: bool,
 }
 
 impl Retention {
     pub fn is_some(&self) -> bool {
-        self.max_age_ms.is_some() || self.max_comp_bytes.is_some()
+        self.max_age_ms.is_some() || self.max_comp_bytes.is_some() || self.unconsumed
     }
 }
 
@@ -133,14 +142,34 @@ pub fn retention_from_map(map: &Map<String, Value>) -> anyhow::Result<Retention>
             Some(v) => bail!("\"{k}\" must be a string, got {v}"),
         }
     };
-    Ok(Retention {
+    let unconsumed = match map.get("retain_unconsumed") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(v) => bail!("\"retain_unconsumed\" must be true or false, got {v}"),
+    };
+    let retention = Retention {
         max_age_ms: get("retain")?
             .map(crate::append::parse_duration_ms)
             .transpose()?,
         max_comp_bytes: get("retain_size")?
             .map(crate::append::parse_size_bytes)
             .transpose()?,
-    })
+        unconsumed,
+    };
+    // The backstop is not optional. Interest is additive, so without a
+    // size budget one stalled follower pins the store until the disk
+    // fills — which kills the PRODUCER, losing the newest data to protect
+    // the oldest. An Err here means callers keep their last good policy
+    // and warn, which is the right failure: never a silent drop to
+    // unbounded, and never an unbounded hold either.
+    if retention.unconsumed && retention.max_comp_bytes.is_none() {
+        bail!(
+            "\"retain_unconsumed\" needs a \"retain_size\" alongside it: interest only ever \
+             holds MORE, so without a budget one stalled follower fills the disk and kills the \
+             producer"
+        );
+    }
+    Ok(retention)
 }
 
 /// Declared line-timestamp format — a CONTENT description (unlike
@@ -237,6 +266,7 @@ const NON_INHERITED: &[&str] = &[
     "wal",
     "retain",
     "retain_size",
+    "retain_unconsumed",
 ];
 
 /// Window bounds are operation facts, recorded as RFC3339 UTC.
@@ -293,6 +323,7 @@ pub fn cmd_create(
     wal: bool,
     retain: Option<&str>,
     retain_size: Option<&str>,
+    retain_unconsumed: bool,
     sets: &[String],
     if_not_exists: bool,
 ) -> anyhow::Result<()> {
@@ -317,6 +348,9 @@ pub fn cmd_create(
         crate::append::parse_size_bytes(r)?;
         map.insert("retain_size".to_string(), Value::String(r.to_string()));
     }
+    if retain_unconsumed {
+        map.insert("retain_unconsumed".to_string(), Value::Bool(true));
+    }
     for kv in sets {
         let Some((k, v)) = kv.split_once('=') else {
             bail!("--set wants key=value, got {kv:?}");
@@ -327,6 +361,9 @@ pub fn cmd_create(
         }
         map.insert(k.to_string(), Value::String(v.to_string()));
     }
+    // Same check `set` makes, on the same whole manifest: a declaration
+    // that no writer could act on must fail before the store exists.
+    retention_from_map(&map)?;
 
     fs::create_dir_all(&dir)?;
     if format::rings_path(&dir, &name).exists() || format::trunk_path(&dir, &name).exists() {
@@ -484,7 +521,7 @@ pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Resu
                 crate::append::parse_size_bytes(&v)?;
                 Value::String(v)
             }
-            "index" | "wal" | "timestamp_utc" => match v.as_str() {
+            "index" | "wal" | "timestamp_utc" | "retain_unconsumed" => match v.as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
                 _ => bail!("\"{k}\" is true or false"),
@@ -524,9 +561,92 @@ pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Resu
     if map.contains_key("timestamp_regex") != map.contains_key("timestamp_format") {
         bail!("timestamp_regex and timestamp_format go together (set both, or unset both)");
     }
+    // Checked against the WHOLE resulting manifest, not just what this
+    // invocation set: `set retain_unconsumed=true` on a store that already
+    // declares a budget is fine, and `unset retain_size` on one that
+    // retains unconsumed data is not. Refused here so the failure is at
+    // the keyboard rather than in a writer's log an hour later.
+    retention_from_map(&map)?;
 
     save(&dir, &name, &map)?;
     let saved = load(&dir, &name).context("re-reading the manifest")?;
     println!("{}", serde_json::to_string_pretty(&Value::Object(saved))?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn the_backstop_is_not_optional() {
+        // Interest only ever holds MORE, so without a size budget one
+        // stalled follower fills the disk and kills the producer. Refused
+        // at parse time, which is what makes it refused at `set` too.
+        let err = retention_from_map(&map(&[("retain_unconsumed", Value::Bool(true))]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retain_size"), "{err}");
+        // An age window is not a backstop: it is a bet on how long the
+        // link stays down, which is the thing this feature exists to stop
+        // making.
+        assert!(retention_from_map(&map(&[
+            ("retain_unconsumed", Value::Bool(true)),
+            ("retain", Value::String("90d".into())),
+        ]))
+        .is_err());
+        // With a budget it parses, and carries all three axes.
+        let p = retention_from_map(&map(&[
+            ("retain_unconsumed", Value::Bool(true)),
+            ("retain_size", Value::String("50G".into())),
+            ("retain", Value::String("90d".into())),
+        ]))
+        .unwrap();
+        assert!(p.unconsumed);
+        assert_eq!(p.max_comp_bytes, Some(50 * 1024 * 1024 * 1024));
+        assert!(p.is_some());
+    }
+
+    #[test]
+    fn retain_unconsumed_false_needs_nothing_and_declares_nothing() {
+        let p = retention_from_map(&map(&[("retain_unconsumed", Value::Bool(false))])).unwrap();
+        assert!(!p.unconsumed);
+        assert!(!p.is_some(), "a store with no limits at all");
+        // A non-boolean is an error, not a truthy string: `toBoolean` on
+        // anything else is the kind of surprise a declaration must not
+        // hold.
+        assert!(
+            retention_from_map(&map(&[("retain_unconsumed", Value::String("yes".into()))]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_axis_does_not_inherit_into_a_derived_artifact() {
+        // Settings are per-store operational choices, and a rotated
+        // segment has no followers: inheriting the axis would make an
+        // archive wait on a consumer that reads the live store.
+        let src = map(&[
+            ("id", Value::String("abc".into())),
+            ("retain_unconsumed", Value::Bool(true)),
+            ("retain_size", Value::String("50G".into())),
+            ("host", Value::String("edge01".into())),
+        ]);
+        let derived = derived_map(Some(&src), "rotate");
+        assert!(!derived.contains_key("retain_unconsumed"));
+        assert!(!derived.contains_key("retain_size"));
+        // Provenance still travels: the lines survive extraction unchanged.
+        assert_eq!(derived.get("host"), Some(&Value::String("edge01".into())));
+        assert_eq!(
+            derived.get("derived_from"),
+            Some(&Value::String("abc".into()))
+        );
+    }
 }

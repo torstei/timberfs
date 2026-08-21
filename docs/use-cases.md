@@ -206,21 +206,46 @@ timber-otlp --follow --cursor /var/lib/timberfs/edge.cursor \
 Plaintext HTTP only: loopback or a private network, or terminate TLS in a
 collector beside it.
 
-The edge store's retention is the link's disconnection budget, and nothing
-enforces that the shipper stays inside it. Register the shipper as a follower
-and the budget becomes observable from the store's side — and the shipper gets
-run by name, with no flags of its own:
+Register the shipper as a **retaining follower** and the edge store stops being
+a hoard. It gets run by name, with no flags of its own, and its position holds
+the head back:
 
 ```sh
 timberfs follower create central --store backing/app.log \
-    --endpoint http://central:4318 --enable --start -- --compress gzip
-timberfs follower list            # position, lag, and whether it is running
-timberfs info backing/app.log     # the same, from the store's side
+    --endpoint http://central:4318 --retaining --enable --start -- --compress gzip
+timberfs set backing/app.log retain_size=20G retain_unconsumed=true
 ```
 
-A shipper that fell outside the window says so on resume (`GAP — N chunk(s)
-were dropped before it read them`) rather than restarting silently from
-whatever is now oldest.
+Now the two requirements that hold at once on an edge box are both satisfied.
+Keep as little log data there as possible — a breach reaches less of it, and
+"shipped off the edge promptly" becomes something you can show rather than
+assert — yet never erase what has not landed elsewhere, including across a
+network outage. No `retain` window satisfies both at any setting: it is a bet on
+how long the link stays down, and the safe bet is the month of hoarding the
+requirement exists to avoid. Only delivery can decide, and that is what a
+position knows.
+
+What remains on the box after a successful ship is **one chunk**, tunable with
+`--chunk-size`/`--flush-age` and with the producer uninvolved — against one
+rotation interval for the ship-then-delete pattern this replaces. And the edge
+needs **push-only** credentials, which is what `rsync`-with-a-hold cannot offer:
+deriving the hold by comparing against the destination means the edge needs read
+access to the archive, i.e. a breached frontend holding a key to wherever the
+data went.
+
+`retain_size` is still required, and is now the disconnection budget outright:
+size it as ingest-rate × the outage worth surviving. When it overrides the
+follower, the writer says exactly what that cost:
+
+```
+app.log: retain_size (20.0 GiB) reached with follower central at chunk 4200
+         — dropped chunks 4200..4830 it had not read
+```
+
+A shipper that fell outside the window also says so on resume (`GAP — N
+chunk(s) were dropped before it read them`) rather than restarting silently from
+whatever is now oldest — the same fact from the other side, inferred rather than
+exact.
 
 ## Hand an investigation to someone else
 
