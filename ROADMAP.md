@@ -152,7 +152,7 @@ works is in [docs/design.md](docs/design.md).
   behind is now surfaced (a store declares a `cursors` directory; `list`
   gains a CONSUMERS column, `info` the per-consumer detail, and the
   shipper warns on a GAP), so what remains open is acting on it — see
-  interest-based retention below.
+  followers below, which supersede the `cursors` key with a registry.
   The larger step is putting a cursor on the RECORDS stream
   (`query --follow --records --cursor`, a flag rather than a new binary —
   the tool boundary is destination-shaped, not format-shaped), because it
@@ -208,127 +208,160 @@ works is in [docs/design.md](docs/design.md).
   Cheap when wanted: the sap is recreated on every seal-and-swap, so a
   format bump there needs no converter and no grace period, unlike the
   rings.
-- **Interest-based retention (a third axis)**: retention drops by age and
-  by size. A frontend box wants a third rule — drop what is CONFIRMED
-  DELIVERED — because two requirements hold at once there: keep as little
-  log data on the box as possible (a breach then reaches less of it, and
-  "shipped off the edge promptly" is a statement that can be made and
-  shown rather than asserted), yet never erase what has not landed
-  elsewhere, including across a network outage. No time window satisfies
-  both at any setting: `retain` is a bet on how long the link stays down,
-  and the safe bet is the month of hoarding the requirement exists to
-  avoid. Only delivery can decide, which is what a cursor already knows.
-  This is NATS's Interest retention, and it makes timberfs a log with
-  interest-based truncation, not a work queue: still position-based and
-  at-least-once, with no per-entry ack, redelivery or dead-letter.
-  **The classic problem, minus the quantum.**
-  Ship-then-delete is as old as log rotation, and its exposure quantum has
-  always been the ROTATION INTERVAL — because rotation couples erasure
-  granularity to the producer's file handle. Every shortening buys
-  exposure with a coordination event: SIGHUP and reopen, or `copytruncate`
-  and its race that loses whatever was written between the copy and the
-  truncate. The prior art gets closer than it is given credit for.
-  `rsync --remove-source-files` unlinks only after a confirmed transfer —
-  delivery-gated deletion, decades old. A shipper's registry (filebeat,
-  fluentd's `pos_file`) is a cursor by another name, computed locally from
-  acks. Neither can delete the delivered PREFIX. rsync derives its hold by
-  COMPARING AGAINST THE DESTINATION, so the edge needs read access to the
-  archive — trust pointing the wrong way for this threat model, since a
-  breached frontend then holds a key to wherever the data went — and it
-  unlinks whole files, which drags rotation back in through the side door.
-  A registry avoids both of those, but a plain file has no prefix-removal:
-  `FALLOC_FL_COLLAPSE_RANGE` is available to anyone, and what a plain log
-  lacks is a FORMAT THAT SURVIVES LOSING ITS HEAD, since every reader's
-  byte offsets shift and nothing rebases them.
-  So what is new here is neither the cursor nor the erasure but their
-  composability on top of design.md's fourth property, "delete from the
-  front": chunk framing plus the rings index IS that format, and this is
-  the second classic file problem that primitive makes easy rather than
-  hard. Two consequences worth stating. Delivery is entry-granular
-  (sub-second with `wal=true`, via the `.sap` live edge) while erasure is
-  chunk-granular, so what remains on the box after a successful ship is
-  ONE CHUNK — tunable with `--chunk-size`/`--flush-age`, with the producer
-  uninvolved — against one rotation interval. And the edge needs
-  PUSH-ONLY credentials, which is exactly what rsync-with-hold cannot
-  offer.
-  **The decisions.**
-  The mechanism is nearly free — `cursor::consumed_prefix` already
-  computes the drop-eligible chunk prefix for a cursor (the exact
-  complement of what `Resume` would deliver), `enforce_retention` already
-  reduces every axis to such a prefix, and head-drop is already a prefix
-  operation.
-  (1) Interest is **additive**: `k = max(age, size, interest)`, never
-  `min`. Letting interest CAP the drop would let one stalled consumer pin
-  the store until the disk fills, which kills the PRODUCER — losing the
-  newest data to protect the oldest, strictly the worse trade. So
-  `retain_size` stays a hard budget and a store declaring interest must
-  declare one too. ⚠ Which means the cap, not the consumption rule, is
-  what decides an outage: it has to be sized as ingest-rate × the outage
-  worth surviving. Interest retention does NOT remove that sizing — it
-  removes the STEADY-STATE hoarding, i.e. the weeks of already-shipped
-  bytes kept just in case, which is the actual win.
-  (2) When the cap overrides consumption, the loss is **recorded exactly**,
-  and this is a requirement rather than a nicety. With finite disk,
-  bounded loss is a choice already made — the alternative is blocking the
-  producer, which for telemetry is a worse outcome than losing an hour of
-  access logs — so what is owed is precise accounting at the moment it
-  happens, and the writer holds both halves of the comparison right
-  there: `retain_size (50G) reached with consumer otlp 6d 2h behind —
-  dropped 4831 chunks covering <from> .. <to> that it had not read`. The
+- **Followers, and retaining what they have not consumed**: retention drops
+  by age and by size. A frontend box wants a third rule — drop what is
+  CONFIRMED DELIVERED — because two requirements hold at once there: keep
+  as little log data on the box as possible (a breach reaches less of it,
+  and "shipped off the edge promptly" becomes a statement that can be shown
+  rather than asserted), yet never erase what has not landed elsewhere,
+  including across a network outage. No time window satisfies both at any
+  setting: `retain` is a bet on how long the link stays down, and the safe
+  bet is the month of hoarding the requirement exists to avoid. Only
+  delivery can decide, which is what a cursor already knows.
+  **A follower is a replication slot.** Postgres arrived at the same shape:
+  a slot holds WAL until its consumer confirms it, a slot name is an
+  operator-chosen string unique per CLUSTER while the slot itself records
+  which database it belongs to, and an unused slot pins WAL forever —
+  whose fix, `max_slot_wal_keep_size`, is precisely the backstop below.
+  Independent arrival at the same design is the strongest argument for it.
+  So timberfs gets registered followers rather than cursors found by
+  convention, and it remains a log with interest-based truncation, not a
+  work queue: still position-based and at-least-once, no per-entry ack, no
+  redelivery, no dead-letter.
+  **The registry.** One directory per follower, named by the follower:
+  ```
+  /var/lib/timberfs/followers/<name>/
+      follower.json    store, type, retaining, config   (operator writes)
+      cursor.json      seq, n, delivered                (follower writes)
+  ```
+  The two files have different OWNERS and that is why they are two: the
+  declaration is the operator's, the position is the follower's, and a
+  cursor save is a whole-file tmp+rename that deliberately drops keys it
+  does not own. One file would make every position write preserve operator
+  fields, and would race `update`.
+  `<name>` is host-unique and constrained to `[A-Za-z0-9_.-]`, so it needs
+  no `systemd-escape` and is a legal directory name as-is — a UUID was the
+  first instinct and is unusable in `systemctl status
+  timberfs-follower@…`, which is where these names are actually typed.
+  Validated and refused-if-taken at `create`, so a collision is caught at
+  registration rather than by two processes overwriting one position — the
+  failure that would let follower A advance past data follower B never
+  sent, and retention then drop it.
+  **The follower declares its store, by identity.** Flat names mean the
+  relation is recorded once, by the party that knows it — like a slot
+  recording its database — so the store keeps no follower list and there is
+  no reverse index to fall out of sync. A store must therefore have a
+  declared `.bark` id before its retention can depend on external state;
+  `create` mints one, and a path would not do, a store being movable. The
+  cost is that a writer's retention tick scans `followers/*/follower.json`
+  and filters by store id rather than reading one directory. Acceptable,
+  and cheaply mitigated: declarations change rarely, so gate the scan on
+  directory mtime — licensed by the asymmetry that DROPPING LATE IS
+  HARMLESS AND DROPPING EARLY IS NOT, which permits lazy evaluation of the
+  whole axis.
+  **The rule.** `retain_unconsumed=true` on the store, and the name's
+  polarity is deliberate: every `retain_*` key names what is KEPT
+  (`retain=90d` keeps 90 days), so `retain_consumed` would have read as
+  exactly the opposite of the behaviour.
+  ```
+  floor = min position over registered followers with retaining=true
+  ki    = chunks.partition_point(|c| c.seq < floor)
+  k     = max(age_k, size_k, ki)
+  ```
+  (1) Interest is **additive**, never a cap. Letting it CAP the drop would
+  let one stalled follower pin the store until the disk fills, which kills
+  the PRODUCER — losing the newest data to protect the oldest, strictly the
+  worse trade. So `retain_size` is REQUIRED alongside, playing
+  `max_slot_wal_keep_size`. ⚠ Which means the cap, not the consumption
+  rule, is what decides an outage: it has to be sized as ingest-rate × the
+  outage worth surviving. This does NOT remove that sizing — it removes the
+  steady-state hoarding, the weeks of already-shipped bytes kept just in
+  case, which is the actual win.
+  (2) A registered follower with `retaining=true` and NO position yet holds
+  everything. That is the point — it is what protects a follower deployed
+  before it first runs, which the earlier find-cursors-by-convention design
+  could not express, "nobody has ever read this" and "the file was deleted"
+  being the same observation there. It is also the footgun, and the same
+  one Postgres has: `create --retaining` without starting it pins the head.
+  So `create` says so in one line, and takes `--enable`/`--start` (systemd's
+  two verbs kept distinct) to make the safe path the easy path.
+  (3) **Fail closed**, since each of these is indistinguishable from
+  "consumed" if read wrong: no registry, an unreadable one, no follower for
+  this store, a follower with no position, or one claiming `seq >=
+  next_seq` — all drop nothing by interest. The last is newly PROVABLE
+  rather than merely suspicious: a chunk number beyond what the store has
+  ever written is a wrong anchor or a hand-edit, where a future timestamp
+  was indistinguishable from clock skew.
+  (4) When the cap overrides consumption the loss is **recorded exactly**,
+  and this is a requirement rather than a nicety. Bounded loss is a choice
+  already made — the alternative is blocking the producer, which for
+  telemetry is worse than losing an hour of access logs — so what is owed
+  is precise accounting at the moment it happens, and the writer holds both
+  halves of the comparison: `retain_size (50G) reached with follower
+  central at chunk 4200 — dropped chunks 4200..4830 it had not read`. The
   shipper's GAP warning is the same fact inferred later, from the other
-  side, bounded only by timestamps; this one is exact.
-  (3) **Fail closed** everywhere: no cursor found, an unreadable one, or
-  one anchored to another store all drop nothing by interest — the minimum
-  over an empty set is 0, not infinity.
-  (4) Nothing about how the store was written, and nothing about arrival
-  time: both were only ever proxies for a write axis that could move
-  backwards, and cursors no longer ride it. The droppable prefix is
-  `cursor::consumed_prefix` — a subtraction over chunk numbers — so the
-  hazard a provenance test was meant to exclude does not exist to be
-  excluded. This was the prerequisite, and it shipped.
-  Two things the guarantee rests on, neither of them ours: the receiver's
-  `200` must mean PERSISTED, not merely accepted — a Collector with an
-  in-memory queue acks and then loses the batch on restart, which silently
-  voids the whole chain since erasure follows the cursor and the cursor
-  follows that ack; and the cursor directory must not be writable by
-  anything but the shipper, or an attacker with that account (a read-only
-  role today) can fast-forward every cursor and have the next tick erase
-  the record of their own intrusion.
+  side; this one is exact.
+  **systemd runs them; timberfs only dispatches.** A template unit per
+  follower, `StateDirectory=timberfs/followers/%i` creating and owning the
+  directory (its permissions matter: a file there can pin a store and,
+  once erasure follows it, destroy one), and
+  `ExecStart=timberfs follower run %i`, which reads the declaration and
+  EXECs the right binary for its `type` — replacing its own process, so
+  systemd keeps the lifecycle, the restarts and the journal. A dispatcher,
+  not a supervisor; no daemon of our own. This is also what lets the
+  registry hold configuration at all: the objection to storing a type and
+  an endpoint was that something must then run them, and `exec` is that
+  something at zero supervisory cost.
+  **Lifecycle.** `create` (with `--retaining`, `--enable`, `--start`),
+  `list`, `status`, `update`, `delete`, `run`. Retiring a follower is two
+  commands on purpose, because the destructive act deserves its own:
+  ```
+  timberfs follower update central retaining=false   # releases, and says what
+  timberfs follower delete central --stop --disable  # bookkeeping
+  ```
+  `update retaining=false` quantifies what it frees (`releases chunks
+  4200..4830, 1.2 GiB, that it alone was holding`) and says the part that
+  is easy to miss — the FLAG toggles but its EFFECT does not: setting it
+  back to true will not bring the data back, and the follower resumes at a
+  position that may now be gapped. `--dry-run` fits here, as on `rotate`.
+  `delete` refuses while `retaining=true` (set it false first) and while
+  the follower is RUNNING, which the held `cursor.json` reveals — deleting
+  under a live process would leave it writing an unlinked file, silently
+  doing nothing. Both refusals are about deliberateness rather than
+  prevention (`update && delete` is still one line), so no `--force`: the
+  two-step IS the force. One escape: a follower whose store no longer
+  exists deletes freely, there being nothing to release.
+  ⚠ **The lock never gates interest.** A follower that is temporarily down
+  holds no lock and must still pin the head — that is the entire purpose of
+  the spool. The lock detects collisions and reports liveness; it decides
+  nothing about retention. Inverting that would turn "the shipper is down"
+  into "drop everything it had not read".
+  Two dependencies the guarantee rests on, neither of them ours: the
+  receiver's `200` must mean PERSISTED, not merely accepted — a Collector
+  with an in-memory queue acks and then loses the batch on restart, which
+  silently voids the chain, since erasure follows the position and the
+  position follows that ack; and the registry directory must not be
+  writable by anything but the followers.
   Also wanted: a one-shot `timberfs trim`, load-bearing rather than
   convenient, since retention only runs inside a live writer and a store
   whose producer went quiet would otherwise keep delivered data
-  indefinitely — and NOT the tempting shortcut of letting the shipper
+  indefinitely — and NOT the tempting shortcut of letting a follower
   collapse the head itself, which would make a reader a writer and put two
-  of them on one head. Dropped on purpose: a declared consumer roster
-  (only earns its keep at two or more consumers, so it stays optional
-  until there are), and a "keep 15m even when consumed" floor for local
-  forensics (it competes for the same disk that buffers an outage, and
-  delivery wins).
-- **`head -f`: following the erasure edge (the drop journal)**: in every
-  other filesystem a file's head is fixed by construction — POSIX has no
-  prefix-delete, so `head` has no `-f` and never could. Here the head
-  MOVES, and under interest-based retention it moves as a function of
-  delivery, which makes following it a meaningful thing to do: it is
-  watching what leaves the box. That is the streaming form of the exact
-  loss record the entry above requires — one event per drop, carrying the
-  window (`<from> .. <to>`), its size, and the REASON: `consumed`
-  (delivered and then erased, the healthy case), `age`/`size` (the
-  declared ceiling doing its job), or `cap override` naming the consumer
-  that had not read it.
-  ⚠ The obvious implementation is the wrong one. A reader tailing the head
-  can only observe that data VANISHED — never why, never by whose
-  authority — and it silently merges two drops that fall between polls, so
-  it can be neither complete nor attributed. Only the WRITER holds both
-  halves of the comparison at the moment it acts, so this record is
-  EMITTED, not observed: the slogan names the property, the implementation
-  lands on the other side of the file. Which also makes it cheap — writers
-  already log their retention actions, so making those structured and
-  complete is most of the value with no new API surface.
-  Open: whether that is enough, or whether the journal deserves to be a
-  store of its own (it is a log, and this project has opinions about where
-  logs go). Either way it must go OFF-BOX — a record of loss that dies
-  with the box it was written on proves nothing — which the systemd
-  journal already gets for free wherever that journal is itself shipped.
+  of them on one head.
+  ⚠ **This supersedes something already released.** 0.18.0 ships the
+  read-only half against a `cursors=<dir>` key on the store, and the
+  registry replaces it: a follower declares its store, so the store
+  declares nothing. `list`'s CONSUMERS column and `info`'s block would read
+  the registry instead. Since `cursors=` is documented in a release, it is
+  owed a deprecation rather than a silent removal — honour it for a stated
+  period, report it as superseded when found, and keep it as the way to
+  register a NON-retaining tap if that turns out to be worth having.
+  Deliberately absent: a staleness rule expiring a ghost follower's
+  interest (the registry makes a ghost discoverable by `list` and removable
+  by `delete`, which beats a heuristic that cannot tell a dead follower
+  from an idle one), and any priority or weighting among followers
+  (`retaining` is the only tier, and it is a declared property rather than
+  a consequence of where a file happens to sit).
 - **Splitting downstream of a spool (fan-out by cursor)**: one store as the
   intake spool — everything a web server writes, the vhost in the line — plus a
   cursor consumer that routes entries into per-stream stores, instead of routing
@@ -354,7 +387,7 @@ works is in [docs/design.md](docs/design.md).
   downtime budget, exactly as it already is for `timber-otlp`, with the same
   hazard the cursor entry raises from the other side: retention that outruns an
   unconsumed cursor drops data, which the consumer view now makes visible and
-  interest-based retention above would act on. Costs
+  a retaining follower (above) would act on. Costs
   are honest ones: every entry is written twice for the spool's retention
   window, there is one more thing to supervise, and per-stream stores compress
   WORSE than the spool they came from (~1.8x on a three-vhost sample, because
