@@ -609,12 +609,58 @@ fn handle(req: &Request) -> (u16, Value) {
             ok(Value::Array(out))
         }
 
-        // Grafana asks for these to size a query before running it. Zeros
-        // are honest here: there is no global index to consult, and a
-        // fabricated estimate would be worse than none.
-        "/loki/api/v1/index/stats" => ok(json!({
-            "streams": 0, "chunks": 0, "entries": 0, "bytes": 0
-        })),
+        // Grafana asks for this before running a query, to tell the user
+        // how much it is about to process.
+        //
+        // ⚠ NOT enveloped. Every other endpoint answers
+        // `{"status":"success","data":…}`, and this one answers the object
+        // BARE — measured: wrapping it makes Grafana read `bytes` as
+        // undefined and render "will process approximately NaNundefined".
+        "/loki/api/v1/index/stats" => {
+            let sel = first(&ps, "query").and_then(|q| parse(q).ok());
+            let to = time_ms(first(&ps, "end").unwrap_or(""), now_ms()).unwrap_or(0);
+            let from = time_ms(
+                first(&ps, "start").unwrap_or(""),
+                to.saturating_sub(3_600_000),
+            )
+            .unwrap_or(0);
+            let (mut n_streams, mut chunks, mut bytes) = (0u64, 0u64, 0u64);
+            for s in streams() {
+                if let Some(q) = &sel {
+                    if !matches(&s.labels, &q.selector) {
+                        continue;
+                    }
+                }
+                let Ok((dir, name)) = crate::query::resolve_backing(&s.path) else {
+                    continue;
+                };
+                let Ok(recs) = crate::format::read_index(&crate::format::rings_path(&dir, &name))
+                else {
+                    continue;
+                };
+                // Chunk windows are on the WRITE axis and the query filters
+                // by logline time, so this is an estimate by construction —
+                // which is all the caller wants. Uncompressed, because that
+                // is what a query actually processes.
+                let overlap: Vec<_> = recs
+                    .iter()
+                    .filter(|c| c.last_write_ms >= from && c.first_write_ms <= to)
+                    .collect();
+                if overlap.is_empty() {
+                    continue;
+                }
+                n_streams += 1;
+                chunks += overlap.len() as u64;
+                bytes += overlap.iter().map(|c| c.uncomp_len).sum::<u64>();
+            }
+            // `entries` would need the chunks decompressed to count, so it
+            // is left at zero rather than guessed; `bytes` is what drives
+            // the estimate Grafana shows.
+            (
+                200,
+                json!({"streams": n_streams, "chunks": chunks, "entries": 0, "bytes": bytes}),
+            )
+        }
 
         "/loki/api/v1/query_range" | "/loki/api/v1/query" => {
             let Some(qs) = first(&ps, "query") else {
@@ -921,6 +967,65 @@ mod tests {
         assert_eq!(time_ms("", 42).unwrap(), 42);
         assert!(time_ms("2026-08-21T10:00:00Z", 0).unwrap() > 1_700_000_000_000);
         assert!(time_ms("not a time", 0).is_err());
+    }
+
+    #[test]
+    fn index_stats_is_the_one_endpoint_that_is_not_enveloped() {
+        // Measured against Grafana 11.3.0: every other endpoint answers
+        // {"status":"success","data":…} and this one answers the object
+        // BARE. Enveloping it makes Grafana read `bytes` as undefined and
+        // render "will process approximately NaNundefined" — a silent
+        // wrong answer in the UI, so it is worth a test.
+        let req = Request {
+            method: "GET".into(),
+            path: "/loki/api/v1/index/stats".into(),
+            query: "query=%7Bstore%3D%22nope%22%7D".into(),
+            body: Vec::new(),
+        };
+        let (status, body) = handle(&req);
+        assert_eq!(status, 200);
+        assert!(
+            body.get("bytes").is_some(),
+            "bytes must be top-level: {body}"
+        );
+        assert!(
+            body.get("status").is_none(),
+            "must NOT be enveloped: {body}"
+        );
+        assert!(body.get("data").is_none(), "must NOT be enveloped: {body}");
+        for k in ["streams", "chunks", "entries", "bytes"] {
+            assert!(body.get(k).is_some(), "missing {k}: {body}");
+        }
+
+        // Whereas a query response IS enveloped, so the two shapes cannot
+        // be conflated by a later refactor.
+        let req = Request {
+            method: "GET".into(),
+            path: "/loki/api/v1/labels".into(),
+            query: String::new(),
+            body: Vec::new(),
+        };
+        let (_, body) = handle(&req);
+        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("success"));
+        assert!(body.get("data").is_some());
+    }
+
+    #[test]
+    fn the_volume_query_grafana_actually_sends_is_refused_by_name() {
+        // Captured verbatim from Grafana 11.3.0's Explore, and bigger than
+        // the docs suggest: it groups by `detected_level` (a PER-ENTRY
+        // derived label, not a store label) and carries a `| drop` stage.
+        // Both are part of the target for a metric subset; neither is
+        // implemented, so both must be REFUSED rather than ignored.
+        let q = r#"sum by (level, detected_level) (count_over_time({service="checkout"} | drop __error__[1m]))"#;
+        let e = parse(q).unwrap_err().to_string();
+        assert!(e.contains("Metric queries"), "{e}");
+        // And the `| drop` stage on its own is named too, so implementing
+        // the aggregation without it would still fail loudly.
+        let e = parse(r#"{service="checkout"} | drop __error__"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("| drop"), "{e}");
     }
 
     #[test]
