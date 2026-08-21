@@ -21,6 +21,7 @@ pub mod import;
 pub mod intake;
 pub mod list;
 pub mod live;
+pub mod logql;
 pub mod note;
 pub mod otlp;
 pub mod otlp_intake;

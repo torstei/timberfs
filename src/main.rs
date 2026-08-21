@@ -1,5 +1,5 @@
 use timberfs::{
-    append, bark, export, follow, follower, forest, forward, fs, grain, import, list, note,
+    append, bark, export, follow, follower, forest, forward, fs, grain, import, list, logql, note,
     otlp_intake, query, rotate, sink, store,
 };
 
@@ -444,6 +444,19 @@ enum Command {
     Reindex {
         /// Backing file: logical name, .trunk or .rings path
         file: PathBuf,
+    },
+    /// ⚠ A SPIKE: serve enough of Loki's read API for Grafana to point a
+    /// Loki datasource at a timberfs forest. Log queries only — the
+    /// stream selector, the four line filters, the time window, limit
+    /// and direction. Every pipeline stage (json, logfmt, label filters,
+    /// formatting) and every metric query (rate, count_over_time, sum
+    /// by) is REFUSED by name rather than ignored. Experimental, and the
+    /// verb name is provisional
+    #[command(name = "logql-serve")]
+    LogqlServe {
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:3100")]
+        listen: String,
     },
     /// Enforce a store's declared retention once, now — the cron-able
     /// complement to the continuous enforcement every writer already
@@ -1054,6 +1067,9 @@ fn main() -> anyhow::Result<()> {
         Command::Reindex { file } => {
             let file = forest::resolve_source(&file)?;
             grain::cmd_reindex(&file)?;
+        }
+        Command::LogqlServe { listen } => {
+            logql::cmd_logql_serve(&listen)?;
         }
         Command::Trim { store, dry_run } => {
             let store = forest::resolve_source(&store)?;
