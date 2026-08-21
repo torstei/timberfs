@@ -10,6 +10,7 @@ pub mod cursor;
 pub mod entry;
 pub mod export;
 pub mod follow;
+pub mod follower;
 pub mod forest;
 pub mod format;
 pub mod forward;

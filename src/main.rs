@@ -1,6 +1,6 @@
 use timberfs::{
-    append, bark, export, follow, forest, forward, fs, grain, import, list, note, otlp_intake,
-    query, rotate, sink, store,
+    append, bark, export, follow, follower, forest, forward, fs, grain, import, list, note,
+    otlp_intake, query, rotate, sink, store,
 };
 
 use std::path::PathBuf;
@@ -390,6 +390,16 @@ enum Command {
     /// Show a store's vital signs on one screen: identity, lineage,
     /// data and compression, time covered, index sizes and coverage,
     /// writer state. Works on backing pairs and .timber bundles alike
+    /// Manage the followers of a store: registered readers, each with a
+    /// name, a type, a `retaining` flag and a durable position. A
+    /// follower is a declared object rather than a cursor found lying in
+    /// a directory, so its intent is recorded, a collision is caught at
+    /// registration, and a follower deployed before it first runs can
+    /// still be known about
+    Follower {
+        #[command(subcommand)]
+        command: FollowerCommand,
+    },
     Info {
         /// Backing file (logical name, .trunk/.rings path) or bundle
         file: PathBuf,
@@ -547,6 +557,115 @@ enum Command {
         #[arg(long)]
         exit_on_upgrade: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum FollowerCommand {
+    /// Register a follower of a store. The name is host-unique and is
+    /// also the systemd instance (`timberfs-follower@<name>`), so it is
+    /// what gets typed into `systemctl status` — refused if taken, so a
+    /// collision is a registration error rather than two processes
+    /// overwriting one position
+    Create {
+        /// The follower's name: [A-Za-z0-9_.-], host-unique
+        name: String,
+        /// The store to follow: a path, or a forest handle. Recorded by
+        /// IDENTITY (its .bark id, minted here if it has none), not by
+        /// path — a store can move
+        #[arg(long, value_name = "STORE")]
+        store: PathBuf,
+        /// What runs it: `otlp` execs timber-otlp
+        #[arg(long = "type", value_name = "TYPE", default_value = "otlp")]
+        kind: String,
+        /// Where it ships to (the shipper's --endpoint)
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+        /// Declare that this follower's position holds the store's head
+        /// back, so retention never drops what it has not read. Note
+        /// that one with no position yet holds EVERYTHING — which is the
+        /// point (it protects a follower deployed before it first runs)
+        /// and also the footgun: start it
+        #[arg(long)]
+        retaining: bool,
+        /// systemctl enable the unit
+        #[arg(long)]
+        enable: bool,
+        /// systemctl start the unit
+        #[arg(long)]
+        start: bool,
+        /// Print the declaration and the command line it would run,
+        /// registering nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Everything after `--` is passed to the shipper verbatim, in
+        /// its own spelling: `-- --service checkout --compress gzip`.
+        /// Deliberately not re-declared here — a second spelling of the
+        /// same flags is a second thing to keep in step
+        #[arg(last = true, value_name = "ARGS")]
+        args: Vec<String>,
+    },
+    /// Every registered follower: name, store, type, whether it retains,
+    /// its position, how far behind it is, and whether it is running
+    /// (from its lock, so a stale unit state cannot lie about it)
+    List {
+        /// Only followers of this store (a path, or a forest handle)
+        #[arg(long, value_name = "STORE")]
+        store: Option<PathBuf>,
+        /// Bare names only, one per line, no header or columns (what
+        /// shell completion consumes)
+        #[arg(long, conflicts_with = "json")]
+        names: bool,
+        /// A JSON array of objects instead of the human table
+        #[arg(long)]
+        json: bool,
+    },
+    /// One follower on one screen: what it declares, where it stands in
+    /// its store, whether anything is honouring its `retaining` flag,
+    /// and whether it is running
+    Status {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a follower's declaration. `update <name> retaining=false`
+    /// is the first half of retiring one, and it says what that frees —
+    /// separate from `delete` because the destructive act deserves its
+    /// own command
+    Update {
+        name: String,
+        /// KEY=VALUE: retaining=true|false, endpoint=URL, type=TYPE,
+        /// store=PATH
+        #[arg(value_name = "KEY=VALUE")]
+        sets: Vec<String>,
+        /// Remove a key (repeatable): --unset endpoint
+        #[arg(long = "unset", value_name = "KEY")]
+        unsets: Vec<String>,
+        /// Preview the new declaration without writing it
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace the shipper's arguments wholesale with what follows
+        /// `--`
+        #[arg(last = true, value_name = "ARGS")]
+        args: Vec<String>,
+    },
+    /// Unregister a follower. Refused while it is `retaining` (release
+    /// the head deliberately first, with `update retaining=false`) and
+    /// while it is running. Both refusals are about deliberateness, not
+    /// prevention, so there is no --force: the two-step IS the force
+    Delete {
+        name: String,
+        /// systemctl stop the unit first
+        #[arg(long)]
+        stop: bool,
+        /// systemctl disable the unit too
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Read a follower's declaration and EXEC its shipper — what the
+    /// systemd template runs. A dispatcher, not a supervisor: the
+    /// process is replaced, so systemd keeps the lifecycle, the restarts
+    /// and the journal
+    Run { name: String },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -848,6 +967,56 @@ fn main() -> anyhow::Result<()> {
                 from_chunk,
             )?;
         }
+        Command::Follower { command } => match command {
+            FollowerCommand::Create {
+                name,
+                store,
+                kind,
+                endpoint,
+                retaining,
+                enable,
+                start,
+                dry_run,
+                args,
+            } => follower::cmd_create(
+                &name,
+                follower::CreateOpts {
+                    store,
+                    kind,
+                    endpoint,
+                    retaining,
+                    enable,
+                    start,
+                    dry_run,
+                    args,
+                },
+            )?,
+            FollowerCommand::List { store, names, json } => {
+                follower::cmd_list(store.as_deref(), names, json)?
+            }
+            FollowerCommand::Status { name, json } => follower::cmd_status(&name, json)?,
+            FollowerCommand::Update {
+                name,
+                sets,
+                unsets,
+                dry_run,
+                args,
+            } => {
+                // An empty `--` tail and no `--` at all are the same
+                // argv, so "replace the arguments with nothing" has to be
+                // spelled `--unset args` rather than inferred from
+                // silence — clearing them by accident would drop an
+                // endpoint's headers.
+                let args = if args.is_empty() { None } else { Some(args) };
+                follower::cmd_update(&name, &sets, &unsets, args, dry_run)?
+            }
+            FollowerCommand::Delete {
+                name,
+                stop,
+                disable,
+            } => follower::cmd_delete(&name, stop, disable)?,
+            FollowerCommand::Run { name } => follower::cmd_run(&name)?,
+        },
         Command::Info { file, json } => {
             let file = forest::resolve_source(&file)?;
             query::cmd_info(&file, json)?;

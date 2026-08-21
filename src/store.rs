@@ -1673,7 +1673,14 @@ pub fn lock_backing_shared(dir: &Path) -> io::Result<Option<File>> {
 
 /// Per-file writer lock, exclusive.
 pub fn lock_file_exclusive(dir: &Path, name: &str) -> io::Result<Option<File>> {
-    try_flock(open_lock_file(&file_lock_path(dir, name))?, libc::LOCK_EX)
+    lock_path_exclusive(&file_lock_path(dir, name))
+}
+
+/// The same lock on an arbitrary path. The per-file helpers are this with
+/// the path spelled by the store layout; the follower registry's lock
+/// lives outside any backing directory and spells its own.
+pub fn lock_path_exclusive(path: &Path) -> io::Result<Option<File>> {
+    try_flock(open_lock_file(path)?, libc::LOCK_EX)
 }
 
 /// The same lock, retried until `timeout` runs out.
@@ -1718,7 +1725,12 @@ pub fn lock_file_exclusive_waiting(
 /// cleared on exit — so the pid is checked against /proc rather than
 /// repeated as fact.
 pub fn describe_file_writer(dir: &Path, name: &str) -> Option<String> {
-    let raw = fs::read_to_string(file_lock_path(dir, name)).ok()?;
+    describe_lock_holder(&file_lock_path(dir, name))
+}
+
+/// The same, for a lock at an arbitrary path.
+pub fn describe_lock_holder(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
     let who = raw.lines().next()?.trim();
     if who.is_empty() {
         return None;
@@ -1794,7 +1806,13 @@ pub fn probe_backing_exclusive(dir: &Path) -> LockProbe {
 /// Read-only probe: is a file's writer lock held — a live appender,
 /// import or rotation?
 pub fn probe_file_writer(dir: &Path, name: &str) -> LockProbe {
-    probe_lock(&file_lock_path(dir, name), libc::LOCK_EX)
+    probe_path_exclusive(&file_lock_path(dir, name))
+}
+
+/// Read-only probe: is a live holder on the exclusive lock at `path`?
+/// The arbitrary-path form, for locks outside a backing directory.
+pub fn probe_path_exclusive(path: &Path) -> LockProbe {
+    probe_lock(path, libc::LOCK_EX)
 }
 
 /// Names of files in the directory whose per-file writer lock is currently

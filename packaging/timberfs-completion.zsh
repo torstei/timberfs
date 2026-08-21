@@ -11,6 +11,25 @@ _timberfs_handles() {
     _describe -t handles 'store handle' handles
 }
 
+_timberfs_follower_names() {
+    local -a names
+    names=(${(f)"$(timberfs follower list --names 2>/dev/null)"})
+    _describe -t followers 'follower' names
+}
+
+_timberfs_follower_verbs() {
+    local -a verbs
+    verbs=(
+        'create:register a follower of a store'
+        'list:list every registered follower'
+        'status:show one follower'\''s declaration and position'
+        'update:change a follower'\''s declaration'
+        'delete:unregister a follower'
+        'run:exec a follower'\''s shipper (what the systemd template runs)'
+    )
+    _describe -t commands 'timberfs follower subcommand' verbs
+}
+
 _timberfs_commands() {
     local -a subcommands
     subcommands=(
@@ -26,6 +45,7 @@ _timberfs_commands() {
         'list:list every store across the configured forests'
         'reindex:rebuild a store'\''s token index'
         'rotate:move or drop chunks written before a cutoff'
+        'follower:manage the registered followers of a store'
         'forward-intake:receive the Fluentd Forward protocol over TCP'
         'otlp-intake:receive OTLP/HTTP logs from OpenTelemetry senders'
     )
@@ -39,6 +59,21 @@ _timberfs() {
     fi
 
     local cmd=${words[2]}
+    if [[ $cmd == follower ]]; then
+        if ((CURRENT == 3)); then
+            _timberfs_follower_verbs
+            return
+        fi
+        if [[ ${words[CURRENT-1]} == --store ]]; then
+            _alternative 'handles:store handle:_timberfs_handles' 'files:file:_files'
+            return
+        fi
+        case ${words[3]} in
+        status | update | delete | run) _timberfs_follower_names ;;
+        esac
+        return
+    fi
+
     case $cmd in
     query | info | index | reindex | set | rotate | export)
         _alternative 'handles:store handle:_timberfs_handles' 'files:file:_files'

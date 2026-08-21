@@ -122,18 +122,25 @@ dropped. That is a WARNING naming exactly how many chunks were dropped
 unread \(em a count, the numbers stating it rather than a timestamp
 comparison implying it \(em and then
 the run continues from the oldest chunk \(em the loss is already in the
-past, and a shipper that refuses to start ships nothing. Declare
-.B cursors
-on the store
-.RB ( timberfs\  set\  ...\  cursors=/var/lib/timberfs )
+past, and a shipper that refuses to start ships nothing. Register this
+shipper as a FOLLOWER of the store
+.RB ( "timberfs follower create" )
 and the same lag is visible from the store's side, in
 .B timberfs list
 and
 .BR "timberfs info" ,
 before it becomes loss \(em see
-.B CONSUMERS
+.B FOLLOWERS
 in
 .BR timberfs (1).
+A registered follower is also run BY name:
+.B timberfs follower run
+supplies
+.BR \-\-follow ,
+.B \-\-cursor
+and the endpoint from the declaration, so a
+.B timberfs\-follower@
+unit needs no flags of its own.
 .SH MAPPING
 .TP
 .B time

@@ -8,6 +8,10 @@
 # that call is silent and empty, so completion just falls back to files —
 # no error ever reaches the terminal.
 #
+# `timberfs follower <TAB>` lists its own verbs, and the ones that name an
+# existing follower complete from `timberfs follower list --names`, which
+# is silent and empty in the same way when nothing is registered.
+#
 # Installed at /usr/share/bash-completion/completions/timberfs, where the
 # bash-completion package auto-sources it for interactive shells.
 
@@ -16,7 +20,8 @@ _timberfs() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
-    local subcommands="mount create set append import export query info index list reindex rotate forward-intake otlp-intake"
+    local subcommands="mount create set append import export query info index list reindex rotate follower forward-intake otlp-intake"
+    local follower_verbs="create list status update delete run"
 
     if [ "$COMP_CWORD" -le 1 ]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -24,6 +29,30 @@ _timberfs() {
     fi
 
     cmd="${COMP_WORDS[1]}"
+
+    # `follower` has its own verb layer, and its own names to complete.
+    if [ "$cmd" = follower ]; then
+        if [ "$COMP_CWORD" -le 2 ]; then
+            COMPREPLY=($(compgen -W "$follower_verbs" -- "$cur"))
+            return 0
+        fi
+        # --store takes a store, which is where handles belong.
+        if [ "$prev" = --store ]; then
+            local handles
+            handles=$(timberfs list --names 2>/dev/null)
+            COMPREPLY=($(compgen -W "$handles" -- "$cur") $(compgen -f -- "$cur"))
+            return 0
+        fi
+        case "${COMP_WORDS[2]}" in
+        status | update | delete | run)
+            local names
+            names=$(timberfs follower list --names 2>/dev/null)
+            COMPREPLY=($(compgen -W "$names" -- "$cur"))
+            ;;
+        *) COMPREPLY=() ;;
+        esac
+        return 0
+    fi
 
     # A flag that takes a value: the word after it is never a handle.
     case "$prev" in

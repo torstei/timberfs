@@ -244,6 +244,33 @@ fn push_if_rings(path: &Path, out: &mut Vec<(String, PathBuf)>) {
     out.push((handle.to_string(), path.with_file_name(logical)));
 }
 
+/// Every store in the configured forests that the cursor anchor `anchor`
+/// identifies — the reverse of `store_anchor`, for a follower that
+/// records its store by IDENTITY and needs a path to hand a shipper.
+///
+/// Identity is authoritative and a path is a hint, so this is the road
+/// taken when the hint no longer holds (the store moved, or the path was
+/// reused by a different store). Several matches are possible only from a
+/// copied `.bark`, which is a mistake worth naming rather than picking a
+/// winner from — so all of them come back and the caller refuses.
+pub fn stores_by_anchor(anchor: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for forest in load_forests() {
+        for (_, store) in scan_forest(&forest.dir) {
+            let Ok((dir, name)) = crate::query::resolve_backing(&store) else {
+                continue;
+            };
+            let bark = crate::bark::load(&dir, &name);
+            if crate::cursor::store_anchor(&dir, &name, bark.as_ref()) == anchor {
+                out.push(store);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
