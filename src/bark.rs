@@ -250,6 +250,69 @@ pub fn declare_wal(dir: &Path, name: &str) -> anyhow::Result<()> {
     save(dir, name, &map)
 }
 
+/// Keys that describe the STORE rather than its content: identity, lineage,
+/// operational settings, and content-format declarations. Everything else in
+/// a manifest is PROVENANCE — where the entries came from and what produced
+/// them — which is what a fleet view selects on.
+///
+/// The split lives here because bark owns what its keys mean. Views that
+/// re-guessed it would drift, and a view that leaked `retain` or `id` into a
+/// label set would invite selecting on an operational setting.
+pub const NOT_PROVENANCE: &[&str] = &[
+    "id",
+    "created",
+    "derived_from",
+    "derived_op",
+    "window_from",
+    "window_to",
+    "index",
+    "wal",
+    "retain",
+    "retain_size",
+    "retain_unconsumed",
+    "cursors",
+    "timestamp_regex",
+    "timestamp_format",
+    "timestamp_utc",
+    "command",
+    "pattern",
+    // Lineage arriving over the wire, not provenance. `timber-otlp` sends
+    // the ORIGIN store's id and path as OTLP resource attributes, and the
+    // receiving intake seeds every attribute it is given — so these name
+    // the store the entries came FROM. Selecting on them would be
+    // selecting on one hop's bookkeeping, and under fan-in (several
+    // senders routed into one store) they name only one of the origins,
+    // which makes them actively wrong rather than merely useless.
+    "timberfs.store.id",
+    "timberfs.store.path",
+];
+
+/// The ORIGIN store's identity, when the entries arrived from another
+/// timberfs store over the wire — `timber-otlp` sends it as an OTLP
+/// resource attribute and the receiving intake seeds it.
+///
+/// ⚠ Trustworthy only where routing gives one store per origin. Under
+/// fan-in it names whichever sender created the store, which is why the
+/// receiving side's routing decides whether this means anything (see
+/// ROADMAP, "Globally addressable chunks").
+pub fn origin_id(map: &Map<String, Value>) -> Option<String> {
+    map.get("timberfs.store.id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// A manifest's provenance keys, in sorted order. The values are left
+/// exactly as declared — flattening a dotted key like `service.name` is a
+/// consumer's concern (Loki requires it, timberfs does not), and doing it
+/// here would lose the key the operator actually wrote.
+pub fn provenance(map: &Map<String, Value>) -> Map<String, Value> {
+    map.iter()
+        .filter(|(k, _)| !NOT_PROVENANCE.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Reserved keys that never inherit into a derived artifact: fresh
 /// identity and lineage are written instead, and settings ("index") are
 /// per-store operational choices (a read-only bundle cannot maintain a
@@ -597,6 +660,41 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    #[test]
+    fn provenance_is_where_the_entries_came_from_not_what_the_store_is() {
+        let m = map(&[
+            // identity, lineage, settings, content format — the store
+            // describing itself. None of these is a label, and a view that
+            // leaked one would invite selecting on an operational setting.
+            ("id", Value::String("abc".into())),
+            ("created", Value::String("2026-08-22T00:00:00Z".into())),
+            ("derived_from", Value::String("xyz".into())),
+            ("index", Value::Bool(true)),
+            ("retain", Value::String("90d".into())),
+            ("retain_unconsumed", Value::Bool(true)),
+            ("cursors", Value::String("/var/lib/timberfs".into())),
+            ("timestamp_utc", Value::Bool(true)),
+            // ...and where the entries came from, which is.
+            ("host", Value::String("apache01".into())),
+            ("service", Value::String("apache".into())),
+            ("service.name", Value::String("apache".into())),
+            ("datacentre", Value::String("osl1".into())),
+        ]);
+        let p = provenance(&m);
+        assert_eq!(
+            p.keys().cloned().collect::<Vec<_>>(),
+            ["datacentre", "host", "service", "service.name"]
+        );
+        // Verbatim: a dotted key is NOT flattened here. Loki's label names
+        // forbid the dot and timberfs does not, so flattening would lose the
+        // key the operator wrote — and would silently merge `service.name`
+        // with a `service_name` that flattens onto it.
+        assert!(p.contains_key("service.name"));
+        // And a manifest that is nothing but settings yields no labels,
+        // rather than an error or a guess.
+        assert!(provenance(&map(&[("index", Value::Bool(true))])).is_empty());
     }
 
     #[test]

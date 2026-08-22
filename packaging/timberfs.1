@@ -918,9 +918,27 @@ completion consumes.
 A JSON array of objects
 .RI ( handle ", " forest ", " dir ", " path ", " size_bytes ", "
 .IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
-.IR retain_size ", " followers ", " cursors_dir ", " consumers ", "
-.IR held_bytes )
+.IR retain_size ", " id ", " created ", " labels ", " first_seq ", "
+.IR last_seq ", " next_seq ", " dropped_chunks ", " dropped_bytes ", "
+.IR dropped_uncompressed_bytes ", " dropped_accounting ", " followers ", "
+.IR cursors_dir ", " consumers ", " held_bytes )
 instead of the human table.
+.I id
+is the store's durable identity, or
+.B null
+for a store with no manifest \(em what anything holding a position against
+it records, and never a path.
+.I labels
+is the manifest's provenance, verbatim (see
+.BR PROVENANCE ).
+The
+.I \%*_seq
+and
+.I dropped_*
+fields carry the same names and meanings as
+.BR info \(aqs ,
+deliberately: a consumer reading both must not have to remember which shape
+each chose.
 .I followers
 is always an array \(em the registry knows every follower of every
 store, so empty means empty.
@@ -1383,6 +1401,96 @@ Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
 unit sets it.
 .PP
 The verb name is provisional.
+.SH PROVENANCE
+A manifest holds two kinds of key, and only one of them is a LABEL.
+.B What the store is
+\(em identity
+.RI ( id ", " created ),
+lineage
+.RI ( derived_from ", " derived_op ", " window_from ", " window_to ),
+operational settings
+.RI ( index ", " wal ", " retain ", " retain_size ", " retain_unconsumed ", "
+.IR cursors )
+and content format
+.RI ( timestamp_regex ", " timestamp_format ", " timestamp_utc )
+\(em is about the store itself.
+.B Where its entries came from
+is everything else, and that is provenance: free-form, operator-owned,
+and what a fleet view selects on.
+.PP
+.B The minimum is
+.BR host :
+the machine that PRODUCED the entries, not the hop that delivered them. No
+amount of reading a line recovers it once the entries have been shipped
+somewhere else, so whatever writes a store first is the only thing that can
+say. What each intake supplies today:
+.TP
+.BR timberfs\-log@ ", " timberfs\-text@ ", " timberfs\-follow@
+.B host=%H
+via an
+.B ExecStartPre
+.BR "timberfs set" ,
+plus whatever
+.B DECLARE
+adds.
+.TP
+.B otlp\-intake
+.IR host ", " service.name ", " service
+and every other resource attribute, from the wire \(em an OTLP sender
+describes itself, so nothing is guessed.
+.TP
+.B forward\-intake
+.I host
+when the sender declares one (the Forward protocol carries none, so the
+record is checked for
+.IR hostname ", " host ", " nodename " or " source_host ,
+and the sender's word is law), always
+.I peer
+\(em the connecting address, which the receiver knows for certain and which
+is not a hostname and is not called one \(em plus
+.IR tag ", " container_id " and " container_name .
+.TP
+.BR append ", " import
+nothing, unless
+.B \-\-set
+says so. A store written by a bare pipe declares nothing, which is a
+legitimate state and not an error.
+.PP
+.B The stream's own name is the store's HANDLE.
+There is no separate key for it: a fleet keys on
+.I host
+plus the handle, so
+.B apache\-error
+on
+.B apache01
+and
+.B apache02
+is two stores differing in one label.
+.B timberfs list \-\-json
+exposes provenance under
+.I labels
+and the handle as
+.IR handle ,
+which is what makes a catalogue a projection of
+.B list
+rather than a new thing.
+.PP
+.B Note: a hop can rename a store,
+so this holds within one host and needs care across the network. After
+shipping, the handle is the DESTINATION's name for the store \(em an OTLP
+receiver routes by
+.IR service.name ,
+so the origin's store name arrives as a label rather than as a handle. A
+view spanning hops therefore keys on provenance and never on the handle.
+Nothing yet carries the origin's handle verbatim; see
+.B ROADMAP
+for the identity work that would.
+.PP
+Values are kept EXACTLY as declared. A dotted key such as
+.I service.name
+is not flattened: that is a consumer's requirement (Loki's label names
+forbid the dot; timberfs does not) and doing it here would lose the key the
+operator actually wrote, and silently merge two keys that flatten alike.
 .SH RETENTION
 Retention is a property of the LOG, declared in its manifest, on THREE
 axes:

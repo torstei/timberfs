@@ -915,6 +915,44 @@ ExecStart=/bin/sh -c 'timberfs list --names | xargs -rn1 timberfs trim'
 The older `cursors=<dir>` key still works and is reported as superseded wherever
 it is found.
 
+## What a store declares about itself
+
+A manifest holds two kinds of key, and mixing them up is the thing that makes a
+fleet view hard to build later.
+
+**What the store *is*** — identity (`id`, `created`), lineage (`derived_from`,
+`window_from`…), settings (`index`, `wal`, `retain`, `retain_size`,
+`retain_unconsumed`, `cursors`) and content format (`timestamp_*`).
+
+**Where its entries *came from*** — everything else. Free-form, yours, and the
+only part a fleet view should select on. `timberfs list --json` exposes it under
+`labels`; selecting on a *setting* would mean querying by an operational choice.
+
+**The minimum is `host`:** the machine that produced the entries, not the hop
+that delivered them. Nothing recovers it by reading a line once the entries have
+been shipped elsewhere, so whatever writes the store first is the only thing
+that can say. Every templated intake now stamps it (`host=%H` in an
+`ExecStartPre`), `otlp-intake` takes it from the wire, and `forward-intake`
+honours a sender-declared `hostname`/`host`/`nodename`/`source_host` — the
+Forward protocol carries none, so it also records `peer`, the connecting
+address, which is a fact rather than a guess. A bare `timberfs append` declares
+nothing, which is legitimate.
+
+**The stream's own name is the store's handle**, so a fleet keys on `host` plus
+the handle — `apache-error` on `apache01` and `apache02` is two stores differing
+in one label. Add anything else you want to slice by:
+
+```sh
+timberfs set /var/log/timberfs/apache-error/apache-error.log \
+    service=apache env=prod datacentre=osl1
+```
+
+⚠ **A hop can rename a store.** After shipping, the handle is the *destination's*
+name — an OTLP receiver routes by `service.name`, so the origin's store name
+arrives as a label rather than as a handle. A view spanning hops therefore keys
+on provenance and never on the handle. `man timberfs`, section PROVENANCE, has
+the full table.
+
 ## Ownership and permissions
 
 - **The store directory** is created by `LogsDirectory=timberfs/%i` in the
