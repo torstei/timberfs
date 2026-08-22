@@ -938,7 +938,9 @@ and
 fields carry the same names and meanings as
 .BR info \(aqs ,
 deliberately: a consumer reading both must not have to remember which shape
-each chose.
+each chose. See
+.B DROP ACCOUNTING
+for what they mean and when to distrust them.
 .I followers
 is always an array \(em the registry knows every follower of every
 store, so empty means empty.
@@ -1401,6 +1403,63 @@ Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
 unit sets it.
 .PP
 The verb name is provisional.
+.SH DROP ACCOUNTING
+A store records what has LEFT it over its whole life: how many chunks, and
+how many bytes both compressed and not.
+.B timberfs info
+prints it on the
+.B numbering
+line and
+.B \-\-json
+carries it as
+.IR dropped_chunks ", " dropped_bytes " and " dropped_uncompressed_bytes .
+.PP
+It has to be RECORDED because it cannot be recovered: a head-drop rebases
+the survivors' offsets, so the bytes that went leave no trace in the index.
+The count alone could once be derived \(em numbering is dense from 0 and only
+a PREFIX ever drops, so the oldest surviving chunk number is the lifetime
+total \(em and recording it is what frees that from assuming the numbering
+started at 0.
+.PP
+.B The figures are not always the whole story,
+which is what
+.I dropped_accounting
+reports. The counters live in the rings header's reserved space, so a store
+written before they existed has none, and \(em the case worth knowing \(em a
+store dropped from by an older binary and THEN by a current one has counters
+covering only the later drops.
+.TP
+.B complete
+Every drop this store ever had is measured. A store that has dropped nothing
+is complete too: there is nothing that failed to be recorded.
+.TP
+.B partial
+Some drops predate the accounting, so
+.I dropped_bytes
+is a FLOOR and not a total.
+.B info
+says so in words rather than presenting the smaller number as fact:
+.RB \(dq "8 dropped, of which 4 measured \(em the rest predates the accounting" \(dq.
+.TP
+.B none
+Chunks were dropped and no sizes were recorded at all \(em an older header.
+Reported as
+.RB \(dq "size not recorded" \(dq
+rather than as a confident zero.
+.PP
+The numbering is the witness that keeps the counters honest, and the reason
+this can be detected rather than merely feared: the oldest surviving chunk
+number is the true lifetime count, so a recorded count below it is provably
+incomplete. Zero would otherwise be ambiguous \(em the reserved-space rule is
+that an absent field reads as zero, which for a byte count collides with
+"nothing dropped".
+.PP
+.B Note:
+a consumer must therefore not read
+.I dropped_bytes
+as a total without checking
+.IR dropped_accounting .
+That is the whole reason the field exists.
 .SH PROVENANCE
 A manifest holds two kinds of key, and only one of them is a LABEL.
 .B What the store is
