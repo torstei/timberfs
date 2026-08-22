@@ -1981,6 +1981,15 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
 /// how many chunks this store has dropped over its life**. A chunk count
 /// cannot say that, and neither can a time span.
 ///
+/// ⚠ That reading rests on numbering STARTING AT 0, which is true of every
+/// store today because nothing may adopt another's numbering. A window
+/// extract or a partial replica that kept source numbers would show a high
+/// first number having dropped nothing — the chunks were never there. So
+/// the moment adoption exists this needs a LOW-WATER mark (dropped =
+/// `first_seq - low_water`, implicitly zero today), and that — not any
+/// dishonesty in the numbers — is why the line is pair-only for now. See
+/// ROADMAP, "Globally addressable chunks".
+///
 /// It also separates two states a chunk count renders identically: a store
 /// that was never written (`next_seq == 0`) and one that retention emptied
 /// (`next_seq > 0`, no chunks held). Numbering deliberately does not

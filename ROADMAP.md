@@ -162,12 +162,18 @@ works is in [docs/design.md](docs/design.md).
   address becomes available one chunk AFTER the entry does. Consistent
   with the asymmetry retention already lives with (delivery is
   entry-granular, erasure chunk-granular) rather than a new surprise.
-  **One case that must refuse rather than configure**: a FILTERED ship
-  (`timber-filter | import --records`) delivers a subset, so the
-  destination's chunk 42 holds fewer entries than the source's — same
-  number, different content, which is a lie and not a tuning choice. The
-  records stream's stream-start carries an echo of the selection, so the
-  sink can see it.
+  **The line is whole-chunk versus entry-level selection**, not window
+  versus whole. A chunk copied INTACT keeps its address however few of its
+  siblings came along: `export`'s window and `rotate`'s prefix both take
+  whole frames verbatim, so `(origin, seq)` still names the same bytes, and
+  a bundle carrying source numbers is a per-chunk CITATION plus a visible
+  hole where something is absent. What destroys an address is selecting
+  ENTRIES: a filtered ship (`timber-filter | import --records`) delivers
+  chunk 42 with fewer entries than the origin's, so the number survives
+  and the address lies. That case must refuse rather than be configured,
+  and it is detectable — the records stream's stream-start carries an echo
+  of the selection. Fan-in from two sources must refuse for the separate
+  reason of monotonicity.
   **Also open**: how a store records that the boundary condition actually
   held, since a later re-chunk would silently invalidate every address
   without touching the manifest — a plain boolean is too easy to leave
@@ -210,11 +216,22 @@ works is in [docs/design.md](docs/design.md).
   anyone would relax this and the place the cost is starkest);
   `sink.rs`'s deliberate discard of `e.chunk` (the number is already ON
   THE WIRE, so this is the cheapest seam and the one that matters for a
-  fleet, since shipping is what crosses hosts); `export.rs`, which numbers
-  a bundle from 0 for a STRONGER reason — a bundle is a window out of the
-  middle, which is the same subset case that must refuse outright, and is
-  why numbering is a pair-only fact that a bundle can never honestly
-  report; and `bark.rs` for the new lineage key.
+  fleet, since shipping is what crosses hosts); `export.rs`, whose stated
+  reason for numbering a bundle from 0 — "neither dense nor meaningful" —
+  is the WEAKEST of the three, since nothing requires density and the
+  source's numbers are meaningful precisely as its identity, so a bundle
+  is a candidate for preserving rather than an argument against it; and
+  `bark.rs` for the new lineage key.
+  ⚠ **A low-water mark is owed the moment numbering can be adopted.**
+  `info`'s new numbering line reads the oldest surviving number as a DROP
+  count, which is sound only because numbering always starts at 0 today. A
+  window extract or a partial replica that kept source numbers would have
+  a high first number and have dropped nothing — the chunks were never
+  there. So a store would have to record the lowest number it ever held,
+  and dropped becomes `first_seq - low_water`; today that is implicitly
+  zero, which is why the line is correct now and would go quietly wrong
+  later. That, and not any dishonesty in the numbers themselves, is why
+  the line is pair-only for now.
 - **Scoped, audited read access**: what a serve API makes possible and
   shell access cannot — a grant of *subject × store or forest × data
   window × grant lifetime*, the last two being different clocks ("this

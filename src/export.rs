@@ -237,8 +237,20 @@ pub fn cmd_export(
             comp_start: comp_off,
             // A bundle is a new store with its own lineage, so it numbers
             // its own chunks from 0 rather than carrying the source's
-            // positions — which would be neither dense nor meaningful here,
-            // an export selecting a window out of the middle.
+            // positions.
+            //
+            // ⚠ That reason is the weakest of the three renumbering sites
+            // (ROADMAP, "Globally addressable chunks"): nothing requires
+            // density — every comparison on `seq` is `<`, none assumes
+            // `+1` — and the source's numbers ARE meaningful, precisely as
+            // its identity. Chunks are copied whole and verbatim here, so
+            // `(origin, seq)` would still name the same bytes and each
+            // chunk would be a citation. What destroys an address is
+            // selecting ENTRIES, not selecting a window of chunks. So this
+            // is a candidate for preserving, and if it ever does, `info`'s
+            // numbering line needs a low-water mark first: it reads the
+            // oldest surviving number as a DROP count, which a window
+            // extract would make false.
             seq: i as u64,
             ..*c
         });
