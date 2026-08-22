@@ -1561,6 +1561,81 @@ forward_intake_container_id_seeded() {
     grep -qE '"container_id": "a{64}"' "$FWD_STORE.bark"
 }
 
+forward_intake_seeds_host_and_peer() {
+    # `host` is the one label a fleet view cannot do without, and the
+    # Forward protocol carries none — so the sender's own field is honoured
+    # when there is one, and the connecting address is recorded either way.
+    # A receiver that guessed a hostname (reverse DNS on the peer) would put
+    # DNS in the write path and still only be guessing.
+    #
+    # The suite's own sender declares no hostname, so this store must have a
+    # `peer` and no `host` at all.
+    grep -q '"peer"' "$FWD_STORE.bark" || { cat "$FWD_STORE.bark"; return 1; }
+    grep -q '"host"' "$FWD_STORE.bark" && { cat "$FWD_STORE.bark"; return 1; }
+
+    # And a sender that DOES name itself is taken at its word.
+    python3 - << 'PYEOF' || return 1
+import socket, struct, time
+def s8(v):
+    b = v.encode()
+    return bytes([0xa0 | len(b)]) + b if len(b) < 32 else bytes([0xd9, len(b)]) + b
+def m(pairs):
+    return bytes([0x80 | len(pairs)]) + b"".join(s8(k) + s8(v) for k, v in pairs)
+def a(items):
+    return bytes([0x90 | len(items)]) + b"".join(items)
+ent = a([bytes([0xce]) + struct.pack(">I", int(time.time())),
+         m([("log", "declared sender"), ("hostname", "vmsender07")])])
+c = socket.create_connection(("127.0.0.1", 24224), timeout=10)
+c.sendall(a([s8("vmfwdhost"), a([ent])]))
+time.sleep(1)
+c.close()
+PYEOF
+    local bark=/var/log/timberfs/vmfwdhost/vmfwdhost.log.bark
+    local i
+    for i in $(seq 1 20); do [ -f "$bark" ] && break; sleep 0.5; done
+    [ -f "$bark" ] || { echo "no store for the declaring sender" >&2; return 1; }
+    jq -e '.host == "vmsender07" and (.peer | startswith("127.0.0.1:"))' "$bark" >/dev/null \
+        || { cat "$bark"; return 1; }
+}
+
+catalogue_fields_are_a_projection_of_list() {
+    # What a query API's catalogue endpoint needs, and all of it from
+    # `list --json`: identity to join on, provenance to select on, coverage
+    # to route by, and whether the drop accounting can be trusted.
+    local d=/var/log/timberfs/vmcat
+    rm -rf "$d"
+    timberfs create --index --retain-size 5G --set host=apache01 --set service=apache \
+        --set 'service.name=apache' "$d/vmcat.log" >/dev/null 2>&1 || return 1
+    printf '2026-08-22T10:00:00Z INFO catalogued\n' \
+        | timberfs append --into "$d/vmcat.log" --quiet 2>/dev/null || return 1
+
+    timberfs list --json /var/log/timberfs > /tmp/cat.json 2>/dev/null || return 1
+    jq -e '.[] | select(.handle == "vmcat")
+           | (.id | type == "string" and length == 36)
+           and .labels.host == "apache01"
+           and .labels.service == "apache"
+           and .labels["service.name"] == "apache"
+           and .dropped_accounting == "complete"
+           and (.from_ms | type == "number")' /tmp/cat.json > /dev/null \
+        || { jq -c '.[] | select(.handle == "vmcat")' /tmp/cat.json; return 1; }
+
+    # Settings are NOT labels: selecting on `retain_size` or `index` would
+    # be selecting on an operational choice.
+    jq -e '.[] | select(.handle == "vmcat") | .labels
+           | has("retain_size") == false and has("index") == false
+             and has("id") == false and has("wal") == false' /tmp/cat.json > /dev/null \
+        || { jq -c '.[] | select(.handle=="vmcat") | .labels' /tmp/cat.json; return 1; }
+
+    # A store with no manifest declares nothing, and says so rather than
+    # inventing an identity.
+    rm -f /var/log/timberfs/vmbare/vmbare.log.*
+    mkdir -p /var/log/timberfs/vmbare
+    printf 'no manifest here\n' | timberfs append --into /var/log/timberfs/vmbare/vmbare.log --quiet 2>/dev/null
+    timberfs list --json /var/log/timberfs \
+        | jq -e '.[] | select(.handle == "vmbare") | .id == null and (.labels | length == 0)' \
+            > /dev/null
+}
+
 forward_intake_restart_survives() {
     systemctl restart timberfs-forward.service
     sleep 1
@@ -1588,7 +1663,9 @@ run_test "forward-intake: store path is the tag, resolvable as a handle" forward
 run_test "forward-intake: split-line partial reassembles to one entry" forward_intake_partial_reassembles
 run_test "forward-intake: entries carry the sender's own event time" forward_intake_event_times_landed
 run_test "forward-intake: first record's container_id seeds the manifest" forward_intake_container_id_seeded
+run_test "forward-intake: a declaring sender seeds host; peer is recorded either way" forward_intake_seeds_host_and_peer
 run_test "forward-intake: service restart is a sender reconnect, no data lost" forward_intake_restart_survives
+run_test "catalogue: list --json carries identity, provenance and coverage" catalogue_fields_are_a_projection_of_list
 
 # The OTLP/HTTP intake (timberfs-otlp.socket/.service) and its mirror,
 # the timber-otlp shipper. A python3 http.client driver posts the real

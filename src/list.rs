@@ -224,6 +224,30 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
                 let mut o = serde_json::Map::new();
                 o.insert("handle".to_string(), r.handle.clone().into());
                 o.insert("forest".to_string(), r.forest.clone().into());
+                // Identity first: a catalogue's rows have to be joinable to
+                // whatever recorded a position against them, and a follower
+                // records its store by this and never by a path. `null` for
+                // a store with no manifest — a plain `append` mints none.
+                o.insert(
+                    "id".to_string(),
+                    s.id.clone()
+                        .map(Into::into)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                o.insert(
+                    "created".to_string(),
+                    s.created
+                        .clone()
+                        .map(Into::into)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                // The manifest's provenance, verbatim — what a fleet view
+                // selects on. Nested so a free-form key can never collide
+                // with a field of this row.
+                o.insert(
+                    "labels".to_string(),
+                    serde_json::Value::Object(s.labels.clone()),
+                );
                 o.insert("dir".to_string(), r.dir.display().to_string().into());
                 o.insert("path".to_string(), r.path.display().to_string().into());
                 o.insert("size_bytes".to_string(), s.compressed_bytes.into());
@@ -254,6 +278,30 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
                         .clone()
                         .map(Into::into)
                         .unwrap_or(serde_json::Value::Null),
+                );
+                // The same key names `info --json` uses, deliberately: a
+                // consumer reading both must not have to remember which
+                // shape each one chose.
+                match s.chunk_seq {
+                    Some((first, last)) => {
+                        o.insert("first_seq".to_string(), first.into());
+                        o.insert("last_seq".to_string(), last.into());
+                    }
+                    None => {
+                        o.insert("first_seq".to_string(), serde_json::Value::Null);
+                        o.insert("last_seq".to_string(), serde_json::Value::Null);
+                    }
+                }
+                o.insert("next_seq".to_string(), s.next_seq.into());
+                o.insert("dropped_chunks".to_string(), s.dropped.chunks.into());
+                o.insert("dropped_bytes".to_string(), s.dropped.comp_bytes.into());
+                o.insert(
+                    "dropped_uncompressed_bytes".to_string(),
+                    s.dropped.uncomp_bytes.into(),
+                );
+                o.insert(
+                    "dropped_accounting".to_string(),
+                    s.dropped_accounting().into(),
                 );
                 // Always an array, never null: the registry knows every
                 // follower of every store, so empty means empty.
@@ -310,6 +358,9 @@ mod tests {
             chunk_seq: if span.is_some() { Some((0, 0)) } else { None },
             next_seq: if span.is_some() { 1 } else { 0 },
             dropped: crate::format::Dropped::default(),
+            id: None,
+            created: None,
+            labels: serde_json::Map::new(),
             grain: if indexed { Some((10, 1)) } else { None },
             index_declared: false,
             wal_declared: false,

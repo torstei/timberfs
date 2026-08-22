@@ -104,6 +104,22 @@ fn find_field<'a>(record: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
+/// Field names a Forward sender may use for its own hostname. The protocol
+/// carries none — Docker's fluentd driver sends a tag, `container_id` and
+/// `container_name`, and no host at all — so this is a convention check, not
+/// a guarantee: Fluent Bit and hand-rolled senders commonly add one of
+/// these. When they do the sender's word is law, exactly as it is for an
+/// entry's write window.
+const HOST_FIELDS: &[&str] = &["hostname", "host", "nodename", "source_host"];
+
+fn sender_host(record: &Value) -> Option<String> {
+    HOST_FIELDS
+        .iter()
+        .find_map(|k| record_str(record, k))
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+}
+
 fn record_str<'a>(record: &'a Value, key: &str) -> Option<&'a str> {
     match find_field(record, key) {
         Some(Value::String(s)) => s.as_str(),
@@ -444,15 +460,30 @@ pub struct ForwardOpts {
 /// index this receiver applies to everything it creates — and `"wal"`,
 /// because the ack contract (durable before acked) is delivered by the
 /// sap. Seeded BEFORE the store opens so the sap exists from entry one.
+#[allow(clippy::too_many_arguments)]
 fn seed_bark(
     dir: &Path,
     name: &str,
     tag: &str,
+    host: Option<&str>,
+    peer: &str,
     container_id: Option<&str>,
     container_name: Option<&str>,
     opts: &ForwardOpts,
 ) -> anyhow::Result<()> {
     let mut map = crate::bark::derived_map(None, "forward-intake");
+    // `host` is the one label a fleet view cannot do without, and this is
+    // the one intake that could not previously supply it. Two sources, in
+    // order of authority: what the sender said about itself, else nothing —
+    // a reverse lookup of the peer would put DNS in the write path and
+    // still only guess.
+    if let Some(h) = host {
+        map.insert("host".to_string(), Json::String(h.to_string()));
+    }
+    // What the receiver knows for certain, either way: who connected. Not a
+    // hostname and not called one — but it distinguishes senders on a host
+    // that declares none, which is the whole reason the gap mattered.
+    map.insert("peer".to_string(), Json::String(peer.to_string()));
     map.insert("tag".to_string(), Json::String(tag.to_string()));
     if let Some(id) = container_id {
         map.insert("container_id".to_string(), Json::String(id.to_string()));
@@ -477,11 +508,14 @@ fn seed_bark(
 /// manifest with what this receiver knows about the tag. The locking,
 /// the refusal of an unknown tag and the wal declaration are the shared
 /// intake core's (see intake.rs); only the seed is Forward's own.
+#[allow(clippy::too_many_arguments)]
 fn ensure_store(
     intake: &mut Intake,
     name: &str,
     tag: &str,
     opts: &ForwardOpts,
+    host: Option<&str>,
+    peer: &str,
     container_id: Option<&str>,
     container_name: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -490,7 +524,18 @@ fn ensure_store(
         name,
         &format!("unknown tag {tag:?}"),
         opts.auto_create,
-        |dir, name| seed_bark(dir, name, tag, container_id, container_name, opts),
+        |dir, name| {
+            seed_bark(
+                dir,
+                name,
+                tag,
+                host,
+                peer,
+                container_id,
+                container_name,
+                opts,
+            )
+        },
     )
 }
 
@@ -600,6 +645,7 @@ fn handle_connection(
         for (time_ms, record) in &decoded.entries {
             let container_id = record_str(record, "container_id").map(str::to_string);
             let container_name = record_str(record, "container_name").map(str::to_string);
+            let host = sender_host(record);
             for (t, payload) in reassembler.feed(*time_ms, record, &opts.payload_key) {
                 let mut g = intake.lock().unwrap();
                 if let Err(e) = ensure_store(
@@ -607,6 +653,8 @@ fn handle_connection(
                     &name,
                     &decoded.tag,
                     &opts,
+                    host.as_deref(),
+                    &peer,
                     container_id.as_deref(),
                     container_name.as_deref(),
                 ) {

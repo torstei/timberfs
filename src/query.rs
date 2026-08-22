@@ -1404,6 +1404,14 @@ pub struct StoreSummary {
     /// Bytes currently buffered in the `.sap` sidecar (header excluded),
     /// not yet folded into a chunk — a read-only stat, never replayed.
     pub sap_pending_bytes: Option<u64>,
+    /// The store's durable identity, when it declares one. A store written
+    /// by a plain `append` has no manifest and so no id — which is why a
+    /// catalogue must be able to say "none" rather than assume.
+    pub id: Option<String>,
+    pub created: Option<String>,
+    /// The manifest's provenance keys — what a fleet view selects on. See
+    /// `bark::provenance`.
+    pub labels: serde_json::Map<String, serde_json::Value>,
     pub retain: Option<String>,
     pub retain_size: Option<String>,
     /// `retain_unconsumed`: the third axis is declared on this store, so
@@ -1470,6 +1478,27 @@ impl StoreSummary {
             .chain(legacy)
             .max_by_key(|(everything, bytes, _)| (*everything, *bytes))
             .map(|(_, _, lag)| lag)
+    }
+
+    /// Whether the recorded drop accounting is the whole story.
+    ///
+    /// `complete` — every drop this store ever had is measured (including
+    /// the case of never having dropped anything). `partial` — a binary
+    /// predating the accounting dropped from it first, so the recorded
+    /// figures are a floor and not a total. `none` — nothing was recorded
+    /// at all.
+    ///
+    /// The witness is the numbering: dense from 0, and only prefixes ever
+    /// drop, so the oldest surviving number is the true lifetime count.
+    /// Shared by `info` and `list` so the two cannot classify the same
+    /// store differently.
+    pub fn dropped_accounting(&self) -> &'static str {
+        let derived = self.chunk_seq.map(|(f, _)| f).unwrap_or(self.next_seq);
+        match self.dropped.chunks {
+            0 if derived > 0 => "none",
+            n if n < derived => "partial",
+            _ => "complete",
+        }
     }
 
     /// `list`'s INDEX column: a `.grain` token index that is present, or
@@ -1578,6 +1607,9 @@ pub fn summarize_store(
         index_declared,
         wal_declared,
         sap_pending_bytes,
+        id: get("id"),
+        created: get("created"),
+        labels: bark.map(crate::bark::provenance).unwrap_or_default(),
         retain: get("retain"),
         retain_size: get("retain_size"),
         retain_unconsumed: bark
@@ -1711,13 +1743,15 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         let anchor = crate::cursor::store_anchor(&dir, &base, handle.bark.as_ref());
         let declared = crate::follower::for_store(&crate::follower::registry_dir(), &anchor);
         let s = summarize_store(&dir, &base, records, handle.bark.as_ref(), declared);
-        consumers = s.consumers;
-        followers = s.followers;
+        // Classified before anything is moved out of the summary.
         numbering = Some(Numbering {
             held: s.chunk_seq,
             next_seq: s.next_seq,
             dropped: s.dropped,
+            accounting: s.dropped_accounting(),
         });
+        consumers = s.consumers;
+        followers = s.followers;
         (
             s.chunks,
             s.logical_bytes,
@@ -1816,26 +1850,17 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             held: seq,
             next_seq: next,
             dropped,
+            accounting,
         }) = numbering
         {
             put("next_seq", next.into());
             put("dropped_chunks", dropped.chunks.into());
             put("dropped_bytes", dropped.comp_bytes.into());
             put("dropped_uncompressed_bytes", dropped.uncomp_bytes.into());
-            // Whether those numbers are the whole story. `partial` happens
-            // when a binary predating the accounting dropped from this store
-            // first, so a consumer must not read `dropped_bytes` as a total
-            // without checking.
-            let derived_total = seq.map(|(f, _)| f).unwrap_or(next);
-            put(
-                "dropped_accounting",
-                match dropped.chunks {
-                    0 if derived_total > 0 => "none",
-                    n if n < derived_total => "partial",
-                    _ => "complete",
-                }
-                .into(),
-            );
+            // Whether those numbers are the whole story — classified by
+            // `StoreSummary::dropped_accounting`, which `list` shares, so
+            // the two cannot disagree about the same store.
+            put("dropped_accounting", accounting.into());
             match seq {
                 Some((first, last)) => {
                     put("first_seq", first.into());
@@ -2041,6 +2066,9 @@ struct Numbering {
     held: Option<(u64, u64)>,
     next_seq: u64,
     dropped: crate::format::Dropped,
+    /// From `StoreSummary::dropped_accounting`, so `info` and `list` cannot
+    /// classify the same store differently.
+    accounting: &'static str,
 }
 
 fn print_numbering(numbering: Option<Numbering>) {
@@ -2048,6 +2076,7 @@ fn print_numbering(numbering: Option<Numbering>) {
         held: seq,
         next_seq: next,
         dropped,
+        accounting: _,
     }) = numbering
     else {
         return;

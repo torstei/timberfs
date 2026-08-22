@@ -25,6 +25,15 @@ After=timberfs-log@%i.socket
 
 [Service]
 Type=simple
+
+# Declare the store's provenance before draining into it, the same way the
+# timberfs-text@ and timberfs-follow@ pairs do. `host` is the one label a fleet
+# view cannot do without: it says which machine produced the entries, which no
+# amount of reading them recovers once they are shipped somewhere else. Add more
+# with a drop-in (`timberfs set <store> service=checkout`) — the manifest keeps
+# whatever it is told, and the intake never rewrites it.
+ExecStartPre=/usr/bin/timberfs create --if-not-exists /var/log/timberfs/%i/%i.log
+ExecStartPre=/usr/bin/timberfs set /var/log/timberfs/%i/%i.log host=%H
 ExecStart=/usr/bin/timberfs append --records --exit-on-upgrade --into /var/log/timberfs/%i/%i.log
 StandardInput=socket
 StandardOutput=journal
