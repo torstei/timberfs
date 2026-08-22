@@ -1752,6 +1752,16 @@ otlp_body() {
         ']}]}]}'
 }
 
+# As otlp_body, but with an explicit event time ($2, nanos) and body ($3).
+otlp_body_at() {
+    printf '%s' '{"resourceLogs":[{"resource":{"attributes":[' \
+        '{"key":"service.name","value":{"stringValue":"'"$1"'"}}' \
+        ']},"scopeLogs":[{"scope":{"name":"vm"},"logRecords":[' \
+        '{"timeUnixNano":"'"$2"'","severityText":"INFO",' \
+        '"body":{"stringValue":"'"$3"'"}}' \
+        ']}]}]}'
+}
+
 # Poll until a store holds $2, or fail. Visibility follows the chunk flush.
 otlp_wait_for() {
     local store=$1 needle=$2 i
@@ -1842,6 +1852,24 @@ otlp_intake_renders_a_native_record() {
     covers=$(date -d "@$((OTLP_NANOS / 1000000000))" '+%Y-%m-%d %H:%M:%S.000')
     timberfs info "$(otlp_store vmotlp)" > /tmp/o8.out 2>&1
     grep -q "covers    $covers" /tmp/o8.out || { cat /tmp/o8.out; return 1; }
+}
+
+otlp_intake_flush_age_survives_a_senders_clock_skew() {
+    # A sender whose clock runs ahead stamps records in the RECEIVER'S
+    # future, and an intake stamps chunks with the sender's window. The
+    # chunk flush age is LOCAL elapsed time, so such a record still becomes
+    # a chunk -- and therefore visible to a windowed read, which is
+    # chunk-granular.
+    local ahead
+    ahead=$(( ($(date +%s) + 86400) * 1000000000 ))
+    otlp_request POST /v1/logs application/json \
+        "$(otlp_body_at vmskew "$ahead" 'sender clock a day ahead')" > /tmp/oskew.out 2>&1
+    head -1 /tmp/oskew.out | grep -q '^200|' || { cat /tmp/oskew.out; return 1; }
+    otlp_wait_for "$(otlp_store vmskew)" "sender clock a day ahead" || return 1
+    # And the chunk still carries the sender's window, not the local clock.
+    timberfs info "$(otlp_store vmskew)" > /tmp/oskew2.out 2>&1
+    grep -q "covers    $(date -d "@$((ahead / 1000000000))" '+%Y-%m-%d')" /tmp/oskew2.out \
+        || { cat /tmp/oskew2.out; return 1; }
 }
 
 otlp_intake_store_path_is_the_route_value() {
@@ -2585,6 +2613,7 @@ run_test "otlp-intake: undeclared stream 503s until the operator creates it" otl
 run_test "otlp-intake: non-OTLP encodings, signals and methods refused by name" otlp_intake_refuses_the_right_things
 run_test "otlp-intake: --auto-create --index drop-in" otlp_intake_enable_auto_create
 run_test "otlp-intake: a native record becomes a stamped, greppable line" otlp_intake_renders_a_native_record
+run_test "otlp-intake: a sender's clock skew does not stall the chunk flush" otlp_intake_flush_age_survives_a_senders_clock_skew
 run_test "otlp-intake: store path is the route value, handle-resolvable" otlp_intake_store_path_is_the_route_value
 run_test "otlp-intake: trace id rides the token index" otlp_intake_trace_id_is_indexed
 run_test "otlp-intake: resource attributes seed the manifest, wal live" otlp_intake_seeds_the_resource

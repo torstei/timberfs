@@ -394,8 +394,21 @@ pub struct FileStore {
     buffer: Vec<u8>,
     /// Uncompressed offset of buffer[0] == total indexed uncompressed bytes.
     buffer_start: u64,
+    /// The entries' own write WINDOW, which becomes the chunk's
+    /// first_write_ms/last_write_ms. Content, not a local clock: on a
+    /// received store it is the ORIGIN's, so it may sit anywhere relative
+    /// to this host's time.
     buffer_first_ms: Option<u64>,
     buffer_last_ms: u64,
+    /// This host's clock when the buffer went from empty to non-empty —
+    /// the flush-age anchor, and nothing else.
+    ///
+    /// Separate from `buffer_first_ms` because the two are different
+    /// clocks: how long bytes have been buffered is LOCAL elapsed time,
+    /// while the write window is content that may sit anywhere relative
+    /// to this host. Their difference is therefore not an elapsed time,
+    /// and must not be used as one.
+    buffer_opened_ms: Option<u64>,
     /// Single-entry decompression cache: (chunk index, uncompressed data).
     /// Enough to make sequential scans (cat/grep) decompress each chunk once.
     cache: Option<(usize, Vec<u8>)>,
@@ -602,6 +615,9 @@ impl FileStore {
             wal = Some(sap::Sap::create(&sap_p, comp_size, buffer_start)?);
         }
 
+        // Recovered from the sap: the flush age restarts here, since
+        // elapsed time is a property of this process's uptime.
+        let buffer_opened_ms = (!buffer.is_empty()).then(now_ms);
         Ok(FileStore {
             dir: dir.to_path_buf(),
             name: name.to_string(),
@@ -613,6 +629,7 @@ impl FileStore {
             buffer_start,
             buffer_first_ms,
             buffer_last_ms,
+            buffer_opened_ms,
             cache: None,
             staged: None,
             wal,
@@ -651,6 +668,7 @@ impl FileStore {
         if self.buffer.is_empty() {
             self.buffer_first_ms = Some(first_ms);
             self.buffer_last_ms = last_ms;
+            self.buffer_opened_ms = Some(now_ms());
         } else {
             self.buffer_first_ms = Some(self.buffer_first_ms.unwrap_or(first_ms).min(first_ms));
             self.buffer_last_ms = self.buffer_last_ms.max(last_ms);
@@ -709,6 +727,7 @@ impl FileStore {
         self.chunks.truncate(b.chunks);
         self.buffer.clear();
         self.buffer_first_ms = None;
+        self.buffer_opened_ms = None;
         Ok(())
     }
 
@@ -772,6 +791,7 @@ impl FileStore {
         self.buffer_start += self.buffer.len() as u64;
         self.buffer.clear();
         self.buffer_first_ms = None;
+        self.buffer_opened_ms = None;
         self.chunks.push(rec);
         if sealing {
             // The frame + index must be durable BEFORE the seal is
@@ -935,6 +955,7 @@ impl FileStore {
         self.buffer.clear();
         self.buffer_start = 0;
         self.buffer_first_ms = None;
+        self.buffer_opened_ms = None;
         self.cache = None;
         let _ = fs::remove_file(format::sap_seal_path(dir, name));
         if self.wal.is_some() {
@@ -958,8 +979,11 @@ impl FileStore {
         }
     }
 
+    /// How long the buffered bytes have been sitting here, by THIS host's
+    /// clock. Deliberately not derived from `buffer_first_ms` — see that
+    /// field.
     fn buffer_age_ms(&self, now: u64) -> Option<u64> {
-        self.buffer_first_ms.map(|t| now.saturating_sub(t))
+        self.buffer_opened_ms.map(|t| now.saturating_sub(t))
     }
 
     /// Number of leading chunks written entirely before the cutoff. An
@@ -2444,6 +2468,58 @@ mod tests {
         assert!(!seal_p.exists());
         assert_eq!(f.chunks.len(), 1);
         assert_eq!(f.size(), 1);
+    }
+
+    #[test]
+    fn the_flush_age_is_local_elapsed_time_not_the_entries_write_window() {
+        // An intake stamps chunks with the sender's window, so on a
+        // received store `buffer_first_ms` can sit in this host's future.
+        // The flush age must still be local elapsed time, and the chunk
+        // must still carry the sender's window.
+        let dir = TempDir::new();
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), "app", &cfg).unwrap();
+
+        let far_future = now_ms() + 10 * 365 * 24 * 3_600_000;
+        f.append_windowed(b"from a host running fast\n", far_future, far_future, &cfg)
+            .unwrap();
+
+        // The window is preserved as content -- it is what the chunk's
+        // first_write_ms must be.
+        assert_eq!(f.buffer_first_ms, Some(far_future));
+        // ...and the age is measured on this host's clock regardless, so a
+        // buffer opened a minute ago is a minute old and flushes.
+        f.buffer_opened_ms = Some(now_ms() - 60_000);
+        let age = f
+            .buffer_age_ms(now_ms())
+            .expect("a filled buffer has an age");
+        assert!(
+            age >= 60_000,
+            "age must come from the local anchor, got {age}"
+        );
+
+        let cfg_5s = Config {
+            flush_age_ms: 5_000,
+            ..cfg
+        };
+        let mut st = Store {
+            dir: dir.path().to_path_buf(),
+            cfg: cfg_5s,
+            files: BTreeMap::new(),
+        };
+        st.files.insert("app".to_string(), f);
+        st.flush_aged();
+        let f = st.files.get("app").unwrap();
+        assert!(f.buffer.is_empty(), "the aged buffer must have been sealed");
+        assert_eq!(f.chunks.len(), 1);
+        assert_eq!(
+            f.chunks[0].first_write_ms, far_future,
+            "the chunk keeps the origin's window"
+        );
+        assert_eq!(
+            f.buffer_opened_ms, None,
+            "the anchor clears with the buffer"
+        );
     }
 
     #[test]
