@@ -394,9 +394,6 @@ enum Command {
         #[arg(long, value_name = "N", requires = "follow", conflicts_with_all = ["from", "tail"])]
         from_chunk: Option<u64>,
     },
-    /// Show a store's vital signs on one screen: identity, lineage,
-    /// data and compression, time covered, index sizes and coverage,
-    /// writer state. Works on backing pairs and .timber bundles alike
     /// Manage the followers of a store: registered readers, each with a
     /// name, a type, a `retaining` flag and a durable position. A
     /// follower is a declared object rather than a cursor found lying in
@@ -407,6 +404,9 @@ enum Command {
         #[command(subcommand)]
         command: FollowerCommand,
     },
+    /// Show a store's vital signs on one screen: identity, lineage,
+    /// data and compression, time covered, index sizes and coverage,
+    /// writer state. Works on backing pairs and .timber bundles alike
     Info {
         /// Backing file (logical name, .trunk/.rings path) or bundle
         file: PathBuf,

@@ -285,35 +285,403 @@ works is in [docs/design.md](docs/design.md).
   root; and its store stays out of the served forests, or a broad grant
   reads the record of its own reads.
 - **Native replication (frames on the wire, not entries)**: shipping a
-  store through OTLP — or through a records stream — throws away the
-  compression already paid for at ingest: both decompress at the source,
-  send plaintext, and make the receiver spend CPU compressing it back into
-  something close to what was sent. Moving the `.trunk` frames verbatim
-  reuses that work twice, for storage and for transport, turning
-  replication into a byte copy at roughly a tenth of the bandwidth. Most
-  of the format exists: a `.timber` bundle is already tar(`.rings`,
-  `.trunk`, `.bark`) and `import` takes it directly, so this is the
-  incremental, streaming form of the batch artifact sawmill already plans
-  to accept over HTTP. Chunk boundaries survive the hop, which is also
-  what would let a `.grain` travel — the index is chunk-positional, so it
-  can only be shipped by a transport that preserves alignment (and is why
-  bundles COULD carry one; they don't yet). Three constraints define it:
-  (1) the resume key is a **write window plus lengths, never a byte
-  offset** — a retention head-drop shifts every offset, and windows and
-  lengths are exactly what `read_chunk` already re-locates a chunk by for
-  that reason; (2) raw is **1:1 mirroring, not fan-in** — frames are
-  opaque and the rings must stay sorted, so interleaving two sources into
-  one store requires decoding, which is the records path's job. Raw
-  mirrors, records merge and transform; the two transports are for
-  different jobs, not competitors; (3) validating what arrives costs the
-  decompression the design exists to avoid, so verification is a choice,
-  not a default — trust the link as the intakes do, keep the cheap
-  structural checks (ring records consistent with frame sizes), and leave
-  a corrupt frame to fail at read, where `zstd -dc` is already the stated
-  recovery path. This is the WRITE-direction complement to read-only
-  serve; whether one endpoint family serves both representations — records
-  for "I want to read this", frames for "I want a copy of this" — is worth
-  deciding only once the read side exists.
+  store's `.trunk` frames verbatim instead of re-encoding its entries.
+  **The win is CPU, not bandwidth** — measured on 200k apache entries
+  (23.5 MB plain, 2.33 MB compressed at rest): a `.timber` bundle is
+  2,341,376 bytes and costs 0.00 s to write, 0.04 s to import; the same
+  data as gzipped OTLP protobuf is 2,579,528 bytes and costs 6.17 s of
+  sender CPU. Uncompressed OTLP is 28.4 MB and a records stream 38.7 MB
+  (per-entry metadata makes it larger than the plain log), so the "tenth
+  of the bandwidth" framing only holds against an uncompressed peer: gzip
+  recovers nearly all of it. What it cannot recover is the work — the node
+  decompresses zstd, encodes protobuf per entry and gzips, while the
+  receiver reverses all three and re-zstds, to move data that was zstd at
+  both ends. That CPU lands on the machine serving production traffic.
+  Shipping frames also carries what re-encoding destroys: chunk
+  boundaries, and therefore chunk numbers and a `.grain` (the index is
+  chunk-positional, so only an alignment-preserving transport can move
+  it — 264 KB shipped versus ~1 s of rebuild per 200k entries).
+
+  **The frame.** One hello per connection, then typed frames each carrying
+  a stream id and their own length — so any frame is skippable without
+  understanding it, which is what serves extensibility and multiplexing
+  with one mechanism.
+
+      connection hello (once)
+         0..8   magic                            8 bytes
+         8..12  version                          u32
+        12..16  incompat_flags                   u32
+
+      every frame thereafter
+         0..4   stream id (0 = the only stream)  u32
+         4..8   frame type                       u32
+         8..12  payload length                   u32
+
+      stream-open payload
+         0..16  origin_id (the travelling half)  uuid
+        16..32  sender's own id -> derived_from  uuid
+        32..40  first seq in this stream         u64
+        40..48  last seq, or 0 = open-ended      u64
+        48..52  mode: coverage | index | frames  u32
+        52..56  sidecar count n                  u32
+        56..56+12n  n x { kind: 8 bytes, len: u32 }
+        then    provenance JSON, then each sidecar's bytes
+
+      chunk payload
+         0..8   seq                              u64
+         8..16  uncomp_len                       u64
+        16..24  comp_len                         u64
+        24..32  first_write_ms                   u64
+        32..40  last_write_ms                    u64
+        40..44  sidecar count n                  u32
+        44..44+12n  n x { kind: 8 bytes, len: u32 }
+        then    comp_len bytes verbatim, then each sidecar's bytes
+
+      ack payload
+         0..8   highest contiguous seq stored    u64
+
+  **Offsets never travel.** A rings record is 56 bytes but only 40 of them
+  are portable: `uncomp_start` and `comp_start` are local, and a head-drop
+  rebases them. The receiver accumulates its own. Same rule as the drop
+  counters — lengths, never offsets.
+
+  **The chunk payload is optional, and that makes the wire a catalogue
+  too.** In `index` mode the frames carry their metadata and sidecars with
+  no trunk bytes — `comp_len` still reports the chunk's TRUE size, because
+  half of what a catalogue is for is how big the thing is. It is a
+  declared mode rather than a silently absent payload: a sender that
+  simply stopped sending bytes is indistinguishable from a broken replica.
+  Rings alone are ~0.2% of the data (4.7 KB against 2.34 MB on a 90-chunk
+  store), which is what makes "what do you hold" cheap enough to ask
+  often — discovery, cross-tier query planning, and a reconciliation
+  richer than an ack (`have 4831` resumes a stream; exchanging indexes
+  finds HOLES). This is the control direction of a central server talking
+  to nodes, or to other tiers with different retention.
+
+  **Three granularities, and the coarsest is the one discovery needs.**
+  `coverage` answers with a RUN LIST — the `(start, end)` seq intervals
+  this node holds — `index` with one metadata frame per chunk, `frames`
+  with the bytes. The gap between the first two is what makes coverage its
+  own mode rather than holes implied by absent frames: ~16 bytes per run
+  either way, against 4.7 KB of index on a 90-chunk store and ~520 MB on a
+  10M-chunk archive. A discovery ping is a run list; `index` is for
+  per-chunk detail of a range already known to be worth asking about.
+
+  **Trunk-only is deliberately NOT a mode.** The write windows exist only
+  in the rings — frame headers give sizes and nothing else — so dropping
+  them discards the time axis that makes this a store rather than a pile
+  of zstd, and saves 0.2%. What that direction actually wants is the seq
+  RANGE above: full frames, fewer of them, for backfilling a tier that
+  found a gap.
+
+  **Sidecars are a list, not a slot.** `.grain` is one kind; the zone-map
+  and record-length sidecars above are two more, and a hardcoded
+  `grain_len` field would need a format change for each. Unknown kinds are
+  **dropped**, which is safe by the sidecar contract itself — derived,
+  rebuildable, and a chunk with no index entry means "scan it" — so this
+  needs no negotiation, no handshake and no incompat bit. That is what
+  makes it cheap. The line: sidecars are droppable, the chunk is not, so
+  `incompat_flags` guards the chunk (a codec or framing change) while
+  sidecars ride an ignore-what-you-do-not-know list. Same split as
+  `header_len` versus `incompat_flags` in the rings header. Cost is 12
+  bytes per sidecar, 0.06% on a 25 KB chunk. Folding a sidecar's
+  parameters into its kind tag also removes a hazard rather than
+  documenting one: `.grain`'s header records case-folding, `MIN_TOKEN`,
+  `MAX_TOKEN` and `K` in bytes 8..12 but `first_record_offset` validates
+  only the magic, so a page written under different constants would be
+  read under the reader's own — a silent FALSE NEGATIVE, the one direction
+  a Bloom filter must never fail in. Parameters in the tag make a mismatch
+  an unrecognised kind, hence a rebuild. (Latent today; shipping pages
+  across a fleet at mixed versions is what makes it reachable.)
+
+  **The resume key is a coverage answer, one number in the common case.**
+  For a CONTIGUOUS receiver the highest contiguous `seq` is the entire
+  cursor: it reports `have 4831`, the sender continues at 4832. A SPARSE
+  receiver has no such number — "highest contiguous" stalls at its first
+  hole and re-requests forever — so its position is a run list, and an ack
+  is therefore a DEGENERATE COVERAGE RESPONSE: the same information at two
+  resolutions, an integer when contiguous and a run list otherwise. This supersedes the earlier
+  formulation of the resume key as a write window plus lengths, which
+  predates chunk numbers; window-plus-lengths remains how `read_chunk`
+  re-locates a chunk internally, and is no longer what the wire needs. A
+  registered `retaining` follower plus `retain_unconsumed` is what
+  guarantees 4832 still exists on reconnect.
+
+  **1:1 mirroring, not fan-in**, and now for two reasons rather than one.
+  Frames are opaque and the rings must stay sorted, so interleaving two
+  sources needs decoding — the records path's job. And shipping `seq`
+  *is* a claim on the origin's numbering: the invariant on
+  `ChunkRecord::seq` is never claim an origin and renumber, and two
+  senders into one numbering-preserving store cannot both be honoured. So
+  the header's numbering-preserving flag is load-bearing: set, the
+  destination copies `origin_id` VERBATIM, preserves `seq`, and refuses a
+  second sender; clear, it makes no origin claim and renumbers, which is
+  what `export` does today. Either way the destination mints its own `id`
+  — two stores sharing one is treated as corruption and refused, per
+  "Which id travels" above, which is why the wire carries `origin_id` and
+  the sender's `id` (the destination's `derived_from`) as separate fields
+  rather than one. This is the transport for "Globally addressable chunks".
+
+  **The header carries `provenance()`, not the whole `.bark`** — labels
+  for routing, while the receiver keeps its own retention and index
+  policy. Operational settings are the receiving tier's business.
+
+  **Transport: multiple streams per connection in the protocol, 1:1 on
+  the wire first.** The stream identity lives in the frame, not the
+  connection: a `stream-open` frame binds a small stream id that every
+  chunk and ack frame carries, so one-connection-per-stream is simply a
+  connection with one open stream, and multiplexing later is a transport
+  change with no format change, no version bump and no incompat bit.
+  Pipelining is **per stream from day one** — a sender must not stall on
+  each chunk's ack, so there is an in-flight window regardless, and
+  scoping it per stream rather than per connection is what leaves the mux
+  as bookkeeping instead of a redesign. Muxing waits because the price of
+  it is flow control: without per-stream credit one slow store (a full
+  disk, an fsync stall, an outsized chunk) head-of-line-blocks every other
+  stream on the connection, which is strictly worse than N connections.
+  N connections also give independent cursors, retry and backpressure for
+  free, and match the intakes' existing thread-per-connection model.
+  The case that will force muxing is a **dynamic store set** — 50
+  containers on one host is 50 connects, 50 receiver threads and constant
+  churn — with a control/pull direction (a central server asking a node
+  what it holds) and per-stream TLS handshakes behind it. Note that
+  HTTP/2 would supply muxing, flow control and TLS ready-made, at the cost
+  of an async runtime and a TLS stack in a tree that today has neither and
+  serves with blocking `TcpListener` plus `thread::spawn`; that is a
+  dependency-posture decision, not a free win (see "OTLP gaps").
+
+  **Latency puts a floor under it.** Only sealed chunks exist to ship, so
+  this wire is one chunk-seal behind the live edge (256 KB or 5 s idle,
+  whichever comes first). The `.sap` live tail is 0.2 s. That, not
+  "transform versus not", is why the entry wire stays: frames replicate,
+  records merge, transform and tail, and the two are chosen by latency and
+  by whether the shape must change — not competitors.
+
+  **Prerequisite (a bug today):** `import` discards a bundle's `.bark`
+  entirely. A bundle carries `id`, `derived_from`, `derived_op` and the
+  labels; the imported store comes out with no manifest at all, so
+  identity and provenance do not survive the hop. Nothing that claims an
+  origin can be built on that.
+
+  **Validation stays a choice, not a default** — checking what arrives
+  costs the decompression this design exists to avoid. Keep the cheap
+  structural checks (ring records consistent with frame sizes) and leave a
+  corrupt frame to fail at read, where `zstd -dc` is already the stated
+  recovery path.
+
+  This is the WRITE-direction complement to read-only serve; whether one
+  endpoint family serves both representations — records for "I want to
+  read this", frames for "I want a copy of this" — is worth deciding only
+  once the read side exists.
+- **Chunks fetched by address (manifest now, bytes on demand)**: the model
+  is a TAPE. A store is an endless tape with a beginning — chunk #0, then
+  an unbounded run of potential chunks (u64-bounded, which at 256 KB a
+  chunk is not a practical ceiling) — and a node holds ZERO OR MORE RUNS
+  of some tape. Two concepts, and only the second is new: a CONTIGUOUS
+  piece of the tape, which is today's store, and an ordered list of
+  FRAGMENTS with holes between them. Nodes stay equivalent either way —
+  how much of a tape one holds is a deployment fact, not a kind of node.
+
+  **The property that makes fragments meaningful is that a chunk carries
+  its meaning alone.** It does, at the byte level: the zstd frame is
+  independent, the portable rings fields (`uncomp_len`, `comp_len`,
+  `first_write_ms`, `last_write_ms`, `seq`) are per-chunk, and a grain
+  page is self-sizing. ⚠ It does NOT at the entry level — an entry may
+  straddle a boundary, which `timberfs-records(5)` states ("a line split
+  across two chunks reports the second") and `EntrySink` implements by
+  carrying the trailing partial line across pushes. So reading across a
+  hole would splice chunk N's tail onto chunk M's head and produce a line
+  THAT NEVER EXISTED: not missing data but fabricated data, which is
+  worse. A fragmented reader therefore needs a "next chunk is not
+  adjacent" signal, and at a hole must terminate the partial line and
+  report both ends as incomplete rather than joining them. That is the
+  one real cost of the model.
+
+  **The current format already expresses it**, which is the strongest form
+  of not making today's files less useful: same files, same format, one
+  loosened invariant. `seq` is SEARCHED and never computed from position
+  (`position(|c| c.seq >= seq)`), `next_seq` comes from the last record
+  rather than a count, `read_chunk` addresses by offset, and `.grain` is
+  indexed by rings POSITION so gaps in seq do not disturb it. The delta is
+  the splice above plus `dropped_chunks()`, which reads the count straight
+  off `first_seq` and so conflates NEVER HAD IT with HAD IT AND DROPPED
+  IT — today those coincide because only prefixes go.
+
+  **Two concepts, two layouts** — the layout follows the concept instead
+  of one being bent to serve both. A CONTIGUOUS piece of tape stays
+  `.trunk` + `.rings`: one seek, a sequential read, the existing write
+  path and the existing `zstd -dc <name>.trunk` promise. A FRAGMENT LIST
+  wants a directory of frames, one file per chunk, named by number
+  (Maildir-style, and the namespace is obviously NOT flat — see the open
+  details below), with conversion between the two a defined operation:
+  assemble a complete fragment set into a contiguous store, explode a
+  store into fragments.
+
+  **The fragment layout's use case is the CACHE** — a fetch-on-demand
+  tier, holding whatever runs it has been asked for. That is what makes
+  its trade-offs the right ones: insert and evict dominate, whole-store
+  scans do not happen, and eviction is not loss because a peer still has
+  the chunk.
+
+  **And the caller never needs to know which it is.** The read API spans
+  both layouts, and collections of them, presenting one view — which is
+  what licenses having two layouts rather than forcing a single format to
+  be adequate at both jobs. The abstraction boundary is the API, not the
+  storage layer, and getting it there is a REQUIREMENT on the API rather
+  than a hope: a query that must ask "is this a store or a cache" has put
+  the boundary in the wrong place.
+
+  What the directory buys is not mainly trivial insert and delete, though
+  it has those (write tmp + rename is atomic, so no WAL; unlink returns
+  the space at once, so `PUNCH_HOLE`, `COLLAPSE_RANGE`, skippable-frame
+  stamping, offset rebasing, `.trim` and the seqlock ALL stop applying
+  here). It is that the on-disk fragment can BE the wire frame: receive is
+  "write these bytes to a file" and serve is `sendfile`, with no
+  re-derivation of offsets into someone else's coordinate space on the way
+  in and no reading them back out on the way out. Parallel fetches from
+  different peers also stop contending, writing separate files rather than
+  sharing one trunk's write lock.
+
+  Iteration is the cost, and the FILENAME is what makes it bearable — the
+  Maildir trick of putting in the name what you would otherwise open the
+  file to learn. With `seq` and the write window in the name, `readdir`
+  yields coverage, time spans and sizes with zero opens, so only the
+  chunks a query actually needs get read; a time-range query is a
+  contiguous run, and whole-store scans are the anti-pattern
+  (`SELECT * FROM huge_table`) rather than the case to optimise. Merging
+  adjacent fragments is then plain CONCATENATION, since zstd frames
+  concatenate — `cat a b > ab`, and the merged fragment names a RANGE,
+  which is the run concept again. That gives hot/cold tiering for free:
+  many small files where inserts land, merged runs for cold data, which
+  also retires the per-file slack (10.6% at the measured mean frame size
+  of 25,919 B, plus an inode each). Remaining costs to size rather than
+  discover: directory scaling (400k files for a 100 GB store is fine with
+  `dir_index`; 10M wants sharding on the high bits of `seq`), and a
+  recovery incantation that changes shape — `cat $(ls -v) | zstd -dc`
+  instead of `zstd -dc <name>.trunk`, still stock tools but dependent on
+  getting the sort right.
+
+  For a contiguous store the record shape already answers the one layout
+  question that is not a detail: `comp_start` and `uncomp_start` are
+  separate fields, so keep `comp_start` dense (the bytes actually held,
+  trunk stays compact) and let `uncomp_start` carry the ORIGIN's logical
+  position. The hole is then real and visible in the uncompressed
+  coordinate space, so a byte offset means the same thing on every node
+  holding that tape — no sparse-file tricks and no new field.
+
+  Note what a hole is NOT: rings referencing bytes that are absent. The
+  trunk holds exactly the frames the node has — the hole is in the
+  NUMBERING, not in the file — so `zstd -dc <name>.trunk` still prints
+  every byte present and the standing recovery promise is untouched.
+
+  **The address is what makes the runs fungible.** With `(origin_id, seq)`
+  global, rings + `.grain` are a MANIFEST and the trunk is content to
+  fetch when needed, from ANY holder, because the address says what the
+  bytes are and not where they live. Two properties make that sound and
+  both already hold: a sealed chunk is **immutable** — append-only, and a
+  head-drop changes a chunk's OFFSET inside the trunk, never its bytes,
+  the same fact behind "offsets never travel, lengths do" — so a cached
+  copy cannot go stale; and the address is **location-independent**, so
+  one holder is as good as another.
+
+  **The payoff is query planning with no data.** `.grain` is per-chunk, so
+  a `--has` predicate evaluated against a manifest names the chunks worth
+  fetching before a byte of trunk moves: measured selectivity is 1 chunk
+  of 136 for a rare identifier, against 136 of 136 for a substring scan.
+  Sizes set the deployment shape rather than leaving it to taste — rings
+  alone are ~0.2% of the trunk, rings + grain ~11% (264 KB against
+  2.33 MB) — so rings for everything and grain for hot stores is a real
+  configuration, not a hypothetical one.
+
+  **The prerequisite is a digest, and it is cheap.** Nothing checks a
+  chunk today: there is no per-chunk checksum, and the encoder
+  (`zstd::stream::encode_all`) leaves zstd's own frame checksum off, so a
+  wrong or truncated frame is undetectable. `(origin_id, seq)` is a NAME
+  rather than a self-verifying hash, so the bytes need their own witness.
+  Between TRUSTED peers that witness is about INTEGRITY — bit rot, a
+  truncated transfer, a buggy tier — and not resistance to a lying holder,
+  so it wants xxhash or crc32c and no crypto. Over the COMPRESSED frame it
+  costs no decompression, so it does not contradict "validation is a
+  choice" above: that caveat is about decoding CONTENT, not hashing bytes.
+  Natural home is a sidecar kind, riding the manifest where old readers
+  ignore it. Worth having whatever the fetch story becomes.
+
+  **Discovery: ask trusted peers, then fetch from the best answer.**
+  `WHOHAS (origin_id, seq)` to a known peer set, then a normal ranged
+  fetch from whoever answers best — which keeps the trust boundary where
+  the intakes already put it, and needs no DHT. The answer is a `coverage`
+  response (a run list), not an index dump. Ranking mostly falls out: the
+  asker measures RTT itself, so a responder only needs a cost hint for
+  what RTT cannot see — cold storage, spinning disk, a tier that would
+  itself have to fetch onward. Two things not to confuse with it. A UDP
+  multicast stops at the first router, so it serves one VLAN and is a
+  possible later TRANSPORT for this question rather than a design. And
+  where the peer set is known and stable, tiers exchanging coverage on a
+  schedule reduces WHOHAS to a LOCAL lookup, with the live query as the
+  fallback for a cold or newly-joined peer. Gossip and DHTs stay out until
+  membership is genuinely unknown.
+
+  Telling NEVER HAD IT from HAD IT AND DROPPED IT is the same distinction
+  as "renumbering destroys the evidence of a gap" above, which is what
+  makes this a consistent extension rather than a new doctrine.
+
+  **Three mechanics a sparse store changes, and none of them is a
+  blocker.**
+
+  *Retention still works, but stops being erasure.* Head-drop means "drop
+  the lowest-seq run", so `retain` and `retain_size` need nothing new.
+  What inverts is the consequence: on a contiguous origin store retention
+  is ERASURE — irreversible, which is why the follower machinery exists —
+  while on a fragment set whose peers hold the same chunks it is EVICTION,
+  undone by a fetch. `retain_unconsumed` generalises with it, from "a
+  follower has not read this" to "I MAY BE THE LAST HOLDER": the same
+  interest floor from a different source, and under the same settled rule
+  that interest is ADDITIVE, never a cap, or one stale catalogue entry
+  pins the disk until it fills. Evicting from the MIDDLE is a different
+  and easier primitive than head-drop — `PUNCH_HOLE` rather than
+  `COLLAPSE_RANGE`, so nothing rebases and no offset moves — and
+  `stamp_skippable_frame` is the precedent for keeping the trunk readable
+  across the gap: stamp the 8-byte header, punch the rest.
+
+  *Inserting a chunk in the middle* is easy for the frame (trunk tail, or
+  a punched hole that fits) and a choice for the RECORD. Rewriting the
+  rings in seq order is nothing at 90 chunks and O(N) per insert at ten
+  million — hopeless for a cache that fetches constantly. Appending the
+  record and SORTING AT OPEN keeps insertion O(1), and `read_index_file`
+  already reads the whole file into a `Vec` so the sort is nearly free;
+  the invariant spent is "records are sorted by seq on disk" becoming "the
+  reader sorts", whose knock-on is `.grain` — indexed by rings POSITION,
+  so pages land in insertion order, still consistent but harder to rebase
+  on a head-drop. Either way `comp_start` stops being monotone with `seq`,
+  which nothing requires (`read_chunk` addresses by `comp_start + len`)
+  but which fragments `export`/`rotate`'s verbatim runs into more and
+  smaller copies. Note the payoff of keeping the origin's `uncomp_start`:
+  an inserted chunk fills the uncompressed gap EXACTLY, so uncomp order
+  stays identical to seq order and offset-based addressing is untouched.
+
+  *Streaming out of a sparse store* needs no protocol change: `coverage`
+  advertises the runs, and the frames' own `seq` values are authoritative
+  with the range as a bound. Streaming INTO one is the insertion case
+  above. `--follow` on a sparse store means "tell me when fragments
+  arrive" rather than tailing a live edge — and sparse is not exclusive
+  with being an origin, since a node can lose middle chunks and keep
+  producing.
+
+  *Reading into a hole is an ERROR*, never a silent short read — and it is
+  the natural trigger for a fetch. Which is the same fact as the splice
+  hazard above seen from the read side: the reader must know where the
+  hole is either way.
+
+  **Deliberately open**, so none of the above is read as a spec: the
+  fragment namespace (flat is wrong; sharding, and on what — `seq` high
+  bits, origin, time — is undecided), what exactly a filename carries and
+  what stays in a rebuildable index beside it, eviction POLICY for a cache
+  (head-drop is one; recency or a last-holder check are others), when
+  merging runs and who triggers it, whether the API exposes coverage to
+  callers or only uses it internally, and how a cache miss surfaces —
+  block and fetch, or answer with a declared gap. All of it downstream of
+  the read API existing.
+
 - **OTLP gaps**: gRPC on :4317 wants HTTP/2 and an async runtime, so the
   answer stays "put a Collector in front" until something forces it.
   Metrics and traces remain out of scope by design. Smaller: a pre-created
