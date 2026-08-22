@@ -123,6 +123,16 @@ pub struct ChunkRecord {
     /// down when the oldest chunks go), and therefore NOT the record's index.
     /// Local to one store: a chunk shipped into another store is renumbered
     /// there, because the number says where it sits, not what it is.
+    ///
+    /// ⚠ That locality is a current CHOICE with a stated precondition, not
+    /// a law — see ROADMAP's "Globally addressable chunks". A single source
+    /// delivered in order could keep its numbering, which is what makes
+    /// `(origin, seq)` a citation that survives the network. If it ever
+    /// does, one invariant decides it: **never claim an origin and
+    /// renumber** — that produces an address that lies. Preserving the
+    /// number without claiming an origin is legal but weaker (gap evidence
+    /// survives, addressing does not), and preserving it without
+    /// preserving CHUNK BOUNDARIES is not preserving an address at all.
     pub seq: u64,
 }
 

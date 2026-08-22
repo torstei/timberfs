@@ -1007,7 +1007,13 @@ impl FileStore {
             // The incoming number is the SOURCE's position and is dropped:
             // it says where the chunk sat there, not what it is, and two
             // sources fanning in would interleave into a sequence that is
-            // neither dense nor monotone.
+            // neither dense nor monotone. ⚠ That reason is a PRECONDITION,
+            // not a law: a single source delivered in order could keep its
+            // numbering (ROADMAP, "Globally addressable chunks"). Relaxing
+            // it here would also mean this destination inherits the
+            // source's chunk BOUNDARIES, since a number only addresses
+            // anything while those hold — and rotate deliberately owns its
+            // own chunking.
             let rec = ChunkRecord {
                 uncomp_start: uncomp_base + (c.uncomp_start - src_uncomp_start),
                 comp_start: comp_base + (c.comp_start - src_comp_start),

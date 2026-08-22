@@ -107,6 +107,84 @@ works is in [docs/design.md](docs/design.md).
   in. Its actually-pluggable layer is an object store, where timberfs
   would hold Loki's own opaque chunks and none of its own indexes would
   apply.
+- **Globally addressable chunks (an ingest choice, not a law)**: a chunk's
+  number is local today — shipping renumbers, so the same data has two
+  addresses and neither knows about the other. `(bark id, seq)` is already
+  unique, the id being a UUID that survives renames, moves and hosts; the
+  defect is not the scheme but that a hop discards half of it. Worth
+  making a **declared choice at ingest** rather than a fixed rule, because
+  in a fleet the addressability is the point: "chunk 42424242 of
+  `8f14e45f-…`" is a citation that survives the network.
+  **What it buys.** Three things, and the third is the one that argues
+  hardest. Federated queries can **dedupe by ADDRESS** — the same chunk
+  seen from an edge and from an archive is one `(origin, seq)` — where the
+  only primitive today is `import`'s line-hash comparison. Cursor
+  positions become **comparable across tiers**, so a position means the
+  same thing wherever the data now lives. And **renumbering destroys the
+  evidence of a gap**: an edge that drops chunk 102 to retention before
+  shipping it hands the centre 100, 101, 103, which dense renumbering
+  turns into 0, 1, 2 — no hole, no record, the loss visible only in a
+  shipper warning on a box that may be thrown away. Preserved numbering
+  puts the hole in the data permanently, which is the same doctrine as the
+  exact loss record extended to survive a hop.
+  **The invariant, and it is the load-bearing part.** The address has two
+  halves and they travel together or not at all:
+  > **Never claim an origin and renumber.** Recording an origin without
+  > preserving `seq` produces an address that LIES, and that combination
+  > must be refused rather than configured. Preserving `seq` without
+  > recording an origin is legal but weaker — gap evidence survives,
+  > addressing does not. Both, or neither, or numbers-only.
+  Four quadrants, one of which must be impossible: origin+numbering is a
+  true replica; origin+renumbered is broken; fresh+numbering keeps gap
+  evidence only; fresh+renumbered is today's behaviour and is therefore
+  CONSISTENT — nothing to fix, only a capability to add.
+  **Which id travels.** Not `id` itself. Two stores sharing an `id` is
+  currently treated as CORRUPTION and says so — `follower.rs` refuses with
+  "a copied .bark gives two stores one identity", and `cursor::check_store`
+  leans on the same assumption that an id names one store's bytes. So the
+  travelling half is a separate lineage key (`origin_id`, copied VERBATIM
+  and never rewritten), which leaves `id` unique per store and every
+  existing check working. It also has to be distinct from `derived_from`,
+  which is the IMMEDIATE parent: a chain of hops cannot be walked, since it
+  crosses hosts, so only a verbatim-copied origin is stable across N hops.
+  **The trade to decide, not to discover.** A number is only an ADDRESS if
+  the chunk BOUNDARIES held. Re-chunk on the way in and the destination's
+  chunk 42 holds a different set of entries — the number survives, the
+  address lies. So "globally addressable" and "tune each tier's chunk size
+  independently" are alternatives, per store: an archive wanting big chunks
+  for compression cannot also inherit an edge's small ones for latency.
+  Expect addressing to survive exactly ONE hop in a three-tier fleet, and
+  say so rather than let it be found out.
+  **The live edge has no address**, by construction: `EntryRec.chunk` is
+  `None` there because the chunk does not exist yet, which is also why a
+  cursor does not advance on those entries. So a `wal`-backed follower
+  delivering sub-second carries no address for the newest data, and an
+  address becomes available one chunk AFTER the entry does. Consistent
+  with the asymmetry retention already lives with (delivery is
+  entry-granular, erasure chunk-granular) rather than a new surprise.
+  **One case that must refuse rather than configure**: a FILTERED ship
+  (`timber-filter | import --records`) delivers a subset, so the
+  destination's chunk 42 holds fewer entries than the source's — same
+  number, different content, which is a lie and not a tuning choice. The
+  records stream's stream-start carries an echo of the selection, so the
+  sink can see it.
+  **Also open**: how a store records that the boundary condition actually
+  held, since a later re-chunk would silently invalidate every address
+  without touching the manifest — a plain boolean is too easy to leave
+  true by accident.
+  **The precondition is enforced, not hoped for.** Preserved numbering is
+  safe only for a single source delivered IN ORDER, monotonicity being
+  what `partition_point`, `rotation_split` and the whole cursor axis rest
+  on. The follower/cursor model already guarantees exactly that: a cursor
+  only moves forward, one follower owns one position, and the registry
+  refuses two followers sharing one. Density need not survive — every
+  comparison is `<`, none assumes `+1`.
+  **Four touchpoints**, all of which currently state the local-only rule
+  and its reason, so the choice is a relaxation of a written precondition
+  rather than a surprise: `format.rs`'s `seq` doc, `store.rs`'s
+  `append_frames` (rotate's path, which renumbers and says why),
+  `sink.rs`'s deliberate discard of `e.chunk`, and `bark.rs` for the new
+  lineage key.
 - **Scoped, audited read access**: what a serve API makes possible and
   shell access cannot — a grant of *subject × store or forest × data
   window × grant lifetime*, the last two being different clocks ("this
