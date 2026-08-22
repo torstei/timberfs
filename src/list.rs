@@ -303,15 +303,11 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
                     }
                 }
                 o.insert("next_seq".to_string(), s.next_seq.into());
-                o.insert("dropped_chunks".to_string(), s.dropped.chunks.into());
+                o.insert("dropped_chunks".to_string(), s.dropped_chunks().into());
                 o.insert("dropped_bytes".to_string(), s.dropped.comp_bytes.into());
                 o.insert(
                     "dropped_uncompressed_bytes".to_string(),
                     s.dropped.uncomp_bytes.into(),
-                );
-                o.insert(
-                    "dropped_accounting".to_string(),
-                    s.dropped_accounting().into(),
                 );
                 // Always an array, never null: the registry knows every
                 // follower of every store, so empty means empty.

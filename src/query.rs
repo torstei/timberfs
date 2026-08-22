@@ -1395,8 +1395,8 @@ pub struct StoreSummary {
     /// chunk a number some cursor counts as consumed.
     pub next_seq: u64,
     /// What has left this store over its life, from the rings header.
-    /// All-zero on a store written before the accounting existed — which
-    /// the numbering tells apart from "nothing dropped".
+    /// All-zero on a store written before the counters existed — which the
+    /// numbering tells apart from "nothing dropped".
     pub dropped: crate::format::Dropped,
     pub grain: Option<(u64, usize)>, // (bytes, chunks covered)
     pub index_declared: bool,
@@ -1484,25 +1484,19 @@ impl StoreSummary {
             .map(|(_, _, lag)| lag)
     }
 
-    /// Whether the recorded drop accounting is the whole story.
+    /// How many chunks this store has dropped over its life, exactly. The
+    /// numbering knows: it is dense from 0 and only prefixes ever drop, so
+    /// the oldest surviving number IS the total — and `next_seq` covers the
+    /// store retention emptied, which has no surviving number.
     ///
-    /// `complete` — every drop this store ever had is measured (including
-    /// the case of never having dropped anything). `partial` — a binary
-    /// predating the accounting dropped from it first, so the recorded
-    /// figures are a floor and not a total. `none` — nothing was recorded
-    /// at all.
-    ///
-    /// The witness is the numbering: dense from 0, and only prefixes ever
-    /// drop, so the oldest surviving number is the true lifetime count.
-    /// Shared by `info` and `list` so the two cannot classify the same
-    /// store differently.
-    pub fn dropped_accounting(&self) -> &'static str {
-        let derived = self.chunk_seq.map(|(f, _)| f).unwrap_or(self.next_seq);
-        match self.dropped.chunks {
-            0 if derived > 0 => "none",
-            n if n < derived => "partial",
-            _ => "complete",
-        }
+    /// Nothing is recorded beside it, because nothing could improve on it:
+    /// a counter only sees the drops it performed, so it is a subset by
+    /// construction. The bytes in `dropped` are the part that HAS to be
+    /// recorded, and they cover a suffix of this count — which is what
+    /// makes them a floor. Shared by `info` and `list` so neither can
+    /// describe the same store differently.
+    pub fn dropped_chunks(&self) -> u64 {
+        self.chunk_seq.map(|(f, _)| f).unwrap_or(self.next_seq)
     }
 
     /// `list`'s INDEX column: a `.grain` token index that is present, or
@@ -1753,7 +1747,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             held: s.chunk_seq,
             next_seq: s.next_seq,
             dropped: s.dropped,
-            accounting: s.dropped_accounting(),
+            total_chunks: s.dropped_chunks(),
         });
         consumers = s.consumers;
         followers = s.followers;
@@ -1855,17 +1849,20 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             held: seq,
             next_seq: next,
             dropped,
-            accounting,
+            total_chunks,
         }) = numbering
         {
             put("next_seq", next.into());
-            put("dropped_chunks", dropped.chunks.into());
+            // One count and one size, both plain integers. The count is
+            // exact — the numbering always knows it. The size is a FLOOR:
+            // it covers the drops a binary that records them performed, so
+            // a store that dropped under an older one is missing that
+            // earlier loss forever. Zero is the floor of a set nothing has
+            // measured, not a stand-in for unknown, so there is nothing
+            // nullable here.
+            put("dropped_chunks", total_chunks.into());
             put("dropped_bytes", dropped.comp_bytes.into());
             put("dropped_uncompressed_bytes", dropped.uncomp_bytes.into());
-            // Whether those numbers are the whole story — classified by
-            // `StoreSummary::dropped_accounting`, which `list` shares, so
-            // the two cannot disagree about the same store.
-            put("dropped_accounting", accounting.into());
             match seq {
                 Some((first, last)) => {
                     put("first_seq", first.into());
@@ -1876,15 +1873,6 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                     put("last_seq", serde_json::Value::Null);
                 }
             }
-            // The pre-accounting derivation, kept for a store whose header
-            // predates `dropped`: numbering is dense and starts at 0, and
-            // only a PREFIX is ever removed, so the oldest surviving number
-            // IS how many went. `dropped_chunks` supersedes it and rests on
-            // no such assumption.
-            put(
-                "dropped_from_head",
-                seq.map(|(f, _)| f).unwrap_or(next).into(),
-            );
         }
         if !bundled {
             // Always an array for a pair, never null: the registry knows
@@ -2050,7 +2038,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
 /// The count and the sizes are now RECORDED in the rings header rather than
 /// derived, so neither rests on numbering starting at 0 — which is what a
 /// window extract or a partial replica would break. The derivation survives
-/// only as the fallback for a header that predates the accounting, and
+/// only as the fallback for a header that predates the counters, and
 /// `chunks == 0` beside a non-zero oldest number is how that is detected:
 /// a store whose oldest chunk is number 0 has genuinely dropped nothing.
 ///
@@ -2071,9 +2059,9 @@ struct Numbering {
     held: Option<(u64, u64)>,
     next_seq: u64,
     dropped: crate::format::Dropped,
-    /// From `StoreSummary::dropped_accounting`, so `info` and `list` cannot
-    /// classify the same store differently.
-    accounting: &'static str,
+    /// The TRUE lifetime drop count, from `StoreSummary::dropped_chunks`.
+    /// The sizes in `dropped` cover a suffix of it, so they are a floor.
+    total_chunks: u64,
 }
 
 fn print_numbering(numbering: Option<Numbering>) {
@@ -2081,32 +2069,19 @@ fn print_numbering(numbering: Option<Numbering>) {
         held: seq,
         next_seq: next,
         dropped,
-        accounting: _,
+        total_chunks,
     }) = numbering
     else {
         return;
     };
-    // How much of the history the accounting actually covers. Numbering is
-    // dense from 0 and only prefixes drop, so the oldest surviving number IS
-    // the true lifetime count — which makes it the witness for whether the
-    // recorded count is COMPLETE.
-    //
-    // ⚠ Partial is a real state, not a theoretical one: a store dropped from
-    // by a binary predating the accounting and then by one that has it
-    // records only the later drops. Reporting that number as if it were the
-    // total is an undercount stated as fact, so it is labelled instead.
-    let derived = seq.map(|(f, _)| f).unwrap_or(next);
-    let cost = match dropped.chunks {
-        0 if derived > 0 => {
-            format!("{derived} dropped (size not recorded — written before the accounting)")
-        }
+    // A count and a size. Zero measured bytes over dropped chunks is said
+    // in words rather than printed as "0 B on disk", which on a store that
+    // dropped gigabytes reads as a broken tool — and it is unambiguous: a
+    // real chunk carries a frame header, so it can never compress to
+    // nothing.
+    let cost = match total_chunks {
         0 => String::new(),
-        n if n < derived => format!(
-            "{derived} dropped, of which {n} measured ({} on disk, {} uncompressed); \
-             the rest predates the accounting",
-            crate::rotate::human_bytes(dropped.comp_bytes),
-            crate::rotate::human_bytes(dropped.uncomp_bytes)
-        ),
+        n if dropped.comp_bytes == 0 => format!("{n} dropped (size not measured yet)"),
         n => format!(
             "{n} dropped ({} on disk, {} uncompressed)",
             crate::rotate::human_bytes(dropped.comp_bytes),
@@ -2116,7 +2091,7 @@ fn print_numbering(numbering: Option<Numbering>) {
     match seq {
         // Holding its whole history: the chunk count on the `data` line
         // already says everything, so say nothing.
-        Some((0, _)) if dropped.chunks == 0 => {}
+        Some((0, _)) if total_chunks == 0 => {}
         Some((first, last)) => println!("  numbering chunks {first}..{last} held; {cost}"),
         // Emptied, not reset — invisible from the chunk count alone.
         None if next > 0 => println!("  numbering no chunks held; {cost} — emptied, not reset"),
@@ -2371,62 +2346,61 @@ pub fn cmd_index(file: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod numbering_tests {
-    /// Capture what `print_numbering` would say, by exercising the same
-    /// match — the line is only worth showing when it carries news.
-    fn line(seq: Option<(u64, u64)>, next: u64) -> Option<String> {
-        match seq {
-            Some((0, _)) => None,
-            Some((first, last)) => Some(format!(
-                "chunks {first}..{last} held; {first} dropped from the head"
-            )),
-            None if next > 0 => Some(format!(
-                "no chunks held; {next} dropped from the head — emptied, not reset"
-            )),
-            None => None,
-        }
-    }
-
     #[test]
-    fn a_store_holding_its_whole_history_says_nothing() {
-        // The chunk count on the `data` line already says it, so a
-        // numbering line here would be noise on every info.
-        assert_eq!(line(Some((0, 16)), 17), None);
-        assert_eq!(line(Some((0, 0)), 1), None);
-    }
-
-    #[test]
-    fn the_oldest_surviving_number_is_the_exact_drop_count() {
+    fn the_oldest_surviving_number_is_the_true_drop_count() {
         // Numbering is dense, starts at 0, and only ever loses a PREFIX
         // (retention and rotation both take from the head) — so the oldest
-        // surviving number IS how many went. No chunk count or time span
-        // can carry that.
-        let l = line(Some((6, 16)), 17).unwrap();
-        assert!(l.contains("chunks 6..16 held"), "{l}");
-        assert!(l.contains("6 dropped from the head"), "{l}");
+        // surviving number IS how many went, whatever the counters saw. No
+        // chunk count and no time span can carry that.
+        assert_eq!(
+            line(Some((6, 16)), 17, 4096).unwrap(),
+            "chunks 6..16 held; 6 dropped"
+        );
+        // Holding its whole history: nothing to say, since the chunk count
+        // on the `data` line already says it.
+        assert_eq!(line(Some((0, 16)), 17, 0), None);
+        assert_eq!(line(Some((0, 0)), 1, 0), None);
     }
 
     #[test]
-    fn a_partial_accounting_is_labelled_not_presented_as_a_total() {
-        // The downgrade path, and it is reachable: a binary predating the
-        // accounting drops 4 chunks, a later one drops 4 more and records
-        // only its own. The recorded number then LOOKS authoritative while
-        // covering half the history. The oldest surviving number is the
-        // witness — numbering is dense from 0 and only prefixes drop, so it
-        // is the true lifetime count.
-        assert_eq!(state(8, 4), "partial");
-        assert_eq!(state(8, 8), "complete");
-        assert_eq!(state(8, 0), "none");
-        // Nothing dropped at all is complete, not "none": there is nothing
-        // to have failed to record.
-        assert_eq!(state(0, 0), "complete");
+    fn an_unmeasured_size_is_said_in_words_not_printed_as_zero() {
+        // A store that dropped under a binary older than the counters: the
+        // count is exact (the numbering knows it) and the size is missing
+        // entirely. "0 B on disk" beside 8 dropped chunks reads as a broken
+        // tool, so the line says which of the two it is. Unambiguous
+        // because a real chunk carries a frame header and can never
+        // compress to nothing.
+        assert_eq!(
+            line(Some((8, 16)), 17, 0).unwrap(),
+            "chunks 8..16 held; 8 dropped (size not measured yet)"
+        );
+        // Any measured size at all: reported as-is. It is a FLOOR — those
+        // 8 chunks may include earlier ones nothing sized — and the count
+        // is the exact number gone either way.
+        assert_eq!(
+            line(Some((8, 16)), 17, 1).unwrap(),
+            "chunks 8..16 held; 8 dropped"
+        );
+        // Nothing dropped at all: nothing to say.
+        assert_eq!(line(Some((0, 16)), 17, 0), None);
     }
 
-    /// The classification `info` and `--json` share.
-    fn state(derived: u64, recorded: u64) -> &'static str {
-        match recorded {
-            0 if derived > 0 => "none",
-            n if n < derived => "partial",
-            _ => "complete",
+    /// What `print_numbering` renders, with the byte text elided — the same
+    /// count-and-size logic and the same outer match, so the tests exercise
+    /// the shape rather than a paraphrase of it. `bytes` is the MEASURED
+    /// compressed size, which is what decides the wording.
+    fn line(seq: Option<(u64, u64)>, next: u64, bytes: u64) -> Option<String> {
+        let total = seq.map(|(f, _)| f).unwrap_or(next);
+        let cost = match total {
+            0 => String::new(),
+            n if bytes == 0 => format!("{n} dropped (size not measured yet)"),
+            n => format!("{n} dropped"),
+        };
+        match seq {
+            Some((0, _)) if total == 0 => None,
+            Some((first, last)) => Some(format!("chunks {first}..{last} held; {cost}")),
+            None if next > 0 => Some(format!("no chunks held; {cost} — emptied, not reset")),
+            None => None,
         }
     }
 
@@ -2436,11 +2410,11 @@ mod numbering_tests {
         // numbering does not restart, so only the never-written store is
         // eligible to adopt an origin's numbering (ROADMAP, "Globally
         // addressable chunks").
-        let emptied = line(None, 12).unwrap();
+        let emptied = line(None, 12, 2048).unwrap();
         assert!(emptied.contains("12 dropped"), "{emptied}");
         assert!(emptied.contains("emptied, not reset"), "{emptied}");
         assert_eq!(
-            line(None, 0),
+            line(None, 0, 0),
             None,
             "never written has no history to report"
         );

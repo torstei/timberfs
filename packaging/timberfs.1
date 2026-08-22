@@ -920,7 +920,7 @@ A JSON array of objects
 .IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
 .IR retain_size ", " id ", " created ", " labels ", " first_seq ", "
 .IR last_seq ", " next_seq ", " dropped_chunks ", " dropped_bytes ", "
-.IR dropped_uncompressed_bytes ", " dropped_accounting ", " followers ", "
+.IR dropped_uncompressed_bytes ", " followers ", "
 .IR cursors_dir ", " consumers ", " held_bytes )
 instead of the human table.
 .I id
@@ -938,7 +938,9 @@ and
 fields carry the same names and meanings as
 .BR info \(aqs ,
 deliberately: a consumer reading both must not have to remember which shape
-each chose.
+each chose. See
+.B WHAT A STORE HAS DROPPED
+for what they mean and when to distrust them.
 .I followers
 is always an array \(em the registry knows every follower of every
 store, so empty means empty.
@@ -1401,6 +1403,50 @@ Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
 unit sets it.
 .PP
 The verb name is provisional.
+.SH WHAT A STORE HAS DROPPED
+A store records what has LEFT it over its whole life: how many chunks, and
+how many bytes both compressed and not.
+.B timberfs info
+prints it on the
+.B numbering
+line and
+.B \-\-json
+carries it as
+.IR dropped_chunks ", " dropped_bytes " and " dropped_uncompressed_bytes .
+.PP
+.B The count is exact; the size is a FLOOR.
+.I dropped_chunks
+comes from the numbering, which always knows it: numbering is dense from 0
+and only a PREFIX ever drops, so the oldest surviving chunk number IS the
+lifetime count. (It is recorded as well, which frees it from assuming the
+numbering started at 0.)
+.PP
+The bytes have to be RECORDED because they cannot be recovered \(em a
+head-drop rebases the survivors' offsets, leaving no trace in the index \(em
+so
+.I dropped_bytes
+covers only the drops performed by a binary that records them. A store that
+dropped under an older one is missing that earlier loss permanently. The
+counters begin accumulating at the store's NEXT drop, so no store has to be
+recreated to start collecting, and neither figure is ever
+.BR null .
+.PP
+.B info
+says it in words, and says which of the two a zero is \(em a bare
+"0 B on disk" beside a store that dropped gigabytes reads as a broken tool.
+The distinction is unambiguous because a real chunk carries a frame header
+and can never compress to nothing:
+.PP
+.RS
+.nf
+8 dropped (2.2 KiB on disk, 32.1 KiB uncompressed)
+8 dropped (size not measured yet)
+.fi
+.RE
+.PP
+.B Note:
+.I dropped_bytes
+is a lower bound, not a total \(em treat it as "at least this much".
 .SH PROVENANCE
 A manifest holds two kinds of key, and only one of them is a LABEL.
 .B What the store is
