@@ -195,11 +195,25 @@ works is in [docs/design.md](docs/design.md).
   FIRST source, and source B arriving later would interleave. Which is
   what the binding is for: `origin_id` is not only the address's other
   half, it is the **exclusivity claim**, so "one source for life" is
-  mechanically enforced rather than configured. It follows that a bound
-  store is **writable only by its origin's stream** — an ordinary append
-  would assign local numbers and silently break every address — which
-  makes a replica closer to a read-only `.timber` bundle than to a general
-  store. Monotonicity is what `partition_point`, `rotation_split` and the
+  mechanically enforced rather than configured. It follows that a store is
+  writable only by its origin's stream **while bound** — an ordinary
+  `append`, or an `import` of anything else, would assign local numbers and
+  silently break every address.
+  **Unbinding is available and deliberate**, because "I need to add records
+  and I accept that this store stops being streamable-from" is a legitimate
+  thing to want. The two-step pattern the follower registry already
+  settled applies unchanged: an explicit release that states what it costs,
+  and then ordinary writes work — no `--force` on the write path, and
+  nothing silently degrading. `append` and `import` are the same case here;
+  both assign local numbers, and only `import --records` could ever have
+  preserved.
+  ⚠ Like `retaining=false`, unbinding is one-way in EFFECT and not just in
+  flag: once a local chunk lands, origin chunks and local ones are
+  indistinguishable, so the addresses the store used to serve stop being
+  verifiable and re-binding would not restore them. Recording the boundary
+  instead of a whole-store flag would fix that — the same per-range
+  provenance shape the low-water mark below keeps asking for, and a reason
+  to suspect the eventual answer is a range rather than a boolean. Monotonicity is what `partition_point`, `rotation_split` and the
   whole cursor axis rest on; density need not survive, since every
   comparison is `<` and none assumes `+1`.
   **What the views owe.** `info` should report the numbering a store
