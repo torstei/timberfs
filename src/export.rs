@@ -260,7 +260,10 @@ pub fn cmd_export(
     let mut rings_bytes = Vec::with_capacity(
         format::RINGS_HEADER_LEN as usize + out_records.len() * format::RECORD_LEN,
     );
-    rings_bytes.extend_from_slice(&format::rings_header(out_records.len() as u64));
+    rings_bytes.extend_from_slice(&format::rings_header(
+        out_records.len() as u64,
+        format::Dropped::default(),
+    ));
     for r in &out_records {
         rings_bytes.extend_from_slice(&r.to_bytes());
     }

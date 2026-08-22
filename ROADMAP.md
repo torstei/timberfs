@@ -236,16 +236,28 @@ works is in [docs/design.md](docs/design.md).
   source's numbers are meaningful precisely as its identity, so a bundle
   is a candidate for preserving rather than an argument against it; and
   `bark.rs` for the new lineage key.
-  ⚠ **A low-water mark is owed the moment numbering can be adopted.**
-  `info`'s new numbering line reads the oldest surviving number as a DROP
-  count, which is sound only because numbering always starts at 0 today. A
-  window extract or a partial replica that kept source numbers would have
-  a high first number and have dropped nothing — the chunks were never
-  there. So a store would have to record the lowest number it ever held,
-  and dropped becomes `first_seq - low_water`; today that is implicitly
-  zero, which is why the line is correct now and would go quietly wrong
-  later. That, and not any dishonesty in the numbers themselves, is why
-  the line is pair-only for now.
+  **The low-water mark turned out not to be owed after all**, because the
+  drop accounting is now RECORDED rather than derived. The rings header had
+  32 reserved bytes and a written growth contract ("reserved space is only
+  safe for OPTIONAL fields, 0 reads as absent"), so `chunks`,
+  `uncomp_bytes` and `comp_bytes` went in at 32..56 with no version bump,
+  maintained by the same two head-drop paths that already keep `next_seq`
+  current. Since the count no longer rests on numbering starting at 0, a
+  window extract or partial replica that kept source numbers needs no
+  correction — which removes the reason a low-water mark was wanted.
+  Two things that had to be got right. The totals are sums of LENGTHS, not
+  of offsets: `collapse_head` rebases survivors by the block-ALIGNED cut and
+  leaves the sliver in `comp_start`, so summing offsets would count it again
+  on the next drop; lengths are immune, agree across both drop paths, and
+  mean "what left the store" rather than "what the filesystem reclaimed" —
+  which genuinely differ by that sliver. And zero-reads-as-absent collides
+  with "nothing dropped" for a byte count, resolved by the numbering
+  itself: a store whose oldest chunk is number 0 has dropped nothing, so
+  `chunks == 0` beside a non-zero oldest number means the header predates
+  the accounting, and `info` says "size not recorded" rather than a
+  confident zero.
+  The bytes are not otherwise obtainable at all — a head-drop rebases the
+  survivors' offsets, so what went leaves no trace in the index.
 - **Scoped, audited read access**: what a serve API makes possible and
   shell access cannot — a grant of *subject × store or forest × data
   window × grant lifetime*, the last two being different clocks ("this

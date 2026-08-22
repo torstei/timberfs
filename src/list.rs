@@ -309,6 +309,7 @@ mod tests {
             rings_bytes: 64,
             chunk_seq: if span.is_some() { Some((0, 0)) } else { None },
             next_seq: if span.is_some() { 1 } else { 0 },
+            dropped: crate::format::Dropped::default(),
             grain: if indexed { Some((10, 1)) } else { None },
             index_declared: false,
             wal_declared: false,
