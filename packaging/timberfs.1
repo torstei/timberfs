@@ -920,7 +920,7 @@ A JSON array of objects
 .IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
 .IR retain_size ", " id ", " created ", " labels ", " first_seq ", "
 .IR last_seq ", " next_seq ", " dropped_chunks ", " dropped_bytes ", "
-.IR dropped_uncompressed_bytes ", " dropped_measured ", " followers ", "
+.IR dropped_uncompressed_bytes ", " dropped_chunks_measured ", " followers ", "
 .IR cursors_dir ", " consumers ", " held_bytes )
 instead of the human table.
 .I id
@@ -1421,47 +1421,46 @@ a PREFIX ever drops, so the oldest surviving chunk number is the lifetime
 total \(em and recording it is what frees that from assuming the numbering
 started at 0.
 .PP
-.B The figures are not always the whole story,
-which is what
-.I dropped_measured
-reports \(em how much of what went was actually MEASURED. The counters live
-in the rings header's reserved space, so a store written before they existed
-has none, and \(em the case worth knowing \(em a store dropped from by an
-older binary and THEN by a current one has counters covering only the later
-drops.
-.TP
-.B all
-Every drop this store ever had. A store that has dropped nothing reads
-.B all
-too: there is nothing that went unmeasured.
-.TP
-.B some
-Earlier drops were never measured, so
+.B The byte figures are not always complete,
+and two numbers say so without a keyword.
+.I dropped_chunks
+is the TRUE lifetime count, which the numbering always knows;
+.I dropped_chunks_measured
+is how many of those the byte figures cover. Equal means the bytes are a
+total. Fewer means a FLOOR \(em a binary older than the counters dropped
+from this store first, and those drops were never sized. Zero means nothing
+was measured at all, and then
 .I dropped_bytes
-is a FLOOR and not a total.
-.B info
-says so in words rather than presenting the smaller number as fact:
-.RB \(dq "8 dropped, of which 4 measured \(em the rest was never measured" \(dq.
-.TP
-.B none
-Chunks were dropped and no sizes were recorded at all \(em an older header.
-Reported as
-.RB \(dq "size not recorded \(em nothing measured it" \(dq
-rather than as a confident zero.
+is
+.B null
+rather than a confident 0, because the bytes are gone: a head-drop rebases
+the survivors' offsets, so nothing can recover them afterwards.
 .PP
-The numbering is the witness that keeps the counters honest, and the reason
-this can be detected rather than merely feared: the oldest surviving chunk
-number is the true lifetime count, so a recorded count below it is provably
-incomplete. Zero would otherwise be ambiguous \(em the reserved-space rule is
-that an absent field reads as zero, which for a byte count collides with
-"nothing dropped".
+.B info
+says the same thing in words:
+.PP
+.RS
+.nf
+8 dropped (2.2 KiB on disk, 32.1 KiB uncompressed)
+8 dropped, of which 4 measured (2.2 KiB on disk, 32.1 KiB uncompressed)
+8 dropped (size never measured)
+.fi
+.RE
+.PP
+The numbering is the witness that makes this detectable rather than merely
+feared: it is dense from 0 and only prefixes ever drop, so the oldest
+surviving chunk number IS the lifetime count, and a measured count below it
+is provably short. Without that witness zero would be ambiguous \(em the
+reserved-space rule is that an absent header field reads as zero, which for
+a byte count collides with "nothing dropped".
 .PP
 .B Note:
 a consumer must therefore not read
 .I dropped_bytes
-as a total without checking
-.IR dropped_measured .
-That is the whole reason the field exists.
+as a total without comparing
+.I dropped_chunks_measured
+against
+.IR dropped_chunks .
 .SH PROVENANCE
 A manifest holds two kinds of key, and only one of them is a LABEL.
 .B What the store is

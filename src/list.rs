@@ -303,13 +303,24 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
                     }
                 }
                 o.insert("next_seq".to_string(), s.next_seq.into());
-                o.insert("dropped_chunks".to_string(), s.dropped.chunks.into());
-                o.insert("dropped_bytes".to_string(), s.dropped.comp_bytes.into());
+                o.insert("dropped_chunks".to_string(), s.dropped_chunks().into());
                 o.insert(
-                    "dropped_uncompressed_bytes".to_string(),
-                    s.dropped.uncomp_bytes.into(),
+                    "dropped_chunks_measured".to_string(),
+                    s.dropped.chunks.into(),
                 );
-                o.insert("dropped_measured".to_string(), s.dropped_measured().into());
+                if s.dropped.chunks > 0 {
+                    o.insert("dropped_bytes".to_string(), s.dropped.comp_bytes.into());
+                    o.insert(
+                        "dropped_uncompressed_bytes".to_string(),
+                        s.dropped.uncomp_bytes.into(),
+                    );
+                } else {
+                    o.insert("dropped_bytes".to_string(), serde_json::Value::Null);
+                    o.insert(
+                        "dropped_uncompressed_bytes".to_string(),
+                        serde_json::Value::Null,
+                    );
+                }
                 // Always an array, never null: the registry knows every
                 // follower of every store, so empty means empty.
                 o.insert(

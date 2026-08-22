@@ -1652,7 +1652,7 @@ catalogue_fields_are_a_projection_of_list() {
            and .labels.host == "apache01"
            and .labels.service == "apache"
            and .labels["service.name"] == "apache"
-           and .dropped_measured == "all"
+           and .dropped_chunks_measured == .dropped_chunks
            and (.from_ms | type == "number")' /tmp/cat.json > /dev/null \
         || { jq -c '.[] | select(.handle == "vmcat")' /tmp/cat.json; return 1; }
 

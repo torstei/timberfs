@@ -1484,25 +1484,21 @@ impl StoreSummary {
             .map(|(_, _, lag)| lag)
     }
 
-    /// How much of what this store dropped was actually MEASURED.
+    /// How many chunks this store has dropped over its life — the TRUE
+    /// count, which the numbering always knows: it is dense from 0 and only
+    /// prefixes ever drop, so the oldest surviving number IS the total.
     ///
-    /// `all` — every drop it ever had, including a store that has dropped
-    /// nothing: there is nothing that went unmeasured. `some` — a binary
-    /// older than the counters dropped from it first, so the recorded
-    /// figures are a FLOOR and not a total. `none` — chunks went and no
-    /// sizes were recorded at all.
-    ///
-    /// The witness is the numbering: dense from 0, and only prefixes ever
-    /// drop, so the oldest surviving number is the true lifetime count and
-    /// a recorded count below it is provably short. Shared by `info` and
-    /// `list` so the two cannot describe the same store differently.
-    pub fn dropped_measured(&self) -> &'static str {
-        let derived = self.chunk_seq.map(|(f, _)| f).unwrap_or(self.next_seq);
-        match self.dropped.chunks {
-            0 if derived > 0 => "none",
-            n if n < derived => "some",
-            _ => "all",
-        }
+    /// Distinct from `dropped.chunks`, which counts only the drops the
+    /// header's counters actually measured. Where the two differ, the byte
+    /// figures cover the smaller set and are therefore a FLOOR — and that
+    /// is the whole story, told by two numbers rather than a keyword
+    /// classifying them. Shared by `info` and `list` so neither can
+    /// describe the same store differently.
+    pub fn dropped_chunks(&self) -> u64 {
+        self.chunk_seq
+            .map(|(f, _)| f)
+            .unwrap_or(self.next_seq)
+            .max(self.dropped.chunks)
     }
 
     /// `list`'s INDEX column: a `.grain` token index that is present, or
@@ -1753,7 +1749,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             held: s.chunk_seq,
             next_seq: s.next_seq,
             dropped: s.dropped,
-            measured: s.dropped_measured(),
+            total_chunks: s.dropped_chunks(),
         });
         consumers = s.consumers;
         followers = s.followers;
@@ -1855,17 +1851,23 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             held: seq,
             next_seq: next,
             dropped,
-            measured,
+            total_chunks,
         }) = numbering
         {
             put("next_seq", next.into());
-            put("dropped_chunks", dropped.chunks.into());
-            put("dropped_bytes", dropped.comp_bytes.into());
-            put("dropped_uncompressed_bytes", dropped.uncomp_bytes.into());
-            // How much of it was measured — classified by
-            // `StoreSummary::dropped_measured`, which `list` shares, so the
-            // two cannot disagree about the same store.
-            put("dropped_measured", measured.into());
+            // The TRUE count, and how many of those the byte figures cover.
+            // Equal means the bytes are a total; fewer means a floor; zero
+            // means the bytes are unknown and are reported as null rather
+            // than as a confident 0.
+            put("dropped_chunks", total_chunks.into());
+            put("dropped_chunks_measured", dropped.chunks.into());
+            if dropped.chunks > 0 {
+                put("dropped_bytes", dropped.comp_bytes.into());
+                put("dropped_uncompressed_bytes", dropped.uncomp_bytes.into());
+            } else {
+                put("dropped_bytes", serde_json::Value::Null);
+                put("dropped_uncompressed_bytes", serde_json::Value::Null);
+            }
             match seq {
                 Some((first, last)) => {
                     put("first_seq", first.into());
@@ -1876,15 +1878,6 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                     put("last_seq", serde_json::Value::Null);
                 }
             }
-            // The pre-counter derivation, kept for a store whose header
-            // predates `dropped`: numbering is dense and starts at 0, and
-            // only a PREFIX is ever removed, so the oldest surviving number
-            // IS how many went. `dropped_chunks` supersedes it and rests on
-            // no such assumption.
-            put(
-                "dropped_from_head",
-                seq.map(|(f, _)| f).unwrap_or(next).into(),
-            );
         }
         if !bundled {
             // Always an array for a pair, never null: the registry knows
@@ -2071,9 +2064,9 @@ struct Numbering {
     held: Option<(u64, u64)>,
     next_seq: u64,
     dropped: crate::format::Dropped,
-    /// From `StoreSummary::dropped_measured`, so `info` and `list` cannot
-    /// describe the same store differently.
-    measured: &'static str,
+    /// The TRUE lifetime drop count, from `StoreSummary::dropped_chunks`.
+    /// `dropped.chunks` beside it is how many of those were measured.
+    total_chunks: u64,
 }
 
 fn print_numbering(numbering: Option<Numbering>) {
@@ -2081,34 +2074,25 @@ fn print_numbering(numbering: Option<Numbering>) {
         held: seq,
         next_seq: next,
         dropped,
-        measured: _,
+        total_chunks,
     }) = numbering
     else {
         return;
     };
-    // How much of the history was actually measured. Numbering is
-    // dense from 0 and only prefixes drop, so the oldest surviving number IS
-    // the true lifetime count — which makes it the witness for whether the
-    // recorded count is COMPLETE.
-    //
-    // ⚠ Partly-measured is a real state, not a theoretical one: a store
-    // dropped from by a binary older than the counters and then by one that
-    // has them records only the later drops. Reporting that number as if it
-    // were the total is an undercount stated as fact, so it is labelled.
-    let derived = seq.map(|(f, _)| f).unwrap_or(next);
+    // Two numbers, no vocabulary: how many chunks went, and how many of
+    // those the byte figures actually cover. Equal is a total, fewer is a
+    // floor, zero means the size was never measured — which is said rather
+    // than printed as a confident zero.
     let cost = match dropped.chunks {
-        0 if derived > 0 => {
-            format!("{derived} dropped (size not recorded — nothing measured it)")
-        }
+        0 if total_chunks > 0 => format!("{total_chunks} dropped (size never measured)"),
         0 => String::new(),
-        n if n < derived => format!(
-            "{derived} dropped, of which {n} measured ({} on disk, {} uncompressed); \
-             the rest was never measured",
+        n if n < total_chunks => format!(
+            "{total_chunks} dropped, of which {n} measured ({} on disk, {} uncompressed)",
             crate::rotate::human_bytes(dropped.comp_bytes),
             crate::rotate::human_bytes(dropped.uncomp_bytes)
         ),
-        n => format!(
-            "{n} dropped ({} on disk, {} uncompressed)",
+        _ => format!(
+            "{total_chunks} dropped ({} on disk, {} uncompressed)",
             crate::rotate::human_bytes(dropped.comp_bytes),
             crate::rotate::human_bytes(dropped.uncomp_bytes)
         ),
@@ -2371,62 +2355,63 @@ pub fn cmd_index(file: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod numbering_tests {
-    /// Capture what `print_numbering` would say, by exercising the same
-    /// match — the line is only worth showing when it carries news.
-    fn line(seq: Option<(u64, u64)>, next: u64) -> Option<String> {
-        match seq {
-            Some((0, _)) => None,
-            Some((first, last)) => Some(format!(
-                "chunks {first}..{last} held; {first} dropped from the head"
-            )),
-            None if next > 0 => Some(format!(
-                "no chunks held; {next} dropped from the head — emptied, not reset"
-            )),
-            None => None,
-        }
-    }
-
     #[test]
-    fn a_store_holding_its_whole_history_says_nothing() {
-        // The chunk count on the `data` line already says it, so a
-        // numbering line here would be noise on every info.
-        assert_eq!(line(Some((0, 16)), 17), None);
-        assert_eq!(line(Some((0, 0)), 1), None);
-    }
-
-    #[test]
-    fn the_oldest_surviving_number_is_the_exact_drop_count() {
+    fn the_oldest_surviving_number_is_the_true_drop_count() {
         // Numbering is dense, starts at 0, and only ever loses a PREFIX
         // (retention and rotation both take from the head) — so the oldest
-        // surviving number IS how many went. No chunk count or time span
-        // can carry that.
-        let l = line(Some((6, 16)), 17).unwrap();
-        assert!(l.contains("chunks 6..16 held"), "{l}");
-        assert!(l.contains("6 dropped from the head"), "{l}");
+        // surviving number IS how many went, whatever the counters saw. No
+        // chunk count and no time span can carry that.
+        assert_eq!(
+            line(Some((6, 16)), 17, 6).unwrap(),
+            "chunks 6..16 held; 6 dropped"
+        );
+        // Holding its whole history: nothing to say, since the chunk count
+        // on the `data` line already says it.
+        assert_eq!(line(Some((0, 16)), 17, 0), None);
+        assert_eq!(line(Some((0, 0)), 1, 0), None);
     }
 
     #[test]
-    fn a_partly_measured_drop_is_labelled_not_presented_as_a_total() {
+    fn two_counts_say_it_without_a_keyword() {
         // The downgrade path, and it is reachable: a binary older than the
-        // counters drops 4 chunks, a later one drops 4 more and records
-        // only its own. The recorded number then LOOKS authoritative while
-        // covering half the history. The oldest surviving number is the
-        // witness — numbering is dense from 0 and only prefixes drop, so it
-        // is the true lifetime count.
-        assert_eq!(state(8, 4), "some");
-        assert_eq!(state(8, 8), "all");
-        assert_eq!(state(8, 0), "none");
-        // Nothing dropped at all reads as "all", not "none": there is
-        // nothing that went unmeasured.
-        assert_eq!(state(0, 0), "all");
+        // counters drops 4 chunks, a later one drops 4 more and measures
+        // only its own. The TRUE count comes from the numbering — dense
+        // from 0, only prefixes drop — so the pair (8 dropped, 4 measured)
+        // says the bytes are a floor with nothing to classify.
+        assert_eq!(
+            line(Some((8, 16)), 17, 4).unwrap(),
+            "chunks 8..16 held; 8 dropped, of which 4 measured"
+        );
+        // Equal: the bytes are a total.
+        assert_eq!(
+            line(Some((8, 16)), 17, 8).unwrap(),
+            "chunks 8..16 held; 8 dropped"
+        );
+        // Zero measured: the size is unknown, and said so rather than 0.
+        assert_eq!(
+            line(Some((8, 16)), 17, 0).unwrap(),
+            "chunks 8..16 held; 8 dropped (size never measured)"
+        );
+        // Nothing dropped at all: nothing to say.
+        assert_eq!(line(Some((0, 16)), 17, 0), None);
     }
 
-    /// The classification `info` and `--json` share.
-    fn state(derived: u64, recorded: u64) -> &'static str {
-        match recorded {
-            0 if derived > 0 => "none",
-            n if n < derived => "some",
-            _ => "all",
+    /// What `print_numbering` renders, with the byte text elided — the same
+    /// two-number logic and the same outer match, so the tests exercise the
+    /// shape rather than a paraphrase of it.
+    fn line(seq: Option<(u64, u64)>, next: u64, measured: u64) -> Option<String> {
+        let total = seq.map(|(f, _)| f).unwrap_or(next).max(measured);
+        let cost = match measured {
+            0 if total > 0 => format!("{total} dropped (size never measured)"),
+            0 => String::new(),
+            n if n < total => format!("{total} dropped, of which {n} measured"),
+            _ => format!("{total} dropped"),
+        };
+        match seq {
+            Some((0, _)) if measured == 0 => None,
+            Some((first, last)) => Some(format!("chunks {first}..{last} held; {cost}")),
+            None if next > 0 => Some(format!("no chunks held; {cost} — emptied, not reset")),
+            None => None,
         }
     }
 
@@ -2436,11 +2421,11 @@ mod numbering_tests {
         // numbering does not restart, so only the never-written store is
         // eligible to adopt an origin's numbering (ROADMAP, "Globally
         // addressable chunks").
-        let emptied = line(None, 12).unwrap();
+        let emptied = line(None, 12, 12).unwrap();
         assert!(emptied.contains("12 dropped"), "{emptied}");
         assert!(emptied.contains("emptied, not reset"), "{emptied}");
         assert_eq!(
-            line(None, 0),
+            line(None, 0, 0),
             None,
             "never written has no history to report"
         );
