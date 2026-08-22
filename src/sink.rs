@@ -297,6 +297,17 @@ pub fn cmd_records_sink(
                 // interleave their numbering into a sequence that is
                 // neither dense nor monotone, so the destination assigns
                 // its own (store.rs's `append_frames` does the same).
+                //
+                // This is the seam a declared ingest choice would open —
+                // the number is already ON THE WIRE and only discarded
+                // here, so honouring it is a relaxation rather than a new
+                // mechanism (ROADMAP, "Globally addressable chunks"). Two
+                // conditions would have to hold, and neither is checkable
+                // from this line alone: one source in order, and the
+                // destination flushing on the SOURCE's chunk boundaries,
+                // since a number addresses nothing once the boundaries
+                // move. A filtered stream must refuse outright: same
+                // number, fewer entries, an address that lies.
                 let (wf, wl) = match (e.wf, e.wl) {
                     // The stream's word is law.
                     (Some(a), Some(b)) => {

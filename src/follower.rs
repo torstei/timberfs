@@ -362,6 +362,13 @@ impl Declaration {
                 },
                 self.name
             ),
+            // ⚠ Load-bearing beyond this message: an `id` names ONE
+            // store's bytes, which is why a duplicate is corruption here
+            // and not a replica. Any future addressable-replica work
+            // (ROADMAP, "Globally addressable chunks") must therefore
+            // travel a SEPARATE lineage key rather than share `id`, or it
+            // turns this refusal — and `cursor::check_store`, which rests
+            // on the same assumption — into a false alarm.
             several => bail!(
                 "store {} is claimed by several stores, so which one follower {} means cannot \
                  be decided — a copied .bark gives two stores one identity:\n{}",

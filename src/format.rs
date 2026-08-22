@@ -123,6 +123,16 @@ pub struct ChunkRecord {
     /// down when the oldest chunks go), and therefore NOT the record's index.
     /// Local to one store: a chunk shipped into another store is renumbered
     /// there, because the number says where it sits, not what it is.
+    ///
+    /// ⚠ That locality is a current CHOICE with a stated precondition, not
+    /// a law — see ROADMAP's "Globally addressable chunks". A single source
+    /// delivered in order could keep its numbering, which is what makes
+    /// `(origin, seq)` a citation that survives the network. If it ever
+    /// does, one invariant decides it: **never claim an origin and
+    /// renumber** — that produces an address that lies. Preserving the
+    /// number without claiming an origin is legal but weaker (gap evidence
+    /// survives, addressing does not), and preserving it without
+    /// preserving CHUNK BOUNDARIES is not preserving an address at all.
     pub seq: u64,
 }
 
@@ -205,13 +215,79 @@ impl ChunkRecord {
 /// so it only ever forbids reuse, and only the paths that rewrite the whole
 /// file (head-drop) keep it current. On the append path the last record is
 /// the better source, so nothing extra is written there.
-pub fn rings_header(next_seq: u64) -> [u8; RINGS_HEADER_LEN as usize] {
+pub fn rings_header(next_seq: u64, dropped: Dropped) -> [u8; RINGS_HEADER_LEN as usize] {
     let mut h = [0u8; RINGS_HEADER_LEN as usize];
     h[0..8].copy_from_slice(RINGS_MAGIC);
     h[8..16].copy_from_slice(&RINGS_HEADER_LEN.to_le_bytes());
     h[16..24].copy_from_slice(&0u64.to_le_bytes());
     h[24..32].copy_from_slice(&next_seq.to_le_bytes());
+    h[32..40].copy_from_slice(&dropped.chunks.to_le_bytes());
+    h[40..48].copy_from_slice(&dropped.uncomp_bytes.to_le_bytes());
+    h[48..56].copy_from_slice(&dropped.comp_bytes.to_le_bytes());
     h
+}
+
+/// What has LEFT this store over its whole life — an optional header field,
+/// so it uses the reserved space rather than a version bump.
+///
+/// Not derivable after the fact, which is why it is recorded: a head-drop
+/// REBASES the survivors' offsets, so the bytes that went leave no trace in
+/// the index. The chunk count was derivable from the oldest surviving
+/// number while numbering always started at 0, and recording it explicitly
+/// is what frees that assumption (see ROADMAP, "Globally addressable
+/// chunks").
+///
+/// **Lengths, never offsets.** `collapse_head` cuts on a filesystem-block
+/// boundary and leaves up to ~2 blocks of the dropped range as an inert
+/// skippable frame, rebasing survivors by the ALIGNED amount — so
+/// `comp_start` carries that sliver forward and summing offsets would
+/// double-count it on the next drop. Summing `comp_len`/`uncomp_len` over
+/// the dropped chunks is immune, identical in both the collapse and rewrite
+/// paths, and means "what left the store" rather than "what the filesystem
+/// reclaimed" — the two genuinely differ by the sliver.
+///
+/// ⚠ Zero reads as ABSENT, per the reserved-space contract, which for a
+/// byte count collides with "nothing dropped". The numbering resolves it:
+/// a store whose oldest chunk is number 0 has dropped nothing, so
+/// `chunks == 0` alongside a non-zero oldest number means the field was
+/// never maintained — a store written before this existed — and not that
+/// nothing went.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub chunks: u64,
+    pub uncomp_bytes: u64,
+    pub comp_bytes: u64,
+}
+
+/// The header's drop accounting, or all-zero when this file is too old to
+/// carry it. Gated on the DECLARED header length, not on the compiled-in
+/// constant: that is what the length field is for.
+pub fn header_dropped(buf: &[u8]) -> Dropped {
+    const NEEDED: usize = 56;
+    if buf.len() < NEEDED || &buf[..8] != RINGS_MAGIC {
+        return Dropped::default();
+    }
+    let declared = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    if declared < NEEDED as u64 {
+        return Dropped::default();
+    }
+    let at = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+    Dropped {
+        chunks: at(32),
+        uncomp_bytes: at(40),
+        comp_bytes: at(48),
+    }
+}
+
+pub fn read_header_dropped(f: &File) -> io::Result<Dropped> {
+    let mut h = [0u8; RINGS_HEADER_LEN as usize];
+    match f.read_exact_at(&mut h, 0) {
+        Ok(()) => Ok(header_dropped(&h)),
+        // Shorter than a v2 header: a v1 file, or an empty one — nothing
+        // recorded, which is exactly what the default says.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(Dropped::default()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The high-water mark a v2 header carries. A v1 header has none, and a
@@ -390,7 +466,7 @@ mod tests {
 
     #[test]
     fn the_header_this_version_writes_round_trips() {
-        let h = rings_header(42);
+        let h = rings_header(42, Dropped::default());
         assert_eq!(&h[..8], RINGS_MAGIC);
         assert_eq!(
             u64::from_le_bytes(h[8..16].try_into().unwrap()),

@@ -187,7 +187,9 @@ fn migrate_rings(dir: &Path, name: &str) -> io::Result<()> {
     let next_seq = records.last().map(|c| c.seq + 1).unwrap_or(0);
     let mut idx =
         Vec::with_capacity(format::RINGS_HEADER_LEN as usize + records.len() * format::RECORD_LEN);
-    idx.extend_from_slice(&format::rings_header(next_seq));
+    // A v1 file never carried the drop accounting, so there is nothing
+    // to migrate and zero is the honest answer.
+    idx.extend_from_slice(&format::rings_header(next_seq, format::Dropped::default()));
     for c in &records {
         idx.extend_from_slice(&c.to_bytes());
     }
@@ -410,6 +412,10 @@ pub struct FileStore {
     /// the greater of the header's high-water mark and one past the newest
     /// surviving record.
     next_seq: u64,
+    /// What has left this store over its whole life — see `format::Dropped`.
+    /// Carried in memory because the head-drop paths, which are the only
+    /// ones that change it, need the running total to write.
+    dropped: format::Dropped,
 }
 
 impl FileStore {
@@ -460,12 +466,14 @@ impl FileStore {
 
         let mut chunks = Vec::new();
         let mut next_seq = 0u64;
+        let mut dropped = format::Dropped::default();
         if rings.metadata()?.len() == 0 {
-            rings.write_all_at(&format::rings_header(0), 0)?;
+            rings.write_all_at(&format::rings_header(0, format::Dropped::default()), 0)?;
         } else {
             chunks = format::read_index_file(&rings)?;
             next_seq = format::read_header_next_seq(&rings)?
                 .max(chunks.last().map(|c| c.seq + 1).unwrap_or(0));
+            dropped = format::read_header_dropped(&rings)?;
         }
 
         let trunk_len = trunk.metadata()?.len();
@@ -609,6 +617,7 @@ impl FileStore {
             staged: None,
             wal,
             next_seq,
+            dropped,
         })
     }
 
@@ -1007,7 +1016,13 @@ impl FileStore {
             // The incoming number is the SOURCE's position and is dropped:
             // it says where the chunk sat there, not what it is, and two
             // sources fanning in would interleave into a sequence that is
-            // neither dense nor monotone.
+            // neither dense nor monotone. ⚠ That reason is a PRECONDITION,
+            // not a law: a single source delivered in order could keep its
+            // numbering (ROADMAP, "Globally addressable chunks"). Relaxing
+            // it here would also mean this destination inherits the
+            // source's chunk BOUNDARIES, since a number only addresses
+            // anything while those hold — and rotate deliberately owns its
+            // own chunking.
             let rec = ChunkRecord {
                 uncomp_start: uncomp_base + (c.uncomp_start - src_uncomp_start),
                 comp_start: comp_base + (c.comp_start - src_comp_start),
@@ -1041,10 +1056,28 @@ impl FileStore {
     /// rebased index are written to temp files which are renamed over the
     /// originals, then the in-memory state is rebased to match. The
     /// unflushed buffer (data newer than any chunk) is untouched.
+    /// The running drop total after dropping the first `k` chunks.
+    ///
+    /// LENGTHS, never offsets: `collapse_head` rebases survivors by the
+    /// block-ALIGNED cut and leaves the sliver in `comp_start`, so summing
+    /// offsets would count that sliver again on the next drop. This also
+    /// makes the two head-drop paths agree, and makes the number mean "what
+    /// left the store" rather than "what the filesystem reclaimed".
+    fn dropped_after(&self, k: usize) -> format::Dropped {
+        let gone = &self.chunks[..k];
+        format::Dropped {
+            chunks: self.dropped.chunks + k as u64,
+            uncomp_bytes: self.dropped.uncomp_bytes
+                + gone.iter().map(|c| c.uncomp_len).sum::<u64>(),
+            comp_bytes: self.dropped.comp_bytes + gone.iter().map(|c| c.comp_len).sum::<u64>(),
+        }
+    }
+
     fn remove_head(&mut self, k: usize, dir: &Path, name: &str) -> io::Result<()> {
         if k == 0 {
             return Ok(());
         }
+        let dropped = self.dropped_after(k);
         let comp_cut = self.chunks[k - 1].comp_end();
         let uncomp_cut = self.chunks[k - 1].uncomp_end();
         let trunk_p = format::trunk_path(dir, name);
@@ -1068,7 +1101,7 @@ impl FileStore {
             let mut idx = Vec::with_capacity(
                 RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN,
             );
-            idx.extend_from_slice(&format::rings_header(self.next_seq));
+            idx.extend_from_slice(&format::rings_header(self.next_seq, dropped));
             for c in &self.chunks[k..] {
                 let rec = ChunkRecord {
                     uncomp_start: c.uncomp_start - uncomp_cut,
@@ -1116,6 +1149,9 @@ impl FileStore {
         }
         self.comp_size -= comp_cut;
         self.buffer_start -= uncomp_cut;
+        // Only now: the staged header already carries this, and it rode the
+        // same rename, so on-disk and in-memory move together.
+        self.dropped = dropped;
         self.cache = None;
         // Retention/rotation touch only already-flushed chunks — the
         // buffer (and thus the sap's entries) are untouched — but this
@@ -1141,6 +1177,7 @@ impl FileStore {
         if k == 0 {
             return Ok(true);
         }
+        let dropped = self.dropped_after(k);
         let comp_cut = self.chunks[k - 1].comp_end();
         let uncomp_cut = self.chunks[k - 1].uncomp_end();
         let bsize = fstatvfs_bsize(&self.trunk)?;
@@ -1162,7 +1199,7 @@ impl FileStore {
             let mut idx = Vec::with_capacity(
                 RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN,
             );
-            idx.extend_from_slice(&format::rings_header(self.next_seq));
+            idx.extend_from_slice(&format::rings_header(self.next_seq, dropped));
             for c in &self.chunks[k..] {
                 let rec = ChunkRecord {
                     uncomp_start: c.uncomp_start - uncomp_cut,
@@ -1289,6 +1326,9 @@ impl FileStore {
         }
         self.comp_size -= aligned;
         self.buffer_start -= uncomp_cut;
+        // Only now, as in remove_head: the staged header already carries
+        // this and rode the same rename.
+        self.dropped = dropped;
         self.cache = None;
         // Same reasoning as remove_head: the collapse just moved comp_size
         // without touching the buffer/sap, so the sap's `base` is stale.
@@ -2262,14 +2302,18 @@ mod tests {
             seq: 0,
         };
         let mut idx = Vec::new();
-        idx.extend_from_slice(&format::rings_header(1));
+        idx.extend_from_slice(&format::rings_header(1, format::Dropped::default()));
         idx.extend_from_slice(&rec.to_bytes());
         fs::write(format::rings_path(dir, name), &idx).unwrap();
         rec
     }
 
     fn write_empty_pair(dir: &Path, name: &str) {
-        fs::write(format::rings_path(dir, name), format::rings_header(0)).unwrap();
+        fs::write(
+            format::rings_path(dir, name),
+            format::rings_header(0, format::Dropped::default()),
+        )
+        .unwrap();
         fs::write(format::trunk_path(dir, name), []).unwrap();
     }
 
@@ -2560,6 +2604,71 @@ mod tests {
         let f = st.files.get_mut(name).unwrap();
         write_n_chunks(f, &cfg, chunks);
         st
+    }
+
+    #[test]
+    fn dropped_bytes_accumulate_and_survive_a_reopen() {
+        let dir = TempDir::new();
+        let name = "app";
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        write_n_chunks(&mut f, &cfg, 5);
+        let gone: u64 = f.chunks[..2].iter().map(|c| c.comp_len).sum();
+        let gone_u: u64 = f.chunks[..2].iter().map(|c| c.uncomp_len).sum();
+        assert_eq!(f.dropped, format::Dropped::default(), "nothing yet");
+
+        f.remove_head(2, dir.path(), name).unwrap();
+        assert_eq!(f.dropped.chunks, 2);
+        assert_eq!(f.dropped.comp_bytes, gone);
+        assert_eq!(f.dropped.uncomp_bytes, gone_u);
+
+        // A second drop ADDS, and the offsets having been rebased must not
+        // disturb it — the totals are sums of LENGTHS, not of offsets.
+        let gone2: u64 = f.chunks[..1].iter().map(|c| c.comp_len).sum();
+        f.remove_head(1, dir.path(), name).unwrap();
+        assert_eq!(f.dropped.chunks, 3);
+        assert_eq!(f.dropped.comp_bytes, gone + gone2);
+
+        // And it is on disk, not just in memory: the header rode the same
+        // rename as the records.
+        let before = f.dropped;
+        drop(f);
+        let f = FileStore::open(dir.path(), name, &cfg).unwrap();
+        assert_eq!(f.dropped, before);
+    }
+
+    #[test]
+    fn a_store_that_never_dropped_records_nothing() {
+        let dir = TempDir::new();
+        let cfg = test_cfg();
+        let mut f = FileStore::open(dir.path(), "app", &cfg).unwrap();
+        write_n_chunks(&mut f, &cfg, 3);
+        drop(f);
+        let f = FileStore::open(dir.path(), "app", &cfg).unwrap();
+        // Zero here is genuine, and the oldest surviving number being 0 is
+        // what tells it apart from a header that predates the accounting.
+        assert_eq!(f.dropped, format::Dropped::default());
+        assert_eq!(f.chunks[0].seq, 0);
+    }
+
+    #[test]
+    fn a_pre_accounting_header_reads_as_absent_not_as_zero() {
+        // A v1 rings file, and a v2 one truncated to just its next_seq: both
+        // carry no accounting, and `header_dropped` must say so rather than
+        // read whatever bytes happen to be there.
+        assert_eq!(format::header_dropped(&[]), format::Dropped::default());
+        let short = &format::rings_header(7, format::Dropped::default())[..32];
+        assert_eq!(format::header_dropped(short), format::Dropped::default());
+        // A full header round-trips.
+        let d = format::Dropped {
+            chunks: 4200,
+            uncomp_bytes: 9_000_000,
+            comp_bytes: 600_000,
+        };
+        let h = format::rings_header(4831, d);
+        assert_eq!(format::header_dropped(&h), d);
+        // ...and the field it shares the header with is untouched.
+        assert_eq!(format::header_next_seq(&h), 4831);
     }
 
     #[test]

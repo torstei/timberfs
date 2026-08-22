@@ -107,6 +107,157 @@ works is in [docs/design.md](docs/design.md).
   in. Its actually-pluggable layer is an object store, where timberfs
   would hold Loki's own opaque chunks and none of its own indexes would
   apply.
+- **Globally addressable chunks (an ingest choice, not a law)**: a chunk's
+  number is local today — shipping renumbers, so the same data has two
+  addresses and neither knows about the other. `(bark id, seq)` is already
+  unique, the id being a UUID that survives renames, moves and hosts; the
+  defect is not the scheme but that a hop discards half of it. Worth
+  making a **declared choice at ingest** rather than a fixed rule, because
+  in a fleet the addressability is the point: "chunk 42424242 of
+  `8f14e45f-…`" is a citation that survives the network.
+  **What it buys.** Three things, and the third is the one that argues
+  hardest. Federated queries can **dedupe by ADDRESS** — the same chunk
+  seen from an edge and from an archive is one `(origin, seq)` — where the
+  only primitive today is `import`'s line-hash comparison. Cursor
+  positions become **comparable across tiers**, so a position means the
+  same thing wherever the data now lives. And **renumbering destroys the
+  evidence of a gap**: an edge that drops chunk 102 to retention before
+  shipping it hands the centre 100, 101, 103, which dense renumbering
+  turns into 0, 1, 2 — no hole, no record, the loss visible only in a
+  shipper warning on a box that may be thrown away. Preserved numbering
+  puts the hole in the data permanently, which is the same doctrine as the
+  exact loss record extended to survive a hop.
+  **The invariant, and it is the load-bearing part.** The address has two
+  halves and they travel together or not at all:
+  > **Never claim an origin and renumber.** Recording an origin without
+  > preserving `seq` produces an address that LIES, and that combination
+  > must be refused rather than configured. Preserving `seq` without
+  > recording an origin is legal but weaker — gap evidence survives,
+  > addressing does not. Both, or neither, or numbers-only.
+  Four quadrants, one of which must be impossible: origin+numbering is a
+  true replica; origin+renumbered is broken; fresh+numbering keeps gap
+  evidence only; fresh+renumbered is today's behaviour and is therefore
+  CONSISTENT — nothing to fix, only a capability to add.
+  **Which id travels.** Not `id` itself. Two stores sharing an `id` is
+  currently treated as CORRUPTION and says so — `follower.rs` refuses with
+  "a copied .bark gives two stores one identity", and `cursor::check_store`
+  leans on the same assumption that an id names one store's bytes. So the
+  travelling half is a separate lineage key (`origin_id`, copied VERBATIM
+  and never rewritten), which leaves `id` unique per store and every
+  existing check working. It also has to be distinct from `derived_from`,
+  which is the IMMEDIATE parent: a chain of hops cannot be walked, since it
+  crosses hosts, so only a verbatim-copied origin is stable across N hops.
+  **The trade to decide, not to discover.** A number is only an ADDRESS if
+  the chunk BOUNDARIES held. Re-chunk on the way in and the destination's
+  chunk 42 holds a different set of entries — the number survives, the
+  address lies. So "globally addressable" and "tune each tier's chunk size
+  independently" are alternatives, per store: an archive wanting big chunks
+  for compression cannot also inherit an edge's small ones for latency.
+  Expect addressing to survive exactly ONE hop in a three-tier fleet, and
+  say so rather than let it be found out.
+  **The live edge has no address**, by construction: `EntryRec.chunk` is
+  `None` there because the chunk does not exist yet, which is also why a
+  cursor does not advance on those entries. So a `wal`-backed follower
+  delivering sub-second carries no address for the newest data, and an
+  address becomes available one chunk AFTER the entry does. Consistent
+  with the asymmetry retention already lives with (delivery is
+  entry-granular, erasure chunk-granular) rather than a new surprise.
+  **The line is whole-chunk versus entry-level selection**, not window
+  versus whole. A chunk copied INTACT keeps its address however few of its
+  siblings came along: `export`'s window and `rotate`'s prefix both take
+  whole frames verbatim, so `(origin, seq)` still names the same bytes, and
+  a bundle carrying source numbers is a per-chunk CITATION plus a visible
+  hole where something is absent. What destroys an address is selecting
+  ENTRIES: a filtered ship (`timber-filter | import --records`) delivers
+  chunk 42 with fewer entries than the origin's, so the number survives
+  and the address lies. That case must refuse rather than be configured,
+  and it is detectable — the records stream's stream-start carries an echo
+  of the selection. Fan-in from two sources must refuse for the separate
+  reason of monotonicity.
+  **Also open**: how a store records that the boundary condition actually
+  held, since a later re-chunk would silently invalidate every address
+  without touching the manifest — a plain boolean is too easy to leave
+  true by accident.
+  **The precondition is a CHECK, not a hope**, and it is checkable at the
+  one moment it has to be decided:
+  > Numbering is preserved iff the destination has **never been written**
+  > (`next_seq == 0`) and the ingest **binds** it to that origin. Once
+  > bound, a stream from another origin — or any ordinary append — is
+  > refused.
+  ⚠ "Never written" is `next_seq == 0`, NOT `chunks.is_empty()`. Retention
+  is allowed to drop every chunk and the numbering deliberately does not
+  restart; `numbering_does_not_restart_when_retention_empties_the_store`
+  exists because a store renumbering from 0 after being emptied "would
+  hand a fresh chunk a number some cursor counts as consumed — which is
+  silent data loss". So an emptied store is NOT eligible, and the two
+  states are indistinguishable by chunk count alone.
+  Empty is necessary and not sufficient — on its own it only covers the
+  FIRST source, and source B arriving later would interleave. Which is
+  what the binding is for: `origin_id` is not only the address's other
+  half, it is the **exclusivity claim**, so "one source for life" is
+  mechanically enforced rather than configured. It follows that a store is
+  writable only by its origin's stream **while bound** — an ordinary
+  `append`, or an `import` of anything else, would assign local numbers and
+  silently break every address.
+  **Unbinding is available and deliberate**, because "I need to add records
+  and I accept that this store stops being streamable-from" is a legitimate
+  thing to want. The two-step pattern the follower registry already
+  settled applies unchanged: an explicit release that states what it costs,
+  and then ordinary writes work — no `--force` on the write path, and
+  nothing silently degrading. `append` and `import` are the same case here;
+  both assign local numbers, and only `import --records` could ever have
+  preserved.
+  ⚠ Like `retaining=false`, unbinding is one-way in EFFECT and not just in
+  flag: once a local chunk lands, origin chunks and local ones are
+  indistinguishable, so the addresses the store used to serve stop being
+  verifiable and re-binding would not restore them. Recording the boundary
+  instead of a whole-store flag would fix that — the same per-range
+  provenance shape the low-water mark below keeps asking for, and a reason
+  to suspect the eventual answer is a range rather than a boolean. Monotonicity is what `partition_point`, `rotation_split` and the
+  whole cursor axis rest on; density need not survive, since every
+  comparison is `<` and none assumes `+1`.
+  **What the views owe.** `info` should report the numbering a store
+  holds and, when it is not the whole history, how much went — which is
+  the single-store form of the gap-evidence argument above, and is exactly
+  the fact a chunk count cannot carry. `list` gets nothing until there is
+  a binding to show, at which point origin-versus-replica is very much a
+  fleet question.
+  **Five touchpoints**, all of which already state the local-only rule and
+  its reason, so the choice is a relaxation of a written precondition
+  rather than a surprise: `format.rs`'s `seq` doc; `store.rs`'s
+  `append_frames` (rotate's move path, which renumbers and says why — and
+  which deliberately owns its own chunking, so it is both the first place
+  anyone would relax this and the place the cost is starkest);
+  `sink.rs`'s deliberate discard of `e.chunk` (the number is already ON
+  THE WIRE, so this is the cheapest seam and the one that matters for a
+  fleet, since shipping is what crosses hosts); `export.rs`, whose stated
+  reason for numbering a bundle from 0 — "neither dense nor meaningful" —
+  is the WEAKEST of the three, since nothing requires density and the
+  source's numbers are meaningful precisely as its identity, so a bundle
+  is a candidate for preserving rather than an argument against it; and
+  `bark.rs` for the new lineage key.
+  **The low-water mark turned out not to be owed after all**, because the
+  drop accounting is now RECORDED rather than derived. The rings header had
+  32 reserved bytes and a written growth contract ("reserved space is only
+  safe for OPTIONAL fields, 0 reads as absent"), so `chunks`,
+  `uncomp_bytes` and `comp_bytes` went in at 32..56 with no version bump,
+  maintained by the same two head-drop paths that already keep `next_seq`
+  current. Since the count no longer rests on numbering starting at 0, a
+  window extract or partial replica that kept source numbers needs no
+  correction — which removes the reason a low-water mark was wanted.
+  Two things that had to be got right. The totals are sums of LENGTHS, not
+  of offsets: `collapse_head` rebases survivors by the block-ALIGNED cut and
+  leaves the sliver in `comp_start`, so summing offsets would count it again
+  on the next drop; lengths are immune, agree across both drop paths, and
+  mean "what left the store" rather than "what the filesystem reclaimed" —
+  which genuinely differ by that sliver. And zero-reads-as-absent collides
+  with "nothing dropped" for a byte count, resolved by the numbering
+  itself: a store whose oldest chunk is number 0 has dropped nothing, so
+  `chunks == 0` beside a non-zero oldest number means the header predates
+  the accounting, and `info` says "size not recorded" rather than a
+  confident zero.
+  The bytes are not otherwise obtainable at all — a head-drop rebases the
+  survivors' offsets, so what went leaves no trace in the index.
 - **Scoped, audited read access**: what a serve API makes possible and
   shell access cannot — a grant of *subject × store or forest × data
   window × grant lifetime*, the last two being different clocks ("this
