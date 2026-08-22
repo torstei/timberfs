@@ -1822,6 +1822,20 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             put("dropped_chunks", dropped.chunks.into());
             put("dropped_bytes", dropped.comp_bytes.into());
             put("dropped_uncompressed_bytes", dropped.uncomp_bytes.into());
+            // Whether those numbers are the whole story. `partial` happens
+            // when a binary predating the accounting dropped from this store
+            // first, so a consumer must not read `dropped_bytes` as a total
+            // without checking.
+            let derived_total = seq.map(|(f, _)| f).unwrap_or(next);
+            put(
+                "dropped_accounting",
+                match dropped.chunks {
+                    0 if derived_total > 0 => "none",
+                    n if n < derived_total => "partial",
+                    _ => "complete",
+                }
+                .into(),
+            );
             match seq {
                 Some((first, last)) => {
                     put("first_seq", first.into());
@@ -2038,19 +2052,32 @@ fn print_numbering(numbering: Option<Numbering>) {
     else {
         return;
     };
-    // `chunks == 0` alongside a non-zero oldest number means the header
-    // predates the accounting: report the derived count and admit the size
-    // is unknown, rather than printing a confident zero.
+    // How much of the history the accounting actually covers. Numbering is
+    // dense from 0 and only prefixes drop, so the oldest surviving number IS
+    // the true lifetime count — which makes it the witness for whether the
+    // recorded count is COMPLETE.
+    //
+    // ⚠ Partial is a real state, not a theoretical one: a store dropped from
+    // by a binary predating the accounting and then by one that has it
+    // records only the later drops. Reporting that number as if it were the
+    // total is an undercount stated as fact, so it is labelled instead.
     let derived = seq.map(|(f, _)| f).unwrap_or(next);
-    let cost = if dropped.chunks > 0 {
-        format!(
-            "{} dropped ({} on disk, {} uncompressed)",
-            dropped.chunks,
+    let cost = match dropped.chunks {
+        0 if derived > 0 => {
+            format!("{derived} dropped (size not recorded — written before the accounting)")
+        }
+        0 => String::new(),
+        n if n < derived => format!(
+            "{derived} dropped, of which {n} measured ({} on disk, {} uncompressed); \
+             the rest predates the accounting",
             crate::rotate::human_bytes(dropped.comp_bytes),
             crate::rotate::human_bytes(dropped.uncomp_bytes)
-        )
-    } else {
-        format!("{derived} dropped (size not recorded — written before the accounting)")
+        ),
+        n => format!(
+            "{n} dropped ({} on disk, {} uncompressed)",
+            crate::rotate::human_bytes(dropped.comp_bytes),
+            crate::rotate::human_bytes(dropped.uncomp_bytes)
+        ),
     };
     match seq {
         // Holding its whole history: the chunk count on the `data` line
@@ -2342,6 +2369,31 @@ mod numbering_tests {
         let l = line(Some((6, 16)), 17).unwrap();
         assert!(l.contains("chunks 6..16 held"), "{l}");
         assert!(l.contains("6 dropped from the head"), "{l}");
+    }
+
+    #[test]
+    fn a_partial_accounting_is_labelled_not_presented_as_a_total() {
+        // The downgrade path, and it is reachable: a binary predating the
+        // accounting drops 4 chunks, a later one drops 4 more and records
+        // only its own. The recorded number then LOOKS authoritative while
+        // covering half the history. The oldest surviving number is the
+        // witness — numbering is dense from 0 and only prefixes drop, so it
+        // is the true lifetime count.
+        assert_eq!(state(8, 4), "partial");
+        assert_eq!(state(8, 8), "complete");
+        assert_eq!(state(8, 0), "none");
+        // Nothing dropped at all is complete, not "none": there is nothing
+        // to have failed to record.
+        assert_eq!(state(0, 0), "complete");
+    }
+
+    /// The classification `info` and `--json` share.
+    fn state(derived: u64, recorded: u64) -> &'static str {
+        match recorded {
+            0 if derived > 0 => "none",
+            n if n < derived => "partial",
+            _ => "complete",
+        }
     }
 
     #[test]
