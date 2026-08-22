@@ -920,7 +920,7 @@ A JSON array of objects
 .IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
 .IR retain_size ", " id ", " created ", " labels ", " first_seq ", "
 .IR last_seq ", " next_seq ", " dropped_chunks ", " dropped_bytes ", "
-.IR dropped_uncompressed_bytes ", " dropped_chunks_measured ", " followers ", "
+.IR dropped_uncompressed_bytes ", " followers ", "
 .IR cursors_dir ", " consumers ", " held_bytes )
 instead of the human table.
 .I id
@@ -1414,53 +1414,39 @@ line and
 carries it as
 .IR dropped_chunks ", " dropped_bytes " and " dropped_uncompressed_bytes .
 .PP
-It has to be RECORDED because it cannot be recovered: a head-drop rebases
-the survivors' offsets, so the bytes that went leave no trace in the index.
-The count alone could once be derived \(em numbering is dense from 0 and only
-a PREFIX ever drops, so the oldest surviving chunk number is the lifetime
-total \(em and recording it is what frees that from assuming the numbering
-started at 0.
-.PP
-.B The byte figures are not always complete,
-and two numbers say so without a keyword.
+.B The count is exact; the size is a FLOOR.
 .I dropped_chunks
-is the TRUE lifetime count, which the numbering always knows;
-.I dropped_chunks_measured
-is how many of those the byte figures cover. Equal means the bytes are a
-total. Fewer means a FLOOR \(em a binary older than the counters dropped
-from this store first, and those drops were never sized. Zero means nothing
-was measured at all, and then
+comes from the numbering, which always knows it: numbering is dense from 0
+and only a PREFIX ever drops, so the oldest surviving chunk number IS the
+lifetime count. (It is recorded as well, which frees it from assuming the
+numbering started at 0.)
+.PP
+The bytes have to be RECORDED because they cannot be recovered \(em a
+head-drop rebases the survivors' offsets, leaving no trace in the index \(em
+so
 .I dropped_bytes
-is
-.B null
-rather than a confident 0, because the bytes are gone: a head-drop rebases
-the survivors' offsets, so nothing can recover them afterwards.
+covers only the drops performed by a binary that records them. A store that
+dropped under an older one is missing that earlier loss permanently. The
+counters begin accumulating at the store's NEXT drop, so no store has to be
+recreated to start collecting, and neither figure is ever
+.BR null .
 .PP
 .B info
-says the same thing in words:
+says it in words, and says which of the two a zero is \(em a bare
+"0 B on disk" beside a store that dropped gigabytes reads as a broken tool.
+The distinction is unambiguous because a real chunk carries a frame header
+and can never compress to nothing:
 .PP
 .RS
 .nf
 8 dropped (2.2 KiB on disk, 32.1 KiB uncompressed)
-8 dropped, of which 4 measured (2.2 KiB on disk, 32.1 KiB uncompressed)
-8 dropped (size never measured)
+8 dropped (size not measured yet)
 .fi
 .RE
 .PP
-The numbering is the witness that makes this detectable rather than merely
-feared: it is dense from 0 and only prefixes ever drop, so the oldest
-surviving chunk number IS the lifetime count, and a measured count below it
-is provably short. Without that witness zero would be ambiguous \(em the
-reserved-space rule is that an absent header field reads as zero, which for
-a byte count collides with "nothing dropped".
-.PP
 .B Note:
-a consumer must therefore not read
 .I dropped_bytes
-as a total without comparing
-.I dropped_chunks_measured
-against
-.IR dropped_chunks .
+is a lower bound, not a total \(em treat it as "at least this much".
 .SH PROVENANCE
 A manifest holds two kinds of key, and only one of them is a LABEL.
 .B What the store is

@@ -1638,7 +1638,7 @@ PYEOF
 catalogue_fields_are_a_projection_of_list() {
     # What a query API's catalogue endpoint needs, and all of it from
     # `list --json`: identity to join on, provenance to select on, coverage
-    # to route by, and how much of what it dropped was measured.
+    # to route by, and what it has dropped.
     local d=/var/log/timberfs/vmcat
     rm -rf "$d"
     timberfs create --index --retain-size 5G --set host=apache01 --set service=apache \
@@ -1652,7 +1652,7 @@ catalogue_fields_are_a_projection_of_list() {
            and .labels.host == "apache01"
            and .labels.service == "apache"
            and .labels["service.name"] == "apache"
-           and .dropped_chunks_measured == .dropped_chunks
+           and .dropped_chunks == 0 and .dropped_bytes == 0
            and (.from_ms | type == "number")' /tmp/cat.json > /dev/null \
         || { jq -c '.[] | select(.handle == "vmcat")' /tmp/cat.json; return 1; }
 
