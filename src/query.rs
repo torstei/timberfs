@@ -1484,21 +1484,19 @@ impl StoreSummary {
             .map(|(_, _, lag)| lag)
     }
 
-    /// How many chunks this store has dropped over its life — the TRUE
-    /// count, which the numbering always knows: it is dense from 0 and only
-    /// prefixes ever drop, so the oldest surviving number IS the total.
+    /// How many chunks this store has dropped over its life, exactly. The
+    /// numbering knows: it is dense from 0 and only prefixes ever drop, so
+    /// the oldest surviving number IS the total — and `next_seq` covers the
+    /// store retention emptied, which has no surviving number.
     ///
-    /// Distinct from `dropped.chunks`, which counts only the drops the
-    /// header's counters actually measured. Where the two differ, the byte
-    /// figures cover the smaller set and are therefore a FLOOR — and that
-    /// is the whole story, told by two numbers rather than a keyword
-    /// classifying them. Shared by `info` and `list` so neither can
+    /// Nothing is recorded beside it, because nothing could improve on it:
+    /// a counter only sees the drops it performed, so it is a subset by
+    /// construction. The bytes in `dropped` are the part that HAS to be
+    /// recorded, and they cover a suffix of this count — which is what
+    /// makes them a floor. Shared by `info` and `list` so neither can
     /// describe the same store differently.
     pub fn dropped_chunks(&self) -> u64 {
-        self.chunk_seq
-            .map(|(f, _)| f)
-            .unwrap_or(self.next_seq)
-            .max(self.dropped.chunks)
+        self.chunk_seq.map(|(f, _)| f).unwrap_or(self.next_seq)
     }
 
     /// `list`'s INDEX column: a `.grain` token index that is present, or

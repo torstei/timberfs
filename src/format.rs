@@ -196,7 +196,9 @@ impl ChunkRecord {
 ///  8..16  header_len      — where record 0 starts
 /// 16..24  incompat_flags  — refuse on a bit you do not know
 /// 24..32  next_seq        — the chunk-number high-water mark
-/// 32..64  reserved, zero
+/// 32..40  dropped_uncomp  — uncompressed bytes that have LEFT the store
+/// 40..48  dropped_comp    — the same, compressed
+/// 48..64  reserved, zero
 /// ```
 ///
 /// `header_len` is what makes the reserved space usable: without it a
@@ -221,9 +223,8 @@ pub fn rings_header(next_seq: u64, dropped: Dropped) -> [u8; RINGS_HEADER_LEN as
     h[8..16].copy_from_slice(&RINGS_HEADER_LEN.to_le_bytes());
     h[16..24].copy_from_slice(&0u64.to_le_bytes());
     h[24..32].copy_from_slice(&next_seq.to_le_bytes());
-    h[32..40].copy_from_slice(&dropped.chunks.to_le_bytes());
-    h[40..48].copy_from_slice(&dropped.uncomp_bytes.to_le_bytes());
-    h[48..56].copy_from_slice(&dropped.comp_bytes.to_le_bytes());
+    h[32..40].copy_from_slice(&dropped.uncomp_bytes.to_le_bytes());
+    h[40..48].copy_from_slice(&dropped.comp_bytes.to_le_bytes());
     h
 }
 
@@ -232,10 +233,16 @@ pub fn rings_header(next_seq: u64, dropped: Dropped) -> [u8; RINGS_HEADER_LEN as
 ///
 /// Not derivable after the fact, which is why it is recorded: a head-drop
 /// REBASES the survivors' offsets, so the bytes that went leave no trace in
-/// the index. The chunk count was derivable from the oldest surviving
-/// number while numbering always started at 0, and recording it explicitly
-/// is what frees that assumption (see ROADMAP, "Globally addressable
-/// chunks").
+/// the index.
+///
+/// Bytes only. The chunk COUNT is not recorded, because the numbering
+/// already carries it exactly — dense from 0, and only a prefix ever drops,
+/// so the oldest surviving number IS the lifetime count. A counter beside it
+/// could only ever be a subset of that (it misses whatever dropped before
+/// the counter existed), so it never changes an answer. Should numbering
+/// ever stop starting at 0 (see ROADMAP, "Globally addressable chunks")
+/// what that needs is a numbering BASE — `first_seq - base` — and not a
+/// count; the reserved space is there for it.
 ///
 /// **Lengths, never offsets.** `collapse_head` cuts on a filesystem-block
 /// boundary and leaves up to ~2 blocks of the dropped range as an inert
@@ -248,13 +255,13 @@ pub fn rings_header(next_seq: u64, dropped: Dropped) -> [u8; RINGS_HEADER_LEN as
 ///
 /// ⚠ Zero reads as ABSENT, per the reserved-space contract, which for a
 /// byte count collides with "nothing dropped". The numbering resolves it:
-/// a store whose oldest chunk is number 0 has dropped nothing, so
-/// `chunks == 0` alongside a non-zero oldest number means the field was
-/// never maintained — a store written before this existed — and not that
-/// nothing went.
+/// a store whose oldest chunk is number 0 has dropped nothing, so zero
+/// bytes alongside a non-zero oldest number means the field was never
+/// maintained — a store written before this existed — and not that nothing
+/// went. A real chunk carries a frame header and cannot compress to
+/// nothing, so the two are never confusable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dropped {
-    pub chunks: u64,
     pub uncomp_bytes: u64,
     pub comp_bytes: u64,
 }
@@ -263,7 +270,7 @@ pub struct Dropped {
 /// carry them. Gated on the DECLARED header length, not on the compiled-in
 /// constant: that is what the length field is for.
 pub fn header_dropped(buf: &[u8]) -> Dropped {
-    const NEEDED: usize = 56;
+    const NEEDED: usize = 48;
     if buf.len() < NEEDED || &buf[..8] != RINGS_MAGIC {
         return Dropped::default();
     }
@@ -273,9 +280,8 @@ pub fn header_dropped(buf: &[u8]) -> Dropped {
     }
     let at = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
     Dropped {
-        chunks: at(32),
-        uncomp_bytes: at(40),
-        comp_bytes: at(48),
+        uncomp_bytes: at(32),
+        comp_bytes: at(40),
     }
 }
 
