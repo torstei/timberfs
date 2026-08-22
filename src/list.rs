@@ -241,6 +241,16 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
                         .map(Into::into)
                         .unwrap_or(serde_json::Value::Null),
                 );
+                // Lineage across a hop: the store these entries came FROM.
+                // A field of its own rather than a label, because selecting
+                // on it would be selecting on one hop's bookkeeping.
+                o.insert(
+                    "origin_id".to_string(),
+                    s.origin_id
+                        .clone()
+                        .map(Into::into)
+                        .unwrap_or(serde_json::Value::Null),
+                );
                 // The manifest's provenance, verbatim — what a fleet view
                 // selects on. Nested so a free-form key can never collide
                 // with a field of this row.
@@ -360,6 +370,7 @@ mod tests {
             dropped: crate::format::Dropped::default(),
             id: None,
             created: None,
+            origin_id: None,
             labels: serde_json::Map::new(),
             grain: if indexed { Some((10, 1)) } else { None },
             index_declared: false,

@@ -334,11 +334,35 @@ collapse_crash_kill_resilience() {
     rm -rf "$d"
     mkdir -p "$d"
 
+    # ⚠ The appenders MUST NOT inherit this function's stderr. They are
+    # backgrounded, so their output would land in the harness's single
+    # $TMPOUT — which the next run_test truncates — and it drowned this
+    # test's own failure messages: a CI failure here dumped three
+    # "appending stdin" lines and NOTHING from any assertion, making the
+    # one thing the test exists to report unreadable.
+    local noise=/tmp/collapse-appender.log
+    : > "$noise"
+
+    # Everything an autopsy needs, written where a later failure can print
+    # it: which iteration, what info said, and the store's own leftovers —
+    # a `.trim` marker or a `.tmp` is the crash state itself.
+    local state=/tmp/collapse-state.log
+    dump_state() {
+        echo "--- iteration ${1:-?} ---"
+        echo "-- info stdout:"; sed 's/^/   /' /tmp/collapse.out 2>/dev/null
+        echo "-- info stderr:"; sed 's/^/   /' /tmp/collapse.err 2>/dev/null
+        echo "-- store directory (a .trim or .tmp IS the crash state):"
+        ls -la "$d" 2>&1 | sed 's/^/   /'
+        echo "-- rings header (64 bytes):"
+        od -A d -t u8 -N 64 "$d/churn.log.rings" 2>&1 | sed 's/^/   /'
+        echo "-- last appender output:"; tail -5 "$noise" 2>/dev/null | sed 's/^/   /'
+    }
+
     local iter pid
     for iter in $(seq 1 8); do
         yes "COLLAPSE-CRASH-FILLER-LINE-0123456789-abcdefghij-$iter" \
             | timberfs append --into "$d/churn.log" --chunk-size 4096 \
-                  --retain-size 16K --flush-age 1 --quiet &
+                  --retain-size 16K --flush-age 1 --quiet >> "$noise" 2>&1 &
         pid=$!
         # Randomize the kill point (50-940ms) across the appender's
         # lifecycle: the startup retention catch-up, the read/flush loop,
@@ -348,14 +372,23 @@ collapse_crash_kill_resilience() {
         kill -9 "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null
 
+        # ⚠ A kill can land before the appender has created the store at
+        # all — the randomized point starts at 50ms, and a contended CI
+        # runner with a cold cache is slower than any laptop. That is the
+        # kill working as intended, not a store that failed to open, so it
+        # is not a failure: there is simply nothing yet to reopen cleanly.
+        if [ ! -e "$d/churn.log.rings" ]; then
+            echo "iteration $iter: killed before the store existed; nothing to check" >&2
+            continue
+        fi
         if ! timberfs info "$d/churn.log" > /tmp/collapse.out 2>/tmp/collapse.err; then
-            echo "iteration $iter: info failed after kill" >&2
-            cat /tmp/collapse.err >&2
+            echo "iteration $iter: info FAILED after kill" >&2
+            dump_state "$iter" >&2
             return 1
         fi
         if [ -s /tmp/collapse.err ]; then
-            echo "iteration $iter: info reported an error after kill" >&2
-            cat /tmp/collapse.err >&2
+            echo "iteration $iter: info wrote to stderr after kill" >&2
+            dump_state "$iter" >&2
             return 1
         fi
     done
@@ -370,18 +403,22 @@ collapse_crash_kill_resilience() {
     empty=$(printf '' | md5sum)
     qsum=$(set -o pipefail; timberfs query "$d/churn.log" 2>/dev/null | md5sum) || {
         echo "final query failed" >&2
+        dump_state final >&2
         return 1
     }
     zsum=$(set -o pipefail; zstd -dc "$d/churn.log.trunk" | md5sum) || {
         echo "stock zstd -dc failed on the post-kill trunk" >&2
+        dump_state final >&2
         return 1
     }
     if [ "$qsum" = "$empty" ]; then
         echo "final query returned no data" >&2
+        dump_state final >&2
         return 1
     fi
     if [ "$qsum" != "$zsum" ]; then
         echo "query output diverges from stock zstd -dc ($qsum vs $zsum)" >&2
+        dump_state final >&2
         return 1
     fi
 

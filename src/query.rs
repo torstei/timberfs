@@ -1409,6 +1409,10 @@ pub struct StoreSummary {
     /// catalogue must be able to say "none" rather than assume.
     pub id: Option<String>,
     pub created: Option<String>,
+    /// The id of the store these entries came FROM, when they arrived over
+    /// the wire from another timberfs store. The cross-hop join key — and
+    /// only truthful where routing gives one store per origin.
+    pub origin_id: Option<String>,
     /// The manifest's provenance keys — what a fleet view selects on. See
     /// `bark::provenance`.
     pub labels: serde_json::Map<String, serde_json::Value>,
@@ -1609,6 +1613,7 @@ pub fn summarize_store(
         sap_pending_bytes,
         id: get("id"),
         created: get("created"),
+        origin_id: bark.and_then(crate::bark::origin_id),
         labels: bark.map(crate::bark::provenance).unwrap_or_default(),
         retain: get("retain"),
         retain_size: get("retain_size"),

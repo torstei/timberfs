@@ -276,7 +276,31 @@ pub const NOT_PROVENANCE: &[&str] = &[
     "timestamp_utc",
     "command",
     "pattern",
+    // Lineage arriving over the wire, not provenance. `timber-otlp` sends
+    // the ORIGIN store's id and path as OTLP resource attributes, and the
+    // receiving intake seeds every attribute it is given — so these name
+    // the store the entries came FROM. Selecting on them would be
+    // selecting on one hop's bookkeeping, and under fan-in (several
+    // senders routed into one store) they name only one of the origins,
+    // which makes them actively wrong rather than merely useless.
+    "timberfs.store.id",
+    "timberfs.store.path",
 ];
+
+/// The ORIGIN store's identity, when the entries arrived from another
+/// timberfs store over the wire — `timber-otlp` sends it as an OTLP
+/// resource attribute and the receiving intake seeds it.
+///
+/// ⚠ Trustworthy only where routing gives one store per origin. Under
+/// fan-in it names whichever sender created the store, which is why the
+/// receiving side's routing decides whether this means anything (see
+/// ROADMAP, "Globally addressable chunks").
+pub fn origin_id(map: &Map<String, Value>) -> Option<String> {
+    map.get("timberfs.store.id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
 
 /// A manifest's provenance keys, in sorted order. The values are left
 /// exactly as declared — flattening a dotted key like `service.name` is a
