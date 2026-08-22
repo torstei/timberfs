@@ -237,7 +237,7 @@ works is in [docs/design.md](docs/design.md).
   is a candidate for preserving rather than an argument against it; and
   `bark.rs` for the new lineage key.
   **The low-water mark turned out not to be owed after all**, because the
-  drop accounting is now RECORDED rather than derived. The rings header had
+  drop counters are now RECORDED rather than derived. The rings header had
   32 reserved bytes and a written growth contract ("reserved space is only
   safe for OPTIONAL fields, 0 reads as absent"), so `chunks`,
   `uncomp_bytes` and `comp_bytes` went in at 32..56 with no version bump,
@@ -254,7 +254,7 @@ works is in [docs/design.md](docs/design.md).
   with "nothing dropped" for a byte count, resolved by the numbering
   itself: a store whose oldest chunk is number 0 has dropped nothing, so
   `chunks == 0` beside a non-zero oldest number means the header predates
-  the accounting, and `info` says "size not recorded" rather than a
+  the counters, and `info` says "size not recorded" rather than a
   confident zero.
   The bytes are not otherwise obtainable at all — a head-drop rebases the
   survivors' offsets, so what went leaves no trace in the index.

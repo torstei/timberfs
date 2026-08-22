@@ -920,7 +920,7 @@ A JSON array of objects
 .IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
 .IR retain_size ", " id ", " created ", " labels ", " first_seq ", "
 .IR last_seq ", " next_seq ", " dropped_chunks ", " dropped_bytes ", "
-.IR dropped_uncompressed_bytes ", " dropped_accounting ", " followers ", "
+.IR dropped_uncompressed_bytes ", " dropped_measured ", " followers ", "
 .IR cursors_dir ", " consumers ", " held_bytes )
 instead of the human table.
 .I id
@@ -939,7 +939,7 @@ fields carry the same names and meanings as
 .BR info \(aqs ,
 deliberately: a consumer reading both must not have to remember which shape
 each chose. See
-.B DROP ACCOUNTING
+.B WHAT A STORE HAS DROPPED
 for what they mean and when to distrust them.
 .I followers
 is always an array \(em the registry knows every follower of every
@@ -1403,7 +1403,7 @@ Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
 unit sets it.
 .PP
 The verb name is provisional.
-.SH DROP ACCOUNTING
+.SH WHAT A STORE HAS DROPPED
 A store records what has LEFT it over its whole life: how many chunks, and
 how many bytes both compressed and not.
 .B timberfs info
@@ -1423,28 +1423,30 @@ started at 0.
 .PP
 .B The figures are not always the whole story,
 which is what
-.I dropped_accounting
-reports. The counters live in the rings header's reserved space, so a store
-written before they existed has none, and \(em the case worth knowing \(em a
-store dropped from by an older binary and THEN by a current one has counters
-covering only the later drops.
+.I dropped_measured
+reports \(em how much of what went was actually MEASURED. The counters live
+in the rings header's reserved space, so a store written before they existed
+has none, and \(em the case worth knowing \(em a store dropped from by an
+older binary and THEN by a current one has counters covering only the later
+drops.
 .TP
-.B complete
-Every drop this store ever had is measured. A store that has dropped nothing
-is complete too: there is nothing that failed to be recorded.
+.B all
+Every drop this store ever had. A store that has dropped nothing reads
+.B all
+too: there is nothing that went unmeasured.
 .TP
-.B partial
-Some drops predate the accounting, so
+.B some
+Earlier drops were never measured, so
 .I dropped_bytes
 is a FLOOR and not a total.
 .B info
 says so in words rather than presenting the smaller number as fact:
-.RB \(dq "8 dropped, of which 4 measured \(em the rest predates the accounting" \(dq.
+.RB \(dq "8 dropped, of which 4 measured \(em the rest was never measured" \(dq.
 .TP
 .B none
 Chunks were dropped and no sizes were recorded at all \(em an older header.
 Reported as
-.RB \(dq "size not recorded" \(dq
+.RB \(dq "size not recorded \(em nothing measured it" \(dq
 rather than as a confident zero.
 .PP
 The numbering is the witness that keeps the counters honest, and the reason
@@ -1458,7 +1460,7 @@ that an absent field reads as zero, which for a byte count collides with
 a consumer must therefore not read
 .I dropped_bytes
 as a total without checking
-.IR dropped_accounting .
+.IR dropped_measured .
 That is the whole reason the field exists.
 .SH PROVENANCE
 A manifest holds two kinds of key, and only one of them is a LABEL.

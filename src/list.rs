@@ -309,10 +309,7 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
                     "dropped_uncompressed_bytes".to_string(),
                     s.dropped.uncomp_bytes.into(),
                 );
-                o.insert(
-                    "dropped_accounting".to_string(),
-                    s.dropped_accounting().into(),
-                );
+                o.insert("dropped_measured".to_string(), s.dropped_measured().into());
                 // Always an array, never null: the registry knows every
                 // follower of every store, so empty means empty.
                 o.insert(

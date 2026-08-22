@@ -259,8 +259,8 @@ pub struct Dropped {
     pub comp_bytes: u64,
 }
 
-/// The header's drop accounting, or all-zero when this file is too old to
-/// carry it. Gated on the DECLARED header length, not on the compiled-in
+/// The header's drop counters, or all-zero when this file is too old to
+/// carry them. Gated on the DECLARED header length, not on the compiled-in
 /// constant: that is what the length field is for.
 pub fn header_dropped(buf: &[u8]) -> Dropped {
     const NEEDED: usize = 56;

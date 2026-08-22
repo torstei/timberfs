@@ -187,7 +187,7 @@ fn migrate_rings(dir: &Path, name: &str) -> io::Result<()> {
     let next_seq = records.last().map(|c| c.seq + 1).unwrap_or(0);
     let mut idx =
         Vec::with_capacity(format::RINGS_HEADER_LEN as usize + records.len() * format::RECORD_LEN);
-    // A v1 file never carried the drop accounting, so there is nothing
+    // A v1 file never carried the drop counters, so there is nothing
     // to migrate and zero is the honest answer.
     idx.extend_from_slice(&format::rings_header(next_seq, format::Dropped::default()));
     for c in &records {
@@ -2646,15 +2646,15 @@ mod tests {
         drop(f);
         let f = FileStore::open(dir.path(), "app", &cfg).unwrap();
         // Zero here is genuine, and the oldest surviving number being 0 is
-        // what tells it apart from a header that predates the accounting.
+        // what tells it apart from a header that predates the counters.
         assert_eq!(f.dropped, format::Dropped::default());
         assert_eq!(f.chunks[0].seq, 0);
     }
 
     #[test]
-    fn a_pre_accounting_header_reads_as_absent_not_as_zero() {
+    fn a_header_without_the_counters_reads_as_absent_not_as_zero() {
         // A v1 rings file, and a v2 one truncated to just its next_seq: both
-        // carry no accounting, and `header_dropped` must say so rather than
+        // carry no counters, and `header_dropped` must say so rather than
         // read whatever bytes happen to be there.
         assert_eq!(format::header_dropped(&[]), format::Dropped::default());
         let short = &format::rings_header(7, format::Dropped::default())[..32];

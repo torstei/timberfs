@@ -1395,8 +1395,8 @@ pub struct StoreSummary {
     /// chunk a number some cursor counts as consumed.
     pub next_seq: u64,
     /// What has left this store over its life, from the rings header.
-    /// All-zero on a store written before the accounting existed — which
-    /// the numbering tells apart from "nothing dropped".
+    /// All-zero on a store written before the counters existed — which the
+    /// numbering tells apart from "nothing dropped".
     pub dropped: crate::format::Dropped,
     pub grain: Option<(u64, usize)>, // (bytes, chunks covered)
     pub index_declared: bool,
@@ -1484,24 +1484,24 @@ impl StoreSummary {
             .map(|(_, _, lag)| lag)
     }
 
-    /// Whether the recorded drop accounting is the whole story.
+    /// How much of what this store dropped was actually MEASURED.
     ///
-    /// `complete` — every drop this store ever had is measured (including
-    /// the case of never having dropped anything). `partial` — a binary
-    /// predating the accounting dropped from it first, so the recorded
-    /// figures are a floor and not a total. `none` — nothing was recorded
-    /// at all.
+    /// `all` — every drop it ever had, including a store that has dropped
+    /// nothing: there is nothing that went unmeasured. `some` — a binary
+    /// older than the counters dropped from it first, so the recorded
+    /// figures are a FLOOR and not a total. `none` — chunks went and no
+    /// sizes were recorded at all.
     ///
     /// The witness is the numbering: dense from 0, and only prefixes ever
-    /// drop, so the oldest surviving number is the true lifetime count.
-    /// Shared by `info` and `list` so the two cannot classify the same
-    /// store differently.
-    pub fn dropped_accounting(&self) -> &'static str {
+    /// drop, so the oldest surviving number is the true lifetime count and
+    /// a recorded count below it is provably short. Shared by `info` and
+    /// `list` so the two cannot describe the same store differently.
+    pub fn dropped_measured(&self) -> &'static str {
         let derived = self.chunk_seq.map(|(f, _)| f).unwrap_or(self.next_seq);
         match self.dropped.chunks {
             0 if derived > 0 => "none",
-            n if n < derived => "partial",
-            _ => "complete",
+            n if n < derived => "some",
+            _ => "all",
         }
     }
 
@@ -1753,7 +1753,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             held: s.chunk_seq,
             next_seq: s.next_seq,
             dropped: s.dropped,
-            accounting: s.dropped_accounting(),
+            measured: s.dropped_measured(),
         });
         consumers = s.consumers;
         followers = s.followers;
@@ -1855,17 +1855,17 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             held: seq,
             next_seq: next,
             dropped,
-            accounting,
+            measured,
         }) = numbering
         {
             put("next_seq", next.into());
             put("dropped_chunks", dropped.chunks.into());
             put("dropped_bytes", dropped.comp_bytes.into());
             put("dropped_uncompressed_bytes", dropped.uncomp_bytes.into());
-            // Whether those numbers are the whole story — classified by
-            // `StoreSummary::dropped_accounting`, which `list` shares, so
-            // the two cannot disagree about the same store.
-            put("dropped_accounting", accounting.into());
+            // How much of it was measured — classified by
+            // `StoreSummary::dropped_measured`, which `list` shares, so the
+            // two cannot disagree about the same store.
+            put("dropped_measured", measured.into());
             match seq {
                 Some((first, last)) => {
                     put("first_seq", first.into());
@@ -1876,7 +1876,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
                     put("last_seq", serde_json::Value::Null);
                 }
             }
-            // The pre-accounting derivation, kept for a store whose header
+            // The pre-counter derivation, kept for a store whose header
             // predates `dropped`: numbering is dense and starts at 0, and
             // only a PREFIX is ever removed, so the oldest surviving number
             // IS how many went. `dropped_chunks` supersedes it and rests on
@@ -2050,7 +2050,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
 /// The count and the sizes are now RECORDED in the rings header rather than
 /// derived, so neither rests on numbering starting at 0 — which is what a
 /// window extract or a partial replica would break. The derivation survives
-/// only as the fallback for a header that predates the accounting, and
+/// only as the fallback for a header that predates the counters, and
 /// `chunks == 0` beside a non-zero oldest number is how that is detected:
 /// a store whose oldest chunk is number 0 has genuinely dropped nothing.
 ///
@@ -2071,9 +2071,9 @@ struct Numbering {
     held: Option<(u64, u64)>,
     next_seq: u64,
     dropped: crate::format::Dropped,
-    /// From `StoreSummary::dropped_accounting`, so `info` and `list` cannot
-    /// classify the same store differently.
-    accounting: &'static str,
+    /// From `StoreSummary::dropped_measured`, so `info` and `list` cannot
+    /// describe the same store differently.
+    measured: &'static str,
 }
 
 fn print_numbering(numbering: Option<Numbering>) {
@@ -2081,29 +2081,29 @@ fn print_numbering(numbering: Option<Numbering>) {
         held: seq,
         next_seq: next,
         dropped,
-        accounting: _,
+        measured: _,
     }) = numbering
     else {
         return;
     };
-    // How much of the history the accounting actually covers. Numbering is
+    // How much of the history was actually measured. Numbering is
     // dense from 0 and only prefixes drop, so the oldest surviving number IS
     // the true lifetime count — which makes it the witness for whether the
     // recorded count is COMPLETE.
     //
-    // ⚠ Partial is a real state, not a theoretical one: a store dropped from
-    // by a binary predating the accounting and then by one that has it
-    // records only the later drops. Reporting that number as if it were the
-    // total is an undercount stated as fact, so it is labelled instead.
+    // ⚠ Partly-measured is a real state, not a theoretical one: a store
+    // dropped from by a binary older than the counters and then by one that
+    // has them records only the later drops. Reporting that number as if it
+    // were the total is an undercount stated as fact, so it is labelled.
     let derived = seq.map(|(f, _)| f).unwrap_or(next);
     let cost = match dropped.chunks {
         0 if derived > 0 => {
-            format!("{derived} dropped (size not recorded — written before the accounting)")
+            format!("{derived} dropped (size not recorded — nothing measured it)")
         }
         0 => String::new(),
         n if n < derived => format!(
             "{derived} dropped, of which {n} measured ({} on disk, {} uncompressed); \
-             the rest predates the accounting",
+             the rest was never measured",
             crate::rotate::human_bytes(dropped.comp_bytes),
             crate::rotate::human_bytes(dropped.uncomp_bytes)
         ),
@@ -2406,27 +2406,27 @@ mod numbering_tests {
     }
 
     #[test]
-    fn a_partial_accounting_is_labelled_not_presented_as_a_total() {
-        // The downgrade path, and it is reachable: a binary predating the
-        // accounting drops 4 chunks, a later one drops 4 more and records
+    fn a_partly_measured_drop_is_labelled_not_presented_as_a_total() {
+        // The downgrade path, and it is reachable: a binary older than the
+        // counters drops 4 chunks, a later one drops 4 more and records
         // only its own. The recorded number then LOOKS authoritative while
         // covering half the history. The oldest surviving number is the
         // witness — numbering is dense from 0 and only prefixes drop, so it
         // is the true lifetime count.
-        assert_eq!(state(8, 4), "partial");
-        assert_eq!(state(8, 8), "complete");
+        assert_eq!(state(8, 4), "some");
+        assert_eq!(state(8, 8), "all");
         assert_eq!(state(8, 0), "none");
-        // Nothing dropped at all is complete, not "none": there is nothing
-        // to have failed to record.
-        assert_eq!(state(0, 0), "complete");
+        // Nothing dropped at all reads as "all", not "none": there is
+        // nothing that went unmeasured.
+        assert_eq!(state(0, 0), "all");
     }
 
     /// The classification `info` and `--json` share.
     fn state(derived: u64, recorded: u64) -> &'static str {
         match recorded {
             0 if derived > 0 => "none",
-            n if n < derived => "partial",
-            _ => "complete",
+            n if n < derived => "some",
+            _ => "all",
         }
     }
 
