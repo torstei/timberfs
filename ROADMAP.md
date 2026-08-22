@@ -172,19 +172,49 @@ works is in [docs/design.md](docs/design.md).
   held, since a later re-chunk would silently invalidate every address
   without touching the manifest — a plain boolean is too easy to leave
   true by accident.
-  **The precondition is enforced, not hoped for.** Preserved numbering is
-  safe only for a single source delivered IN ORDER, monotonicity being
-  what `partition_point`, `rotation_split` and the whole cursor axis rest
-  on. The follower/cursor model already guarantees exactly that: a cursor
-  only moves forward, one follower owns one position, and the registry
-  refuses two followers sharing one. Density need not survive — every
-  comparison is `<`, none assumes `+1`.
-  **Four touchpoints**, all of which currently state the local-only rule
-  and its reason, so the choice is a relaxation of a written precondition
-  rather than a surprise: `format.rs`'s `seq` doc, `store.rs`'s
-  `append_frames` (rotate's path, which renumbers and says why),
-  `sink.rs`'s deliberate discard of `e.chunk`, and `bark.rs` for the new
-  lineage key.
+  **The precondition is a CHECK, not a hope**, and it is checkable at the
+  one moment it has to be decided:
+  > Numbering is preserved iff the destination has **never been written**
+  > (`next_seq == 0`) and the ingest **binds** it to that origin. Once
+  > bound, a stream from another origin — or any ordinary append — is
+  > refused.
+  ⚠ "Never written" is `next_seq == 0`, NOT `chunks.is_empty()`. Retention
+  is allowed to drop every chunk and the numbering deliberately does not
+  restart; `numbering_does_not_restart_when_retention_empties_the_store`
+  exists because a store renumbering from 0 after being emptied "would
+  hand a fresh chunk a number some cursor counts as consumed — which is
+  silent data loss". So an emptied store is NOT eligible, and the two
+  states are indistinguishable by chunk count alone.
+  Empty is necessary and not sufficient — on its own it only covers the
+  FIRST source, and source B arriving later would interleave. Which is
+  what the binding is for: `origin_id` is not only the address's other
+  half, it is the **exclusivity claim**, so "one source for life" is
+  mechanically enforced rather than configured. It follows that a bound
+  store is **writable only by its origin's stream** — an ordinary append
+  would assign local numbers and silently break every address — which
+  makes a replica closer to a read-only `.timber` bundle than to a general
+  store. Monotonicity is what `partition_point`, `rotation_split` and the
+  whole cursor axis rest on; density need not survive, since every
+  comparison is `<` and none assumes `+1`.
+  **What the views owe.** `info` should report the numbering a store
+  holds and, when it is not the whole history, how much went — which is
+  the single-store form of the gap-evidence argument above, and is exactly
+  the fact a chunk count cannot carry. `list` gets nothing until there is
+  a binding to show, at which point origin-versus-replica is very much a
+  fleet question.
+  **Five touchpoints**, all of which already state the local-only rule and
+  its reason, so the choice is a relaxation of a written precondition
+  rather than a surprise: `format.rs`'s `seq` doc; `store.rs`'s
+  `append_frames` (rotate's move path, which renumbers and says why — and
+  which deliberately owns its own chunking, so it is both the first place
+  anyone would relax this and the place the cost is starkest);
+  `sink.rs`'s deliberate discard of `e.chunk` (the number is already ON
+  THE WIRE, so this is the cheapest seam and the one that matters for a
+  fleet, since shipping is what crosses hosts); `export.rs`, which numbers
+  a bundle from 0 for a STRONGER reason — a bundle is a window out of the
+  middle, which is the same subset case that must refuse outright, and is
+  why numbering is a pair-only fact that a bundle can never honestly
+  report; and `bark.rs` for the new lineage key.
 - **Scoped, audited read access**: what a serve API makes possible and
   shell access cannot — a grant of *subject × store or forest × data
   window × grant lifetime*, the last two being different clocks ("this
