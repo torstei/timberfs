@@ -226,6 +226,80 @@ TLS ready-made, at the cost of an async runtime and a TLS stack in a tree that
 today has neither and serves with blocking `TcpListener` plus `thread::spawn`;
 that is a dependency-posture decision, not a free win (see "OTLP gaps").
 
+## A WAL frame would lift the latency floor, at a price
+
+Not needed yet, and worth writing down because the constraint is
+non-obvious. Only sealed chunks ship, so a replica is always one chunk-seal
+behind while the `.sap` serves a 0.2 s tail locally. A frame carrying WAL
+bytes would move that capability across the wire: a live tail on the
+archive, which is grepping the fleet's live edge from one box — the thing
+this design otherwise gives up.
+
+**The WAL is append-only, and that is what makes it simple.** Bytes are
+written from beginning to end and never in the middle, so a frame is a pure
+byte-range append: `uncomp_base` plus bytes, and the receiver takes only
+what lies past what it holds. Nothing already sent can change, so there is
+no invalidation and no reconciliation — one integer of state per stream, on
+both sides, and a reconnect resumes from the receiver's offset. When the
+chunk covering those bytes finally arrives, the receiver drops that many
+bytes from the FRONT of its tail buffer: a truncate, because the chunk
+always covers a prefix of an append-only log.
+
+**It wants a separate file, not a new state for `.sap`.** A crashed store's
+`.sap` is replayed into a chunk on the next open — `FileStore::open`
+compresses the replayed entries and writes a `ChunkRecord` — and for a
+replica that is fatal, since it would mint a chunk the origin never made,
+with boundaries the origin does not have, so `(origin_id, seq)` would name
+different bytes at each end. But that replay is a WRITER's path keyed on
+the sap's filename, and the tail READER is already separate: `live.rs`
+deliberately does not use `sap::replay` ("right for a writer opening its
+own store, wrong for every reader") and reads the longest CRC-valid prefix
+by path. So a differently-named received-tail file is never replayed by
+construction, and the read path needs to learn one more filename rather
+than the sap needing a new state. Discarding that file after a crash is
+also safe: the sender still holds those bytes in its own unsealed sap and
+resends from the offset the receiver reports.
+
+**The cost is duplication, and it only applies while someone is watching.**
+WAL bytes are uncompressed, so the same entries cross twice: raw now, and
+again inside the chunk that eventually compresses them — at 10:1, 256 KB
+plus 25 KB where the chunk alone was 25 KB, an 11x increase over the live
+window. But the tail only has to flow when a reader wants it, which makes
+this a RUNTIME STATE rather than a configuration decision: nobody watching
+costs nothing, and no operator has to predict in advance where a live tail
+will be wanted.
+
+**Interest travels upstream, on the connection that already exists.** The
+reverse direction carries acks today, so a tail-interest frame is one more
+additive kind — and the first use of that direction for something other
+than acknowledging. It composes over hops: a tier asks its own upstream
+whenever it has an interested downstream, so interest propagates and lapses
+along the chain without anything coordinating it.
+
+How the archive notices a reader is open, and `flock` fits the question the
+way it already does elsewhere: `LockProbe` exists precisely for read-only
+"is anyone there", and a lock is released by the kernel when the holder
+dies — which is what an ephemeral `query --follow` needs and what a
+registry entry would get wrong. Some linger before dropping interest keeps
+a reader that restarts from thrashing the upstream.
+
+⚠ **Starting interest must send the CURRENT unsealed tail**, not only what
+arrives next. The sender's WAL already holds bytes written before anyone
+asked, and a reader that sees nothing until the next entry reads as broken
+rather than as idle. So "start" means "your tail from its base, then keep
+going".
+
+⚠ **The obvious way to avoid that duplication is a trap.** Since the
+receiver already holds the raw bytes, the sender could send chunk metadata
+only and let the receiver compress its own — zstd is deterministic, so with
+the same input and level the frame is byte-identical. It is not a guarantee
+worth resting byte-identity on: output can change between zstd versions and
+build settings, and a fleet is never on one version. Ship the chunk.
+
+Smaller consequence: `follower list` reporting "at the live edge" would
+become optimistic, since caught up on chunks is not caught up on entries.
+The two would want telling apart.
+
 ## Latency puts a floor under it
 
 Only sealed chunks exist to ship, so this wire is one chunk-seal behind the
