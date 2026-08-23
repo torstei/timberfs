@@ -107,7 +107,7 @@ const LOCK_FILE: &str = "follower.lock";
 /// The follower types `run` knows how to exec. One per shipper binary:
 /// the type names a DESTINATION SHAPE, which is also how the tool
 /// boundary is drawn everywhere else here.
-pub const TYPES: &[&str] = &["otlp"];
+pub const TYPES: &[&str] = &["otlp", "frames"];
 
 pub fn registry_dir() -> PathBuf {
     match std::env::var_os(REGISTRY_ENV) {
@@ -407,6 +407,26 @@ impl Declaration {
                     argv.push("--start".to_string());
                     argv.push(if self.retaining { "begin" } else { "end" }.to_string());
                 }
+                if let (Some(e), false) = (&self.endpoint, declares(&self.args, "--endpoint")) {
+                    argv.push("--endpoint".to_string());
+                    argv.push(e.clone());
+                }
+                argv.extend(self.args.iter().cloned());
+                argv.push(store.display().to_string());
+                Ok(argv)
+            }
+            "frames" => {
+                // The native wire. No `--start`: a frames sender resumes
+                // from the RECEIVER's coverage, which is authoritative, so
+                // there is no local decision about where to begin — and no
+                // way to accidentally re-ship a whole store.
+                let mut argv = vec![
+                    binary("timberfs").display().to_string(),
+                    "frames-send".to_string(),
+                    "--follow".to_string(),
+                    "--cursor".to_string(),
+                    cursor.display().to_string(),
+                ];
                 if let (Some(e), false) = (&self.endpoint, declares(&self.args, "--endpoint")) {
                     argv.push("--endpoint".to_string());
                     argv.push(e.clone());

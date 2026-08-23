@@ -573,9 +573,21 @@ enum Command {
         /// host:port of a `frames-intake`
         #[arg(long, value_name = "ADDR")]
         endpoint: String,
+        /// Keep shipping as chunks seal, on the same connection — what a
+        /// registered `--type frames` follower runs
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Record the far end's acknowledged position here, so
+        /// `retain_unconsumed` knows what has left this box. Not a resume
+        /// point: the receiver's own coverage is what a resume reads
+        #[arg(long, value_name = "PATH")]
+        cursor: Option<PathBuf>,
         /// Ship no sidecars, so the receiver rebuilds its own index
         #[arg(long)]
         no_sidecars: bool,
+        /// How long to wait between polls of the store with --follow
+        #[arg(long, default_value = "1s", value_name = "DUR")]
+        poll: String,
         /// Socket read/write timeout
         #[arg(long, default_value = "30s", value_name = "DUR")]
         timeout: String,
@@ -646,7 +658,9 @@ enum FollowerCommand {
         /// path — a store can move
         #[arg(long, value_name = "STORE")]
         store: PathBuf,
-        /// What runs it: `otlp` execs timber-otlp
+        /// What runs it: `otlp` execs timber-otlp (entries, over OTLP);
+        /// `frames` execs `timberfs frames-send` (chunks verbatim, over the
+        /// native wire, to a `frames-intake`)
         #[arg(long = "type", value_name = "TYPE", default_value = "otlp")]
         kind: String,
         /// Where it ships to (the shipper's --endpoint)
@@ -1171,18 +1185,27 @@ fn main() -> anyhow::Result<()> {
         Command::FramesSend {
             store,
             endpoint,
+            follow,
+            cursor,
             no_sidecars,
+            poll,
             timeout,
         } => {
+            let ms = |s: &str| -> anyhow::Result<std::time::Duration> {
+                Ok(std::time::Duration::from_millis(
+                    timberfs::append::parse_duration_ms(s)?,
+                ))
+            };
             let sent = timberfs::frames::cmd_send(
                 &store,
                 &timberfs::frames::SendOpts {
                     endpoint: endpoint.clone(),
                     first_seq: 0,
                     sidecars: !no_sidecars,
-                    timeout: std::time::Duration::from_millis(timberfs::append::parse_duration_ms(
-                        &timeout,
-                    )?),
+                    timeout: ms(&timeout)?,
+                    follow,
+                    poll: ms(&poll)?,
+                    cursor,
                 },
             )?;
             if sent.chunks == 0 {

@@ -27,10 +27,11 @@ use anyhow::{bail, Context};
 use crate::frame::{self, Frame, Framed, Hello, Mode, Run};
 use crate::receive::{Numbering, Reader, ReceiveOpts, Received, Session};
 
-/// A conservative ceiling on a single stream's in-flight bytes. Per STREAM
-/// from the start, not per connection: the window is needed either way so a
-/// sender does not stall on each chunk's ack, and scoping it here is what
-/// leaves multiplexing as bookkeeping rather than a redesign.
+/// Where per-stream flow control will attach. Declared per STREAM rather
+/// than per connection because that is the shape multiplexing needs — one
+/// stalled store must not head-of-line-block the others — but nothing
+/// waits on it yet: a sender ships what it has and TCP's own backpressure
+/// does the work while one connection carries one stream.
 pub const WINDOW_BYTES: u64 = 8 << 20;
 
 #[derive(Debug, Clone)]
@@ -193,15 +194,15 @@ pub fn serve_connection(sock: TcpStream, opts: &IntakeOpts) -> anyhow::Result<Re
         },
     )?;
 
-    let mut unacked = 0u64;
+    // Ack every chunk. A byte-window cadence starved a low-volume stream
+    // of acks entirely — the ack IS what advances a sender's cursor, and
+    // that cursor is what `retain_unconsumed` reads, so a quiet store
+    // would never release its head. A coverage frame is ~28 bytes against
+    // a 25 KB chunk, so the chattiness is 0.1% and buys correctness.
     while let Some(f) = r.next_frame()? {
-        let size = match &f.frame {
-            Frame::Chunk { comp_len, .. } => *comp_len,
-            _ => 0,
-        };
+        let was_chunk = matches!(f.frame, Frame::Chunk { .. });
         session.apply(f.frame)?;
-        unacked += size;
-        if unacked >= WINDOW_BYTES / 2 {
+        if was_chunk {
             send(
                 &mut w,
                 stream_id,
@@ -209,7 +210,6 @@ pub fn serve_connection(sock: TcpStream, opts: &IntakeOpts) -> anyhow::Result<Re
                     runs: session.coverage(),
                 },
             )?;
-            unacked = 0;
         }
     }
     // A final ack, so a sender that streamed less than a window still
@@ -252,6 +252,28 @@ pub struct SendOpts {
     pub first_seq: u64,
     pub sidecars: bool,
     pub timeout: Duration,
+    /// Keep shipping as chunks seal, on the same connection.
+    pub follow: bool,
+    /// How long to wait between polls of the store in `--follow`.
+    pub poll: Duration,
+    /// Record the far end's acked position here, so `retain_unconsumed`
+    /// knows what has left the box. Nothing else needs it: the RECEIVER's
+    /// coverage is what a resume reads.
+    pub cursor: Option<PathBuf>,
+}
+
+impl SendOpts {
+    pub fn to(endpoint: &str) -> SendOpts {
+        SendOpts {
+            endpoint: endpoint.to_string(),
+            first_seq: 0,
+            sidecars: true,
+            timeout: Duration::from_secs(30),
+            follow: false,
+            poll: Duration::from_secs(1),
+            cursor: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,47 +352,150 @@ pub fn cmd_send(store: &Path, opts: &SendOpts) -> anyhow::Result<Sent> {
         None => bail!("{addr} closed the connection without answering the handshake"),
     };
 
-    // Resume from the RECEIVER's position: it is authoritative, so a sender
-    // keeps no cursor of its own for this.
-    let resume = accepted_at
+    // Resume from the RECEIVER's position: it is authoritative, so a
+    // sender keeps no position of its own and cannot re-ship.
+    let mut resume = accepted_at
         .iter()
         .map(|r| r.end + 1)
         .max()
         .unwrap_or(opts.first_seq)
         .max(opts.first_seq);
+    let skipped = resume.saturating_sub(opts.first_seq);
 
-    let mut body = Vec::new();
-    let served = crate::serve::serve(
-        store,
-        &crate::serve::Request {
-            stream: 0,
-            mode: Mode::Frames,
-            first_seq: resume,
-            last_seq: frame::OPEN_ENDED,
-            sidecars: opts.sidecars,
-        },
-        &mut body,
-    )?;
-    // Skip serve's own stream-open: the handshake already opened this
-    // stream, and a second open would be a second stream.
-    let (_, skip) = frame::decode(&body)?.expect("serve wrote a whole frame");
-    w.write_all(&body[skip..])?;
-    w.flush()?;
-    w.shutdown(std::net::Shutdown::Write).ok();
+    let mut out = Sent {
+        chunks: 0,
+        comp_bytes: 0,
+        skipped_already_held: skipped,
+        accepted_at,
+        acked: Vec::new(),
+    };
 
-    let mut acked = Vec::new();
-    while let Some(f) = r.next_frame()? {
-        if let Frame::Coverage { runs } = f.frame {
-            acked = runs;
+    // In follow mode the read side polls for acks, so its timeout IS the
+    // poll interval; a one-shot send reads acks only after it has stopped
+    // writing, where blocking to EOF is correct.
+    if opts.follow {
+        r.get_ref().set_read_timeout(Some(opts.poll)).ok();
+    }
+
+    loop {
+        let mut body = Vec::new();
+        let served = crate::serve::serve(
+            store,
+            &crate::serve::Request {
+                stream: 0,
+                mode: Mode::Frames,
+                first_seq: resume,
+                last_seq: frame::OPEN_ENDED,
+                sidecars: opts.sidecars,
+            },
+            &mut body,
+        )?;
+        if served.chunks > 0 {
+            // Skip serve's own stream-open: the handshake already opened
+            // this stream, and a second open would be a second stream.
+            let (_, skip) = frame::decode(&body)?.expect("serve wrote a whole frame");
+            w.write_all(&body[skip..])?;
+            w.flush()?;
+            out.chunks += served.chunks;
+            out.comp_bytes += served.comp_bytes;
+            resume += served.chunks + served.raced_away;
+        }
+        if !opts.follow {
+            break;
+        }
+        // Record whatever the far end has acknowledged. That is what
+        // `retain_unconsumed` reads to know what has left this box — the
+        // RECEIVER's position, not our own idea of progress, so nothing
+        // is dropped locally until it is durably elsewhere.
+        if let Some(runs) = poll_ack(&mut r)? {
+            out.acked = runs;
+            if let Some(path) = &opts.cursor {
+                write_cursor(path, store, &out.acked, out.chunks)?;
+            }
+        } else {
+            thread::sleep(opts.poll);
         }
     }
-    Ok(Sent {
-        chunks: served.chunks,
-        comp_bytes: served.comp_bytes,
-        skipped_already_held: resume.saturating_sub(opts.first_seq),
-        accepted_at,
-        acked,
-    })
+
+    // Done writing: now the far end will finish and send its last ack.
+    w.shutdown(std::net::Shutdown::Write).ok();
+    r.get_ref().set_read_timeout(Some(opts.timeout)).ok();
+    while let Some(f) = r.next_frame()? {
+        if let Frame::Coverage { runs } = f.frame {
+            out.acked = runs;
+        }
+    }
+    if let Some(path) = &opts.cursor {
+        write_cursor(path, store, &out.acked, out.chunks)?;
+    }
+    Ok(out)
+}
+
+/// One pending ack, if the far end has sent one. The socket's read timeout
+/// bounds the wait, and hitting it is not an error here — it means "nothing
+/// acked yet", which is the normal state of a follow loop.
+fn poll_ack<R: std::io::Read>(r: &mut Reader<R>) -> anyhow::Result<Option<Vec<Run>>> {
+    match r.next_frame() {
+        Ok(Some(Framed {
+            frame: Frame::Coverage { runs },
+            ..
+        })) => Ok(Some(runs)),
+        Ok(Some(_)) => Ok(None),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            // A read timeout IS "nothing yet" in a poll loop. Matched on
+            // the error kind rather than its text: the same condition
+            // surfaces as WouldBlock on Linux and TimedOut elsewhere, and
+            // its message ("Resource temporarily unavailable") says
+            // neither.
+            let timed_out = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            });
+            if timed_out {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Record what the FAR END holds, in the registry's cursor format, so the
+/// retention interest axis can read it.
+///
+/// `seq` is the last chunk the receiver acknowledged, not the next one
+/// wanted: the interest floor is `min(seq)` over retaining followers and
+/// treats `seq >= next_seq` as a hand-edit that pins the whole store, so a
+/// caught-up sender must stay one below. That over-retains by exactly one
+/// chunk — the harmless direction, and interest is additive anyway.
+fn write_cursor(path: &Path, store: &Path, acked: &[Run], delivered: u64) -> anyhow::Result<()> {
+    let Some(last) = acked.iter().map(|r| r.end).max() else {
+        return Ok(()); // nothing acknowledged yet: no position to record
+    };
+    let (dir, name) = crate::query::resolve_backing(store)?;
+    let anchor = crate::cursor::store_anchor(&dir, &name, crate::bark::load(&dir, &name).as_ref());
+    let mut c = crate::cursor::Cursor::load(path)
+        .unwrap_or(None)
+        .unwrap_or_else(|| {
+            crate::cursor::Cursor::new("frames-send", &anchor, &store.display().to_string())
+        });
+    c.store = anchor;
+    c.path = store.display().to_string();
+    c.seq = Some(last);
+    c.n = 0;
+    c.delivered = delivered;
+    // Informational, but `follower list` renders lag from it: left at 0 it
+    // reads as decades behind. The write time of the last acked chunk is
+    // the honest value — the far end holds everything up to there.
+    if let Ok(records) = crate::format::read_index(&crate::format::rings_path(&dir, &name)) {
+        if let Some(rec) = records.iter().find(|r| r.seq == last) {
+            c.wl = rec.last_write_ms;
+        }
+    }
+    c.save(path)
 }
 
 #[cfg(test)]
@@ -462,10 +587,8 @@ mod tests {
 
     fn send_opts(addr: &str) -> SendOpts {
         SendOpts {
-            endpoint: addr.to_string(),
-            first_seq: 0,
-            sidecars: true,
             timeout: Duration::from_secs(10),
+            ..SendOpts::to(addr)
         }
     }
 
@@ -623,6 +746,106 @@ mod tests {
         assert!(!bark.contains_key("origin_id"), "{bark:?}");
         assert!(bark.contains_key("derived_from"), "lineage still travels");
         assert_eq!(bark.get("host").unwrap(), "apache01");
+    }
+
+    #[test]
+    fn the_cursor_records_what_the_far_end_holds() {
+        // The cursor is not a resume point -- the receiver's coverage is.
+        // It exists so `retain_unconsumed` knows what has left this box,
+        // which means it must record the far end's acknowledgement and not
+        // our own idea of progress.
+        let d = TempDir::new();
+        let src = a_store(d.path(), "src", 4, "svc");
+        let into = d.path().join("recv");
+        let cur = d.path().join("cursor.json");
+        let (addr, server) = one_shot(opts(&into, true, true));
+        let sent = cmd_send(
+            &src,
+            &SendOpts {
+                cursor: Some(cur.clone()),
+                timeout: Duration::from_secs(10),
+                ..SendOpts::to(&addr)
+            },
+        )
+        .unwrap();
+        server.join().unwrap().unwrap();
+
+        assert_eq!(sent.acked, vec![Run { start: 0, end: 3 }]);
+        let c = crate::cursor::Cursor::load(&cur).unwrap().expect("written");
+        // The LAST ACKED chunk, deliberately not the next one wanted: the
+        // interest floor is min(seq) and treats seq >= next_seq as a
+        // hand-edit that pins the whole store, so a caught-up sender stays
+        // one below. One chunk of over-retention, the harmless direction.
+        assert_eq!(c.seq, Some(3));
+        assert_eq!(c.n, 0, "whole chunks only; never a partial position");
+        assert_eq!(c.consumer, "frames-send");
+        // `follower list` renders lag from wl, so an unset one reads as
+        // decades behind rather than caught up.
+        assert!(c.wl > 0, "the acked chunk's write time is recorded");
+        // Anchored by the store's IDENTITY, so a moved store still matches.
+        let bark = crate::bark::load(d.path(), "src.log").unwrap();
+        assert_eq!(c.store, bark.get("id").unwrap().as_str().unwrap());
+    }
+
+    #[test]
+    fn nothing_acked_writes_no_position_rather_than_a_false_one() {
+        // A sender that shipped nothing must not record a position: a
+        // retaining follower with no position holds everything, which is
+        // the safe reading, and inventing seq 0 would release the head.
+        let d = TempDir::new();
+        let src = a_store(d.path(), "src", 0, "svc");
+        let into = d.path().join("recv");
+        let cur = d.path().join("cursor.json");
+        let (addr, server) = one_shot(opts(&into, true, true));
+        cmd_send(
+            &src,
+            &SendOpts {
+                cursor: Some(cur.clone()),
+                timeout: Duration::from_secs(10),
+                ..SendOpts::to(&addr)
+            },
+        )
+        .unwrap();
+        let _ = server.join().unwrap();
+        assert!(!cur.exists(), "no acknowledgement, no position");
+    }
+
+    #[test]
+    fn a_follower_of_type_frames_runs_frames_send() {
+        // What the systemd unit executes. No `--start`: a frames sender
+        // resumes from the receiver's coverage, so there is no local
+        // decision about where to begin -- and no way to re-ship a store
+        // by getting it wrong.
+        let decl = crate::follower::Declaration {
+            name: "ship".to_string(),
+            store: "an-id".to_string(),
+            path: "/var/log/timberfs/app/app.log".to_string(),
+            kind: "frames".to_string(),
+            endpoint: Some("archive:4319".to_string()),
+            retaining: true,
+            args: vec![],
+            created: String::new(),
+            extra: serde_json::Map::new(),
+        };
+        let argv = decl
+            .argv(
+                Path::new("/reg/ship/cursor.json"),
+                Path::new("/var/log/timberfs/app/app.log"),
+            )
+            .unwrap();
+        assert!(argv[0].ends_with("timberfs"), "{argv:?}");
+        assert_eq!(argv[1], "frames-send");
+        assert!(argv.contains(&"--follow".to_string()), "{argv:?}");
+        assert!(argv.contains(&"--cursor".to_string()), "{argv:?}");
+        assert!(
+            argv.contains(&"archive:4319".to_string()),
+            "the endpoint is passed through: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&"--start".to_string()),
+            "a frames sender has no start to choose: {argv:?}"
+        );
+        assert_eq!(argv.last().unwrap(), "/var/log/timberfs/app/app.log");
     }
 
     #[test]

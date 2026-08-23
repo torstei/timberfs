@@ -13,8 +13,9 @@ preserved together) or a copy (neither). The TRANSPORT is built too, in
 `src/frames.rs`: `timberfs frames-intake` and `timberfs frames-send`, with the
 registration handshake — a sender resumes from the receiver's position rather
 than a cursor of its own, and a colliding origin is refused at setup naming
-the holder. What is left is `follower --type frames` (so shipping is a
-registered, supervised follower rather than a command), multiplexing, and the
+the holder. `follower --type frames` registers it as a
+supervised shipper, so the whole loop closes: retention releases a prefix only
+once the far end has acknowledged it. What is left is multiplexing and the
 receiving end's naming policy. The digest is deferred (see
 chunks-by-address.md).
 

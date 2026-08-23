@@ -87,6 +87,13 @@ impl<R: Read> Reader<R> {
         }
     }
 
+    /// The underlying source, for a caller that needs to reconfigure it —
+    /// a socket's read timeout, say, which a poll loop and a drain-to-EOF
+    /// want set differently.
+    pub fn get_ref(&self) -> &R {
+        &self.src
+    }
+
     fn fill(&mut self) -> anyhow::Result<bool> {
         if self.eof {
             return Ok(false);
