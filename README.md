@@ -478,7 +478,9 @@ which is why it travels with the store.
 The full design — why FUSE, the on-disk format, the `.bark` manifest, the
 semantics table, and the `.grain` token index — lives in
 **[docs/design.md](docs/design.md)**. You don't need any of it to use timberfs;
-the curious and the contributors start there.
+the curious and the contributors start there. Where a direction is still being
+designed rather than described, the note is under
+**[docs/plans/](docs/plans/)** and the roadmap points at it.
 
 ## Build
 
