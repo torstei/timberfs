@@ -30,5 +30,6 @@ pub mod query;
 pub mod records;
 pub mod rotate;
 pub mod sap;
+pub mod serve;
 pub mod sink;
 pub mod store;

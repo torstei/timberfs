@@ -231,7 +231,7 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
 /// again, so there's nothing a reader could race), `Some(dir, name)` for
 /// a live backing pair, which a concurrent writer's retention can
 /// collapse out from under a standalone reader in another process.
-fn seq_guard(input: &Path) -> Option<(PathBuf, String)> {
+pub(crate) fn seq_guard(input: &Path) -> Option<(PathBuf, String)> {
     if is_bundle(input) {
         None
     } else {
@@ -253,6 +253,23 @@ fn read_chunk(
     input: &Path,
     guard: &Option<(PathBuf, String)>,
     handle: &mut SourceHandle,
+    c: ChunkRecord,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match read_chunk_raw(input, guard, handle, c)? {
+        Some(comp) => Ok(Some(zstd::stream::decode_all(&comp[..]).with_context(
+            || "decompressing a stored chunk — the .trunk may be corrupt",
+        )?)),
+        None => Ok(None),
+    }
+}
+
+/// The COMPRESSED frame of chunk `c`, under the same guard. Replication
+/// moves frames verbatim, so it must not pay for a decompression it has no
+/// use for — and the guard is far too subtle to have two copies of.
+pub(crate) fn read_chunk_raw(
+    input: &Path,
+    guard: &Option<(PathBuf, String)>,
+    handle: &mut SourceHandle,
     mut c: ChunkRecord,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     // Bound the retries: a writer that died mid-collapse (before it could
@@ -271,9 +288,7 @@ fn read_chunk(
         };
         if !raced {
             read_res.context("reading a stored chunk")?;
-            return Ok(Some(zstd::stream::decode_all(&comp[..]).with_context(
-                || "decompressing a stored chunk — the .trunk may be corrupt",
-            )?));
+            return Ok(Some(comp));
         }
         tries += 1;
         if tries > 64 {

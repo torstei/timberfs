@@ -185,6 +185,14 @@ impl Grain {
         self.filters.len()
     }
 
+    /// One chunk's filter bytes, for shipping it alongside its chunk: the
+    /// receiver adopts a page it recognises instead of decompressing to
+    /// re-tokenize. `None` beyond the grain's coverage, which means the
+    /// destination rebuilds — the same contract as a missing entry.
+    pub fn page(&self, idx: usize) -> Option<&[u8]> {
+        self.filters.get(idx).map(|v| &v[..])
+    }
+
     /// May chunk `idx` contain ALL the tokens? A chunk beyond the grain's
     /// coverage answers yes — missing means scan, per the contract.
     pub fn may_contain_all(&self, idx: usize, tokens: &[Vec<u8>]) -> bool {
