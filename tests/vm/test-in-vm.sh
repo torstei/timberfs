@@ -3166,6 +3166,104 @@ frames_follower_ships_and_releases_the_head() {
     timberfs info $d/archive/folwire.log/folwire.log | grep -q "4 chunk(s)"
 }
 
+FRAMES_UNIT_SRC=/tmp/framesunit/src.log
+
+frames_unit_installed() {
+    # A wrong asset path in Cargo.toml only shows up in the built package,
+    # which is what this VM installs. The man page is checked too, since a
+    # unit nobody can find documented is half-shipped.
+    test -f /lib/systemd/system/timberfs-frames.socket \
+        && test -f /lib/systemd/system/timberfs-frames.service \
+        && grep -q 'ListenStream=127.0.0.1:4319' \
+            /lib/systemd/system/timberfs-frames.socket \
+        && grep -q 'timberfs frames-intake' /lib/systemd/system/timberfs-frames.service \
+        && grep -q 'RestartForceExitStatus=85' /lib/systemd/system/timberfs-frames.service \
+        && zcat /usr/share/man/man1/timberfs.1.gz | tr -d ' \n' \
+            | grep -q 'timberfs\\-frames.socket'
+}
+
+frames_unit_socket_activates() {
+    # The SHIPPED unit, started by systemd rather than by hand: every other
+    # unit family is exercised this way, and a unit file that has only been
+    # parsed has never been proven to start.
+    rm -rf /tmp/framesunit; mkdir -p /tmp/framesunit
+    systemd-tmpfiles --create
+    systemctl enable --now timberfs-frames.socket || return 1
+    # Socket-activated, so the service is not running until something
+    # connects -- that is the point of the pair.
+    systemctl --quiet is-active timberfs-frames.socket || return 1
+    ! systemctl --quiet is-active timberfs-frames.service || return 1
+
+    timberfs create $FRAMES_UNIT_SRC --index --set service=unitwire >/dev/null 2>&1 || return 1
+    local i
+    for i in 1 2 3; do
+        printf '2026-06-0%dT10:00:00Z unit line %d marker%04d padding\n' "$i" "$i" "$i" \
+            | timberfs append --into $FRAMES_UNIT_SRC --quiet 2>/dev/null
+    done
+
+    # The shipped unit has no --auto-create, so an undeclared stream is
+    # refused -- and the sender is TOLD, which is what the handshake buys.
+    timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "refused the stream" || {
+        timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319
+        return 1
+    }
+    # ...and the connection activated the service even so.
+    systemctl --quiet is-active timberfs-frames.service
+}
+
+frames_unit_replicates_into_a_declared_store() {
+    # The operator provisions the destination; the sender's retry lands.
+    # The shipped unit passes --replica, so this is a replica: same bytes,
+    # same numbering, origin recorded.
+    timberfs create --wal /var/log/timberfs/unitwire.log/unitwire.log >/dev/null 2>&1 || return 1
+    timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "sent 3 chunk" || {
+        timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319
+        journalctl -u timberfs-frames.service -n 20 --no-pager
+        return 1
+    }
+    sleep 1
+    local dst=/var/log/timberfs/unitwire.log/unitwire.log
+    cmp -s $FRAMES_UNIT_SRC.trunk $dst.trunk || {
+        echo "trunk differs" >&2
+        return 1
+    }
+    # --replica means the origin travelled and the numbering was preserved.
+    jq -e '.origin_id == (input | .id)' $dst.bark $FRAMES_UNIT_SRC.bark >/dev/null || {
+        cat $dst.bark
+        return 1
+    }
+    # Re-running is a no-op: the receiver's position is authoritative.
+    timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "already has everything"
+}
+
+frames_unit_survives_a_restart() {
+    # Socket activation means the address stays bound across a service
+    # restart, so a sender that reconnects is not refused -- which is what
+    # --exit-on-upgrade relies on when dpkg replaces the binary.
+    systemctl restart timberfs-frames.service || return 1
+    sleep 1
+    printf '2026-06-09T10:00:00Z unit line after restart marker9999\n' \
+        | timberfs append --into $FRAMES_UNIT_SRC --quiet 2>/dev/null
+    timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "sent 1 chunk" || {
+        timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319
+        journalctl -u timberfs-frames.service -n 20 --no-pager
+        return 1
+    }
+    sleep 1
+    cmp -s $FRAMES_UNIT_SRC.trunk /var/log/timberfs/unitwire.log/unitwire.log.trunk
+}
+
+frames_unit_teardown() {
+    systemctl disable --now timberfs-frames.socket >/dev/null 2>&1
+    systemctl stop timberfs-frames.service >/dev/null 2>&1
+    rm -rf /tmp/framesunit /var/log/timberfs/unitwire.log
+    true
+}
+
 frames_wire_replicates_a_store_byte_for_byte() {
     # The native wire end to end through the CLI: a store crosses a socket
     # as compressed frames, arrives byte-identical, and its shipped token
@@ -3296,6 +3394,11 @@ run_test "import: shipped segment merges verbatim, idempotently" import_segment_
 run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
 run_test "frames wire: a store replicates over a socket byte for byte" frames_wire_replicates_a_store_byte_for_byte
 run_test "frames wire: a retaining follower ships, then the head releases" frames_follower_ships_and_releases_the_head
+run_test "frames unit: installed by the package, and documented" frames_unit_installed
+run_test "frames unit: socket activates, undeclared stream refused" frames_unit_socket_activates
+run_test "frames unit: replicates into a declared store" frames_unit_replicates_into_a_declared_store
+run_test "frames unit: the socket outlives a service restart" frames_unit_survives_a_restart
+run_test "frames unit: teardown" frames_unit_teardown
 grain_needle_search() {
     python3 -c "
 import datetime
