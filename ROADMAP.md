@@ -81,11 +81,14 @@ here.
   Concurrency needs nothing new; a server is just another standalone
   reader, already covered by the collapse seqlock and the grain/rings
   generation check.
-- **What the LogQL spike measured** (branch `spike/logql-serve`, not for
-  merge — kept as evidence): enough of Loki's read API for a real Grafana
-  11.3.0 to point at a forest. It is the reason the facade above is
-  dropped, and it is worth keeping because a negative result that stops
-  the wrong build is worth more than an estimate.
+- **What the LogQL spike measured** (the branch is gone; this entry is the
+  evidence): enough of Loki's read API for a real Grafana 11.3.0 to point
+  at a forest. It is the reason the facade above is dropped, and the
+  measurement is the part worth keeping — a negative result that stops the
+  wrong build is worth more than an estimate, and it does not need the code
+  that produced it. Rebuilding the spike from what is written here would
+  cost an afternoon, which is the right price for evidence nobody has
+  needed since.
   Grafana asks for a CORNER of LogQL, not the language: four routes
   (`/query` for the health check, `/labels` for autocomplete,
   `/index/stats` for query sizing, `/query_range` for both panels) and
