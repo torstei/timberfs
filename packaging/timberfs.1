@@ -1715,9 +1715,13 @@ A
 is a registered reader of one store: a name, a type, a
 .B retaining
 flag and a durable position.
+Two types today \(em
 .BR timber\-otlp (1)
-is the one type today; any shipper the registry learns to exec is one
-tomorrow. The registry is one directory per follower:
+ships ENTRIES over OTLP, and
+.B frames
+ships CHUNKS verbatim over the native wire (see REPLICATION) \(em and any
+shipper the registry learns to exec is one tomorrow. The registry is one
+directory per follower:
 .PP
 .RS
 .nf
@@ -1803,7 +1807,11 @@ as an exact COUNT, the chunk numbers stating how many rather than a
 timestamp comparison implying a duration.
 .BR timber\-otlp (1)
 warns by name on resume with the size of the hole, and this view shows
-the same fact from the store's side, before it becomes loss. What to
+the same fact from the store's side, before it becomes loss. A
+.B frames
+follower learns it from the other end instead: the receiver's answer says
+what it holds, so a gap is the distance between that and this store's
+oldest chunk. What to
 watch is a follower whose lag approaches the retention window \(em that
 is the disconnection budget being spent.
 .PP

@@ -362,6 +362,38 @@ timberfs trim app
 
 > The older `cursors=<dir>` key still works and is reported as superseded.
 
+## Replicating to another timberfs (`frames-send`)
+
+OTLP above ships **entries** to anything that speaks the protocol. When the far
+end is also timberfs, the native wire ships **frames** instead — the compressed
+chunks, verbatim:
+
+```sh
+# on the archive
+timberfs frames-intake --into-dir /var/log/timberfs --listen 0.0.0.0:4319 \
+    --route service --auto-create --replica --index
+
+# on the node
+timberfs frames-send /var/log/timberfs/apache-error/apache-error.log \
+    --endpoint archive:4319
+```
+
+Nothing is decompressed at either end, so the destination's `.trunk` is
+byte-identical to the source's — `.grain` included, which means a `--has` lookup
+on the replica skips chunks exactly as it does at home. Re-running sends
+nothing: the receiver's position is authoritative, so a sender keeps no cursor
+of its own and cannot re-send.
+
+With `--replica` the destination also keeps the sender's chunk numbers and
+records its origin, so a chunk answers to the same address at both ends; without
+it, the destination renumbers and claims no origin. The two travel together or
+not at all. As a registered follower it is `--type frames`, and then retention
+releases a prefix only once the far end has acknowledged it.
+
+Frames replicate, records merge: interleaving two sources into one store needs
+decoding, which is the entries path's job. See **REPLICATION** in
+`man timberfs`.
+
 ## Rotation & retention
 
 `timberfs rotate` does **time-based** rotation: everything written before the
@@ -515,31 +547,6 @@ stream over one listener) for the two network intakes above, and
 plus `timberfs-follower@<instance>`, which is the one to prefer for that last
 job: it runs a *registered* follower, so the store, the type and the endpoint
 come from the declaration rather than from a per-instance `.conf`.
-## Shipping a store to another host
-
-Two wires, answering different questions. **Entries** over OTLP
-(`timber-otlp`, or a `--type otlp` follower) reach anything that speaks the
-protocol and can be filtered or merged on the way. **Frames** over the native
-wire (`timberfs frames-send` to a `timberfs frames-intake`, or a
-`--type frames` follower) reach only another timberfs — and go *verbatim*:
-
-```sh
-# on the archive
-timberfs frames-intake --into-dir /var/log/timberfs --listen 0.0.0.0:4319     --route service --auto-create --replica --index
-
-# on the node
-timberfs frames-send /var/log/timberfs/apache-error/apache-error.log     --endpoint archive:4319
-```
-
-The compressed frames are copied, so nothing is decompressed at either end and
-the destination's `.trunk` is byte-identical to the source's — index included,
-so a `--has` lookup on the replica skips chunks the same way it does at home.
-Re-running sends nothing: the receiver's position is authoritative, so a sender
-keeps no cursor of its own and cannot re-send.
-
-With `--replica` the destination also keeps the sender's chunk numbers and
-records its origin, so a chunk answers to the same address at both ends. See
-**REPLICATION** in `man timberfs`.
 
 See **[Deploying timberfs](docs/deployment.md)** for the directory layout, all
 eight unit families, the ownership/permission model, and
