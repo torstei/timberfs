@@ -1302,6 +1302,51 @@ mod cli_tests {
         }
     }
 
+    /// Every subcommand must be reachable from the prose docs too, not
+    /// only the man page. The failures this catches are ABSENCES: a
+    /// capability that landed and never reached a surface, which is how
+    /// `frames-send` came to be missing from the deployment guide and the
+    /// use cases while working fine. A drift check over commands that ARE
+    /// documented would not have seen any of it.
+    ///
+    /// Omissions are allowed but must be stated here, so leaving one out
+    /// is a decision somebody made rather than something nobody noticed.
+    #[test]
+    fn every_subcommand_reaches_the_prose_docs() {
+        // (surface, subcommands deliberately absent, and why)
+        let surfaces: &[(&str, &[(&str, &str)])] = &[
+            (
+                include_str!("../README.md"),
+                &[(
+                    "reindex",
+                    "maintenance verb; the README sends readers to man timberfs for those",
+                )],
+            ),
+            (include_str!("../docs/deployment.md"), &[]),
+            (
+                include_str!("../docs/use-cases.md"),
+                &[(
+                    "reindex",
+                    "a use case is a why, not a verb list; rebuilding an index is neither",
+                )],
+            ),
+        ];
+        for (text, allowed) in surfaces {
+            for sub in Cli::command().get_subcommands() {
+                let name = sub.get_name();
+                if name == "help" || allowed.iter().any(|(a, _)| *a == name) {
+                    continue;
+                }
+                assert!(
+                    text.contains(name),
+                    "`{name}` appears in no command block or prose of one of the \
+                     documentation surfaces. Document it, or add it to that \
+                     surface's allowlist with a reason."
+                );
+            }
+        }
+    }
+
     /// Every subcommand needs a description. A doc comment that ends up
     /// attached to the wrong variant leaves its own blank, which `--help`
     /// shows and nothing else does — `info` shipped that way once.

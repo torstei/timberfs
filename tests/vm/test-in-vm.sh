@@ -3166,6 +3166,106 @@ frames_follower_ships_and_releases_the_head() {
     timberfs info $d/archive/folwire.log/folwire.log | grep -q "4 chunk(s)"
 }
 
+frames_fleet_two_nodes_one_archive() {
+    # The COMPOSED story, which no per-verb test covers: two hosts, each
+    # with two logs, replicating into one archive. Every verb below is
+    # tested on its own elsewhere; what this asserts is that the setup an
+    # operator actually performs produces the right four stores -- and
+    # what happens when the routing is wrong, which is the mistake the
+    # shape invites.
+    local d=/tmp/framesfleet
+    rm -rf $d; mkdir -p $d/apache01 $d/apache02 $d/archive-a $d/archive-b
+    local h s i
+    for h in apache01 apache02; do
+        for s in apache-error apache-access; do
+            timberfs create $d/$h/$s.log --index \
+                --set host=$h --set service=$s --set stream=$h.$s >/dev/null 2>&1 || return 1
+            for i in 1 2 3; do
+                printf '2026-06-0%dT10:00:00Z %s %s entry %d tok%s%04d\n' \
+                    "$i" "$h" "$s" "$i" "${h#apache}" "$i" \
+                    | timberfs append --into $d/$h/$s.log --quiet 2>/dev/null
+            done
+        done
+    done
+
+    # ROUTING ON `service` IS THE MISTAKE: both hosts call their error log
+    # apache-error, so both route to one store. The first lands; the second
+    # is refused and NAMES the origin already there, which is the whole
+    # point of one-store-one-origin.
+    #
+    # Without that check the failure is quiet in either of two ways, and
+    # measured with the guard disabled it is the second: apache02 is told
+    # the archive "already has everything" -- because its own chunks 0..2
+    # match the coverage apache01 established -- so its logs silently ship
+    # NOWHERE. Where the numbering does not line up they merge instead, and
+    # the manifest then describes only one of the two hosts.
+    timberfs frames-intake --into-dir $d/archive-a --listen 127.0.0.1:4330 \
+        --route service --auto-create --replica >$d/a.log 2>&1 &
+    local pid_a=$!
+    sleep 1
+    timberfs frames-send $d/apache01/apache-error.log --endpoint 127.0.0.1:4330 2>&1 \
+        | grep -q "sent 3 chunk" || { kill $pid_a; cat $d/a.log; return 1; }
+    sleep 1
+    timberfs frames-send $d/apache02/apache-error.log --endpoint 127.0.0.1:4330 2>&1 \
+        | grep -q "one store" || {
+        timberfs frames-send $d/apache02/apache-error.log --endpoint 127.0.0.1:4330
+        kill $pid_a
+        return 1
+    }
+    kill $pid_a 2>/dev/null
+    sleep 1
+    # apache01's data only: the refusal wrote nothing.
+    timberfs query $d/archive-a/apache-error.log/apache-error.log 2>/dev/null \
+        | grep -q apache02 && { echo "apache02 data leaked in" >&2; return 1; }
+
+    # THE WORKING SHAPE: route on a label whose value is unique per stream.
+    timberfs frames-intake --into-dir $d/archive-b --listen 127.0.0.1:4331 \
+        --route stream --auto-create --replica --index >$d/b.log 2>&1 &
+    local pid_b=$!
+    sleep 1
+    for h in apache01 apache02; do
+        for s in apache-error apache-access; do
+            timberfs frames-send $d/$h/$s.log --endpoint 127.0.0.1:4331 2>&1 \
+                | grep -q "sent 3 chunk" || { kill $pid_b; cat $d/b.log; return 1; }
+            sleep 0.3
+        done
+    done
+    kill $pid_b 2>/dev/null
+    sleep 1
+
+    # Four stores, each byte-identical, each still saying which host it is
+    # -- the label travelled, the settings did not.
+    local n=0
+    for h in apache01 apache02; do
+        for s in apache-error apache-access; do
+            local dst=$d/archive-b/$h.$s.log/$h.$s.log
+            cmp -s $d/$h/$s.log.trunk $dst.trunk || {
+                echo "$h.$s trunk differs" >&2
+                return 1
+            }
+            jq -e --arg h "$h" --arg s "$s" \
+                '.host == $h and .service == $s and has("origin_id")' $dst.bark >/dev/null || {
+                cat $dst.bark
+                return 1
+            }
+            n=$((n + 1))
+        done
+    done
+    [ "$n" = 4 ] || return 1
+    # And the archive lists exactly those four.
+    [ "$(timberfs list $d/archive-b --names 2>/dev/null | wc -l)" = 4 ] || {
+        timberfs list $d/archive-b
+        return 1
+    }
+    # The shipped index works on the far side, per host.
+    timberfs query $d/archive-b/apache02.apache-error.log/apache02.apache-error.log \
+        --has tok020002 2>&1 | grep -q "1 of 3 chunk" || {
+        timberfs query $d/archive-b/apache02.apache-error.log/apache02.apache-error.log --has tok020002
+        return 1
+    }
+    rm -rf $d
+}
+
 FRAMES_UNIT_SRC=/tmp/framesunit/src.log
 
 frames_unit_installed() {
@@ -3394,6 +3494,7 @@ run_test "import: shipped segment merges verbatim, idempotently" import_segment_
 run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
 run_test "frames wire: a store replicates over a socket byte for byte" frames_wire_replicates_a_store_byte_for_byte
 run_test "frames wire: a retaining follower ships, then the head releases" frames_follower_ships_and_releases_the_head
+run_test "frames fleet: two nodes, one archive, and the routing mistake" frames_fleet_two_nodes_one_archive
 run_test "frames unit: installed by the package, and documented" frames_unit_installed
 run_test "frames unit: socket activates, undeclared stream refused" frames_unit_socket_activates
 run_test "frames unit: replicates into a declared store" frames_unit_replicates_into_a_declared_store
