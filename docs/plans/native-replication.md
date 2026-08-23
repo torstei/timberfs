@@ -1,10 +1,26 @@
 # Native replication: frames on the wire, not entries
 
-**Status: design.** The batch ancestor exists — `timberfs export --into x.timber`
-writes a tar of `.rings`, `.trunk` and `.bark`, and `import` reads it. The
-streaming wire, the sidecar list and the transport are not built.
+**Status: design, with the first pieces built.** The batch ancestor exists —
+`timberfs export --into x.timber` writes a tar of `.rings`, `.trunk` and
+`.bark`, `import` reads it, and identity now crosses that hop. The frame codec
+is implemented in `src/frame.rs` (encode, decode, skip-what-you-do-not-know,
+and the bounds checks a length off the network needs), the SERVE side in
+`src/serve.rs` — a store read out as `coverage`, `index` or `frames`, reusing
+`query`'s seqlock guard and shipping `.grain` pages as the first real sidecar
+kind — and the RECEIVE side in `src/receive.rs`, which turns a stream back
+into a store, byte-identically, either as a replica (origin and numbering
+preserved together) or a copy (neither). The TRANSPORT is built too, in
+`src/frames.rs`: `timberfs frames-intake` and `timberfs frames-send`, with the
+registration handshake — a sender resumes from the receiver's position rather
+than a cursor of its own, and a colliding origin is refused at setup naming
+the holder. `follower --type frames` registers it as a
+supervised shipper, so the whole loop closes: retention releases a prefix only
+once the far end has acknowledged it. What is left is multiplexing and the
+receiving end's naming policy. The digest is deferred (see
+chunks-by-address.md).
 
-See also [chunks by address](chunks-by-address.md), which this is the transport
+See also [chunks by address](chunks-by-address.md), which this is the
+transport
 for, and [the receiving end](receiving-end.md) for identity and routing.
 
 Shipping a store's `.trunk` frames verbatim instead of re-encoding its
@@ -24,44 +40,75 @@ and therefore chunk numbers and a `.grain` (the index is chunk-positional,
 so only an alignment-preserving transport can move it — 264 KB shipped
 versus ~1 s of rebuild per 200k entries).
 
-## The frame
+## The frame (built: `src/frame.rs`)
 
 One hello per connection, then typed frames each carrying a stream id and
 their own length — so any frame is skippable without understanding it, which
 is what serves extensibility and multiplexing with one mechanism.
 
-    connection hello (once)
+    connection hello (once)               magic "TIMBSTR1", version 1
        0..8   magic                            8 bytes
        8..12  version                          u32
       12..16  incompat_flags                   u32
 
     every frame thereafter
        0..4   stream id (0 = the only stream)  u32
-       4..8   frame type                       u32
+       4..8   frame kind                       u32
        8..12  payload length                   u32
 
-    stream-open payload
+    stream-open payload                   kind 1
        0..16  origin_id (the travelling half)  uuid
       16..32  sender's own id -> derived_from  uuid
       32..40  first seq in this stream         u64
-      40..48  last seq, or 0 = open-ended      u64
-      48..52  mode: coverage | index | frames  u32
-      52..56  sidecar count n                  u32
-      56..56+12n  n x { kind: 8 bytes, len: u32 }
+      40..48  last seq, or u64::MAX = open      u64
+      48..52  mode: 1 coverage, 2 index, 3 frames  u32
+      52..56  provenance length                u32
+      56..60  sidecar count n                  u32
+      60..60+12n  n x { kind: 8 bytes, len: u32 }
       then    provenance JSON, then each sidecar's bytes
 
-    chunk payload
+    chunk payload                         kind 2
        0..8   seq                              u64
        8..16  uncomp_len                       u64
-      16..24  comp_len                         u64
+      16..24  comp_len (TRUE size, always)     u64
       24..32  first_write_ms                   u64
       32..40  last_write_ms                    u64
       40..44  sidecar count n                  u32
       44..44+12n  n x { kind: 8 bytes, len: u32 }
-      then    comp_len bytes verbatim, then each sidecar's bytes
+      then    comp_len bytes verbatim (absent in index mode),
+              then each sidecar's bytes
 
-    ack payload
-       0..8   highest contiguous seq stored    u64
+    coverage payload                      kind 3
+       0..4   run count n                      u32
+       4..4+16n  n x { start: u64, end: u64 }  inclusive
+
+    accepted payload                      kind 4
+       0..16  registration id (server-assigned)  uuid
+      16..    coverage: what the server holds
+
+    conflict payload                      kind 5
+       0..16  holder origin_id                 uuid
+      16..    coverage of the holder, then a u32-prefixed reason
+
+Two corrections the implementation forced, both cases of the written layout
+being undecodable rather than merely awkward:
+
+**`last_seq` uses `u64::MAX`, not 0, for open-ended.** Zero is a legitimate
+last seq — a stream carrying only chunk 0 — so the sentinel had to move.
+
+**A `provenance length` field was missing.** With variable-length sidecar
+bodies *and* variable-length provenance, nothing said where the provenance
+ended; the two were undecidable from each other. Every length now sits in the
+fixed prefix, which is the property the whole design leans on.
+
+There is no separate ack frame: an ack is a `coverage` frame, since a
+contiguous receiver acking a store it holds to 424242 is sending one run —
+the degenerate case of the same answer rather than a second kind.
+
+Per-chunk cost is 12 bytes of header plus 44 of fixed fields, so 0.2% on the
+measured mean frame size of 25,919 bytes, and 12 bytes per sidecar beyond
+that. Asserted by a test, because a field added carelessly is invisible until
+it is on every chunk.
 
 ## Offsets never travel
 
@@ -155,7 +202,8 @@ why the wire carries `origin_id` and the sender's `id` (the destination's
 labels for routing, while the receiver keeps its own retention and index
 policy. Operational settings are the receiving tier's business.
 
-## Transport: multiple streams per connection in the protocol, 1:1 on the wire first
+## Transport: multiple streams per connection in the protocol, 1:1 on the wire
+first
 
 The stream identity lives in the frame, not the connection: a `stream-open`
 frame binds a small stream id that every chunk and ack frame carries, so
@@ -178,6 +226,80 @@ TLS ready-made, at the cost of an async runtime and a TLS stack in a tree that
 today has neither and serves with blocking `TcpListener` plus `thread::spawn`;
 that is a dependency-posture decision, not a free win (see "OTLP gaps").
 
+## A WAL frame would lift the latency floor, at a price
+
+Not needed yet, and worth writing down because the constraint is
+non-obvious. Only sealed chunks ship, so a replica is always one chunk-seal
+behind while the `.sap` serves a 0.2 s tail locally. A frame carrying WAL
+bytes would move that capability across the wire: a live tail on the
+archive, which is grepping the fleet's live edge from one box — the thing
+this design otherwise gives up.
+
+**The WAL is append-only, and that is what makes it simple.** Bytes are
+written from beginning to end and never in the middle, so a frame is a pure
+byte-range append: `uncomp_base` plus bytes, and the receiver takes only
+what lies past what it holds. Nothing already sent can change, so there is
+no invalidation and no reconciliation — one integer of state per stream, on
+both sides, and a reconnect resumes from the receiver's offset. When the
+chunk covering those bytes finally arrives, the receiver drops that many
+bytes from the FRONT of its tail buffer: a truncate, because the chunk
+always covers a prefix of an append-only log.
+
+**It wants a separate file, not a new state for `.sap`.** A crashed store's
+`.sap` is replayed into a chunk on the next open — `FileStore::open`
+compresses the replayed entries and writes a `ChunkRecord` — and for a
+replica that is fatal, since it would mint a chunk the origin never made,
+with boundaries the origin does not have, so `(origin_id, seq)` would name
+different bytes at each end. But that replay is a WRITER's path keyed on
+the sap's filename, and the tail READER is already separate: `live.rs`
+deliberately does not use `sap::replay` ("right for a writer opening its
+own store, wrong for every reader") and reads the longest CRC-valid prefix
+by path. So a differently-named received-tail file is never replayed by
+construction, and the read path needs to learn one more filename rather
+than the sap needing a new state. Discarding that file after a crash is
+also safe: the sender still holds those bytes in its own unsealed sap and
+resends from the offset the receiver reports.
+
+**The cost is duplication, and it only applies while someone is watching.**
+WAL bytes are uncompressed, so the same entries cross twice: raw now, and
+again inside the chunk that eventually compresses them — at 10:1, 256 KB
+plus 25 KB where the chunk alone was 25 KB, an 11x increase over the live
+window. But the tail only has to flow when a reader wants it, which makes
+this a RUNTIME STATE rather than a configuration decision: nobody watching
+costs nothing, and no operator has to predict in advance where a live tail
+will be wanted.
+
+**Interest travels upstream, on the connection that already exists.** The
+reverse direction carries acks today, so a tail-interest frame is one more
+additive kind — and the first use of that direction for something other
+than acknowledging. It composes over hops: a tier asks its own upstream
+whenever it has an interested downstream, so interest propagates and lapses
+along the chain without anything coordinating it.
+
+How the archive notices a reader is open, and `flock` fits the question the
+way it already does elsewhere: `LockProbe` exists precisely for read-only
+"is anyone there", and a lock is released by the kernel when the holder
+dies — which is what an ephemeral `query --follow` needs and what a
+registry entry would get wrong. Some linger before dropping interest keeps
+a reader that restarts from thrashing the upstream.
+
+⚠ **Starting interest must send the CURRENT unsealed tail**, not only what
+arrives next. The sender's WAL already holds bytes written before anyone
+asked, and a reader that sees nothing until the next entry reads as broken
+rather than as idle. So "start" means "your tail from its base, then keep
+going".
+
+⚠ **The obvious way to avoid that duplication is a trap.** Since the
+receiver already holds the raw bytes, the sender could send chunk metadata
+only and let the receiver compress its own — zstd is deterministic, so with
+the same input and level the frame is byte-identical. It is not a guarantee
+worth resting byte-identity on: output can change between zstd versions and
+build settings, and a fleet is never on one version. Ship the chunk.
+
+Smaller consequence: `follower list` reporting "at the live edge" would
+become optimistic, since caught up on chunks is not caught up on entries.
+The two would want telling apart.
+
 ## Latency puts a floor under it
 
 Only sealed chunks exist to ship, so this wire is one chunk-seal behind the
@@ -186,12 +308,19 @@ live edge (256 KB or 5 s idle, whichever comes first). The `.sap` live tail is
 replicate, records merge, transform and tail, and the two are chosen by
 latency and by whether the shape must change — not competitors.
 
-## Prerequisite (a bug today)
+## Identity across a hop (done)
 
-`import` discards a bundle's `.bark` entirely. A bundle carries `id`,
-`derived_from`, `derived_op` and the labels; the imported store comes out with
-no manifest at all, so identity and provenance do not survive the hop. Nothing
-that claims an origin can be built on that.
+A timberfs import seeds the destination's manifest from its source: the
+destination mints its own `id`, records the immediate parent as
+`derived_from`, and inherits the labels, while operational settings —
+retention, the index, the wal — stay the destination's own. Lineage is claimed
+only when exactly one source declares a manifest, since a stitched set of
+segments has no single parent to name, and a re-import never rewrites a
+manifest that already exists.
+
+This was the prerequisite: `import` used to discard the source's manifest
+entirely, so an imported store came out anonymous and nothing that cites an
+origin could be built on it.
 
 ## Validation stays a choice, not a default
 

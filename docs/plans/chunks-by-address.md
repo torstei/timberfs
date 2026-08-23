@@ -2,8 +2,8 @@
 
 **Status: design.** Two things it rests on are already true — a sealed chunk is
 immutable, and every store is already a run of a longer tape, since retention
-drops only prefixes. Sparse stores, the digest, the cache layout and discovery
-are not built.
+drops only prefixes. Sparse stores, the cache layout and discovery are not
+built; the digest is deferred and optional (see below).
 
 See also [native replication](native-replication.md) for the wire that carries
 this, and the roadmap's "Globally addressable chunks" for the addressing rules
@@ -133,19 +133,101 @@ substring scan. Sizes set the deployment shape rather than leaving it to taste
 MB) — so rings for everything and grain for hot stores is a real
 configuration, not a hypothetical one.
 
-## The prerequisite is a digest, and it is cheap
+## A corrupt chunk is not a hole
 
-Nothing checks a chunk today: there is no per-chunk checksum, and the encoder
-(`zstd::stream::encode_all`) leaves zstd's own frame checksum off, so a wrong
-or truncated frame is undetectable. `(origin_id, seq)` is a NAME rather than a
-self-verifying hash, so the bytes need their own witness. Between TRUSTED
-peers that witness is about INTEGRITY — bit rot, a truncated transfer, a buggy
-tier — and not resistance to a lying holder, so it wants xxhash or crc32c and
-no crypto. Over the COMPRESSED frame it costs no decompression, so it does not
-contradict "validation is a choice" above: that caveat is about decoding
-CONTENT, not hashing bytes. Natural home is a sidecar kind, riding the
-manifest where old readers ignore it. Worth having whatever the fetch story
-becomes.
+Three states, not two. NOT HELD — never received, or dropped — has nothing to
+retrieve. HELD BUT UNVERIFIED is different: the bytes are there, they are
+readable, and most of the content usually survives. Measured on a 1.5 MB chunk
+with one byte flipped, streaming decompression recovers what precedes the
+damage, which `zstd -dc` already writes to stdout before it errors:
+
+    damage at 25% of the frame   1,441,792 of 1,540,000 bytes   18,724 lines
+    damage at 50%                  393,216 bytes                 5,106 lines
+    damage at 90%                1,179,648 bytes                15,320 lines
+
+The recovered amounts are multiples of zstd's block size, so what survives is
+whole BLOCKS decoded before the damage — the ratio depends on where in a block
+the corruption landed, not how far through the frame. A chunk is internally
+divisible, which is the fragment model one level down.
+
+So the action on a failed check is to ROUTE AROUND, never to condemn: skip it
+in normal reads, decline to serve it onward as authoritative, prefer a peer's
+copy — while keeping the bytes and reaching them through an explicit path.
+Deleting a chunk because it failed a checksum would destroy the only copy of
+data that is 90% readable.
+
+⚠ The salvaged prefix ends mid-line, which is the same hazard as reading
+across a hole. One mechanism covers both: know where the trustworthy bytes
+stop, and terminate the partial line rather than splicing.
+
+⚠ And `coverage` as specified cannot SAY this — a run list of `(start, end)`
+expresses held-or-not and has no third value. Suspect chunks are exceptional,
+so this wants a run list plus a sparse exception list, which the framing
+already permits additively (a sidecar kind on the coverage frame, or a new
+frame kind). No codec change is needed for it; the shape is.
+
+## A digest is computed on send, not stored
+
+It was recorded here as a prerequisite with a sidecar file. It is neither. The
+case against storing it:
+
+- **Gross corruption is already loud.** One flipped bit breaks zstd's entropy
+  decoding, so `zstd -dc` and `timberfs query` both error today. A digest is
+  not what stands between an operator and silent corruption.
+- **A stored mismatch is DISAGREEMENT, not proof.** A digest sidecar is
+  derived and rebuildable, so it rots too, and nothing distinguishes a corrupt
+  chunk from a corrupt digest without a peer to break the tie.
+- **AEAD subsumes it for anyone who needs it properly.** Encrypting chunks
+  brings a mandatory per-chunk authentication tag — a cryptographic digest
+  decryption cannot skip — so the population most concerned about integrity
+  gets something strictly better for free.
+- **And the transfer case needs no storage at all.** The sender is already
+  reading those bytes in order to send them, so it hashes in the same pass and
+  puts the result in the frame's sidecar. No file, no rebase question, and no
+  corrupt-sidecar ambiguity, because nothing is kept.
+
+What that buys is not saved work — the receive path never decompresses, so
+there is no decompression for a check to come "before". It is WHEN damage is
+found: at ingest the sender still holds a good copy and a re-fetch is trivial,
+while at first read, weeks later and possibly on a downstream tier, the source
+may have dropped that chunk to retention and the loss is permanent. Retention
+is what makes finding out late expensive, not CPU. It is also the textbook
+end-to-end case: TCP's checksum is 16 bits, and corruption is as likely in the
+sender's disk read, the receiver's write or a middlebox, which no hop but the
+endpoints can see.
+
+⚠ The limit of computing on send: it certifies the TRANSFER, not the original
+write. A sender whose disk rotted hashes the corrupt bytes and the receiver
+accepts them. A digest stored when the chunk was written would catch that —
+but a pure forwarding tier never decompresses its own chunks, so it would not
+notice its own rot in any case, and the receiver finds it at first read. The
+same late-detection argument, and equally marginal.
+
+**The frame layout already permits computing it while streaming**, by luck
+rather than design: the sidecar TABLE (kind and length) sits in the prefix and
+a digest is fixed-length, so its length is known before its value is, and
+bodies follow the chunk bytes. A sender writes the header and table, streams
+the compressed bytes while hashing, then writes the digest — no buffering, no
+second pass.
+
+(One exception argues for shipping grain pages rather than digests: a receiver
+that declares `--index` and is NOT sent them must decompress every chunk to
+tokenize it. The path is decompression-free only when the sidecars it needs
+come along.)
+
+## Scrubbing is the only customer for a stored digest
+
+And it is a genuine cost argument, unlike the transfer case: hashing
+compressed bytes rather than decompressing them measured ~10x faster and 17x
+less memory traffic (238 MB plain / 14 MB compressed: 0.06 s to decompress,
+under 0.01 s to CRC), which makes a periodic archive-wide verify feasible
+where decompressing everything is not.
+
+A scrub needs a baseline recorded EARLIER to compare against, which is the one
+thing computing on send cannot provide. Since a retroactive digest certifies
+the bytes only as of the scrub anyway, the first scrub can write that baseline
+itself. So the file, if it ever exists, is a scrub artifact and not part of the
+wire.
 
 ## Discovery: ask trusted peers, then fetch from the best answer
 

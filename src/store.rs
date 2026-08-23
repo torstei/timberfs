@@ -1000,6 +1000,79 @@ impl FileStore {
         self.buffer_first_ms.map(|t| t < cutoff_ms).unwrap_or(false)
     }
 
+    /// Append ONE compressed frame that arrived from somewhere else — the
+    /// replication receive path, where the bytes come off a wire rather
+    /// than out of a file, so `append_frames`' contiguous-run-in-a-trunk
+    /// shape does not apply.
+    ///
+    /// `seq` is the numbering decision, and it enforces the invariant on
+    /// `ChunkRecord::seq`: `None` renumbers (the destination owns its
+    /// numbering and claims no origin), `Some(n)` preserves the sender's
+    /// number and is REFUSED unless it continues this store's numbering
+    /// exactly. Dense and monotone or not at all — a preserved number with
+    /// a gap under it is an address that lies, and there is no numbering
+    /// base yet to make a non-zero start legal.
+    pub fn append_wire_frame(
+        &mut self,
+        comp: &[u8],
+        uncomp_len: u64,
+        first_write_ms: u64,
+        last_write_ms: u64,
+        seq: Option<u64>,
+        cfg: &Config,
+    ) -> io::Result<()> {
+        self.flush_chunk(cfg)?;
+        if let Some(last_ms) = self.last_write_ms() {
+            if last_ms > first_write_ms {
+                return Err(invalid_input(
+                    "target already contains data newer than the incoming chunk \
+                     (would break the index time ordering)",
+                ));
+            }
+        }
+        let seq = match seq {
+            None => self.next_seq,
+            Some(n) if n == self.next_seq => n,
+            Some(n) => {
+                return Err(invalid_input(&format!(
+                    "cannot preserve chunk number {n}: this store's numbering is at \
+                     {} and a preserved number must continue it exactly (dense and \
+                     monotone), so either receive without claiming an origin or \
+                     start from a store whose numbering lines up",
+                    self.next_seq
+                )))
+            }
+        };
+        let rec = ChunkRecord {
+            uncomp_start: self.buffer_start,
+            uncomp_len,
+            comp_start: self.comp_size,
+            comp_len: comp.len() as u64,
+            first_write_ms,
+            last_write_ms,
+            seq,
+        };
+        self.trunk.write_all_at(comp, self.comp_size)?;
+        let off = RINGS_HEADER_LEN + (self.chunks.len() * RECORD_LEN) as u64;
+        self.rings.write_all_at(&rec.to_bytes(), off)?;
+        self.comp_size += rec.comp_len;
+        self.buffer_start += uncomp_len;
+        self.next_seq = seq + 1;
+        self.chunks.push(rec);
+        self.cache = None;
+        self.trunk.sync_all()?;
+        self.rings.sync_all()?;
+        // As append_frames: the frame bypassed the buffer entirely, so the
+        // sap has nothing new to record but its base headers are stale.
+        if let Some(wal) = &mut self.wal {
+            wal.refresh_base(self.comp_size, self.buffer_start)?;
+        }
+        // No header rewrite: open() takes max(header, last record + 1), so
+        // the records are authoritative for next_seq and the header is a
+        // fallback for the emptied-store case only.
+        Ok(())
+    }
+
     /// Append another timberfs file's chunks verbatim: the compressed
     /// frames are copied as-is (no recompression) and the index records
     /// are rebased into this file's offset space. Used by rotation and by

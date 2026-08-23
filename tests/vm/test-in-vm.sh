@@ -3100,6 +3100,171 @@ import_segment_merge() {
         | grep -q "event number 100"
 }
 
+frames_follower_ships_and_releases_the_head() {
+    # The whole point of a retaining follower on the native wire: retention
+    # holds the head back until the far end has it, the ack advances the
+    # cursor, and only then may the prefix go. A byte-window ack cadence
+    # starved this loop -- a quiet store was never acked, so its cursor
+    # never advanced and nothing was ever released.
+    local d=/tmp/framesfol
+    rm -rf $d; mkdir -p $d/node $d/archive $d/reg
+    export TIMBERFS_FOLLOWERS=$d/reg
+    timberfs create $d/node/src.log --set service=folwire >/dev/null 2>&1 || return 1
+    timberfs set $d/node/src.log retain_size=1M retain_unconsumed=true >/dev/null || return 1
+    local c i
+    for c in 1 2 3 4; do
+        for i in $(seq 1 200); do
+            echo "2026-06-0${c}T10:00:00Z chunk $c line $i padding padding padding"
+        done | timberfs append --into $d/node/src.log --quiet 2>/dev/null
+    done
+
+    # Nothing to release yet: with no position the follower's interest
+    # drops nothing, and the budget is deliberately generous so THIS axis
+    # is what the test exercises rather than the size backstop. (Interest
+    # is additive -- it only ever drops the consumed prefix, and a small
+    # budget would empty the store as it was written, before any of this.)
+    timberfs trim $d/node/src.log 2>&1 | grep -q "nothing to trim" || {
+        timberfs trim $d/node/src.log
+        unset TIMBERFS_FOLLOWERS
+        return 1
+    }
+
+    timberfs frames-intake --into-dir $d/archive --listen 127.0.0.1:4320 \
+        --route service --auto-create --replica >$d/intake.log 2>&1 &
+    local pid=$!
+    sleep 1
+    timberfs follower create --store $d/node/src.log ship \
+        --type frames --endpoint 127.0.0.1:4320 --retaining >/dev/null 2>&1 || {
+        kill $pid; unset TIMBERFS_FOLLOWERS; return 1
+    }
+    timeout 5 timberfs follower run ship >$d/run.log 2>&1
+    kill $pid 2>/dev/null
+    sleep 1
+
+    # The cursor holds the FAR END's acknowledged position, and the lag
+    # renders as caught up rather than decades behind (wl unset).
+    jq -e '.consumer == "frames-send" and .seq == 3 and .n == 0 and .wl > 0' \
+        $d/reg/ship/cursor.json > /dev/null || {
+        cat $d/reg/ship/cursor.json
+        unset TIMBERFS_FOLLOWERS
+        return 1
+    }
+    timberfs follower list 2>&1 | grep -q "at the live edge" || {
+        timberfs follower list
+        unset TIMBERFS_FOLLOWERS
+        return 1
+    }
+
+    # And now the shipped prefix may go: the budget is 1K, so the interest
+    # floor is what decides, and it releases everything below chunk 3.
+    timberfs trim $d/node/src.log 2>&1 | grep -q "chunks 0\.\.2" || {
+        timberfs trim $d/node/src.log
+        unset TIMBERFS_FOLLOWERS
+        return 1
+    }
+    unset TIMBERFS_FOLLOWERS
+    timberfs info $d/archive/folwire.log/folwire.log | grep -q "4 chunk(s)"
+}
+
+frames_wire_replicates_a_store_byte_for_byte() {
+    # The native wire end to end through the CLI: a store crosses a socket
+    # as compressed frames, arrives byte-identical, and its shipped token
+    # index still skips chunks on the far side. Re-running sends nothing,
+    # because the receiver's position is what the sender resumes from.
+    local d=/tmp/frames
+    rm -rf $d; mkdir -p $d/node $d/archive
+    timberfs create $d/node/src.log --index --set host=vmnode --set service=vmwire \
+        >/dev/null 2>&1 || return 1
+    local i
+    for i in $(seq 1 6); do
+        printf '2026-06-0%dT10:00:00Z wire line %d marker%04d padding padding\n' \
+            "$i" "$i" "$i" | timberfs append --into $d/node/src.log --quiet 2>/dev/null
+    done
+
+    timberfs frames-intake --into-dir $d/archive --listen 127.0.0.1:4319 \
+        --route service --auto-create --replica --index >$d/intake.log 2>&1 &
+    local pid=$!
+    sleep 1
+
+    timberfs frames-send $d/node/src.log --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "sent 6 chunk" || { cat $d/intake.log; kill $pid; return 1; }
+    sleep 1
+    # Idempotent: the receiver already holds it all.
+    timberfs frames-send $d/node/src.log --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "already has everything" || { kill $pid; return 1; }
+    sleep 1
+    kill $pid 2>/dev/null; sleep 1
+
+    local dst=$d/archive/vmwire.log/vmwire.log
+    # Byte-identical trunk AND grain -- nothing recompressed, nothing
+    # re-tokenized.
+    local ext
+    for ext in trunk grain; do
+        cmp -s "$d/node/src.log.$ext" "$dst.$ext" || {
+            echo "$ext differs" >&2
+            return 1
+        }
+    done
+    # The origin travelled and the numbering was preserved together.
+    jq -e '.origin_id == (input | .id) and .derived_op == "receive"' \
+        "$dst.bark" "$d/node/src.log.bark" > /dev/null || {
+        cat "$dst.bark"
+        return 1
+    }
+    # And the shipped index is live on the replica. The token has to be a
+    # run of 3+ alphanumerics to be indexed at all -- `unique-3` tokenizes
+    # to [unique, 3] and the digit is below MIN_TOKEN, so it would scan
+    # every chunk and prove nothing.
+    timberfs query "$dst" --has marker0003 2>&1 | grep -q "1 of 6 chunk" || {
+        timberfs query "$dst" --has marker0003
+        return 1
+    }
+}
+
+import_carries_identity_across_the_hop() {
+    # A timberfs source describes itself, so an import must not land
+    # anonymous: the destination mints its own id, records the IMMEDIATE
+    # parent as derived_from, and inherits the labels. Operational settings
+    # do NOT travel -- retention and the index are the destination's own
+    # policy, so a store received here keeps what the operator declared.
+    local d=/tmp/lineage
+    rm -rf $d; mkdir -p $d
+    timberfs create $d/src.log --index --set host=vmnode --set service=vmsvc         --set retain_size=5G >/dev/null 2>&1 || return 1
+    printf '2026-06-02T08:00:00 INFO lineage one\n'         | timberfs append --into $d/src.log --quiet 2>/dev/null || return 1
+    local src_id
+    src_id=$(jq -r .id $d/src.log.bark)
+
+    timberfs export $d/src.log --into $d/ship.timber --quiet 2>/dev/null || return 1
+    timberfs import --into $d/dst.log $d/ship.timber --quiet 2>/dev/null || return 1
+
+    # Labels and lineage arrived; identity is the destination's own; the
+    # source's retention and index declarations did not follow.
+    jq -e '.host == "vmnode" and .service == "vmsvc"
+           and .derived_op == "import"
+           and (.derived_from | type == "string")
+           and (.id | type == "string")
+           and has("retain_size") == false
+           and has("index") == false' $d/dst.log.bark > /dev/null         || { cat $d/dst.log.bark; return 1; }
+    [ "$(jq -r .id $d/dst.log.bark)" != "$src_id" ] || return 1
+
+    # A pair source names itself as the parent directly.
+    timberfs import --into $d/pair.log $d/src.log --quiet 2>/dev/null || return 1
+    [ "$(jq -r .derived_from $d/pair.log.bark)" = "$src_id" ] || return 1
+
+    # Two identified sources have no single parent, so no lineage is
+    # claimed rather than one of them guessed at.
+    timberfs create $d/src2.log --set host=vmnode2 >/dev/null 2>&1 || return 1
+    printf '2026-06-02T09:00:00 INFO lineage two\n'         | timberfs append --into $d/src2.log --quiet 2>/dev/null || return 1
+    timberfs import --into $d/multi.log $d/src.log $d/src2.log 2>&1         | grep -q "no single parent" || return 1
+    [ ! -f $d/multi.log.bark ] || return 1
+
+    # And a re-import leaves the manifest alone: it is the operator's now.
+    local before
+    before=$(jq -r .id $d/dst.log.bark)
+    timberfs import --into $d/dst.log $d/ship.timber --quiet 2>/dev/null
+    [ "$(jq -r .id $d/dst.log.bark)" = "$before" ]
+}
+
 import_leading_backfill() {
     # a file starting mid-entry (rotation cut a stack trace): head lines
     # are backfilled with the first timestamp found
@@ -3128,6 +3293,9 @@ export_bundle_roundtrip() {
 }
 
 run_test "import: shipped segment merges verbatim, idempotently" import_segment_merge
+run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
+run_test "frames wire: a store replicates over a socket byte for byte" frames_wire_replicates_a_store_byte_for_byte
+run_test "frames wire: a retaining follower ships, then the head releases" frames_follower_ships_and_releases_the_head
 grain_needle_search() {
     python3 -c "
 import datetime
