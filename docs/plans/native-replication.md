@@ -1,11 +1,14 @@
 # Native replication: frames on the wire, not entries
 
-**Status: design, with the first piece built.** The batch ancestor exists —
+**Status: design, with the first pieces built.** The batch ancestor exists —
 `timberfs export --into x.timber` writes a tar of `.rings`, `.trunk` and
-`.bark`, `import` reads it, and identity now crosses that hop (see below). The
-streaming wire, the sidecar list and the transport are not built.
+`.bark`, `import` reads it, and identity now crosses that hop. The frame codec
+is implemented in `src/frame.rs` (encode, decode, skip-what-you-do-not-know,
+and the bounds checks a length off the network needs). The serve and receive
+sides, the digest, and the transport are not built.
 
-See also [chunks by address](chunks-by-address.md), which this is the transport
+See also [chunks by address](chunks-by-address.md), which this is the
+transport
 for, and [the receiving end](receiving-end.md) for identity and routing.
 
 Shipping a store's `.trunk` frames verbatim instead of re-encoding its
@@ -25,44 +28,75 @@ and therefore chunk numbers and a `.grain` (the index is chunk-positional,
 so only an alignment-preserving transport can move it — 264 KB shipped
 versus ~1 s of rebuild per 200k entries).
 
-## The frame
+## The frame (built: `src/frame.rs`)
 
 One hello per connection, then typed frames each carrying a stream id and
 their own length — so any frame is skippable without understanding it, which
 is what serves extensibility and multiplexing with one mechanism.
 
-    connection hello (once)
+    connection hello (once)               magic "TIMBSTR1", version 1
        0..8   magic                            8 bytes
        8..12  version                          u32
       12..16  incompat_flags                   u32
 
     every frame thereafter
        0..4   stream id (0 = the only stream)  u32
-       4..8   frame type                       u32
+       4..8   frame kind                       u32
        8..12  payload length                   u32
 
-    stream-open payload
+    stream-open payload                   kind 1
        0..16  origin_id (the travelling half)  uuid
       16..32  sender's own id -> derived_from  uuid
       32..40  first seq in this stream         u64
-      40..48  last seq, or 0 = open-ended      u64
-      48..52  mode: coverage | index | frames  u32
-      52..56  sidecar count n                  u32
-      56..56+12n  n x { kind: 8 bytes, len: u32 }
+      40..48  last seq, or u64::MAX = open      u64
+      48..52  mode: 1 coverage, 2 index, 3 frames  u32
+      52..56  provenance length                u32
+      56..60  sidecar count n                  u32
+      60..60+12n  n x { kind: 8 bytes, len: u32 }
       then    provenance JSON, then each sidecar's bytes
 
-    chunk payload
+    chunk payload                         kind 2
        0..8   seq                              u64
        8..16  uncomp_len                       u64
-      16..24  comp_len                         u64
+      16..24  comp_len (TRUE size, always)     u64
       24..32  first_write_ms                   u64
       32..40  last_write_ms                    u64
       40..44  sidecar count n                  u32
       44..44+12n  n x { kind: 8 bytes, len: u32 }
-      then    comp_len bytes verbatim, then each sidecar's bytes
+      then    comp_len bytes verbatim (absent in index mode),
+              then each sidecar's bytes
 
-    ack payload
-       0..8   highest contiguous seq stored    u64
+    coverage payload                      kind 3
+       0..4   run count n                      u32
+       4..4+16n  n x { start: u64, end: u64 }  inclusive
+
+    accepted payload                      kind 4
+       0..16  registration id (server-assigned)  uuid
+      16..    coverage: what the server holds
+
+    conflict payload                      kind 5
+       0..16  holder origin_id                 uuid
+      16..    coverage of the holder, then a u32-prefixed reason
+
+Two corrections the implementation forced, both cases of the written layout
+being undecodable rather than merely awkward:
+
+**`last_seq` uses `u64::MAX`, not 0, for open-ended.** Zero is a legitimate
+last seq — a stream carrying only chunk 0 — so the sentinel had to move.
+
+**A `provenance length` field was missing.** With variable-length sidecar
+bodies *and* variable-length provenance, nothing said where the provenance
+ended; the two were undecidable from each other. Every length now sits in the
+fixed prefix, which is the property the whole design leans on.
+
+There is no separate ack frame: an ack is a `coverage` frame, since a
+contiguous receiver acking a store it holds to 424242 is sending one run —
+the degenerate case of the same answer rather than a second kind.
+
+Per-chunk cost is 12 bytes of header plus 44 of fixed fields, so 0.2% on the
+measured mean frame size of 25,919 bytes, and 12 bytes per sidecar beyond
+that. Asserted by a test, because a field added carelessly is invisible until
+it is on every chunk.
 
 ## Offsets never travel
 
@@ -156,7 +190,8 @@ why the wire carries `origin_id` and the sender's `id` (the destination's
 labels for routing, while the receiver keeps its own retention and index
 policy. Operational settings are the receiving tier's business.
 
-## Transport: multiple streams per connection in the protocol, 1:1 on the wire first
+## Transport: multiple streams per connection in the protocol, 1:1 on the wire
+first
 
 The stream identity lives in the frame, not the connection: a `stream-open`
 frame binds a small stream id that every chunk and ack frame carries, so
