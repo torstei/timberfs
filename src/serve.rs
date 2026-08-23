@@ -62,6 +62,10 @@ pub struct Served {
     /// hidden: the stream is short by this many, which the receiver sees
     /// as a gap and the operator should see as a number.
     pub raced_away: u64,
+    /// The highest chunk actually sent, and its write window's end. Handed
+    /// back so a caller needing that write time does not re-read the rings
+    /// to find what it just had in hand.
+    pub last_sent: Option<(u64, u64)>,
 }
 
 /// Group a store's chunk numbers into runs, both ends inclusive. Today a
@@ -202,6 +206,7 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
         out.write_all(&buf)?;
         stats.frames += 1;
         stats.chunks += 1;
+        stats.last_sent = Some((c.seq, c.last_write_ms));
     }
     Ok(stats)
 }

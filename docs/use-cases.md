@@ -206,6 +206,27 @@ timber-otlp --follow --cursor /var/lib/timberfs/edge.cursor \
 Plaintext HTTP only: loopback or a private network, or terminate TLS in a
 collector beside it.
 
+**When both ends are timberfs, there is a shorter path.** OTLP's virtue is that
+it is not ours — a Collector, a vendor tier or a queue can sit in the middle.
+The cost is re-encoding: the edge decompresses and encodes per entry, the centre
+decodes and compresses again, to move data that was zstd at both ends. The
+native wire skips all of it and copies the compressed chunks:
+
+```sh
+# on the central host
+timberfs frames-intake --into-dir /var/log/timberfs --route service     --replica --index --auto-create
+
+# on each edge host
+timberfs frames-send backing/app.log --endpoint central:4319
+```
+
+Nothing is decompressed at either end, so the central store is byte-identical —
+`.grain` included, so a `--has` lookup there skips chunks exactly as it does at
+the edge. With `--replica` the centre also keeps the edge's chunk numbers and
+records its origin, so a chunk answers to the same address on both hosts. Only
+another timberfs can be on the far end, and only *sealed* chunks ship, so the
+centre trails the edge by one chunk flush.
+
 Register the shipper as a **retaining follower** and the edge store stops being
 a hoard. It gets run by name, with no flags of its own, and its position holds
 the head back:
@@ -215,6 +236,11 @@ timberfs follower create central --store backing/app.log \
     --endpoint http://central:4318 --retaining --enable --start -- --compress gzip
 timberfs set backing/app.log retain_size=20G retain_unconsumed=true
 ```
+
+The same shape carries the native wire — `--type frames --endpoint central:4319`
+— and there it takes no `--start` at all: a frames sender resumes from the
+*receiver's* position, so there is no local decision about where to begin and no
+way to re-ship a store by getting one wrong.
 
 Now the two requirements that hold at once on an edge box are both satisfied.
 Keep as little log data there as possible — a breach reaches less of it, and
@@ -232,6 +258,12 @@ needs **push-only** credentials, which is what `rsync`-with-a-hold cannot offer:
 deriving the hold by comparing against the destination means the edge needs read
 access to the archive, i.e. a breached frontend holding a key to wherever the
 data went.
+
+One caveat about *when* that release happens: retention runs inside a live
+writer, so a store whose producer has gone quiet keeps its data until something
+prompts it. `timberfs trim` is that prompt, and on an edge box it belongs on a
+timer — otherwise "shipped off promptly" holds only while the application is
+still talking.
 
 `retain_size` is still required, and is now the disconnection budget outright:
 size it as ingest-rate × the outage worth surviving. When it overrides the

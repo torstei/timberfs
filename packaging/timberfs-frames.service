@@ -1,0 +1,33 @@
+# Receives the native replication wire: compressed chunks land verbatim, so
+# the store here is byte-identical to its source. Routes by a LABEL, like
+# the other intakes.
+#
+# --replica keeps the sender's chunk numbering and records its origin, so
+# (origin_id, seq) names the same bytes at both ends. Omit it and the
+# destination renumbers and claims no origin — weaker, but always possible.
+#
+# --auto-create is deliberately absent: an undeclared stream is refused and
+# said so, as the other intakes do. Add it when senders should be allowed to
+# mint stores here.
+#
+#   systemctl edit timberfs-frames.service
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/bin/timberfs frames-intake --into-dir /var/log/timberfs \
+#         --route service --replica --index --auto-create --exit-on-upgrade
+[Unit]
+Description=timberfs native replication intake
+Documentation=https://github.com/torstei/timberfs
+Requires=timberfs-frames.socket
+After=timberfs-frames.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/timberfs frames-intake --into-dir /var/log/timberfs --replica --exit-on-upgrade
+StandardOutput=journal
+StandardError=journal
+LogsDirectory=timberfs
+Restart=always
+RestartSec=1
+SuccessExitStatus=85
+RestartForceExitStatus=85

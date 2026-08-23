@@ -37,6 +37,11 @@ pub const WINDOW_BYTES: u64 = 8 << 20;
 #[derive(Debug, Clone)]
 pub struct IntakeOpts {
     pub listen: String,
+    /// Exit cleanly when this binary is replaced on disk, so a supervised
+    /// run re-execs into the new one. The same contract as the other
+    /// intakes: exit code 85, paired with `RestartForceExitStatus` in the
+    /// unit.
+    pub exit_on_upgrade: bool,
     pub into_dir: PathBuf,
     /// Which label names the store, as in the other intakes.
     pub route: String,
@@ -67,11 +72,25 @@ fn send(out: &mut impl Write, stream: u32, f: Frame) -> anyhow::Result<()> {
 
 /// Listen and receive, one thread per connection.
 pub fn cmd_intake(opts: &IntakeOpts) -> anyhow::Result<()> {
-    let listener =
-        TcpListener::bind(&opts.listen).with_context(|| format!("binding {}", opts.listen))?;
+    // Socket activation when systemd handed us the listener, as the other
+    // intakes do: the unit then owns the address and the port is bound
+    // before the first sender can miss it.
+    let listener = match crate::intake::socket_activated_listener() {
+        Some(l) => l,
+        None => TcpListener::bind(&opts.listen)
+            .with_context(|| format!("binding frames-intake listener on {}", opts.listen))?,
+    };
+    let watch = if opts.exit_on_upgrade {
+        crate::store::BinaryWatch::current()
+    } else {
+        None
+    };
     crate::note!(
         "timberfs: frames intake listening on {} -> {} (route {}, {})",
-        opts.listen,
+        listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| opts.listen.clone()),
         opts.into_dir.display(),
         opts.route,
         if opts.replica { "replica" } else { "copy" }
@@ -79,6 +98,12 @@ pub fn cmd_intake(opts: &IntakeOpts) -> anyhow::Result<()> {
     std::fs::create_dir_all(&opts.into_dir)
         .with_context(|| format!("creating {}", opts.into_dir.display()))?;
     for conn in listener.incoming() {
+        // Checked between connections rather than mid-stream: a receive in
+        // flight finishes, and the sender reconnects to the new binary.
+        if watch.as_ref().is_some_and(|w| w.changed()) {
+            crate::note!("timberfs: frames intake: binary replaced; exiting to re-exec");
+            std::process::exit(crate::store::EXIT_BINARY_UPGRADED);
+        }
         let stream = match conn {
             Ok(s) => s,
             Err(e) => {
@@ -362,6 +387,7 @@ pub fn cmd_send(store: &Path, opts: &SendOpts) -> anyhow::Result<Sent> {
         .max(opts.first_seq);
     let skipped = resume.saturating_sub(opts.first_seq);
 
+    let mut last_sent: Option<(u64, u64)> = None;
     let mut out = Sent {
         chunks: 0,
         comp_bytes: 0,
@@ -399,6 +425,9 @@ pub fn cmd_send(store: &Path, opts: &SendOpts) -> anyhow::Result<Sent> {
             out.chunks += served.chunks;
             out.comp_bytes += served.comp_bytes;
             resume += served.chunks + served.raced_away;
+            if let Some(sent) = served.last_sent {
+                last_sent = Some(sent);
+            }
         }
         if !opts.follow {
             break;
@@ -407,13 +436,29 @@ pub fn cmd_send(store: &Path, opts: &SendOpts) -> anyhow::Result<Sent> {
         // `retain_unconsumed` reads to know what has left this box — the
         // RECEIVER's position, not our own idea of progress, so nothing
         // is dropped locally until it is durably elsewhere.
-        if let Some(runs) = poll_ack(&mut r)? {
-            out.acked = runs;
-            if let Some(path) = &opts.cursor {
-                write_cursor(path, store, &out.acked, out.chunks)?;
+        //
+        // DRAIN the acks before writing: they arrive one per chunk, and
+        // writing per ack made the cursor the most expensive thing in the
+        // loop. One write per pass says the same thing to both of its
+        // readers, neither of which needs per-chunk precision.
+        let mut acked = None;
+        while let Some(runs) = poll_ack(&mut r)? {
+            acked = Some(runs);
+        }
+        match acked {
+            Some(runs) => {
+                out.acked = runs;
+                if let Some(path) = &opts.cursor {
+                    write_cursor(
+                        path,
+                        store,
+                        &out.acked,
+                        out.chunks,
+                        wl_for(&out.acked, last_sent),
+                    )?;
+                }
             }
-        } else {
-            thread::sleep(opts.poll);
+            None => thread::sleep(opts.poll),
         }
     }
 
@@ -426,9 +471,27 @@ pub fn cmd_send(store: &Path, opts: &SendOpts) -> anyhow::Result<Sent> {
         }
     }
     if let Some(path) = &opts.cursor {
-        write_cursor(path, store, &out.acked, out.chunks)?;
+        write_cursor(
+            path,
+            store,
+            &out.acked,
+            out.chunks,
+            wl_for(&out.acked, last_sent),
+        )?;
     }
     Ok(out)
+}
+
+/// The acked chunk's write time, but only when the acknowledgement has
+/// caught up with what was sent — that is the one chunk whose window this
+/// sender still has in hand. Behind that, `None` leaves the recorded value
+/// alone rather than overstating it with a newer chunk's time.
+fn wl_for(acked: &[Run], last_sent: Option<(u64, u64)>) -> Option<u64> {
+    let last_acked = acked.iter().map(|r| r.end).max()?;
+    match last_sent {
+        Some((seq, wl)) if seq == last_acked => Some(wl),
+        _ => None,
+    }
 }
 
 /// One pending ack, if the far end has sent one. The socket's read timeout
@@ -471,9 +534,22 @@ fn poll_ack<R: std::io::Read>(r: &mut Reader<R>) -> anyhow::Result<Option<Vec<Ru
 /// treats `seq >= next_seq` as a hand-edit that pins the whole store, so a
 /// caught-up sender must stay one below. That over-retains by exactly one
 /// chunk — the harmless direction, and interest is additive anyway.
-fn write_cursor(path: &Path, store: &Path, acked: &[Run], delivered: u64) -> anyhow::Result<()> {
+///
+/// `wl` is the acked chunk's write time when the caller knows it, and is
+/// informational: `follower list` renders lag from it, so leaving it at 0
+/// reads as decades behind. Deliberately a PARAMETER rather than something
+/// looked up here — finding it meant parsing the whole `.rings`, once per
+/// ack, which is quadratic over a run and reads 560 KB per chunk shipped on
+/// a 10,000-chunk store, all for a display column.
+fn write_cursor(
+    path: &Path,
+    store: &Path,
+    acked: &[Run],
+    delivered: u64,
+    wl: Option<u64>,
+) -> anyhow::Result<bool> {
     let Some(last) = acked.iter().map(|r| r.end).max() else {
-        return Ok(()); // nothing acknowledged yet: no position to record
+        return Ok(false); // nothing acknowledged yet: no position to record
     };
     let (dir, name) = crate::query::resolve_backing(store)?;
     let anchor = crate::cursor::store_anchor(&dir, &name, crate::bark::load(&dir, &name).as_ref());
@@ -482,20 +558,19 @@ fn write_cursor(path: &Path, store: &Path, acked: &[Run], delivered: u64) -> any
         .unwrap_or_else(|| {
             crate::cursor::Cursor::new("frames-send", &anchor, &store.display().to_string())
         });
+    if c.seq == Some(last) && c.delivered == delivered {
+        return Ok(false); // unchanged: no write, so a quiet loop is quiet
+    }
     c.store = anchor;
     c.path = store.display().to_string();
     c.seq = Some(last);
     c.n = 0;
     c.delivered = delivered;
-    // Informational, but `follower list` renders lag from it: left at 0 it
-    // reads as decades behind. The write time of the last acked chunk is
-    // the honest value — the far end holds everything up to there.
-    if let Ok(records) = crate::format::read_index(&crate::format::rings_path(&dir, &name)) {
-        if let Some(rec) = records.iter().find(|r| r.seq == last) {
-            c.wl = rec.last_write_ms;
-        }
+    if let Some(wl) = wl {
+        c.wl = wl;
     }
-    c.save(path)
+    c.save(path)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -571,6 +646,7 @@ mod tests {
             replica,
             index: false,
             wal: false,
+            exit_on_upgrade: false,
         }
     }
 
@@ -785,6 +861,47 @@ mod tests {
         // Anchored by the store's IDENTITY, so a moved store still matches.
         let bark = crate::bark::load(d.path(), "src.log").unwrap();
         assert_eq!(c.store, bark.get("id").unwrap().as_str().unwrap());
+    }
+
+    #[test]
+    fn an_unchanged_position_is_not_rewritten() {
+        // Acks arrive one per chunk, so writing on every one made the
+        // cursor the most expensive thing in the loop. A write that would
+        // say what the file already says is skipped.
+        let d = TempDir::new();
+        let src = a_store(d.path(), "src", 3, "svc");
+        let cur = d.path().join("cursor.json");
+        let runs = vec![Run { start: 0, end: 2 }];
+        assert!(
+            write_cursor(&cur, &src, &runs, 3, Some(1_002)).unwrap(),
+            "the first write happens"
+        );
+        assert!(
+            !write_cursor(&cur, &src, &runs, 3, Some(1_002)).unwrap(),
+            "the same position is not written again"
+        );
+        assert!(
+            write_cursor(&cur, &src, &[Run { start: 0, end: 2 }], 4, Some(1_002)).unwrap(),
+            "a changed delivered count is a change"
+        );
+    }
+
+    #[test]
+    fn the_write_time_comes_from_the_frame_not_from_the_rings() {
+        // Finding it in the .rings meant parsing the whole file, once per
+        // ack -- quadratic over a run. It is only supplied when the ack has
+        // caught up with what was sent, which is the one chunk whose window
+        // the sender still has in hand.
+        assert_eq!(
+            wl_for(&[Run { start: 0, end: 4 }], Some((4, 9_999))),
+            Some(9_999)
+        );
+        // The ack is behind what was sent: no value rather than a newer
+        // chunk's time, which would overstate the position.
+        assert_eq!(wl_for(&[Run { start: 0, end: 2 }], Some((4, 9_999))), None);
+        // Nothing sent this pass, or nothing acked at all.
+        assert_eq!(wl_for(&[Run { start: 0, end: 2 }], None), None);
+        assert_eq!(wl_for(&[], Some((4, 9_999))), None);
     }
 
     #[test]

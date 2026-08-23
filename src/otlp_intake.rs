@@ -398,8 +398,9 @@ fn handle_export(
             if let Err(e) = intake::ensure_store(
                 &mut g,
                 &name,
-                &format!("undeclared stream {route:?}"),
+                &format!("stream {route:?}"),
                 opts.auto_create,
+                &route,
                 |dir, name| seed_bark(dir, name, &batch.resource, opts),
             ) {
                 if g.refused.insert(name.clone()) {

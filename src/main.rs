@@ -536,7 +536,8 @@ enum Command {
     /// receiver's position rather than guessing, or why it is refused. The
     /// verb name is provisional.
     FramesIntake {
-        /// Address to listen on
+        /// Address to listen on (systemd socket activation on fd 3 is used
+        /// instead when LISTEN_PID/LISTEN_FDS name this process)
         #[arg(long, default_value = "127.0.0.1:4319")]
         listen: String,
         /// Backing directory: one store per stream
@@ -563,6 +564,11 @@ enum Command {
         /// Declare the write-ahead sidecar on stores this receiver creates
         #[arg(long)]
         wal: bool,
+        /// Exit for a clean re-exec when this binary is upgraded on disk
+        /// (dpkg replaces it). Only for supervised runs: the unit sets it
+        /// and pairs it with RestartForceExitStatus
+        #[arg(long)]
+        exit_on_upgrade: bool,
     },
     /// Ship a store over the native replication wire. Sends what the
     /// receiver says it lacks, so re-running is a no-op rather than a
@@ -1173,6 +1179,7 @@ fn main() -> anyhow::Result<()> {
             replica,
             index,
             wal,
+            exit_on_upgrade,
         } => timberfs::frames::cmd_intake(&timberfs::frames::IntakeOpts {
             listen,
             into_dir,
@@ -1181,6 +1188,7 @@ fn main() -> anyhow::Result<()> {
             replica,
             index,
             wal,
+            exit_on_upgrade,
         })?,
         Command::FramesSend {
             store,
@@ -1268,6 +1276,75 @@ mod cli_tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// Every subcommand must appear in the man page. Documentation drift
+    /// is invisible to every other check: `forward-intake` and
+    /// `otlp-intake` were each shipped before this existed, and only an
+    /// audit found whether they were covered.
+    #[test]
+    fn every_subcommand_is_in_the_man_page() {
+        let man = include_str!("../packaging/timberfs.1");
+        let heads: Vec<String> = man
+            .lines()
+            .filter_map(|l| l.strip_prefix(".SS "))
+            .map(|h| h.replace("\\-", "-").trim().to_string())
+            .collect();
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            if name == "help" {
+                continue;
+            }
+            assert!(
+                heads.iter().any(|h| h == name),
+                "`{name}` has no `.SS {name}` in packaging/timberfs.1"
+            );
+        }
+    }
+
+    /// Every subcommand must be reachable from the prose docs too, not
+    /// only the man page. The failures this catches are ABSENCES: a
+    /// capability that landed and never reached a surface, which is how
+    /// `frames-send` came to be missing from the deployment guide and the
+    /// use cases while working fine. A drift check over commands that ARE
+    /// documented would not have seen any of it.
+    ///
+    /// Omissions are allowed but must be stated here, so leaving one out
+    /// is a decision somebody made rather than something nobody noticed.
+    #[test]
+    fn every_subcommand_reaches_the_prose_docs() {
+        // (surface, subcommands deliberately absent, and why)
+        let surfaces: &[(&str, &[(&str, &str)])] = &[
+            (
+                include_str!("../README.md"),
+                &[(
+                    "reindex",
+                    "maintenance verb; the README sends readers to man timberfs for those",
+                )],
+            ),
+            (include_str!("../docs/deployment.md"), &[]),
+            (
+                include_str!("../docs/use-cases.md"),
+                &[(
+                    "reindex",
+                    "a use case is a why, not a verb list; rebuilding an index is neither",
+                )],
+            ),
+        ];
+        for (text, allowed) in surfaces {
+            for sub in Cli::command().get_subcommands() {
+                let name = sub.get_name();
+                if name == "help" || allowed.iter().any(|(a, _)| *a == name) {
+                    continue;
+                }
+                assert!(
+                    text.contains(name),
+                    "`{name}` appears in no command block or prose of one of the \
+                     documentation surfaces. Document it, or add it to that \
+                     surface's allowlist with a reason."
+                );
+            }
+        }
     }
 
     /// Every subcommand needs a description. A doc comment that ends up

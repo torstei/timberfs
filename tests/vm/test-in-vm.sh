@@ -3166,6 +3166,204 @@ frames_follower_ships_and_releases_the_head() {
     timberfs info $d/archive/folwire.log/folwire.log | grep -q "4 chunk(s)"
 }
 
+frames_fleet_two_nodes_one_archive() {
+    # The COMPOSED story, which no per-verb test covers: two hosts, each
+    # with two logs, replicating into one archive. Every verb below is
+    # tested on its own elsewhere; what this asserts is that the setup an
+    # operator actually performs produces the right four stores -- and
+    # what happens when the routing is wrong, which is the mistake the
+    # shape invites.
+    local d=/tmp/framesfleet
+    rm -rf $d; mkdir -p $d/apache01 $d/apache02 $d/archive-a $d/archive-b
+    local h s i
+    for h in apache01 apache02; do
+        for s in apache-error apache-access; do
+            timberfs create $d/$h/$s.log --index \
+                --set host=$h --set service=$s --set stream=$h.$s >/dev/null 2>&1 || return 1
+            for i in 1 2 3; do
+                printf '2026-06-0%dT10:00:00Z %s %s entry %d tok%s%04d\n' \
+                    "$i" "$h" "$s" "$i" "${h#apache}" "$i" \
+                    | timberfs append --into $d/$h/$s.log --quiet 2>/dev/null
+            done
+        done
+    done
+
+    # ROUTING ON `service` IS THE MISTAKE: both hosts call their error log
+    # apache-error, so both route to one store. The first lands; the second
+    # is refused and NAMES the origin already there, which is the whole
+    # point of one-store-one-origin.
+    #
+    # Without that check the failure is quiet in either of two ways, and
+    # measured with the guard disabled it is the second: apache02 is told
+    # the archive "already has everything" -- because its own chunks 0..2
+    # match the coverage apache01 established -- so its logs silently ship
+    # NOWHERE. Where the numbering does not line up they merge instead, and
+    # the manifest then describes only one of the two hosts.
+    timberfs frames-intake --into-dir $d/archive-a --listen 127.0.0.1:4330 \
+        --route service --auto-create --replica >$d/a.log 2>&1 &
+    local pid_a=$!
+    sleep 1
+    timberfs frames-send $d/apache01/apache-error.log --endpoint 127.0.0.1:4330 2>&1 \
+        | grep -q "sent 3 chunk" || { kill $pid_a; cat $d/a.log; return 1; }
+    sleep 1
+    timberfs frames-send $d/apache02/apache-error.log --endpoint 127.0.0.1:4330 2>&1 \
+        | grep -q "one store" || {
+        timberfs frames-send $d/apache02/apache-error.log --endpoint 127.0.0.1:4330
+        kill $pid_a
+        return 1
+    }
+    kill $pid_a 2>/dev/null
+    sleep 1
+    # apache01's data only: the refusal wrote nothing.
+    timberfs query $d/archive-a/apache-error.log/apache-error.log 2>/dev/null \
+        | grep -q apache02 && { echo "apache02 data leaked in" >&2; return 1; }
+
+    # THE WORKING SHAPE: route on a label whose value is unique per stream.
+    timberfs frames-intake --into-dir $d/archive-b --listen 127.0.0.1:4331 \
+        --route stream --auto-create --replica --index >$d/b.log 2>&1 &
+    local pid_b=$!
+    sleep 1
+    for h in apache01 apache02; do
+        for s in apache-error apache-access; do
+            timberfs frames-send $d/$h/$s.log --endpoint 127.0.0.1:4331 2>&1 \
+                | grep -q "sent 3 chunk" || { kill $pid_b; cat $d/b.log; return 1; }
+            sleep 0.3
+        done
+    done
+    kill $pid_b 2>/dev/null
+    sleep 1
+
+    # Four stores, each byte-identical, each still saying which host it is
+    # -- the label travelled, the settings did not.
+    local n=0
+    for h in apache01 apache02; do
+        for s in apache-error apache-access; do
+            local dst=$d/archive-b/$h.$s.log/$h.$s.log
+            cmp -s $d/$h/$s.log.trunk $dst.trunk || {
+                echo "$h.$s trunk differs" >&2
+                return 1
+            }
+            jq -e --arg h "$h" --arg s "$s" \
+                '.host == $h and .service == $s and has("origin_id")' $dst.bark >/dev/null || {
+                cat $dst.bark
+                return 1
+            }
+            n=$((n + 1))
+        done
+    done
+    [ "$n" = 4 ] || return 1
+    # And the archive lists exactly those four.
+    [ "$(timberfs list $d/archive-b --names 2>/dev/null | wc -l)" = 4 ] || {
+        timberfs list $d/archive-b
+        return 1
+    }
+    # The shipped index works on the far side, per host.
+    timberfs query $d/archive-b/apache02.apache-error.log/apache02.apache-error.log \
+        --has tok020002 2>&1 | grep -q "1 of 3 chunk" || {
+        timberfs query $d/archive-b/apache02.apache-error.log/apache02.apache-error.log --has tok020002
+        return 1
+    }
+    rm -rf $d
+}
+
+FRAMES_UNIT_SRC=/tmp/framesunit/src.log
+
+frames_unit_installed() {
+    # A wrong asset path in Cargo.toml only shows up in the built package,
+    # which is what this VM installs. The man page is checked too, since a
+    # unit nobody can find documented is half-shipped.
+    test -f /lib/systemd/system/timberfs-frames.socket \
+        && test -f /lib/systemd/system/timberfs-frames.service \
+        && grep -q 'ListenStream=127.0.0.1:4319' \
+            /lib/systemd/system/timberfs-frames.socket \
+        && grep -q 'timberfs frames-intake' /lib/systemd/system/timberfs-frames.service \
+        && grep -q 'RestartForceExitStatus=85' /lib/systemd/system/timberfs-frames.service \
+        && zcat /usr/share/man/man1/timberfs.1.gz | tr -d ' \n' \
+            | grep -q 'timberfs\\-frames.socket'
+}
+
+frames_unit_socket_activates() {
+    # The SHIPPED unit, started by systemd rather than by hand: every other
+    # unit family is exercised this way, and a unit file that has only been
+    # parsed has never been proven to start.
+    rm -rf /tmp/framesunit; mkdir -p /tmp/framesunit
+    systemd-tmpfiles --create
+    systemctl enable --now timberfs-frames.socket || return 1
+    # Socket-activated, so the service is not running until something
+    # connects -- that is the point of the pair.
+    systemctl --quiet is-active timberfs-frames.socket || return 1
+    ! systemctl --quiet is-active timberfs-frames.service || return 1
+
+    timberfs create $FRAMES_UNIT_SRC --index --set service=unitwire >/dev/null 2>&1 || return 1
+    local i
+    for i in 1 2 3; do
+        printf '2026-06-0%dT10:00:00Z unit line %d marker%04d padding\n' "$i" "$i" "$i" \
+            | timberfs append --into $FRAMES_UNIT_SRC --quiet 2>/dev/null
+    done
+
+    # The shipped unit has no --auto-create, so an undeclared stream is
+    # refused -- and the sender is TOLD, which is what the handshake buys.
+    timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "refused the stream" || {
+        timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319
+        return 1
+    }
+    # ...and the connection activated the service even so.
+    systemctl --quiet is-active timberfs-frames.service
+}
+
+frames_unit_replicates_into_a_declared_store() {
+    # The operator provisions the destination; the sender's retry lands.
+    # The shipped unit passes --replica, so this is a replica: same bytes,
+    # same numbering, origin recorded.
+    timberfs create --wal /var/log/timberfs/unitwire.log/unitwire.log >/dev/null 2>&1 || return 1
+    timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "sent 3 chunk" || {
+        timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319
+        journalctl -u timberfs-frames.service -n 20 --no-pager
+        return 1
+    }
+    sleep 1
+    local dst=/var/log/timberfs/unitwire.log/unitwire.log
+    cmp -s $FRAMES_UNIT_SRC.trunk $dst.trunk || {
+        echo "trunk differs" >&2
+        return 1
+    }
+    # --replica means the origin travelled and the numbering was preserved.
+    jq -e '.origin_id == (input | .id)' $dst.bark $FRAMES_UNIT_SRC.bark >/dev/null || {
+        cat $dst.bark
+        return 1
+    }
+    # Re-running is a no-op: the receiver's position is authoritative.
+    timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "already has everything"
+}
+
+frames_unit_survives_a_restart() {
+    # Socket activation means the address stays bound across a service
+    # restart, so a sender that reconnects is not refused -- which is what
+    # --exit-on-upgrade relies on when dpkg replaces the binary.
+    systemctl restart timberfs-frames.service || return 1
+    sleep 1
+    printf '2026-06-09T10:00:00Z unit line after restart marker9999\n' \
+        | timberfs append --into $FRAMES_UNIT_SRC --quiet 2>/dev/null
+    timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "sent 1 chunk" || {
+        timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319
+        journalctl -u timberfs-frames.service -n 20 --no-pager
+        return 1
+    }
+    sleep 1
+    cmp -s $FRAMES_UNIT_SRC.trunk /var/log/timberfs/unitwire.log/unitwire.log.trunk
+}
+
+frames_unit_teardown() {
+    systemctl disable --now timberfs-frames.socket >/dev/null 2>&1
+    systemctl stop timberfs-frames.service >/dev/null 2>&1
+    rm -rf /tmp/framesunit /var/log/timberfs/unitwire.log
+    true
+}
+
 frames_wire_replicates_a_store_byte_for_byte() {
     # The native wire end to end through the CLI: a store crosses a socket
     # as compressed frames, arrives byte-identical, and its shipped token
@@ -3296,6 +3494,12 @@ run_test "import: shipped segment merges verbatim, idempotently" import_segment_
 run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
 run_test "frames wire: a store replicates over a socket byte for byte" frames_wire_replicates_a_store_byte_for_byte
 run_test "frames wire: a retaining follower ships, then the head releases" frames_follower_ships_and_releases_the_head
+run_test "frames fleet: two nodes, one archive, and the routing mistake" frames_fleet_two_nodes_one_archive
+run_test "frames unit: installed by the package, and documented" frames_unit_installed
+run_test "frames unit: socket activates, undeclared stream refused" frames_unit_socket_activates
+run_test "frames unit: replicates into a declared store" frames_unit_replicates_into_a_declared_store
+run_test "frames unit: the socket outlives a service restart" frames_unit_survives_a_restart
+run_test "frames unit: teardown" frames_unit_teardown
 grain_needle_search() {
     python3 -c "
 import datetime
