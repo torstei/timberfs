@@ -226,6 +226,44 @@ TLS ready-made, at the cost of an async runtime and a TLS stack in a tree that
 today has neither and serves with blocking `TcpListener` plus `thread::spawn`;
 that is a dependency-posture decision, not a free win (see "OTLP gaps").
 
+## The frames cursor is a cache, and is named like a position
+
+Built, and worth revisiting. `frames-send --cursor` writes what the far end
+has acknowledged, and the sender NEVER READS IT to decide where to start:
+`first_seq` is always 0 and the resume point comes from the receiver's
+`accepted` answer. So for the thing a cursor is normally for — resumption —
+it is dead weight.
+
+It does have two consumers, and both need state that is local, synchronous
+and available offline, so something has to persist: the retention interest
+floor (`min(seq)` over retaining followers, computed inside a live writer
+on every flush, which cannot make a network call) and `follower list`'s
+POSITION and LAG columns.
+
+**But it is a CACHE, not a cursor, and that distinction is load-bearing.**
+Lose an OTLP cursor and `--start` decides, so a store is re-shipped whole
+or skipped to the end. Lose a frames cursor and nothing happens: the next
+connect re-learns the position from the receiver, and the only cost is
+slightly conservative retention until the first ack. It may be stale,
+absent or hand-deleted with no consequence.
+
+⚠ **The naming is the hazard.** Calling it a cursor, storing it in
+`cursor.json` and typing it as `Cursor` all invite a future reader to
+"simplify" by resuming from it — reintroducing exactly the re-send that
+making the receiver authoritative was for. That regression would look like
+a cleanup. It wants a name that cannot be mistaken for a position.
+
+⚠ **And it is written far too eagerly.** `write_cursor` reads the manifest,
+reads the cursor, calls `format::read_index` — which parses the WHOLE rings
+file — and then writes, all to record one chunk's write time for a column
+an operator glances at. Since acks became per-chunk, shipping N chunks in
+follow mode does N full rings reads: 56 bytes a record, so a 10,000-chunk
+store reads and parses 560 KB per chunk shipped, quadratic in the run. The
+rings read is avoidable outright — the write window is already in the frame
+that was just sent — and the interest floor does not need per-chunk
+precision anyway, so throttling the write to a flush boundary or every N
+chunks would be indistinguishable to both consumers.
+
 ## A WAL frame would lift the latency floor, at a price
 
 Not needed yet, and worth writing down because the constraint is
