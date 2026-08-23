@@ -253,16 +253,19 @@ absent or hand-deleted with no consequence.
 making the receiver authoritative was for. That regression would look like
 a cleanup. It wants a name that cannot be mistaken for a position.
 
-⚠ **And it is written far too eagerly.** `write_cursor` reads the manifest,
-reads the cursor, calls `format::read_index` — which parses the WHOLE rings
-file — and then writes, all to record one chunk's write time for a column
-an operator glances at. Since acks became per-chunk, shipping N chunks in
-follow mode does N full rings reads: 56 bytes a record, so a 10,000-chunk
-store reads and parses 560 KB per chunk shipped, quadratic in the run. The
-rings read is avoidable outright — the write window is already in the frame
-that was just sent — and the interest floor does not need per-chunk
-precision anyway, so throttling the write to a flush boundary or every N
-chunks would be indistinguishable to both consumers.
+**It used to be written far too eagerly (fixed).** `write_cursor` read the
+manifest, read the cursor, called `format::read_index` — parsing the WHOLE
+rings file — and wrote, all to record one chunk's write time for a display
+column. With acks arriving per chunk that was N full rings reads to ship N
+chunks: 56 bytes a record, so 560 KB parsed per chunk shipped on a
+10,000-chunk store, quadratic over a run. Two changes, and neither costs
+accuracy: `serve` hands back the highest chunk it sent with its write
+window, so the value comes from the frame instead of the rings; and the
+loop DRAINS pending acks and writes once per pass rather than once per ack,
+skipping the write entirely when it would say what the file already says.
+The write time is supplied only when the acknowledgement has caught up with
+what was sent — behind that, the previous value stands rather than being
+overstated by a newer chunk's time.
 
 ## A WAL frame would lift the latency floor, at a price
 
