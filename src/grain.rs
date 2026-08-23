@@ -312,6 +312,39 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Does a grain header from elsewhere describe the tokenizer THIS build
+/// uses? Parameters live in bytes 8..12 (case folding, MIN_TOKEN,
+/// MAX_TOKEN, K) and a page built under different ones, read under ours,
+/// gives FALSE NEGATIVES — the single answer a search index must never
+/// give. So a mismatch means "do not adopt", and the destination rebuilds.
+pub fn header_matches(bytes: &[u8]) -> bool {
+    if bytes.len() < HEADER_LEN {
+        return false;
+    }
+    let known = &bytes[..8] == GRAIN_MAGIC || &bytes[..8] == GRAIN_MAGIC_V2;
+    known && bytes[8..12] == header_bytes(HEADER_LEN)[8..12]
+}
+
+/// Adopt one filter page computed elsewhere as the next chunk's record.
+/// The caller has just appended the corresponding chunk, so position and
+/// chunk index stay in step — which is the grain's whole indexing scheme.
+///
+/// Best-effort like the rest of the sidecar: a grain that cannot be
+/// extended is removed and the next `extend_grain` rebuilds it.
+pub fn append_page(dir: &Path, name: &str, page: &[u8]) -> anyhow::Result<()> {
+    let gpath = format::grain_path(dir, name);
+    let mut buf = match fs::read(&gpath) {
+        Ok(b) if first_record_offset(&b).is_some() => b,
+        _ => header_bytes(HEADER_LEN).to_vec(),
+    };
+    buf.extend_from_slice(&(page.len() as u32).to_le_bytes());
+    buf.extend_from_slice(page);
+    let tmp = gpath.with_extension("grain.tmp");
+    fs::write(&tmp, &buf).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &gpath).with_context(|| format!("renaming onto {}", gpath.display()))?;
+    Ok(())
+}
+
 /// Drop the first `k` chunks' filters, after retention has cut the same
 /// `k` chunks off the head of the store.
 ///

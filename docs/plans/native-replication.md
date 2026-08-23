@@ -4,11 +4,14 @@
 `timberfs export --into x.timber` writes a tar of `.rings`, `.trunk` and
 `.bark`, `import` reads it, and identity now crosses that hop. The frame codec
 is implemented in `src/frame.rs` (encode, decode, skip-what-you-do-not-know,
-and the bounds checks a length off the network needs), and the SERVE side in
+and the bounds checks a length off the network needs), the SERVE side in
 `src/serve.rs` — a store read out as `coverage`, `index` or `frames`, reusing
 `query`'s seqlock guard and shipping `.grain` pages as the first real sidecar
-kind. The receive side and the transport are not built; the digest is
-deferred (see chunks-by-address.md).
+kind — and the RECEIVE side in `src/receive.rs`, which turns a stream back
+into a store, byte-identically, either as a replica (origin and numbering
+preserved together) or a copy (neither). What is left is the TRANSPORT: a
+socket, the registration handshake and `follower --type frames`. The digest
+is deferred (see chunks-by-address.md).
 
 See also [chunks by address](chunks-by-address.md), which this is the
 transport
