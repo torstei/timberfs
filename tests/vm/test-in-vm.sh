@@ -3100,6 +3100,61 @@ import_segment_merge() {
         | grep -q "event number 100"
 }
 
+frames_wire_replicates_a_store_byte_for_byte() {
+    # The native wire end to end through the CLI: a store crosses a socket
+    # as compressed frames, arrives byte-identical, and its shipped token
+    # index still skips chunks on the far side. Re-running sends nothing,
+    # because the receiver's position is what the sender resumes from.
+    local d=/tmp/frames
+    rm -rf $d; mkdir -p $d/node $d/archive
+    timberfs create $d/node/src.log --index --set host=vmnode --set service=vmwire \
+        >/dev/null 2>&1 || return 1
+    local i
+    for i in $(seq 1 6); do
+        printf '2026-06-0%dT10:00:00Z wire line %d marker%04d padding padding\n' \
+            "$i" "$i" "$i" | timberfs append --into $d/node/src.log --quiet 2>/dev/null
+    done
+
+    timberfs frames-intake --into-dir $d/archive --listen 127.0.0.1:4319 \
+        --route service --auto-create --replica --index >$d/intake.log 2>&1 &
+    local pid=$!
+    sleep 1
+
+    timberfs frames-send $d/node/src.log --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "sent 6 chunk" || { cat $d/intake.log; kill $pid; return 1; }
+    sleep 1
+    # Idempotent: the receiver already holds it all.
+    timberfs frames-send $d/node/src.log --endpoint 127.0.0.1:4319 2>&1 \
+        | grep -q "already has everything" || { kill $pid; return 1; }
+    sleep 1
+    kill $pid 2>/dev/null; sleep 1
+
+    local dst=$d/archive/vmwire.log/vmwire.log
+    # Byte-identical trunk AND grain -- nothing recompressed, nothing
+    # re-tokenized.
+    local ext
+    for ext in trunk grain; do
+        cmp -s "$d/node/src.log.$ext" "$dst.$ext" || {
+            echo "$ext differs" >&2
+            return 1
+        }
+    done
+    # The origin travelled and the numbering was preserved together.
+    jq -e '.origin_id == (input | .id) and .derived_op == "receive"' \
+        "$dst.bark" "$d/node/src.log.bark" > /dev/null || {
+        cat "$dst.bark"
+        return 1
+    }
+    # And the shipped index is live on the replica. The token has to be a
+    # run of 3+ alphanumerics to be indexed at all -- `unique-3` tokenizes
+    # to [unique, 3] and the digit is below MIN_TOKEN, so it would scan
+    # every chunk and prove nothing.
+    timberfs query "$dst" --has marker0003 2>&1 | grep -q "1 of 6 chunk" || {
+        timberfs query "$dst" --has marker0003
+        return 1
+    }
+}
+
 import_carries_identity_across_the_hop() {
     # A timberfs source describes itself, so an import must not land
     # anonymous: the destination mints its own id, records the IMMEDIATE
@@ -3173,6 +3228,7 @@ export_bundle_roundtrip() {
 
 run_test "import: shipped segment merges verbatim, idempotently" import_segment_merge
 run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
+run_test "frames wire: a store replicates over a socket byte for byte" frames_wire_replicates_a_store_byte_for_byte
 grain_needle_search() {
     python3 -c "
 import datetime

@@ -15,6 +15,7 @@ pub mod forest;
 pub mod format;
 pub mod forward;
 pub mod frame;
+pub mod frames;
 pub mod fs;
 pub mod grain;
 pub mod grep;

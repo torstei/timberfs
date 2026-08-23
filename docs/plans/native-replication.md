@@ -9,9 +9,14 @@ and the bounds checks a length off the network needs), the SERVE side in
 `query`'s seqlock guard and shipping `.grain` pages as the first real sidecar
 kind — and the RECEIVE side in `src/receive.rs`, which turns a stream back
 into a store, byte-identically, either as a replica (origin and numbering
-preserved together) or a copy (neither). What is left is the TRANSPORT: a
-socket, the registration handshake and `follower --type frames`. The digest
-is deferred (see chunks-by-address.md).
+preserved together) or a copy (neither). The TRANSPORT is built too, in
+`src/frames.rs`: `timberfs frames-intake` and `timberfs frames-send`, with the
+registration handshake — a sender resumes from the receiver's position rather
+than a cursor of its own, and a colliding origin is refused at setup naming
+the holder. What is left is `follower --type frames` (so shipping is a
+registered, supervised follower rather than a command), multiplexing, and the
+receiving end's naming policy. The digest is deferred (see
+chunks-by-address.md).
 
 See also [chunks by address](chunks-by-address.md), which this is the
 transport

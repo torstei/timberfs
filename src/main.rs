@@ -529,6 +529,57 @@ enum Command {
         #[arg(long)]
         exit_on_upgrade: bool,
     },
+    /// Receive the native replication wire: compressed chunks move
+    /// verbatim, so nothing is decompressed at either end and the
+    /// destination is byte-identical to its source. Answers a handshake
+    /// first — what it already holds, so a sender resumes from the
+    /// receiver's position rather than guessing, or why it is refused. The
+    /// verb name is provisional.
+    FramesIntake {
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:4319")]
+        listen: String,
+        /// Backing directory: one store per stream
+        #[arg(long = "into-dir", value_name = "DIR")]
+        into_dir: PathBuf,
+        /// The label whose value names the store
+        #[arg(long, default_value = "service", value_name = "LABEL")]
+        route: String,
+        /// Create a store for a never-seen stream. Default: refuse it and
+        /// say so, as the other intakes do
+        #[arg(long)]
+        auto_create: bool,
+        /// Keep the sender's chunk numbering and record its origin, making
+        /// this a replica whose `(origin, seq)` addresses match the
+        /// source's. Refused when the numbering would not continue
+        /// exactly; without it the destination renumbers and claims no
+        /// origin, which is weaker but always possible
+        #[arg(long)]
+        replica: bool,
+        /// Declare and maintain the token index on stores this receiver
+        /// creates. Its own policy: settings never travel, only labels
+        #[arg(long)]
+        index: bool,
+        /// Declare the write-ahead sidecar on stores this receiver creates
+        #[arg(long)]
+        wal: bool,
+    },
+    /// Ship a store over the native replication wire. Sends what the
+    /// receiver says it lacks, so re-running is a no-op rather than a
+    /// re-send. The verb name is provisional.
+    FramesSend {
+        /// The store to ship
+        store: PathBuf,
+        /// host:port of a `frames-intake`
+        #[arg(long, value_name = "ADDR")]
+        endpoint: String,
+        /// Ship no sidecars, so the receiver rebuilds its own index
+        #[arg(long)]
+        no_sidecars: bool,
+        /// Socket read/write timeout
+        #[arg(long, default_value = "30s", value_name = "DUR")]
+        timeout: String,
+    },
     /// Receive OTLP/HTTP logs — the OpenTelemetry wire protocol every SDK
     /// and the Collector speak — writing each stream into its own store
     /// under --into-dir. Answers 200 only after the batch is fsynced, and
@@ -1100,6 +1151,58 @@ fn main() -> anyhow::Result<()> {
                 exit_on_upgrade,
             )?;
         }
+        Command::FramesIntake {
+            listen,
+            into_dir,
+            route,
+            auto_create,
+            replica,
+            index,
+            wal,
+        } => timberfs::frames::cmd_intake(&timberfs::frames::IntakeOpts {
+            listen,
+            into_dir,
+            route,
+            auto_create,
+            replica,
+            index,
+            wal,
+        })?,
+        Command::FramesSend {
+            store,
+            endpoint,
+            no_sidecars,
+            timeout,
+        } => {
+            let sent = timberfs::frames::cmd_send(
+                &store,
+                &timberfs::frames::SendOpts {
+                    endpoint: endpoint.clone(),
+                    first_seq: 0,
+                    sidecars: !no_sidecars,
+                    timeout: std::time::Duration::from_millis(timberfs::append::parse_duration_ms(
+                        &timeout,
+                    )?),
+                },
+            )?;
+            if sent.chunks == 0 {
+                timberfs::note!("timberfs: {endpoint} already has everything; nothing sent");
+            } else {
+                timberfs::note!(
+                    "timberfs: sent {} chunk(s), {} to {endpoint}{}",
+                    sent.chunks,
+                    timberfs::rotate::human_bytes(sent.comp_bytes),
+                    if sent.skipped_already_held > 0 {
+                        format!(
+                            " (resumed at {}, which it already held)",
+                            sent.skipped_already_held
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
         Command::OtlpIntake {
             listen,
             into_dir,
@@ -1128,4 +1231,36 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Clap validates the command tree only when one is built, so a
+    /// duplicated name or a doc comment attached to the wrong variant
+    /// panics at STARTUP and no amount of library testing sees it. This
+    /// test is that check, and it costs microseconds.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// Every subcommand needs a description. A doc comment that ends up
+    /// attached to the wrong variant leaves its own blank, which `--help`
+    /// shows and nothing else does — `info` shipped that way once.
+    #[test]
+    fn every_subcommand_describes_itself() {
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            if name == "help" {
+                continue;
+            }
+            assert!(
+                sub.get_about().is_some_and(|a| !a.to_string().is_empty()),
+                "`{name}` has no description"
+            );
+        }
+    }
 }

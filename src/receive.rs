@@ -70,7 +70,7 @@ pub struct Received {
 
 /// A buffered frame reader. `decode` works on a slice and says "not yet",
 /// so this only has to keep reading until it stops saying that.
-struct Reader<R> {
+pub struct Reader<R> {
     src: R,
     buf: Vec<u8>,
     at: usize,
@@ -78,7 +78,7 @@ struct Reader<R> {
 }
 
 impl<R: Read> Reader<R> {
-    fn new(src: R) -> Self {
+    pub fn new(src: R) -> Self {
         Reader {
             src,
             buf: Vec::new(),
@@ -110,7 +110,7 @@ impl<R: Read> Reader<R> {
         Ok(true)
     }
 
-    fn next_frame(&mut self) -> anyhow::Result<Option<Framed>> {
+    pub fn next_frame(&mut self) -> anyhow::Result<Option<Framed>> {
         loop {
             match frame::decode(&self.buf[self.at..])? {
                 Some((f, used)) => {
@@ -135,7 +135,7 @@ impl<R: Read> Reader<R> {
         }
     }
 
-    fn read_hello(&mut self) -> anyhow::Result<()> {
+    pub fn read_hello(&mut self) -> anyhow::Result<()> {
         loop {
             match frame::decode_hello(&self.buf[self.at..])? {
                 Some((_, used)) => {
@@ -153,108 +153,157 @@ impl<R: Read> Reader<R> {
 }
 
 /// Consume a stream into `dest`, creating it if absent.
-pub fn receive(
-    dest: &Path,
-    src: impl Read,
-    opts: &ReceiveOpts,
-    cfg: &crate::store::Config,
-) -> anyhow::Result<Received> {
-    let mut r = Reader::new(src);
-    r.read_hello()?;
+/// What the far end's `stream-open` said. Split out so a transport can
+/// answer the handshake between the open and the chunks — a pipe cannot,
+/// which is why `receive` exists as well.
+#[derive(Debug, Clone)]
+pub struct Opening {
+    pub origin_id: [u8; 16],
+    pub sender_id: [u8; 16],
+    pub provenance: Vec<u8>,
+    pub sidecars: Vec<crate::frame::Sidecar>,
+}
 
-    let Some(first) = r.next_frame()? else {
-        bail!("stream carried a hello and nothing else");
-    };
-    let Frame::StreamOpen {
-        origin_id,
-        sender_id,
-        provenance,
-        sidecars: open_sidecars,
-        ..
-    } = first.frame
-    else {
-        bail!("a stream must open with stream-open, describing what follows");
-    };
+impl Opening {
+    /// The store's labels, or an empty map when it declared none.
+    pub fn labels(&self) -> serde_json::Map<String, serde_json::Value> {
+        if self.provenance.is_empty() {
+            return serde_json::Map::new();
+        }
+        serde_json::from_slice(&self.provenance).unwrap_or_default()
+    }
+}
 
-    let (dir, name) = crate::query::resolve_backing(dest)?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating backing directory {}", dir.display()))?;
-    let existed = crate::format::rings_path(&dir, &name).exists();
-    let mut out = Received {
-        store: dest.to_path_buf(),
-        created: !existed,
-        chunks: 0,
-        comp_bytes: 0,
-        runs: Vec::new(),
-        sidecars_declined: 0,
-        sidecars_adopted: 0,
-        frames_skipped: 0,
-    };
+/// A destination being written by one stream. Holds the writer locks for
+/// its whole life, so a second stream for the same store is refused by the
+/// lock rather than by racing it.
+pub struct Session {
+    dir: PathBuf,
+    name: String,
+    st: crate::store::Store,
+    cfg: crate::store::Config,
+    numbering: Numbering,
+    adopt_pages: bool,
+    out: Received,
+    _dir_lock: std::fs::File,
+    _file_lock: std::fs::File,
+}
 
-    // One destination store, one origin. The check is here because this is
-    // where an origin is claimed; without it a reinstall or a renamed host
-    // silently appends a second tape to the first, and the manifest then
-    // names only one of them.
-    if opts.numbering == Numbering::Preserve {
-        if let Some(bark) = crate::bark::load(&dir, &name) {
-            if let Some(held) = bark
-                .get("origin_id")
-                .and_then(|v| v.as_str())
-                .and_then(frame::uuid_bytes)
-            {
-                if held != origin_id {
-                    bail!(
-                        "{}: holds origin {} and the stream carries {} — one store, \
-                         one origin. Receive into a different store, or without \
-                         claiming an origin",
-                        dest.display(),
-                        frame::uuid_string(&held),
-                        frame::uuid_string(&origin_id)
-                    );
+impl Session {
+    /// Validate the opening against `dest` and take the locks. Refuses
+    /// before creating anything, so a rejected stream leaves no trace.
+    pub fn open(
+        dest: &Path,
+        open: &Opening,
+        opts: &ReceiveOpts,
+        cfg: &crate::store::Config,
+    ) -> anyhow::Result<Session> {
+        let (dir, name) = crate::query::resolve_backing(dest)?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating backing directory {}", dir.display()))?;
+        let existed = crate::format::rings_path(&dir, &name).exists();
+
+        // One destination store, one origin. Checked here because this is
+        // where an origin is claimed; without it a reinstall or a renamed
+        // host silently appends a second tape to the first, and the
+        // manifest then names only one of them.
+        if opts.numbering == Numbering::Preserve {
+            if let Some(bark) = crate::bark::load(&dir, &name) {
+                if let Some(held) = bark
+                    .get("origin_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(frame::uuid_bytes)
+                {
+                    if held != open.origin_id {
+                        bail!(
+                            "{}: holds origin {} and the stream carries {} — one store, \
+                             one origin. Receive into a different store, or without \
+                             claiming an origin",
+                            dest.display(),
+                            frame::uuid_string(&held),
+                            frame::uuid_string(&open.origin_id)
+                        );
+                    }
                 }
             }
         }
-    }
 
-    let _dir_lock = match crate::store::lock_backing_shared(&dir)? {
-        Some(l) => l,
-        None => bail!(
-            "backing directory {} is served by a timberfs mount; unmount first",
-            dir.display()
-        ),
-    };
-    let _file_lock = match crate::store::lock_file_exclusive(&dir, &name)? {
-        Some(f) => f,
-        None => bail!("{name} already has a writer"),
-    };
+        let dir_lock = match crate::store::lock_backing_shared(&dir)? {
+            Some(l) => l,
+            None => bail!(
+                "backing directory {} is served by a timberfs mount; unmount first",
+                dir.display()
+            ),
+        };
+        let file_lock = match crate::store::lock_file_exclusive(&dir, &name)? {
+            Some(f) => f,
+            None => bail!("{name} already has a writer"),
+        };
 
-    let mut st = crate::store::Store {
-        dir: dir.clone(),
-        cfg: *cfg,
-        files: std::collections::BTreeMap::new(),
-    };
-    st.create(&name)?;
-
-    if !existed {
-        seed_manifest(&dir, &name, origin_id, sender_id, &provenance, opts)?;
-    }
-
-    // The sender's grain parameters, if it offered them: pages are adopted
-    // only when the tokenizer matches, since a filter read under different
-    // constants gives false negatives.
-    let mut adopt_pages = false;
-    for s in &open_sidecars {
-        if s.kind == crate::frame::Sidecar::tag(crate::serve::GRAIN_TAG)
-            && crate::grain::header_matches(&s.bytes)
-        {
-            adopt_pages = crate::bark::index_declared(&dir, &name);
-        } else {
-            out.sidecars_declined += 1;
+        let mut st = crate::store::Store {
+            dir: dir.clone(),
+            cfg: *cfg,
+            files: std::collections::BTreeMap::new(),
+        };
+        st.create(&name)?;
+        if !existed {
+            seed_manifest(
+                &dir,
+                &name,
+                open.origin_id,
+                open.sender_id,
+                &open.provenance,
+                opts,
+            )?;
         }
+
+        // The sender's grain parameters, if offered: pages are adopted only
+        // when the tokenizer matches, since a filter read under different
+        // constants gives false negatives.
+        let mut adopt_pages = false;
+        let mut declined = 0u64;
+        for s in &open.sidecars {
+            if s.kind == crate::frame::Sidecar::tag(crate::serve::GRAIN_TAG)
+                && crate::grain::header_matches(&s.bytes)
+            {
+                adopt_pages = crate::bark::index_declared(&dir, &name);
+            } else {
+                declined += 1;
+            }
+        }
+
+        Ok(Session {
+            out: Received {
+                store: dest.to_path_buf(),
+                created: !existed,
+                chunks: 0,
+                comp_bytes: 0,
+                runs: Vec::new(),
+                sidecars_declined: declined,
+                sidecars_adopted: 0,
+                frames_skipped: 0,
+            },
+            dir,
+            name,
+            st,
+            cfg: *cfg,
+            numbering: opts.numbering,
+            adopt_pages,
+            _dir_lock: dir_lock,
+            _file_lock: file_lock,
+        })
     }
 
-    while let Some(f) = r.next_frame()? {
-        match f.frame {
+    /// What this destination holds now — the ack, and a coverage answer.
+    pub fn coverage(&self) -> Vec<Run> {
+        let file = self.st.files.get(&self.name).expect("created in open");
+        crate::serve::runs_of(file.chunks.iter().map(|c| c.seq))
+    }
+
+    /// Apply one frame. Returns false for a frame that ends the stream
+    /// (there is none yet) so a transport loop reads uniformly.
+    pub fn apply(&mut self, f: Frame) -> anyhow::Result<()> {
+        match f {
             Frame::Chunk {
                 seq,
                 uncomp_len,
@@ -276,50 +325,111 @@ pub fn receive(
                         bytes.len()
                     );
                 }
-                let file = st.files.get_mut(&name).expect("created above");
+                let cfg = self.cfg;
+                let file = self.st.files.get_mut(&self.name).expect("created in open");
                 file.append_wire_frame(
                     &bytes,
                     uncomp_len,
                     first_write_ms,
                     last_write_ms,
-                    match opts.numbering {
+                    match self.numbering {
                         Numbering::Preserve => Some(seq),
                         Numbering::Renumber => None,
                     },
-                    cfg,
+                    &cfg,
                 )
-                .with_context(|| format!("appending chunk {seq} to {name}"))?;
-                out.chunks += 1;
-                out.comp_bytes += comp_len;
-
+                .with_context(|| format!("appending chunk {seq} to {}", self.name))?;
+                self.out.chunks += 1;
+                self.out.comp_bytes += comp_len;
                 for s in &sidecars {
-                    if adopt_pages && s.kind == crate::frame::Sidecar::tag(crate::serve::GRAIN_TAG)
+                    if self.adopt_pages
+                        && s.kind == crate::frame::Sidecar::tag(crate::serve::GRAIN_TAG)
                     {
-                        crate::grain::append_page(&dir, &name, &s.bytes)?;
-                        out.sidecars_adopted += 1;
+                        crate::grain::append_page(&self.dir, &self.name, &s.bytes)?;
+                        self.out.sidecars_adopted += 1;
                     } else {
-                        out.sidecars_declined += 1;
+                        self.out.sidecars_declined += 1;
                     }
                 }
             }
-            // A coverage frame from the far end is information, not
-            // instruction: what it holds does not change what we store.
+            // Coverage from the far end is information, not instruction.
             Frame::Coverage { .. } => {}
-            Frame::Unknown { .. } => out.frames_skipped += 1,
+            Frame::Unknown { .. } => self.out.frames_skipped += 1,
             other => bail!("unexpected {other:?} in a replication stream"),
         }
+        Ok(())
     }
 
-    let file = st.files.get(&name).expect("created above");
-    out.runs = crate::serve::runs_of(file.chunks.iter().map(|c| c.seq));
-    drop(st);
-
-    // A grain declared but not adopted is rebuilt rather than left short,
-    // so the destination's index is whole either way.
-    if crate::bark::index_declared(&dir, &name) && out.sidecars_adopted == 0 && out.chunks > 0 {
-        crate::grain::extend_grain(&dir, &name)?;
+    pub fn finish(mut self) -> anyhow::Result<Received> {
+        self.out.runs = self.coverage();
+        let (dir, name) = (self.dir.clone(), self.name.clone());
+        let adopted = self.out.sidecars_adopted;
+        let chunks = self.out.chunks;
+        let out = std::mem::replace(
+            &mut self.out,
+            Received {
+                store: PathBuf::new(),
+                created: false,
+                chunks: 0,
+                comp_bytes: 0,
+                runs: Vec::new(),
+                sidecars_declined: 0,
+                sidecars_adopted: 0,
+                frames_skipped: 0,
+            },
+        );
+        drop(self);
+        // A grain declared but not adopted is rebuilt rather than left
+        // short, so the destination's index is whole either way.
+        if crate::bark::index_declared(&dir, &name) && adopted == 0 && chunks > 0 {
+            crate::grain::extend_grain(&dir, &name)?;
+        }
+        Ok(out)
     }
-    Ok(out)
+}
+
+/// Consume a whole stream from `src` into `dest` — the pipe case, with no
+/// handshake. A transport drives a `Session` directly instead.
+pub fn receive(
+    dest: &Path,
+    src: impl Read,
+    opts: &ReceiveOpts,
+    cfg: &crate::store::Config,
+) -> anyhow::Result<Received> {
+    let mut r = Reader::new(src);
+    r.read_hello()?;
+    let (open, _) = read_opening(&mut r)?;
+    let mut session = Session::open(dest, &open, opts, cfg)?;
+    while let Some(f) = r.next_frame()? {
+        session.apply(f.frame)?;
+    }
+    session.finish()
+}
+
+/// Read the stream's opening frame.
+pub fn read_opening<R: Read>(r: &mut Reader<R>) -> anyhow::Result<(Opening, u32)> {
+    let Some(first) = r.next_frame()? else {
+        bail!("stream carried a hello and nothing else");
+    };
+    let stream = first.stream;
+    match first.frame {
+        Frame::StreamOpen {
+            origin_id,
+            sender_id,
+            provenance,
+            sidecars,
+            ..
+        } => Ok((
+            Opening {
+                origin_id,
+                sender_id,
+                provenance,
+                sidecars,
+            },
+            stream,
+        )),
+        other => bail!("a stream must open with stream-open, not {other:?}"),
+    }
 }
 
 /// The destination's manifest: its OWN identity, the sender as its
