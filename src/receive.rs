@@ -262,6 +262,23 @@ impl Session {
                 &open.provenance,
                 opts,
             )?;
+        } else if opts.numbering == Numbering::Preserve {
+            // A store the operator pre-created keeps its manifest — the
+            // OTLP intake makes the same promise, and overwriting a
+            // declaration is not a receiver's business. But the ORIGIN is
+            // not provenance, it is the address: without it `--replica`
+            // preserves the numbering and silently records nothing, so
+            // `(origin_id, seq)` does not apply and the one-store-one-origin
+            // guard has nothing to compare against.
+            //
+            // Only into a store with no chunks, per the rule already
+            // established for adopting a numbering: a store that has
+            // written something has bytes an origin claim would
+            // misattribute, and only a never-written one is eligible.
+            let empty = st.files.get(&name).is_some_and(|f| f.chunks.is_empty());
+            if empty {
+                claim_origin(&dir, &name, open.origin_id, open.sender_id)?;
+            }
         }
 
         // The sender's grain parameters, if offered: pages are adopted only
@@ -437,6 +454,36 @@ pub fn read_opening<R: Read>(r: &mut Reader<R>) -> anyhow::Result<(Opening, u32)
         )),
         other => bail!("a stream must open with stream-open, not {other:?}"),
     }
+}
+
+/// Record the origin on a store that already had a manifest but no origin,
+/// leaving everything the operator declared alone. Absent keys only: this
+/// adds an address, it does not restate provenance.
+fn claim_origin(
+    dir: &Path,
+    name: &str,
+    origin_id: [u8; 16],
+    sender_id: [u8; 16],
+) -> anyhow::Result<()> {
+    if origin_id == [0u8; 16] {
+        return Ok(());
+    }
+    let mut map = crate::bark::load(dir, name).unwrap_or_default();
+    if map.contains_key("origin_id") {
+        return Ok(());
+    }
+    map.insert(
+        "origin_id".to_string(),
+        serde_json::Value::String(frame::uuid_string(&origin_id)),
+    );
+    map.entry("derived_op")
+        .or_insert_with(|| serde_json::Value::String("receive".to_string()));
+    if sender_id != [0u8; 16] {
+        map.entry("derived_from")
+            .or_insert_with(|| serde_json::Value::String(frame::uuid_string(&sender_id)));
+    }
+    crate::bark::save(dir, name, &map)?;
+    Ok(())
 }
 
 /// The destination's manifest: its OWN identity, the sender as its
@@ -646,6 +693,60 @@ mod tests {
         let db = crate::bark::load(d.path(), "copy.log").unwrap();
         assert!(!db.contains_key("origin_id"), "{db:?}");
         assert!(db.contains_key("derived_from"), "lineage still travels");
+    }
+
+    #[test]
+    fn a_pre_created_store_still_gets_the_origin_recorded() {
+        // `--replica` preserved the numbering but recorded no origin when
+        // the operator had pre-created the destination, so the address did
+        // not apply and the one-store-one-origin guard had nothing to
+        // compare. The manifest the operator wrote is otherwise untouched.
+        let d = TempDir::new();
+        let src = a_store(d.path(), "src", 3, false);
+        let dst = d.path().join("declared.log");
+        crate::bark::cmd_create(&dst, false, true, None, None, false, &[], false).unwrap();
+        let before = crate::bark::load(d.path(), "declared.log").unwrap();
+
+        let opts = ReceiveOpts {
+            numbering: Numbering::Preserve,
+            ..Default::default()
+        };
+        receive(&dst, &wire(&src, Mode::Frames)[..], &opts, &cfg()).unwrap();
+
+        let sb = crate::bark::load(d.path(), "src.log").unwrap();
+        let db = crate::bark::load(d.path(), "declared.log").unwrap();
+        assert_eq!(db.get("origin_id").unwrap(), sb.get("id").unwrap());
+        // The operator's own declarations survive, id included.
+        assert_eq!(db.get("id"), before.get("id"));
+        assert_eq!(db.get("wal"), before.get("wal"));
+        // Labels are NOT added: a pre-created manifest is the operator's,
+        // which is the promise the OTLP intake makes too.
+        assert!(!db.contains_key("service"), "{db:?}");
+
+        // And the guard now engages, which was the point.
+        let other = a_store(d.path(), "other", 1, false);
+        let err = receive(&dst, &wire(&other, Mode::Frames)[..], &opts, &cfg())
+            .expect_err("a second origin must be refused");
+        assert!(format!("{err:#}").contains("one store"), "{err:#}");
+    }
+
+    #[test]
+    fn a_store_that_already_holds_chunks_is_not_claimed() {
+        // Only a never-written store may adopt an origin: one that has
+        // written something has bytes an origin claim would misattribute.
+        let d = TempDir::new();
+        let src = a_store(d.path(), "src", 2, false);
+        let dst = a_store(d.path(), "used", 2, false);
+        let opts = ReceiveOpts {
+            numbering: Numbering::Preserve,
+            ..Default::default()
+        };
+        // Its numbering is at 2, and the stream starts at 0, so the frames
+        // are refused anyway -- but the manifest must not have been
+        // claimed on the way to that refusal.
+        let _ = receive(&dst, &wire(&src, Mode::Frames)[..], &opts, &cfg());
+        let db = crate::bark::load(d.path(), "used.log").unwrap();
+        assert!(!db.contains_key("origin_id"), "{db:?}");
     }
 
     #[test]
