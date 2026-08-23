@@ -35,6 +35,20 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .I SOURCE
 .I DEST
 .br
+.B timberfs frames\-intake
+.B \-\-into\-dir
+.I DIR
+.RB [ \-\-replica ]
+.RB [ \-\-auto\-create ]
+.br
+.B timberfs frames\-send
+.I STORE
+.B \-\-endpoint
+.I ADDR
+.RB [ \-\-follow ]
+.RB [ \-\-cursor
+.IR PATH ]
+.br
 .B timberfs query
 .RB [ \-\-from
 .IR TIME ]
@@ -581,6 +595,19 @@ second). A chunk closes on whichever comes first, that age or
 .B \-\-chunk\-size
 (256 KiB of uncompressed data), plus once at exit. Waits for a source that does not exist yet rather than failing,
 so a unit may start before its producer.
+.PP
+.B Identity crosses the hop.
+Importing FROM a timberfs source (a pair or a bundle) seeds the
+destination's manifest from it: the destination mints its own
+.IR id ,
+records the source as
+.IR derived_from ,
+and inherits its LABELS \(em while retention, the index and the wal stay
+the destination's own, since settings are not provenance. Lineage is
+claimed only when exactly one source declares a manifest: a stitched set
+of segments from several stores has no single parent, so the import says so
+and proceeds without one. A re-import never rewrites a manifest that
+already exists.
 .SS export
 .B timberfs export
 .I SOURCE
@@ -1087,7 +1114,18 @@ move, and a path can come to hold a different store.
 What runs it.
 .B otlp
 (the default) execs
-.BR timber\-otlp (1).
+.BR timber\-otlp (1),
+shipping ENTRIES over OTLP to anything that speaks it.
+.B frames
+execs
+.B timberfs frames\-send
+instead, shipping CHUNKS verbatim to a
+.B frames\-intake
+\(em see REPLICATION. A frames follower takes no
+.BR \-\-start :
+it resumes from the RECEIVER's position, which is authoritative, so there
+is no local decision about where to begin and no way to re-ship a store by
+getting one wrong.
 .TP
 .BI \-\-endpoint " URL"
 Where it ships to. Promoted out of
@@ -1403,6 +1441,64 @@ Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
 unit sets it.
 .PP
 The verb name is provisional.
+.SS frames\-intake
+Receive the native replication wire: compressed chunks land in the
+destination's
+.I .trunk
+VERBATIM and a record in its
+.IR .rings ,
+so nothing is decompressed at either end and the store is byte-identical
+to its source. One store per stream under
+.BR \-\-into\-dir ,
+named by
+.B \-\-route
+as the other intakes name theirs. Blocking, one thread per connection, no
+TLS \(em a private network or a tunnel.
+.TP
+.BI \-\-listen " ADDR"
+Default
+.BR 127.0.0.1:4319 .
+.TP
+.B \-\-replica
+Keep the sender's chunk NUMBERING and record its origin, so
+.RI ( origin_id ", " seq )
+names the same bytes at both ends. Refused when the numbering would not
+continue exactly \(em see REPLICATION. Without it the destination
+renumbers and claims no origin, which is weaker and always possible.
+.TP
+.B \-\-auto\-create
+Create a store for a never-seen stream. Default: refuse it and say so,
+as the other intakes do.
+.TP
+.BR \-\-index ", " \-\-wal
+The receiving store's OWN policy. Settings never travel; only labels do.
+.SS frames\-send
+Ship a store over the same wire. Sends what the receiver says it LACKS, so
+re-running is a no-op rather than a re-send \(em the receiver's position
+is authoritative and a sender keeps none of its own.
+.TP
+.BI \-\-endpoint " ADDR"
+host:port of a
+.BR frames\-intake .
+.TP
+.BR \-f ", " \-\-follow
+Keep shipping as chunks seal, on the same connection. What a registered
+.B \-\-type frames
+follower runs.
+.TP
+.BI \-\-cursor " PATH"
+Record what the far end has ACKNOWLEDGED, so
+.B retain_unconsumed
+knows what has left this box. Not a resume point: the receiver's coverage
+is what a resume reads.
+.TP
+.B \-\-no\-sidecars
+Ship no
+.I .grain
+pages, leaving the receiver to rebuild its own index. Shipping them is the
+default because otherwise a receiver that maintains a token index must
+decompress every chunk to re-tokenize what the sender already computed.
+
 .SH WHAT A STORE HAS DROPPED
 A store records what has LEFT it over its whole life: how many chunks, and
 how many bytes both compressed and not.
@@ -1740,6 +1836,74 @@ Either alone holds nothing back, and
 .B follower status
 says which case it is looking at rather than letting a declared interest
 read as an enforced one.
+.SH REPLICATION
+Two wires carry a store to another host, and they answer different
+questions.
+.B ENTRIES
+over OTLP
+.RB ( timber\-otlp (1),
+a
+.B \-\-type otlp
+follower) go to anything that speaks the protocol, and can be filtered,
+merged and re-windowed on the way.
+.B FRAMES
+over the native wire
+.RB ( frames\-send ,
+a
+.B \-\-type frames
+follower) go only to another timberfs, and go VERBATIM: the compressed
+frames are copied, so nothing is decompressed at either end and the
+destination's
+.I .trunk
+is byte-identical to the source's. Measured on 200k apache entries, the
+bytes on the wire are a wash against gzipped OTLP while the CPU is not
+\(em and that work lands on the machine serving production traffic.
+.PP
+.B A replica or a copy, and the difference is the numbering.
+With
+.B \-\-replica
+the destination keeps the sender's chunk numbers and records its
+.IR origin_id ,
+so
+.RI ( origin_id ", " seq )
+names the same bytes at both ends. That is refused unless the numbering
+continues EXACTLY: a preserved number with a gap under it is an address
+that lies, so a stream beginning mid-tape says so rather than leaving one.
+Without it the destination renumbers and claims no origin \(em always
+possible, and weaker, since neither the address nor the evidence of a gap
+survives. The two travel together or not at all.
+.PP
+.B Identity is the destination's own.
+It mints its own
+.IR id ,
+records the sender as
+.IR derived_from ,
+and takes the sender's LABELS \(em while retention, the index and the wal
+stay its own policy. Settings never travel.
+.PP
+.B One destination store, one origin.
+A second origin into a store that already holds one is refused, naming
+both. Without that a host reinstall, or two hosts sharing a short
+hostname, silently appends a second tape to the first while the manifest
+describes only one of them.
+.PP
+.B The handshake is what this has over a pipe.
+A sender opens by saying what it is about to send; the receiver answers
+with what it ALREADY HOLDS, so the sender resumes from the receiver's
+position and cannot re-send \(em running
+.B frames\-send
+twice does nothing and says so. Or the receiver answers with a conflict,
+naming the origin that holds the name, so a collision is a sentence on a
+terminal at setup rather than a mislabelled store found weeks later.
+.PP
+.B What it cannot do.
+Only SEALED chunks exist to ship, so a replica trails the source by one
+chunk flush; the live edge belongs to
+.B query \-\-follow
+on the source itself. And frames are 1:1 \(em opaque bytes whose rings
+must stay sorted, so interleaving two sources into one store needs
+decoding, which is the entries path's job. Frames replicate; records merge
+and transform.
 .SH FORESTS
 A
 .I forest

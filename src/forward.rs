@@ -522,8 +522,9 @@ fn ensure_store(
     crate::intake::ensure_store(
         intake,
         name,
-        &format!("unknown tag {tag:?}"),
+        &format!("tag {tag:?}"),
         opts.auto_create,
+        tag,
         |dir, name| {
             seed_bark(
                 dir,

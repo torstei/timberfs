@@ -1270,6 +1270,30 @@ mod cli_tests {
         Cli::command().debug_assert();
     }
 
+    /// Every subcommand must appear in the man page. Documentation drift
+    /// is invisible to every other check: `forward-intake` and
+    /// `otlp-intake` were each shipped before this existed, and only an
+    /// audit found whether they were covered.
+    #[test]
+    fn every_subcommand_is_in_the_man_page() {
+        let man = include_str!("../packaging/timberfs.1");
+        let heads: Vec<String> = man
+            .lines()
+            .filter_map(|l| l.strip_prefix(".SS "))
+            .map(|h| h.replace("\\-", "-").trim().to_string())
+            .collect();
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            if name == "help" {
+                continue;
+            }
+            assert!(
+                heads.iter().any(|h| h == name),
+                "`{name}` has no `.SS {name}` in packaging/timberfs.1"
+            );
+        }
+    }
+
     /// Every subcommand needs a description. A doc comment that ends up
     /// attached to the wrong variant leaves its own blank, which `--help`
     /// shows and nothing else does — `info` shipped that way once.

@@ -285,7 +285,17 @@ pub const NOT_PROVENANCE: &[&str] = &[
     // which makes them actively wrong rather than merely useless.
     "timberfs.store.id",
     "timberfs.store.path",
+    // Which routed value opened this store. One hop's bookkeeping, kept so
+    // a SECOND value that sanitizes to the same store name is refused
+    // rather than merged into it — see `intake::ensure_store`.
+    ROUTED_FROM,
 ];
+
+/// The routed value a store was opened by. Recorded because store names are
+/// SANITIZED: `/` becomes `_`, so `checkout/v2` and `checkout_v2` produce
+/// one name, and without this the second silently appends to the first's
+/// store and the manifest describes only one of them.
+pub const ROUTED_FROM: &str = "timberfs.routed_from";
 
 /// The ORIGIN store's identity, when the entries arrived from another
 /// timberfs store over the wire — `timber-otlp` sends it as an OTLP

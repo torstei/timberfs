@@ -53,6 +53,11 @@ pub struct Intake<X = ()> {
     /// --auto-create) — remembered so the refusal is logged once, not
     /// once per record of a retrying sender.
     pub refused: BTreeSet<String>,
+    /// The routed value each open store was opened by, so the collision
+    /// check costs a map lookup per batch rather than a manifest read.
+    /// Store names are SANITIZED, so this is what stops two distinct
+    /// values merging into one store.
+    pub routed_from: BTreeMap<String, String>,
     pub extra: X,
 }
 
@@ -65,6 +70,7 @@ impl<X> Intake<X> {
             dir_locks: BTreeMap::new(),
             file_locks: BTreeMap::new(),
             refused: BTreeSet::new(),
+            routed_from: BTreeMap::new(),
             extra,
         }
     }
@@ -175,14 +181,70 @@ pub fn open_backing_dir(dir: &Path) -> anyhow::Result<File> {
 /// Every store a receiver writes declares `wal`: an acknowledgement means
 /// durable, and the sap is what makes that cost one fsync instead of one
 /// chunk per record.
+/// One store, one routed value. Store names are SANITIZED, so distinct
+/// values collapse onto one name — `checkout/v2` and `checkout_v2` both
+/// become `checkout_v2` — and without this the second silently appends to
+/// the first's store while the manifest describes only one of them. Two
+/// senders merged and half the data mislabelled, with a 200 for both.
+///
+/// The value is recorded on first use rather than only at creation, so a
+/// store an operator pre-created is protected from the second arrival too.
+/// A store whose manifest cannot be written is left alone: this is a guard,
+/// not a reason to fail an ingest that would otherwise work.
+fn record_or_refuse_route(
+    dir: &Path,
+    name: &str,
+    subject: &str,
+    routed_from: &str,
+) -> anyhow::Result<()> {
+    if routed_from.is_empty() {
+        return Ok(());
+    }
+    let mut map = crate::bark::load(dir, name).unwrap_or_default();
+    match map.get(crate::bark::ROUTED_FROM).and_then(|v| v.as_str()) {
+        Some(held) if held == routed_from => Ok(()),
+        Some(held) => bail!(
+            "{subject}: store {} was opened by {held:?} and this batch routes \
+             from {routed_from:?} — both sanitize to the same store name, so \
+             receiving it would merge two sources into one store. Route on a \
+             value that does not collide, or send them to different stores",
+            dir.join(name).display()
+        ),
+        None => {
+            map.insert(
+                crate::bark::ROUTED_FROM.to_string(),
+                serde_json::Value::String(routed_from.to_string()),
+            );
+            let _ = crate::bark::save(dir, name, &map);
+            Ok(())
+        }
+    }
+}
+
 pub fn ensure_store<X>(
     intake: &mut Intake<X>,
     name: &str,
     subject: &str,
     auto_create: bool,
+    routed_from: &str,
     seed: impl FnOnce(&Path, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     if intake.stores.contains_key(name) {
+        // Already open in this process. The collision check still has to
+        // run — this is the path every batch after the first takes — so it
+        // compares in memory rather than re-reading a manifest per batch.
+        if let Some(held) = intake.routed_from.get(name) {
+            if held != routed_from && !routed_from.is_empty() {
+                bail!(
+                    "{subject}: store {} was opened by {held:?} and this batch \
+                     routes from {routed_from:?} — both sanitize to the same \
+                     store name, so receiving it would merge two sources into \
+                     one store. Route on a value that does not collide, or send \
+                     them to different stores",
+                    store_dir(&intake.root, name).join(name).display()
+                );
+            }
+        }
         return Ok(());
     }
     let dir = store_dir(&intake.root, name);
@@ -210,6 +272,12 @@ pub fn ensure_store<X>(
         seed(&dir, name)?;
     } else if !crate::bark::wal_declared(&dir, name) {
         crate::bark::declare_wal(&dir, name)?;
+    }
+    record_or_refuse_route(&dir, name, subject, routed_from)?;
+    if !routed_from.is_empty() {
+        intake
+            .routed_from
+            .insert(name.to_string(), routed_from.to_string());
     }
     let mut opened = Store {
         dir,
@@ -391,6 +459,121 @@ pub fn store_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            let dir = std::env::temp_dir()
+                .join(format!("timberfs-intake-test-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn an_intake(root: &Path) -> Intake {
+        Intake::new(
+            root,
+            Config {
+                chunk_size: 1 << 20,
+                level: 1,
+                flush_age_ms: u64::MAX,
+            },
+            (),
+        )
+    }
+
+    fn open(intake: &mut Intake, routed_from: &str) -> anyhow::Result<()> {
+        let name = store_name(routed_from);
+        ensure_store(
+            intake,
+            &name,
+            &format!("stream {routed_from:?}"),
+            true,
+            routed_from,
+            crate::bark::declare_wal,
+        )
+    }
+
+    #[test]
+    fn two_values_that_sanitize_alike_do_not_merge_into_one_store() {
+        // The collision was silent: `checkout/v2` and `checkout_v2` both
+        // name the store `checkout_v2`, and the second used to append to
+        // the first's store while the manifest described only one of them.
+        // Two senders merged, half the data mislabelled, 200 for both.
+        let d = TempDir::new("collide");
+        let mut intake = an_intake(&d.0);
+        open(&mut intake, "checkout/v2").expect("the first opens it");
+
+        let err = open(&mut intake, "checkout_v2").expect_err("the second collides");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("checkout/v2"), "{msg}");
+        assert!(msg.contains("checkout_v2"), "{msg}");
+        assert!(msg.contains("merge two sources"), "{msg}");
+
+        // The same value again is not a collision, however often it comes.
+        open(&mut intake, "checkout/v2").expect("idempotent");
+
+        // And what opened it is on record, so a restart refuses too.
+        let sub = store_dir(&d.0, "checkout_v2.log");
+        let bark = crate::bark::load(&sub, "checkout_v2.log").expect("a manifest");
+        assert_eq!(
+            bark.get(crate::bark::ROUTED_FROM).and_then(|v| v.as_str()),
+            Some("checkout/v2")
+        );
+        // Recorded as bookkeeping about one hop, so it must not travel as
+        // a label to anywhere this store is shipped.
+        assert!(!crate::bark::provenance(&bark).contains_key(crate::bark::ROUTED_FROM));
+    }
+
+    #[test]
+    fn a_restart_still_refuses_because_the_value_is_on_disk() {
+        // The in-memory map goes with the process; the manifest is what
+        // makes the guard survive one.
+        let d = TempDir::new("restart");
+        let mut first = an_intake(&d.0);
+        open(&mut first, "a/b").expect("opens");
+        drop(first);
+
+        let mut second = an_intake(&d.0);
+        let err = open(&mut second, "a_b").expect_err("still refused after a restart");
+        assert!(format!("{err:#}").contains("a/b"), "{err:#}");
+    }
+
+    #[test]
+    fn a_store_the_operator_pre_created_is_protected_too() {
+        // The value is recorded on FIRST USE rather than only at creation,
+        // so a store somebody made by hand gets the same guard.
+        let d = TempDir::new("precreated");
+        let sub = store_dir(&d.0, "svc.log");
+        fs::create_dir_all(&sub).unwrap();
+        crate::bark::cmd_create(
+            &sub.join("svc.log"),
+            false,
+            true,
+            None,
+            None,
+            false,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let mut intake = an_intake(&d.0);
+        open(&mut intake, "svc").expect("opens the pre-created store");
+        drop(intake);
+        let mut intake = an_intake(&d.0);
+        // A different value that sanitizes to `svc.log` would have merged.
+        let err = open(&mut intake, "svc").map(|_| ()).err();
+        assert!(err.is_none(), "the same value is fine: {err:?}");
+    }
 
     #[test]
     fn name_sanitization_keeps_safe_charset() {
