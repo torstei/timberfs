@@ -3100,6 +3100,50 @@ import_segment_merge() {
         | grep -q "event number 100"
 }
 
+import_carries_identity_across_the_hop() {
+    # A timberfs source describes itself, so an import must not land
+    # anonymous: the destination mints its own id, records the IMMEDIATE
+    # parent as derived_from, and inherits the labels. Operational settings
+    # do NOT travel -- retention and the index are the destination's own
+    # policy, so a store received here keeps what the operator declared.
+    local d=/tmp/lineage
+    rm -rf $d; mkdir -p $d
+    timberfs create $d/src.log --index --set host=vmnode --set service=vmsvc         --set retain_size=5G >/dev/null 2>&1 || return 1
+    printf '2026-06-02T08:00:00 INFO lineage one\n'         | timberfs append --into $d/src.log --quiet 2>/dev/null || return 1
+    local src_id
+    src_id=$(jq -r .id $d/src.log.bark)
+
+    timberfs export $d/src.log --into $d/ship.timber --quiet 2>/dev/null || return 1
+    timberfs import --into $d/dst.log $d/ship.timber --quiet 2>/dev/null || return 1
+
+    # Labels and lineage arrived; identity is the destination's own; the
+    # source's retention and index declarations did not follow.
+    jq -e '.host == "vmnode" and .service == "vmsvc"
+           and .derived_op == "import"
+           and (.derived_from | type == "string")
+           and (.id | type == "string")
+           and has("retain_size") == false
+           and has("index") == false' $d/dst.log.bark > /dev/null         || { cat $d/dst.log.bark; return 1; }
+    [ "$(jq -r .id $d/dst.log.bark)" != "$src_id" ] || return 1
+
+    # A pair source names itself as the parent directly.
+    timberfs import --into $d/pair.log $d/src.log --quiet 2>/dev/null || return 1
+    [ "$(jq -r .derived_from $d/pair.log.bark)" = "$src_id" ] || return 1
+
+    # Two identified sources have no single parent, so no lineage is
+    # claimed rather than one of them guessed at.
+    timberfs create $d/src2.log --set host=vmnode2 >/dev/null 2>&1 || return 1
+    printf '2026-06-02T09:00:00 INFO lineage two\n'         | timberfs append --into $d/src2.log --quiet 2>/dev/null || return 1
+    timberfs import --into $d/multi.log $d/src.log $d/src2.log 2>&1         | grep -q "no single parent" || return 1
+    [ ! -f $d/multi.log.bark ] || return 1
+
+    # And a re-import leaves the manifest alone: it is the operator's now.
+    local before
+    before=$(jq -r .id $d/dst.log.bark)
+    timberfs import --into $d/dst.log $d/ship.timber --quiet 2>/dev/null
+    [ "$(jq -r .id $d/dst.log.bark)" = "$before" ]
+}
+
 import_leading_backfill() {
     # a file starting mid-entry (rotation cut a stack trace): head lines
     # are backfilled with the first timestamp found
@@ -3128,6 +3172,7 @@ export_bundle_roundtrip() {
 }
 
 run_test "import: shipped segment merges verbatim, idempotently" import_segment_merge
+run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
 grain_needle_search() {
     python3 -c "
 import datetime

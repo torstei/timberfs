@@ -1,7 +1,8 @@
 # Native replication: frames on the wire, not entries
 
-**Status: design.** The batch ancestor exists — `timberfs export --into x.timber`
-writes a tar of `.rings`, `.trunk` and `.bark`, and `import` reads it. The
+**Status: design, with the first piece built.** The batch ancestor exists —
+`timberfs export --into x.timber` writes a tar of `.rings`, `.trunk` and
+`.bark`, `import` reads it, and identity now crosses that hop (see below). The
 streaming wire, the sidecar list and the transport are not built.
 
 See also [chunks by address](chunks-by-address.md), which this is the transport
@@ -186,12 +187,19 @@ live edge (256 KB or 5 s idle, whichever comes first). The `.sap` live tail is
 replicate, records merge, transform and tail, and the two are chosen by
 latency and by whether the shape must change — not competitors.
 
-## Prerequisite (a bug today)
+## Identity across a hop (done)
 
-`import` discards a bundle's `.bark` entirely. A bundle carries `id`,
-`derived_from`, `derived_op` and the labels; the imported store comes out with
-no manifest at all, so identity and provenance do not survive the hop. Nothing
-that claims an origin can be built on that.
+A timberfs import seeds the destination's manifest from its source: the
+destination mints its own `id`, records the immediate parent as
+`derived_from`, and inherits the labels, while operational settings —
+retention, the index, the wal — stay the destination's own. Lineage is claimed
+only when exactly one source declares a manifest, since a stitched set of
+segments has no single parent to name, and a re-import never rewrites a
+manifest that already exists.
+
+This was the prerequisite: `import` used to discard the source's manifest
+entirely, so an imported store came out anonymous and nothing that cites an
+origin could be built on it.
 
 ## Validation stays a choice, not a default
 

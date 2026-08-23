@@ -399,6 +399,11 @@ enum Source {
     Timber {
         trunk: PathBuf,
         records: Vec<crate::format::ChunkRecord>,
+        /// The source's own manifest, so a timberfs-to-timberfs import can
+        /// carry provenance and lineage across the hop. `None` for a
+        /// source that declares nothing (a plain `append` writes no
+        /// manifest at all).
+        bark: Option<serde_json::Map<String, serde_json::Value>>,
     },
 }
 
@@ -448,12 +453,14 @@ fn classify_source(path: &Path, extractor: &Extractor) -> anyhow::Result<(u64, S
     if crate::query::is_bundle(path) {
         // A bundle reads in place: open_source already shifted the record
         // offsets to the trunk member's position within the tar.
-        let records = crate::query::open_source(path)?.records;
+        let handle = crate::query::open_source(path)?;
+        let (records, bark) = (handle.records, handle.bark);
         return Ok((
             records.first().map(|r| r.first_write_ms).unwrap_or(0),
             Source::Timber {
                 trunk: path.to_path_buf(),
                 records,
+                bark,
             },
         ));
     }
@@ -486,6 +493,7 @@ fn classify_source(path: &Path, extractor: &Extractor) -> anyhow::Result<(u64, S
         Source::Timber {
             trunk: crate::format::trunk_path(&sdir, &sname),
             records,
+            bark: crate::bark::load(&sdir, &sname),
         },
     ))
 }
@@ -615,6 +623,36 @@ pub fn cmd_import(
     let dest_existed = crate::format::rings_path(&dir, &name).exists();
     st.create(&name)?;
 
+    // Identity and provenance cross the hop. A timberfs source describes
+    // itself, and without this the destination comes out anonymous — which
+    // nothing that cites an origin can be built on. Only for a NEW
+    // destination that declares nothing: an existing store's manifest is
+    // the operator's, and re-importing must not rewrite it.
+    //
+    // Exactly ONE identified source, because lineage names a parent: a
+    // stitched set of segments from several stores has no single one, and
+    // claiming either would be a guess. `derived_map` inherits provenance
+    // and drops identity, window and every operational setting, so the
+    // destination keeps its own index/wal/retention policy and `save`
+    // mints it a fresh id.
+    if !dest_existed && crate::bark::load(&dir, &name).is_none() {
+        let mut parents = sources.iter().filter_map(|(_, s)| match s {
+            Source::Timber { bark: Some(b), .. } => Some(b),
+            _ => None,
+        });
+        match (parents.next(), parents.next()) {
+            (Some(parent), None) => {
+                let map = crate::bark::derived_map(Some(parent), "import");
+                crate::bark::save(&dir, &name, &map)?;
+            }
+            (Some(_), Some(_)) => crate::note!(
+                "timberfs: {name}: several sources declare a manifest; \
+                 importing without lineage (no single parent to name)"
+            ),
+            _ => {}
+        }
+    }
+
     if sources.is_empty() {
         // Every source was empty. The import still succeeds — and still
         // materializes the destination: an empty store that EXISTS is the
@@ -700,7 +738,7 @@ pub fn cmd_import(
 
     for (source_idx, (t0, source)) in sources.iter().enumerate() {
         let source_path = match source {
-            Source::Timber { trunk, records } => {
+            Source::Timber { trunk, records, .. } => {
                 // A shipped segment: merge the chunks verbatim — unless the
                 // target's index already CONTAINS this exact segment (same
                 // consecutive run of records), which makes re-running a
