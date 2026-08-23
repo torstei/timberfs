@@ -2268,6 +2268,25 @@ listening on TCP for OTLP/HTTP senders (any OpenTelemetry SDK or
 Collector). Also not templated \(em OTLP multiplexes resources inside the
 request body, and each stream lands in its own store.
 .PP
+A sixth pair,
+.B timberfs\-frames.socket
+and
+.BR timberfs\-frames.service ,
+runs
+.B frames\-intake
+for the NATIVE replication wire: compressed chunks land verbatim, so a
+store received here is byte-identical to its source, its
+.I .grain
+included. The
+other three intakes take data from other SYSTEMS and compress it; this one
+takes it from another timberfs and copies what is already compressed \(em
+which is the axis to choose on. The shipped unit passes
+.B \-\-replica
+and deliberately not
+.BR \-\-auto\-create ,
+and its socket is on loopback: an archive taking senders from other hosts
+overrides that, and there is no TLS here. See REPLICATION.
+.PP
 Finally, the template unit
 .B timberfs\-otlp@.service
 runs

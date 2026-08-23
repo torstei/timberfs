@@ -1,0 +1,22 @@
+# Socket activation for the native replication intake: systemd owns the
+# address, so the port is bound before the first sender can miss it and the
+# service can be restarted (or upgraded) without a connection refused.
+#
+# The default is loopback. A receiving archive takes senders from other
+# hosts, so it needs an interface they can reach — override rather than
+# edit, and remember there is no TLS here: a private network or a tunnel.
+#
+#   systemctl edit timberfs-frames.socket
+#     [Socket]
+#     ListenStream=
+#     ListenStream=0.0.0.0:4319
+[Unit]
+Description=timberfs native replication intake
+Documentation=https://github.com/torstei/timberfs
+
+[Socket]
+ListenStream=127.0.0.1:4319
+Accept=no
+
+[Install]
+WantedBy=sockets.target

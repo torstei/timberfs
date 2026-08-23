@@ -70,7 +70,10 @@ OTLP/HTTP (any OpenTelemetry SDK or Collector) — so those producers log \
 straight into a store. In the other direction, timberfs-otlp@.service ships \
 a store to an OTLP/HTTP receiver, and timberfs-follower@.service runs a \
 REGISTERED follower of a store: a named consumer with a durable position, \
-declared once with `timberfs follower create` and thereafter managed by name."""
+declared once with `timberfs follower create` and thereafter managed by name. \
+timberfs-frames.socket/.service receive the NATIVE replication wire, where \
+compressed chunks move verbatim and the store on this host is byte-identical \
+to its source."""
 assets = [
     ["target/release/timberfs", "usr/bin/", "755"],
     ["target/release/timber-filter", "usr/bin/", "755"],
@@ -94,6 +97,8 @@ assets = [
     ["packaging/timberfs-text@.service", "lib/systemd/system/timberfs-text@.service", "644"],
     ["packaging/timberfs-follow@.service", "lib/systemd/system/timberfs-follow@.service", "644"],
     ["packaging/timberfs-follower@.service", "lib/systemd/system/timberfs-follower@.service", "644"],
+    ["packaging/timberfs-frames.socket", "lib/systemd/system/timberfs-frames.socket", "644"],
+    ["packaging/timberfs-frames.service", "lib/systemd/system/timberfs-frames.service", "644"],
     ["packaging/timberfs-forward.socket", "lib/systemd/system/timberfs-forward.socket", "644"],
     ["packaging/timberfs-forward.service", "lib/systemd/system/timberfs-forward.service", "644"],
     ["packaging/timberfs-otlp@.service", "lib/systemd/system/timberfs-otlp@.service", "644"],

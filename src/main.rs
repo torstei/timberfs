@@ -536,7 +536,8 @@ enum Command {
     /// receiver's position rather than guessing, or why it is refused. The
     /// verb name is provisional.
     FramesIntake {
-        /// Address to listen on
+        /// Address to listen on (systemd socket activation on fd 3 is used
+        /// instead when LISTEN_PID/LISTEN_FDS name this process)
         #[arg(long, default_value = "127.0.0.1:4319")]
         listen: String,
         /// Backing directory: one store per stream
@@ -563,6 +564,11 @@ enum Command {
         /// Declare the write-ahead sidecar on stores this receiver creates
         #[arg(long)]
         wal: bool,
+        /// Exit for a clean re-exec when this binary is upgraded on disk
+        /// (dpkg replaces it). Only for supervised runs: the unit sets it
+        /// and pairs it with RestartForceExitStatus
+        #[arg(long)]
+        exit_on_upgrade: bool,
     },
     /// Ship a store over the native replication wire. Sends what the
     /// receiver says it lacks, so re-running is a no-op rather than a
@@ -1173,6 +1179,7 @@ fn main() -> anyhow::Result<()> {
             replica,
             index,
             wal,
+            exit_on_upgrade,
         } => timberfs::frames::cmd_intake(&timberfs::frames::IntakeOpts {
             listen,
             into_dir,
@@ -1181,6 +1188,7 @@ fn main() -> anyhow::Result<()> {
             replica,
             index,
             wal,
+            exit_on_upgrade,
         })?,
         Command::FramesSend {
             store,

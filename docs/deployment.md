@@ -148,11 +148,16 @@ An instance that needs more than one stream in one directory just sets a custom
 
 ## systemd units
 
-Six independent families ship with the package: one mount, three intakes
-(FIFO, Forward, OTLP) and two shippers — `timberfs-otlp@`, configured per
-instance in `/etc/timberfs`, and `timberfs-follower@`, which takes its
-configuration from the follower registry instead. Prefer the latter for
-anything long-lived.
+Seven independent families ship with the package: one mount, four intakes
+(FIFO, Forward, OTLP and the native replication wire) and two shippers —
+`timberfs-otlp@`, configured per instance in `/etc/timberfs`, and
+`timberfs-follower@`, which takes its configuration from the follower
+registry instead. Prefer the latter for anything long-lived.
+
+The three protocol intakes take data from *other* systems and compress it
+here; `timberfs-frames` takes it from another timberfs and copies the
+compressed chunks verbatim. That is the axis to choose on — what is on the
+other end, not how much data there is.
 
 ### Mounting a store — `timberfs@.service`
 
@@ -772,6 +777,73 @@ durability needs to know what it is acknowledging); no TLS; and no gRPC on
 The verb name (`otlp-intake`) is provisional. `timber-otlp` ships the same
 wire format in the other direction; a store shipped out and received back
 arrives byte for byte.
+
+### Replicating between timberfs hosts — `timberfs-frames.socket` + `timberfs-frames.service`
+
+The two intakes above take log data from *other* systems and compress it here.
+When the sender is also timberfs, the native wire skips that work entirely:
+compressed chunks are copied **verbatim**, so nothing is decompressed at either
+end and the store on this host is byte-identical to its source — `.grain`
+included, so a `--has` lookup here skips chunks exactly as it does at the
+origin.
+
+```sh
+# the archive: take senders from other hosts, so off loopback
+systemctl edit timberfs-frames.socket
+  [Socket]
+  ListenStream=
+  ListenStream=0.0.0.0:4319
+
+# and its policy — which is ITS policy: settings never travel, only labels
+systemctl edit timberfs-frames.service
+  [Service]
+  ExecStart=
+  ExecStart=/usr/bin/timberfs frames-intake --into-dir /var/log/timberfs \
+      --route service --replica --index --auto-create --exit-on-upgrade
+
+systemctl enable --now timberfs-frames.socket
+```
+
+Like the other two this is **one listener for every stream**, and it routes by
+a label rather than a tag or a resource attribute: `--route service` puts each
+stream at `/var/log/timberfs/<service>/<service>.log`. `--auto-create` is
+absent from the shipped unit on purpose — an undeclared stream is refused and
+said so, as elsewhere.
+
+`--replica` is the one flag worth understanding. With it, the destination keeps
+the sender's chunk **numbering** and records its origin, so `(origin_id, seq)`
+names the same bytes at both ends; without it the destination renumbers and
+claims no origin, which is weaker but always possible. The two travel together
+or not at all — recording an origin while renumbering would produce an address
+that lies, so it is refused rather than configured. A replica is also refused
+if the numbering would not continue exactly, which is what a stream beginning
+mid-tape does.
+
+**One destination store, one origin.** A second origin arriving at a store that
+already holds one is refused, naming both — otherwise a host reinstall, or two
+hosts sharing a short hostname, silently appends a second tape to the first
+while the manifest describes only one of them.
+
+On the sending host, `timberfs frames-send STORE --endpoint archive:4319` ships
+once; as a registered follower it is `--type frames`, which is what a service
+unit should run:
+
+```sh
+timberfs set apache-error retain_size=5G retain_unconsumed=true
+timberfs follower create --store apache-error ship-apache-error \
+    --type frames --endpoint archive:4319 --retaining --enable --start
+```
+
+A frames follower takes no `--start`: it resumes from the **receiver's**
+position, which is authoritative, so re-running ships nothing rather than
+re-sending, and there is no local decision to get wrong. With `--retaining`
+plus `retain_unconsumed`, retention here releases a prefix only once the far
+end has acknowledged it.
+
+There is no TLS: a private network, or a tunnel. And only *sealed* chunks
+ship, so a replica trails its source by one chunk flush — the live edge
+belongs to `query --follow` on the source itself. The verb names
+(`frames-intake`, `frames-send`) are provisional.
 
 ### Shipping a store out — `timberfs-otlp@.service`
 

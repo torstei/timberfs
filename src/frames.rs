@@ -37,6 +37,11 @@ pub const WINDOW_BYTES: u64 = 8 << 20;
 #[derive(Debug, Clone)]
 pub struct IntakeOpts {
     pub listen: String,
+    /// Exit cleanly when this binary is replaced on disk, so a supervised
+    /// run re-execs into the new one. The same contract as the other
+    /// intakes: exit code 85, paired with `RestartForceExitStatus` in the
+    /// unit.
+    pub exit_on_upgrade: bool,
     pub into_dir: PathBuf,
     /// Which label names the store, as in the other intakes.
     pub route: String,
@@ -67,11 +72,25 @@ fn send(out: &mut impl Write, stream: u32, f: Frame) -> anyhow::Result<()> {
 
 /// Listen and receive, one thread per connection.
 pub fn cmd_intake(opts: &IntakeOpts) -> anyhow::Result<()> {
-    let listener =
-        TcpListener::bind(&opts.listen).with_context(|| format!("binding {}", opts.listen))?;
+    // Socket activation when systemd handed us the listener, as the other
+    // intakes do: the unit then owns the address and the port is bound
+    // before the first sender can miss it.
+    let listener = match crate::intake::socket_activated_listener() {
+        Some(l) => l,
+        None => TcpListener::bind(&opts.listen)
+            .with_context(|| format!("binding frames-intake listener on {}", opts.listen))?,
+    };
+    let watch = if opts.exit_on_upgrade {
+        crate::store::BinaryWatch::current()
+    } else {
+        None
+    };
     crate::note!(
         "timberfs: frames intake listening on {} -> {} (route {}, {})",
-        opts.listen,
+        listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| opts.listen.clone()),
         opts.into_dir.display(),
         opts.route,
         if opts.replica { "replica" } else { "copy" }
@@ -79,6 +98,12 @@ pub fn cmd_intake(opts: &IntakeOpts) -> anyhow::Result<()> {
     std::fs::create_dir_all(&opts.into_dir)
         .with_context(|| format!("creating {}", opts.into_dir.display()))?;
     for conn in listener.incoming() {
+        // Checked between connections rather than mid-stream: a receive in
+        // flight finishes, and the sender reconnects to the new binary.
+        if watch.as_ref().is_some_and(|w| w.changed()) {
+            crate::note!("timberfs: frames intake: binary replaced; exiting to re-exec");
+            std::process::exit(crate::store::EXIT_BINARY_UPGRADED);
+        }
         let stream = match conn {
             Ok(s) => s,
             Err(e) => {
@@ -621,6 +646,7 @@ mod tests {
             replica,
             index: false,
             wal: false,
+            exit_on_upgrade: false,
         }
     }
 
