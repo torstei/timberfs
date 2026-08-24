@@ -673,10 +673,13 @@ enum FollowerCommand {
         #[arg(long, value_name = "URL")]
         endpoint: Option<String>,
         /// Declare that this follower's position holds the store's head
-        /// back, so retention never drops what it has not read. Note
-        /// that one with no position yet holds EVERYTHING — which is the
-        /// point (it protects a follower deployed before it first runs)
-        /// and also the footgun: start it
+        /// back: retention keeps what it has not read ON TOP OF what age
+        /// and size keep, never as a cap on them — `retain_size` still
+        /// overrides it, and the writer records what was dropped unread.
+        /// Takes effect only where the store declares
+        /// `retain_unconsumed`. Note that one with no position yet holds
+        /// EVERYTHING — which is the point (it protects a follower
+        /// deployed before it first runs) and also the footgun: start it
         #[arg(long)]
         retaining: bool,
         /// systemctl enable the unit

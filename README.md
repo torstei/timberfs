@@ -23,6 +23,17 @@ The one trade-off: data must arrive in log order (by timestamp). `import`
 stitches historical files into order for you, and live ingestion is in order
 by definition — so in practice it rarely bites.
 
+Storage is the middle of a log pipeline, and timberfs speaks both ends of it
+too. **In**: OTLP/HTTP from any OpenTelemetry SDK or Collector, Fluentd Forward
+from Docker's log driver and Fluent Bit, a pipe, a file it tails, or a FUSE
+mount for software that insists on a real path. **Out**: [OTLP to any
+backend](#shipping-onward-timber-otlp) — one record per entry, resumable across
+restarts, with the store itself as the send buffer, so retention *is* the
+disconnection budget and any window can be re-shipped afterwards; or [native
+replication](#replicating-to-another-timberfs-frames-send) to another timberfs,
+which moves the compressed chunks verbatim — token index included, nothing
+decompressed at either end.
+
 ## Getting started: you have a pile of logs
 
 Install (see [Install](#install) for details and verification):
@@ -207,6 +218,10 @@ logs, replaying an incident window into a backend — are in
 The full command reference — every flag, `import`/`export`/`rotate`, retention,
 forests, `.timber` bundles, and the records stream — is in the man pages:
 `man timberfs`, `man timber-filter`, `man timber-otlp`, and `man timberfs-records`.
+
+When a term wants a definition rather than a tour — chunk, entry, follower,
+forest, the two clocks — **[Concepts](docs/concepts.md)** indexes the
+vocabulary, one line each, with a pointer to wherever it is explained.
 
 ## Shipping onward (`timber-otlp`)
 

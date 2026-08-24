@@ -320,6 +320,8 @@ Named limits, so the compositions above are not read as more than they are.
 ## See also
 
 - [README](../README.md) — the feature tour and getting started
+- [Concepts](concepts.md) — the vocabulary, one line per term, and where each
+  is explained
 - [Deploying timberfs](deployment.md) — directory layout, systemd units,
   ownership and permissions
 - [Design](design.md) — why FUSE, the on-disk format, the semantics table
