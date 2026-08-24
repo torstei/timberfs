@@ -1135,8 +1135,14 @@ an operator reads in
 .BR list .
 .TP
 .B \-\-retaining
-Declare that this follower's position holds the store's head back, so
-retention never drops what it has not read.
+Declare that this follower's position holds the store's head back:
+retention keeps what it has not read ON TOP OF what age and size keep,
+never as a cap on them \(em
+.B retain_size
+still overrides it, and the writer records what was dropped unread (see
+.BR RETENTION ).
+Takes effect only where the store declares
+.BR retain_unconsumed .
 .B A retaining follower with no position holds EVERYTHING
 \(em which is the point (it is what protects a follower deployed before
 it first runs) and equally the footgun, the same one an unused Postgres

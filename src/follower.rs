@@ -1388,7 +1388,10 @@ fn print_retaining(r: &Registered) {
         .and_then(|m| m.get("retain_unconsumed").and_then(Value::as_bool))
         .unwrap_or(false);
     if honoured {
-        println!("retaining yes — its position holds the store's head back");
+        println!(
+            "retaining yes — its position holds the store's head back, until retain_size \
+             overrides it"
+        );
     } else {
         println!(
             "retaining yes — declared, but no writer honours it yet (the store does not declare \

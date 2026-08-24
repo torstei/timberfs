@@ -19,7 +19,9 @@ thing; a log filesystem is just their flagship application.
 
 The rest of this document is how the store earns those properties. You don't
 need any of it to *use* timberfs — the README covers that; this is for the
-curious and contributors.
+curious and contributors. For a term rather than a chapter,
+[Concepts](concepts.md) indexes the vocabulary and points at wherever each one
+is explained.
 
 ## Why FUSE (and not overlayfs / a kernel module)
 

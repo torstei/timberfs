@@ -1161,3 +1161,5 @@ One contract, spelled in each protocol's own vocabulary: Forward acks a
 
 `timberfs(1)`, `timber-filter(1)`, `timber-otlp(1)`, `timberfs-records(5)`, and
 the example configs at `/usr/share/doc/timberfs/examples/`.
+[Concepts](concepts.md) indexes the vocabulary used here — store, forest,
+follower, intake, the two clocks — and points at wherever each is explained.
