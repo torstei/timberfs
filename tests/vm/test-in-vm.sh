@@ -1683,6 +1683,75 @@ selection_is_by_label_not_by_name() {
         || { jq -c '.[] | select(.handle=="vmsel-a") | .labels' /tmp/vmsel.list; return 1; }
 }
 
+identity_reports_and_repairs_the_three_broken_states() {
+    # An id is a fact, not a setting, so `set` will not touch it. But it
+    # can be broken in three ways, each with an obvious intended fix, and
+    # an operator who knows which one applies needs a way to say so.
+    local d=/var/log/timberfs/vmident
+    rm -rf "$d"
+    printf 'no manifest here\n' | timberfs append --into "$d/vmident.log" --quiet 2>/dev/null || return 1
+
+    # 1. Nothing on either side: not a store. Reporting exits non-zero, so
+    #    this doubles as the check a script runs.
+    timberfs identity "$d/vmident.log" > /tmp/vmident.out 2>&1 && return 1
+    grep -q 'verdict   NONE' /tmp/vmident.out || { cat /tmp/vmident.out >&2; return 1; }
+    timberfs identity "$d/vmident.log" --mint >/dev/null 2>&1 || return 1
+    timberfs identity "$d/vmident.log" > /tmp/vmident.out 2>&1 || return 1
+    grep -q 'verdict   consistent' /tmp/vmident.out || { cat /tmp/vmident.out >&2; return 1; }
+    local minted
+    minted=$(jq -r .id "$d/vmident.log.bark")
+    # Minting where one already exists is a --keep question, not a mint.
+    timberfs identity "$d/vmident.log" --mint >/dev/null 2>&1 && return 1
+
+    # 2. Two identities for one store: no writer may pick, and the report
+    #    says which flag resolves it.
+    python3 - "$d/vmident.log.bark" <<'PYBAD'
+import json, sys
+p = sys.argv[1]
+m = json.load(open(p)); m["id"] = "ffffffff-0000-4000-8000-000000000000"
+json.dump(m, open(p, "w"), indent=1)
+PYBAD
+    printf 'x\n' | timberfs append --into "$d/vmident.log" >/dev/null 2>&1 && return 1
+    timberfs identity "$d/vmident.log" > /tmp/vmident.out 2>&1 && return 1
+    grep -q 'verdict   DISAGREE' /tmp/vmident.out || { cat /tmp/vmident.out >&2; return 1; }
+
+    # 3a. Keep the index: the pair IS the store, so this is the usual
+    #     answer after a manifest was hand-edited or restored.
+    timberfs identity "$d/vmident.log" --keep index >/dev/null 2>&1 || return 1
+    [ "$(jq -r .id "$d/vmident.log.bark")" = "$minted" ] || return 1
+    timberfs identity "$d/vmident.log" >/dev/null 2>&1 || return 1
+    # A writer works again, and the data was never touched.
+    printf 'second\n' | timberfs append --into "$d/vmident.log" --quiet 2>/dev/null || return 1
+    timberfs query "$d/vmident.log" 2>/dev/null | grep -q 'no manifest here' || return 1
+
+    # 3b. Keep the manifest: the other side of the same repair.
+    python3 - "$d/vmident.log.bark" <<'PYBAD2'
+import json, sys
+p = sys.argv[1]
+m = json.load(open(p)); m["id"] = "ffffffff-0000-4000-8000-000000000000"
+json.dump(m, open(p, "w"), indent=1)
+PYBAD2
+    timberfs identity "$d/vmident.log" --keep manifest >/dev/null 2>&1 || return 1
+    timberfs identity "$d/vmident.log" > /tmp/vmident.out 2>&1 || return 1
+    grep -q 'ffffffff-0000-4000-8000-000000000000' /tmp/vmident.out || return 1
+    grep -q 'verdict   consistent' /tmp/vmident.out || return 1
+
+    # Repair rewrites the rings header, which a live writer also rewrites
+    # on a head-drop. It refuses to race one.
+    mkfifo /tmp/vmident.fifo
+    timberfs append --into "$d/vmident.log" --flush-age 60 < /tmp/vmident.fifo >/dev/null 2>&1 &
+    local wpid=$!
+    exec 8>/tmp/vmident.fifo
+    sleep 1
+    timberfs identity "$d/vmident.log" --keep index > /tmp/vmident.err 2>&1
+    local raced=$?
+    exec 8>&-
+    wait $wpid 2>/dev/null
+    rm -f /tmp/vmident.fifo
+    [ $raced -ne 0 ] || { echo "repair raced a live writer" >&2; return 1; }
+    grep -q 'live writer' /tmp/vmident.err || { cat /tmp/vmident.err >&2; return 1; }
+}
+
 store_identity_lives_in_the_backing_pair() {
     # The `.bark` is a sidecar; the backing PAIR is the store. Identity
     # therefore lives in the .rings header too, so losing the manifest does
@@ -1900,6 +1969,7 @@ run_test "catalogue: list --json carries identity, provenance and coverage" cata
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 run_test "selection: the id list prints is the id info accepts" store_identity_is_printed_and_typeable
 run_test "identity: the backing pair carries the store id, and retention keeps it" store_identity_lives_in_the_backing_pair
+run_test "identity: report exits non-zero when broken; --mint and --keep repair it" identity_reports_and_repairs_the_three_broken_states
 
 # The OTLP/HTTP intake (timberfs-otlp.socket/.service) and its mirror,
 # the timber-otlp shipper. A python3 http.client driver posts the real

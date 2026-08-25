@@ -450,6 +450,26 @@ enum Command {
         #[arg(long)]
         full_id: bool,
     },
+    /// Report or repair a store's identity — the id that makes a backing
+    /// pair a store. Without a flag it only reports, and exits non-zero
+    /// when the two sides do not agree or there is no identity at all, so
+    /// it is also the check a script runs. An id is a fact rather than a
+    /// setting, so `set` will not touch it; these are the three ways it
+    /// can be broken and the fix each one wants.
+    Identity {
+        /// Backing file: logical name, .trunk or .rings path
+        file: PathBuf,
+        /// Make an identity for a pair that carries none on either side.
+        /// Refused where one already exists — that is a --keep question
+        #[arg(long)]
+        mint: bool,
+        /// Resolve a disagreement by keeping one side's identity and
+        /// writing it to the other: `index` (the backing pair, which IS
+        /// the store — the usual answer after a manifest was hand-edited
+        /// or restored) or `manifest`
+        #[arg(long, value_name = "SIDE")]
+        keep: Option<IdentitySideArg>,
+    },
     /// Build or rebuild the .grain token index for a log: one Bloom filter
     /// per chunk over every token in it (~1% false positives), letting
     /// `query --has` skip chunks — e.g. find a request id with no known
@@ -661,6 +681,12 @@ enum Command {
         #[arg(long)]
         exit_on_upgrade: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum IdentitySideArg {
+    Index,
+    Manifest,
 }
 
 #[derive(Subcommand)]
@@ -1132,6 +1158,17 @@ fn main() -> anyhow::Result<()> {
             let file = forest::resolve_source(&file)?;
             query::cmd_info(&file, json)?;
         }
+        Command::Identity { file, mint, keep } => {
+            let file = forest::resolve_source(&file)?;
+            bark::cmd_identity(
+                &file,
+                mint,
+                keep.map(|k| match k {
+                    IdentitySideArg::Index => bark::IdentitySide::Index,
+                    IdentitySideArg::Manifest => bark::IdentitySide::Manifest,
+                }),
+            )?;
+        }
         Command::Index { file } => {
             let file = forest::resolve_source(&file)?;
             query::cmd_index(&file)?;
@@ -1348,10 +1385,17 @@ mod cli_tests {
             (include_str!("../docs/deployment.md"), &[]),
             (
                 include_str!("../docs/use-cases.md"),
-                &[(
-                    "reindex",
-                    "a use case is a why, not a verb list; rebuilding an index is neither",
-                )],
+                &[
+                    (
+                        "reindex",
+                        "a use case is a why, not a verb list; rebuilding an index is neither",
+                    ),
+                    (
+                        "identity",
+                        "a repair verb for a store that is already broken, not a reason to \
+                         reach for timberfs; the man page and the deployment guide carry it",
+                    ),
+                ],
             ),
         ];
         for (text, allowed) in surfaces {

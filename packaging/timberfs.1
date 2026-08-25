@@ -872,6 +872,51 @@ bundles \(em a bundle is a snapshot, so nothing holds a position in one.
 .B \-\-json
 prints the same facts as one JSON object for scripting. Read-only and
 safe against live writers.
+.SS identity
+.B timberfs identity
+.I FILE
+.RB [ \-\-mint ]
+.RB [ \-\-keep
+.IR index | manifest ]
+reports, and on request repairs, the id that makes a backing pair a
+store. The id is a fact rather than a setting, so
+.B set
+refuses it; this is the verb for the three ways it can be broken.
+.PP
+With no flag it only reports \(em what the manifest says, what the
+.B .rings
+header says, and a verdict \(em and exits non\-zero when the two do not
+agree or there is no identity at all, so it doubles as the check a
+script runs.
+.TP
+.B \-\-mint
+make an identity for a pair that carries none on either side. Refused
+where one already exists: that is a
+.B \-\-keep
+question.
+.B timberfs create \-\-if\-not\-exists
+does the same thing as part of provisioning.
+.TP
+.BI \-\-keep " index"
+resolve a disagreement by keeping what the backing pair says and writing
+it into the manifest. The usual answer, because the pair
+.I is
+the store: reach for it after a manifest was hand\-edited, restored from
+an older backup, or copied in from elsewhere.
+.TP
+.BI \-\-keep " manifest"
+the other side of the same repair, for a pair restored under a manifest
+you trust.
+.PP
+Repair rewrites the
+.B .rings
+header, which a live writer also rewrites when retention drops a head,
+so it refuses to run while one holds the store \(em stop the writer
+first. Log data is never touched by any of this.
+.PP
+Choosing wrongly is not cosmetic: a follower records its store by
+identity, so the side you discard is the one whose cursors stop
+resolving.
 .SS index
 .B timberfs index
 .I FILE

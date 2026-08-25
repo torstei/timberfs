@@ -131,6 +131,16 @@ is what you call it and **provenance** is how you find it. `list` prints its
 leading 8 characters — a UUID's first group — and `info` takes that back, in full
 or as any prefix of 4 or more; an ambiguous prefix is refused rather than picked.
 `list --full-id` spells one out.
+
+It lives in the `.rings` header as well as the manifest, because the backing
+**pair** is the store: lose the sidecar and the data still says what it is. The
+manifest is the source of truth and the header its mirror, so a store predating
+the field is stamped on its next write. Where the two disagree, every writer
+refuses — no writer can know which identity the cursors mean — and
+`timberfs identity` reports it and takes the operator's answer: `--keep index`
+(the pair, the usual answer after a manifest was hand-edited or restored),
+`--keep manifest`, or `--mint` for a pair carrying none at all. With no flag it
+only reports, exiting non-zero when the store is not in one consistent state.
 → [design](design.md#the-bark-manifest), [receiving end](plans/receiving-end.md)
 
 **intake** — a way in: plain text, the records stream, Fluentd Forward, OTLP, or
