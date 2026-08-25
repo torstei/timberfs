@@ -1430,6 +1430,10 @@ pub struct StoreSummary {
     pub origin_id: Option<String>,
     /// The manifest's provenance keys — what a fleet view selects on. See
     /// `bark::provenance`.
+    /// The name the store DECLARES for itself. None where it declares
+    /// none, and then the path is the only name it has — the caller
+    /// supplies that fallback, because only it knows the path.
+    pub declared_name: Option<String>,
     pub labels: serde_json::Map<String, serde_json::Value>,
     pub retain: Option<String>,
     pub retain_size: Option<String>,
@@ -1623,6 +1627,7 @@ pub fn summarize_store(
         id: get("id"),
         created: get("created"),
         origin_id: bark.and_then(crate::bark::origin_id),
+        declared_name: get("name"),
         labels: bark.map(crate::bark::provenance).unwrap_or_default(),
         retain: get("retain"),
         retain_size: get("retain_size"),
@@ -1696,10 +1701,20 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     // Pair-only facts: size/span, sidecar sizes, grain coverage, writer
     // state — computed by the same `summarize_store` that builds a `list`
     // row, so the two commands agree on what they report.
-    let mut name = input
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // What the store is CALLED: the name it declares, else the one its
+    // path gives it. `list` answers the same way, and `info <name>` that
+    // replied with a uuid header would be answering a different question
+    // than the one asked.
+    let mut name = bark
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            input
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
     let mut location = String::new();
     let mut bundle_bytes: Option<u64> = None;
     // Pair-only facts, like the writer state: a bundle is a snapshot,
@@ -1741,7 +1756,17 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         )
     } else {
         let (dir, base) = resolve_backing(input)?;
-        name = base.clone();
+        // Only where the store declares no name of its own: the path is
+        // then the only name it has.
+        if handle
+            .bark
+            .as_ref()
+            .and_then(|b| b.get("name"))
+            .and_then(|v| v.as_str())
+            .is_none()
+        {
+            name = base.clone();
+        }
         location = dir.display().to_string();
         let anchor = crate::cursor::store_anchor(&dir, &base, handle.bark.as_ref());
         let declared = crate::follower::for_store(&crate::follower::registry_dir(), &anchor);

@@ -79,12 +79,21 @@ impl Selector {
         Ok(Selector { terms })
     }
 
-    /// Does this store's labels satisfy every term? `labels` is a
-    /// manifest's provenance, never the whole manifest — selecting on an
-    /// operational setting is what `bark::NOT_PROVENANCE` exists to stop.
-    pub fn matches(&self, labels: &Map<String, Value>) -> bool {
+    /// Does this store satisfy every term? `fields` is the WHOLE manifest,
+    /// plus a `name` where one is only implied by the path: labels, name,
+    /// id and settings are all matchable.
+    ///
+    /// Nothing is held back on the grounds of being the wrong KIND of
+    /// fact. A key label is unique and stable where a name is neither, but
+    /// that is a difference in what a match GUARANTEES, not in what a
+    /// caller is allowed to ask — and a rule that exists only because we
+    /// sorted two facts into different boxes is a rule that annoys the
+    /// person who wanted the other one. The constraint that does bite is
+    /// elsewhere: a writer's lookup must land on exactly one store or
+    /// none, and that is enforced where the writing happens.
+    pub fn matches(&self, fields: &Map<String, Value>) -> bool {
         self.terms.iter().all(|t| {
-            let have = labels.get(&t.key).map(stringify).unwrap_or_default();
+            let have = fields.get(&t.key).map(stringify).unwrap_or_default();
             t.matches(&have)
         })
     }
@@ -183,6 +192,17 @@ fn unquote(v: &str) -> String {
         .to_string()
 }
 
+/// Everything about a store a selector may match on: its manifest as it
+/// stands, plus a `name` for a store that has not declared one — where the
+/// path is all the name there is, `--select name=...` must still find it.
+pub fn selectable(bark: &Map<String, Value>, handle: &str) -> Map<String, Value> {
+    let mut fields = bark.clone();
+    fields
+        .entry("name".to_string())
+        .or_insert_with(|| Value::String(handle.to_string()));
+    fields
+}
+
 /// One store a selector matched: enough to open it, and the labels it
 /// matched on so a caller can say WHY it matched.
 #[derive(Debug)]
@@ -214,10 +234,10 @@ pub fn resolve(dirs: &[std::path::PathBuf], sel: &Selector) -> Vec<Match> {
             let Ok((dir, name)) = crate::query::resolve_backing(&path) else {
                 continue;
             };
-            let labels = crate::bark::load(&dir, &name)
-                .map(|m| crate::bark::provenance(&m))
-                .unwrap_or_default();
-            if sel.matches(&labels) {
+            let bark = crate::bark::load(&dir, &name).unwrap_or_default();
+            let fields = selectable(&bark, &handle);
+            if sel.matches(&fields) {
+                let labels = crate::bark::provenance(&bark);
                 out.push(Match {
                     handle,
                     dir,

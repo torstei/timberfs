@@ -62,6 +62,15 @@ metadata, not identity: what tells such stores apart is their **labels**, and
 Reach for a label before you reach for a longer name; a name that has grown a
 suffix to avoid a collision has just moved the collision.
 
+A store may therefore **declare** its name (`name` in the manifest) instead of
+taking one from its path, which is what lets a path be opaque — an intake that
+mints its own stores names the directory after the store's id and puts the
+readable name where it belongs. `timberfs list` shows that name, `--names`
+offers it, and `timberfs info` answers to it; a store that declares none is
+still called what its path calls it, so both kinds render in the same column.
+Declared names are not unique, and looking one up that several stores answer to
+reports them rather than picking.
+
 The directory is per store rather than per intake because a directory is the unit
 that matters: **any** writer operation (indexing, rotation) needs write
 permission on it, it is what carries the mount exclusion, and it is what one

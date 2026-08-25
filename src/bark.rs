@@ -253,13 +253,24 @@ pub fn declare_wal(dir: &Path, name: &str) -> anyhow::Result<()> {
 /// Keys that describe the STORE rather than its content: identity, lineage,
 /// operational settings, and content-format declarations. Everything else in
 /// a manifest is PROVENANCE — where the entries came from and what produced
-/// them — which is what a fleet view selects on.
+/// them.
 ///
-/// The split lives here because bark owns what its keys mean. Views that
-/// re-guessed it would drift, and a view that leaked `retain` or `id` into a
-/// label set would invite selecting on an operational setting.
+/// This is what counts as a LABEL: what `list` shows in that column, what
+/// `frames` routes on, what a fleet view groups by. It is NOT a limit on
+/// what a selector may match — `--select` matches the whole manifest, name
+/// and settings included, because a rule that forbids asking a question
+/// only because we filed the answer under a different heading is a rule
+/// that helps nobody.
+///
+/// The split lives here because bark owns what its keys mean; views that
+/// re-guessed it drifted, which is why `info` once showed `wal` as a label.
 pub const NOT_PROVENANCE: &[&str] = &[
     "id",
+    // What the store is CALLED. Rendered in its own column by `list` and
+    // in its own line by `info`, so showing it among the labels would say
+    // it twice — and it is not where the entries came from. Still fully
+    // matchable: `--select` reads the manifest, not this list.
+    "name",
     "created",
     "derived_from",
     "derived_op",

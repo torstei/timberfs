@@ -114,9 +114,10 @@ fn lookup_handle(handle: &str) -> anyhow::Result<PathBuf> {
     }
     match matches.len() {
         1 => Ok(matches.pop().unwrap().1),
-        // No handle by that name: it may be an id, which is what `list`
-        // prints and what a follower cursor already keys on.
-        0 => lookup_id_prefix(handle, &forests),
+        // No directory by that name. It may be the name a store DECLARES
+        // — the only name it has once its path is opaque — or an id,
+        // which is what `list` prints beside it.
+        0 => lookup_declared_name(handle, &forests),
         _ => {
             let candidates = matches
                 .iter()
@@ -127,6 +128,43 @@ fn lookup_handle(handle: &str) -> anyhow::Result<PathBuf> {
                 "handle `{handle}` is ambiguous — it matches several stores:\n{candidates}\n\
                  pass a full path or an id to pick one"
             );
+        }
+    }
+}
+
+/// Resolve by the name a store declares in its manifest. Declared names
+/// are NOT unique — two hosts' `gateway01-console` in one archive is the
+/// case this exists for — so several matches are reported rather than
+/// picked between, exactly as an ambiguous directory handle is.
+fn lookup_declared_name(token: &str, forests: &[Forest]) -> anyhow::Result<PathBuf> {
+    let mut hits: Vec<(String, PathBuf, String)> = Vec::new();
+    for forest in forests {
+        for (handle, store) in scan_forest(&forest.dir) {
+            let Ok((dir, name)) = crate::query::resolve_backing(&store) else {
+                continue;
+            };
+            let declared = crate::bark::load(&dir, &name)
+                .and_then(|b| b.get("name").and_then(|v| v.as_str()).map(str::to_string));
+            if declared.as_deref() == Some(token) {
+                let id = store_id(&store).unwrap_or_else(|| "no identity".to_string());
+                hits.push((forest.name.clone(), store, id));
+                let _ = handle;
+            }
+        }
+    }
+    match hits.len() {
+        1 => Ok(hits.pop().unwrap().1),
+        0 => lookup_id_prefix(token, forests),
+        _ => {
+            let candidates = hits
+                .iter()
+                .map(|(forest, store, id)| format!("  {id}  {} ({forest})", store.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "several stores are called `{token}` — a declared name is not unique:\n\
+                 {candidates}\npick one by its id"
+            )
         }
     }
 }

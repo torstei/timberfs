@@ -73,8 +73,21 @@ pub fn cmd_list(
             }
         }
     }
+    // By what the store is CALLED, not by its directory — an opaque path
+    // sorts as a uuid, which shuffles the listing every time a store is
+    // created. Identity breaks the tie, because declared names are not
+    // unique and a listing must still have one stable order.
     rows.sort_by(|a, b| {
-        (a.forest.as_str(), a.handle.as_str()).cmp(&(b.forest.as_str(), b.handle.as_str()))
+        (
+            a.forest.as_str(),
+            display_name(a),
+            a.summary.id.clone().unwrap_or_default(),
+        )
+            .cmp(&(
+                b.forest.as_str(),
+                display_name(b),
+                b.summary.id.clone().unwrap_or_default(),
+            ))
     });
 
     // A selection owes coverage: an empty result has to say how much was
@@ -105,7 +118,7 @@ pub fn cmd_list(
 
     if names_only {
         for r in &rows {
-            println!("{}", r.handle);
+            println!("{}", display_name(r));
         }
         return Ok(());
     }
@@ -167,7 +180,7 @@ fn span_text(s: &StoreSummary) -> String {
 }
 
 const COLUMNS: [&str; 8] = [
-    "ID", "HANDLE", "FOREST", "SIZE", "SPAN", "WRITER", "INDEX", "RETAIN",
+    "ID", "NAME", "FOREST", "SIZE", "SPAN", "WRITER", "INDEX", "RETAIN",
 ];
 
 /// How much of an `id` the table prints. A UUID's first group is exactly
@@ -202,6 +215,17 @@ fn labels_text(s: &StoreSummary) -> String {
         .map(|(k, v)| format!("{k}={}", crate::select::stringify(v)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// What a store is called: the name it declares, else the one its path
+/// gives it. One column for both, because it answers the same question
+/// either way — and because an opaque path would otherwise leave the
+/// column repeating the id.
+fn display_name(r: &Row) -> String {
+    r.summary
+        .declared_name
+        .clone()
+        .unwrap_or_else(|| r.handle.clone())
 }
 
 /// The id column: short by default, whole with `--full-id`. `-` where the
@@ -257,7 +281,7 @@ fn columns(rows: &[Row]) -> (Vec<&'static str>, Optional) {
 fn row_cells(r: &Row, opt: Optional) -> Vec<String> {
     let mut cells = Vec::from([
         id_text(&r.summary, opt.full_id),
-        r.handle.clone(),
+        display_name(r),
         r.forest.clone(),
         crate::rotate::human_bytes(r.summary.compressed_bytes),
         span_text(&r.summary),
@@ -321,6 +345,14 @@ fn rows_to_json(rows: &[Row]) -> serde_json::Value {
             .map(|r| {
                 let s = &r.summary;
                 let mut o = serde_json::Map::new();
+                // What the store is CALLED, resolved the same way the
+                // table resolves it. `handle` is the path's own word for
+                // it, which an opaque path makes a uuid — so a consumer
+                // that wants to show a name needs this one.
+                o.insert(
+                    "name".to_string(),
+                    serde_json::Value::String(display_name(r)),
+                );
                 o.insert("handle".to_string(), r.handle.clone().into());
                 o.insert("forest".to_string(), r.forest.clone().into());
                 // Identity first: a catalogue's rows have to be joinable to
@@ -465,6 +497,7 @@ mod tests {
             dropped: crate::format::Dropped::default(),
             id: None,
             created: None,
+            declared_name: None,
             origin_id: None,
             labels: serde_json::Map::new(),
             grain: if indexed { Some((10, 1)) } else { None },
@@ -484,6 +517,17 @@ mod tests {
     /// so a test never pairs cells with a header it would not get.
     fn opts(rows: &[Row]) -> Optional {
         columns(rows).1
+    }
+
+    impl Row {
+        /// A copy with an independent summary, so a test can vary one
+        /// field without a full Clone on StoreSummary.
+        fn clone_for_name_test(&self) -> Row {
+            let mut s = summary(1, Some((1, 2)), WriterState::Idle, false, None, None);
+            s.labels = self.summary.labels.clone();
+            s.id = self.summary.id.clone();
+            row(&self.handle, &self.forest, s)
+        }
     }
 
     fn row(handle: &str, forest: &str, summary: StoreSummary) -> Row {
@@ -660,8 +704,15 @@ mod tests {
         let (cols, o) = columns(&rich);
         assert!(o.labels);
         assert_eq!(cols.first(), Some(&"ID"), "identity leads");
-        assert_eq!(cols[1], "HANDLE");
+        assert_eq!(cols[1], "NAME");
         assert_eq!(cols.last(), Some(&"LABELS"), "the widest column trails");
+        // NAME is what the store is CALLED: what it declares, else what
+        // its path gives it. An opaque path would otherwise leave the
+        // column repeating the id.
+        assert_eq!(row_cells(&rich[0], o)[1], "rich", "falls back to the path");
+        let mut declared = rich[0].clone_for_name_test();
+        declared.summary.declared_name = Some("gateway01-console".to_string());
+        assert_eq!(row_cells(&declared, o)[1], "gateway01-console");
         // Header and cells must stay in step, which is the bug a bool
         // per optional column invites.
         assert_eq!(row_cells(&rich[0], o).len(), cols.len());
