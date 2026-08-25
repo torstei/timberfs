@@ -569,6 +569,12 @@ pub struct IncusOpts {
     pub retain_size: Option<String>,
     pub index: bool,
     pub idle_ms: u64,
+    /// Keep the console ring buffer instead of consuming it, so
+    /// `incus console --show-log` still has something to show. Costs
+    /// correctness across a restart: see `drain_every_ms`.
+    pub keep_ring: bool,
+    /// How often, at most, to consume the ring while attached.
+    pub drain_every_ms: u64,
     pub mark_episodes: bool,
     pub exit_on_upgrade: bool,
 }
@@ -676,12 +682,37 @@ fn tap_attached(
         append(intake, &store, &first)?;
     }
 
+    // The ring and the websocket are INDEPENDENT feeds: while we stream,
+    // the ring quietly accumulates its own copy of everything we have
+    // already written, and the next attach's drain would replay it. So
+    // the ring is consumed as we go.
+    //
+    // Receiving bytes IS the notification that the ring has grown — both
+    // feeds come from the same console loop — so this needs no timer, and
+    // a silent container costs nothing. Rate-limited because a busy one
+    // would otherwise mean an HTTP request per frame; that limit is also
+    // the bound on how much an UNCLEAN kill can duplicate, counting only
+    // time when output was actually flowing.
+    //
+    // Discarding is always safe with respect to data: draining the ring
+    // cannot remove anything from the websocket's queue.
+    let consume_ring = inst.is_container() && !opts.keep_ring;
+    let mut last_drain = now_ms();
     while !stop.load(Ordering::Relaxed) {
         match ws.read() {
             Ok(Some(bytes)) => {
-                let out = stamper.push(&bytes, now_ms());
+                let now = now_ms();
+                let out = stamper.push(&bytes, now);
                 if !out.is_empty() {
                     append(intake, &store, &out)?;
+                }
+                if consume_ring && now.saturating_sub(last_drain) >= opts.drain_every_ms as i64 {
+                    last_drain = now;
+                    // A failure here costs a duplicate after a restart,
+                    // never data — so it must not end the episode.
+                    if let Err(e) = incus.console_drain(&inst.name) {
+                        crate::note!("timberfs: {}: consuming the console ring: {e}", inst.name);
+                    }
                 }
             }
             // The console closed: the instance stopped or restarted. Not
@@ -1161,6 +1192,34 @@ mod tests {
             text.lines().filter(|l| l.starts_with("1970-")).count(),
             2,
             "{text}"
+        );
+    }
+    #[test]
+    fn the_ring_is_consumed_for_containers_unless_asked_otherwise() {
+        // The ring is a duplicate of what the websocket already
+        // delivered, so it is consumed as we stream — but only where
+        // there IS a ring. A VM's console is a file: "draining" it reads
+        // it without emptying it, so doing so every few seconds would be
+        // pure cost.
+        let mk = |keep_ring: bool, kind: &str| {
+            let inst = Instance {
+                name: "x".into(),
+                project: "default".into(),
+                kind: kind.into(),
+                status: "Running".into(),
+                location: String::new(),
+                image: String::new(),
+                base_image: String::new(),
+                entrypoint: String::new(),
+                user_keys: vec![],
+            };
+            (inst.is_container() && !keep_ring, inst)
+        };
+        assert!(mk(false, "container").0, "consumed by default");
+        assert!(!mk(true, "container").0, "--keep-ring opts out");
+        assert!(
+            !mk(false, "virtual-machine").0,
+            "a VM has no ring to consume"
         );
     }
 }

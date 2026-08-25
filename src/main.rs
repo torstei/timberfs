@@ -691,6 +691,17 @@ enum Command {
         /// trace whole while not swallowing the next message into it
         #[arg(long, default_value_t = 100, value_name = "MS")]
         idle: u64,
+        /// Keep the console ring buffer instead of consuming it, so
+        /// `incus console --show-log` still has something to show for a
+        /// tapped container. The cost is duplication: the ring
+        /// accumulates its own copy of what this intake has already
+        /// written, and the next attach replays it
+        #[arg(long)]
+        keep_ring: bool,
+        /// At most how often to consume the ring while attached. Also the
+        /// bound on how much an unclean kill can duplicate
+        #[arg(long, default_value = "30s", value_name = "DUR")]
+        drain_every: String,
         /// Do not write a marker line at each attach. The marker carries
         /// the image, entrypoint and instance uuid — facts that change
         /// when a container is rebuilt, so they belong in the timeline
@@ -1240,6 +1251,8 @@ fn main() -> anyhow::Result<()> {
             retain_size,
             index,
             idle,
+            keep_ring,
+            drain_every,
             no_marker,
             exit_on_upgrade,
         } => {
@@ -1256,6 +1269,8 @@ fn main() -> anyhow::Result<()> {
                 retain_size,
                 index,
                 idle_ms: idle,
+                keep_ring,
+                drain_every_ms: append::parse_duration_ms(&drain_every)?,
                 mark_episodes: !no_marker,
                 exit_on_upgrade,
             })?;
