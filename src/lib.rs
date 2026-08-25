@@ -20,6 +20,8 @@ pub mod fs;
 pub mod grain;
 pub mod grep;
 pub mod import;
+pub mod incus;
+pub mod incus_intake;
 pub mod intake;
 pub mod list;
 pub mod live;

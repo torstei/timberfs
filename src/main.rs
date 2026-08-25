@@ -1,6 +1,6 @@
 use timberfs::{
-    append, bark, export, follow, follower, forest, forward, fs, grain, import, list, note,
-    otlp_intake, query, rotate, sink, store,
+    append, bark, export, follow, follower, forest, forward, fs, grain, import, incus,
+    incus_intake, list, note, otlp_intake, query, rotate, sink, store,
 };
 
 use std::path::PathBuf;
@@ -632,6 +632,76 @@ enum Command {
         #[arg(long, default_value = "30s", value_name = "DUR")]
         timeout: String,
     },
+    /// Tap the consoles of incus containers into timberfs, over the local
+    /// incus unix socket. The console is the "everything else" channel —
+    /// boot output, a crashing JVM's fatal log, whatever a process writes
+    /// on its way down — and incus keeps only the last 128 KiB of it, in a
+    /// ring that wraps in silence. An app that ships its own logs is
+    /// better served by `otlp-intake`; this is for the output that arrives
+    /// when the app's own logging is already dead.
+    #[command(name = "incus-intake")]
+    IncusIntake {
+        /// Backing directory: each store lives in its own directory named
+        /// after its id, with the readable name in its manifest
+        #[arg(long = "into-dir", value_name = "DIR")]
+        into_dir: PathBuf,
+        /// The incus unix socket
+        #[arg(long, default_value = incus::DEFAULT_SOCKET)]
+        socket: String,
+        /// The incus project whose instances to tap
+        #[arg(long, default_value = "default")]
+        project: String,
+        /// Which facts identify a store, comma-separated. The default is
+        /// one store per instance; `type,incus.project,incus.instance,image`
+        /// is one per image version, and `type` puts every console on the
+        /// host in one store. Whatever is named here is written as a label,
+        /// so a store can always be found again by the key that made it
+        #[arg(long, default_value = incus_intake::DEFAULT_KEY, value_name = "LABELS")]
+        key: String,
+        /// What to put in front of a line that STARTS an entry, as a
+        /// template over the same facts plus `{time}`: `--prefix '{time}
+        /// {incus.instance} '` attributes a store several instances share.
+        /// A `{time}` that does not come first is fine — the store is
+        /// taught how to find it
+        #[arg(long, default_value = "{time} ", value_name = "TEMPLATE")]
+        prefix: String,
+        /// Tap only these instances (repeatable). Default: every one the
+        /// project has
+        #[arg(long, value_name = "NAME")]
+        only: Vec<String>,
+        /// Also tap virtual machines. Their console is file-backed and
+        /// carries the kernel's boot output rather than an application's
+        /// stdout, so it is a different thing to collect
+        #[arg(long)]
+        include_vms: bool,
+        /// Continuously drop data older than this (e.g. 7d, 12h) in every
+        /// store this intake creates
+        #[arg(long)]
+        retain: Option<String>,
+        /// Keep the on-disk size of every store this intake creates at or
+        /// under this budget (e.g. 2G, 512M)
+        #[arg(long)]
+        retain_size: Option<String>,
+        /// Declare and maintain the .grain token index on every store this
+        /// intake creates
+        #[arg(long)]
+        index: bool,
+        /// How long an entry may go quiet before the next line starts a
+        /// new one instead of continuing it. This is what keeps a stack
+        /// trace whole while not swallowing the next message into it
+        #[arg(long, default_value_t = 100, value_name = "MS")]
+        idle: u64,
+        /// Do not write a marker line at each attach. The marker carries
+        /// the image, entrypoint and instance uuid — facts that change
+        /// when a container is rebuilt, so they belong in the timeline
+        /// rather than in labels that would claim today's values for all
+        /// of history
+        #[arg(long)]
+        no_marker: bool,
+        /// Exit for a clean re-exec when this binary is upgraded on disk
+        #[arg(long)]
+        exit_on_upgrade: bool,
+    },
     /// Receive OTLP/HTTP logs — the OpenTelemetry wire protocol every SDK
     /// and the Collector speak — writing each stream into its own store
     /// under --into-dir. Answers 200 only after the batch is fsynced, and
@@ -1157,6 +1227,38 @@ fn main() -> anyhow::Result<()> {
         Command::Info { file, json } => {
             let file = forest::resolve_source(&file)?;
             query::cmd_info(&file, json)?;
+        }
+        Command::IncusIntake {
+            into_dir,
+            socket,
+            project,
+            key,
+            prefix,
+            only,
+            include_vms,
+            retain,
+            retain_size,
+            index,
+            idle,
+            no_marker,
+            exit_on_upgrade,
+        } => {
+            let known = incus_intake::known_facts();
+            incus_intake::run(incus_intake::IncusOpts {
+                socket,
+                project,
+                into_dir,
+                key: incus_intake::parse_key(&key)?,
+                prefix: incus_intake::parse_prefix(&prefix, &known)?,
+                include_vms,
+                only,
+                retain,
+                retain_size,
+                index,
+                idle_ms: idle,
+                mark_episodes: !no_marker,
+                exit_on_upgrade,
+            })?;
         }
         Command::Identity { file, mint, keep } => {
             let file = forest::resolve_source(&file)?;

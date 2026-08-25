@@ -1635,6 +1635,93 @@ PYEOF
         || { cat "$bark"; return 1; }
 }
 
+incus_intake_is_installed_and_validates_its_options() {
+    # The VM has no incus, so what is testable here is the surface: the
+    # unit ships, the options are checked BEFORE anything is opened, and
+    # an absent daemon is said plainly rather than surfacing as a bare
+    # errno. The tap itself is exercised against a real container, which
+    # a VM without incus cannot provide.
+    [ -f /lib/systemd/system/timberfs-incus.service ] || return 1
+    grep -q 'SupplementaryGroups=incus-admin' /lib/systemd/system/timberfs-incus.service || return 1
+    # It reaches OUT to a socket rather than being connected to, so it is
+    # not socket-activated and must not have picked up a .socket by
+    # accident.
+    [ -f /lib/systemd/system/timberfs-incus.socket ] && return 1
+
+    local d=/var/log/timberfs/vmincus
+    rm -rf "$d"; mkdir -p "$d"
+    # A key naming nothing selects everything, which is the one key that
+    # is refused.
+    timberfs incus-intake --into-dir "$d" --key '' > /tmp/vmincus.err 2>&1 && return 1
+    grep -q 'at least one label' /tmp/vmincus.err || { cat /tmp/vmincus.err >&2; return 1; }
+    # A prefix naming a fact we cannot supply would expand to nothing and
+    # be noticed only at query time.
+    timberfs incus-intake --into-dir "$d" --prefix '{nope} ' > /tmp/vmincus.err 2>&1 && return 1
+    grep -q 'not a fact this intake has' /tmp/vmincus.err || { cat /tmp/vmincus.err >&2; return 1; }
+    timberfs incus-intake --into-dir "$d" --prefix '{time' > /tmp/vmincus.err 2>&1 && return 1
+    grep -q 'unclosed' /tmp/vmincus.err || { cat /tmp/vmincus.err >&2; return 1; }
+    # No daemon: named as such, with the group that usually explains it.
+    timberfs incus-intake --into-dir "$d" --socket /nonexistent.sock > /tmp/vmincus.err 2>&1 && return 1
+    grep -q 'connecting to incus' /tmp/vmincus.err || { cat /tmp/vmincus.err >&2; return 1; }
+    # Nothing was created before the options were checked.
+    [ -z "$(ls -A "$d")" ] || { ls -A "$d" >&2; return 1; }
+}
+
+a_store_is_called_what_it_declares() {
+    # Once a path is opaque, the only name a store has is the one it
+    # declares. `list` shows that, `--names` offers it, and `info` answers
+    # to it — while a store that declares none is still called what its
+    # path calls it, so both worlds render in one column.
+    local d=/var/log/timberfs/vmname
+    rm -rf "$d"
+    local u=0f0f0f0f-1111-4222-8333-444444444444
+    mkdir -p "$d/$u"
+    # Seed the manifest BEFORE the pair, with the id the path uses: the
+    # store's two sides must agree from the first byte, and patching the
+    # id afterwards is refused (as it should be).
+    cat > "$d/$u/$u.log.bark" <<BARK
+{"id": "$u", "name": "gateway01-console", "type": "console",
+ "host": "vmhost", "incus.instance": "gateway01", "incus.project": "default"}
+BARK
+    printf 'console line\n' | timberfs append --into "$d/$u/$u.log" --quiet 2>/dev/null || return 1
+    # ...and a store beside it that declares no name at all.
+    printf 'legacy line\n' | timberfs append --into "$d/plainstore/plainstore.log" --quiet 2>/dev/null || return 1
+
+    # NAME, not HANDLE: the opaque one shows what it declares, the other
+    # what its path gives it.
+    timberfs list "$d" > /tmp/vmname.tab 2>/dev/null || return 1
+    head -1 /tmp/vmname.tab | grep -qE '^ID[[:space:]]+NAME' || { head -1 /tmp/vmname.tab >&2; return 1; }
+    grep -q 'gateway01-console' /tmp/vmname.tab || { cat /tmp/vmname.tab >&2; return 1; }
+    grep -q 'plainstore' /tmp/vmname.tab || { cat /tmp/vmname.tab >&2; return 1; }
+    grep -q "$u" /tmp/vmname.tab && { echo "the uuid leaked into NAME" >&2; return 1; }
+
+    # --names is what completion consumes, so it must offer the same.
+    timberfs list "$d" --names 2>/dev/null | sort | tr '\n' ',' | grep -qx 'gateway01-console,plainstore,' \
+        || { timberfs list "$d" --names >&2; return 1; }
+
+    # `info` answers to the declared name, and leads with it rather than
+    # with the uuid the path happens to use.
+    timberfs info "$d/$u/$u.log" > /tmp/vmname.info 2>&1 || return 1
+    head -1 /tmp/vmname.info | grep -q '^gateway01-console' || { head -1 /tmp/vmname.info >&2; return 1; }
+    # The name is NOT among the labels: it has its own column and its own
+    # line, and it is not where the entries came from.
+    grep -E '^  manifest' /tmp/vmname.info | grep -q 'name=' && { grep manifest /tmp/vmname.info >&2; return 1; }
+    timberfs list "$d" --json 2>/dev/null \
+        | jq -e '.[] | select(.labels.type == "console") | .labels | has("name") == false' >/dev/null || return 1
+
+    # Everything in the manifest is matchable — labels, the name, the id
+    # and the settings alike. Nothing is withheld for being the wrong KIND
+    # of fact.
+    local got
+    for q in 'type=console' 'name=gateway01-console' 'name=~.*-console' "id=$u" 'incus.instance=gateway01'; do
+        got=$(timberfs list "$d" --names --select "$q" 2>/dev/null)
+        [ "$got" = "gateway01-console" ] || { echo "select $q gave '$got'" >&2; return 1; }
+    done
+    # ...including a store whose name only its path supplies.
+    got=$(timberfs list "$d" --names --select 'name=plainstore' 2>/dev/null)
+    [ "$got" = "plainstore" ] || { echo "path-named select gave '$got'" >&2; return 1; }
+}
+
 selection_is_by_label_not_by_name() {
     # Two stores of one service, told apart only by a label — the case a
     # store NAME cannot express, and the reason selection is the primitive.
@@ -1864,7 +1951,9 @@ store_identity_is_printed_and_typeable() {
     timberfs list /var/log/timberfs > /tmp/vmid.tab 2>/dev/null || return 1
     # Identity leads the table: it is what a store IS, not a contingent
     # fact like FOLLOWERS. A store that declares none reads as a dash.
-    head -1 /tmp/vmid.tab | grep -qE '^ID[[:space:]]+HANDLE[[:space:]]+FOREST' || { head -1 /tmp/vmid.tab >&2; return 1; }
+    # NAME follows it — what the store is CALLED, which is a different
+    # question and answered from the manifest when it declares one.
+    head -1 /tmp/vmid.tab | grep -qE '^ID[[:space:]]+NAME[[:space:]]+FOREST' || { head -1 /tmp/vmid.tab >&2; return 1; }
     head -1 /tmp/vmid.tab | grep -q 'ID' || { head -1 /tmp/vmid.tab >&2; return 1; }
     head -1 /tmp/vmid.tab | grep -q 'LABELS' || { head -1 /tmp/vmid.tab >&2; return 1; }
     grep -E "^$short[[:space:]]+vmsel-a[[:space:]]" /tmp/vmid.tab >/dev/null || { grep vmsel-a /tmp/vmid.tab >&2; return 1; }
@@ -1967,6 +2056,8 @@ run_test "forward-intake: a declaring sender seeds host; peer is recorded either
 run_test "forward-intake: service restart is a sender reconnect, no data lost" forward_intake_restart_survives
 run_test "catalogue: list --json carries identity, provenance and coverage" catalogue_fields_are_a_projection_of_list
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
+run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares
+run_test "incus-intake: unit installed; options checked before anything opens" incus_intake_is_installed_and_validates_its_options
 run_test "selection: the id list prints is the id info accepts" store_identity_is_printed_and_typeable
 run_test "identity: the backing pair carries the store id, and retention keeps it" store_identity_lives_in_the_backing_pair
 run_test "identity: report exits non-zero when broken; --mint and --keep repair it" identity_reports_and_repairs_the_three_broken_states
@@ -3213,7 +3304,7 @@ forest_list_command() {
 
     local out names dir_names
     out=$(timberfs list) || return 1
-    echo "$out" | head -1 | grep -qE '^ID[[:space:]]+HANDLE' || return 1
+    echo "$out" | head -1 | grep -qE '^ID[[:space:]]+NAME' || return 1
     # Both stores here were made by a bare `append`, which declares
     # nothing and so writes no manifest: the ID column is structural, so
     # they show a dash rather than the column disappearing.

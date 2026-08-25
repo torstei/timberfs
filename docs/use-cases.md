@@ -186,6 +186,38 @@ rotation is a size cap that silently discards. This gives the same containers
 compression, a time index and a declared retention, and — composed with the
 section above — an OTLP feed they never had to know about.
 
+## Keep the output that arrives when the app's own logging is dead
+
+A container's console carries what nothing else does: boot messages, a JVM's
+fatal error log, the last thing a process writes on its way down. Incus keeps
+the last 128 KiB of it in a ring buffer that wraps in silence, and reading that
+ring is a *destructive drain* — so `incus console --show-log` and any collector
+polling it are taking the backlog from each other.
+
+```sh
+timberfs incus-intake --into-dir /var/log/timberfs --index --retain 7d
+```
+
+That attaches to each running instance's live console, drains the ring once
+behind it to recover what came before, and follows incus's lifecycle events so
+a container started later is tapped too. One store per instance by default,
+found by its labels rather than by a name built from them:
+
+```sh
+timberfs list --select 'type=console,incus.instance=gateway01'
+timberfs query gateway01-console --follow
+```
+
+*Why not the ring on a timer:* it loses everything between polls whenever more
+than 128 KiB accumulates, it takes the backlog away from whoever else looks,
+and every line in one poll would share that poll's timestamp — which is the
+axis the store is indexed on.
+
+*This is not where an application's own logs should go.* An app that can emit
+OTLP should, into `otlp-intake` above: structured, properly timestamped, with
+stdout and stderr distinguished, and no exclusivity. The console is the channel
+for everything that happens outside its logger's lifetime.
+
 ## Move logs between hosts over a protocol you already trust
 
 `timber-otlp` out and `timberfs otlp-intake` in are the same mapping in both

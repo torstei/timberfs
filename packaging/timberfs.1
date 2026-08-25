@@ -1391,6 +1391,115 @@ Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
 unit sets it.
 .PP
 The verb name is provisional.
+.SS incus\-intake
+.B timberfs incus\-intake
+.BI \-\-into\-dir " DIR"
+.RB [ \-\-socket
+.IR PATH ]
+.RB [ \-\-project
+.IR NAME ]
+.RB [ \-\-key
+.IR LABELS ]
+.RB [ \-\-prefix
+.IR TEMPLATE ]
+.RB [ \-\-only
+.IR NAME ]...
+.RB [ \-\-include\-vms ]
+.RB [ \-\-index ]
+.RB [ \-\-retain
+.IR DUR ]
+taps the consoles of incus instances into timberfs over the local incus
+unix socket, following incus's lifecycle events so an instance started
+later is tapped too.
+.PP
+The console is the
+.I everything else
+channel: boot output, a crashing JVM's fatal log, whatever a process
+writes on its way down. An application that ships its own logs is better
+served by
+.BR otlp\-intake ;
+this is for the output that arrives when the application's own logging is
+already dead. Incus keeps only the last 128 KiB of it, in a ring buffer
+that wraps in silence, so what is not collected is not recoverable.
+.PP
+The live console websocket is the feed, not that ring. Reading the ring is
+a
+.B destructive drain
+\(em what it returns is gone from it, including for a human running
+.B incus console \-\-show\-log
+\(em and everything drained in one poll would carry that poll's timestamp,
+collapsing write\-time granularity to the poll interval. The ring is
+drained
+.B once,
+immediately after attaching, so the backlog the instance produced before
+the tap arrived is recovered; attaching first means that backlog overlaps
+the live feed rather than leaving a gap between them.
+.PP
+⚠ An instance's console is
+.BR exclusive .
+While this holds one,
+.B incus console
+on that instance is refused unless forced, and forcing it takes the
+console away from the tap (which reconnects).
+.TP
+.BI \-\-key " LABELS"
+which facts identify a store, comma\-separated. Default
+.BR type,incus.project,incus.instance :
+one store per instance. Add
+.B image
+for one store per image version; give only
+.B type
+to put every console on the host into one store. Whatever is named here
+is written as a label, so a store can always be found again by the key
+that made it \(em which is also why an episodic fact in the key means a
+new store each time it changes.
+.TP
+.BI \-\-prefix " TEMPLATE"
+what to put in front of a line that STARTS an entry, over the same facts
+plus
+.BR {time} .
+Default
+.BR "{time} " .
+A store several instances share wants
+.B "{time} {incus.instance} "
+so its lines say which one wrote them. A
+.B {time}
+that is not first is fine: the store is given a
+.B timestamp_regex
+that finds it, since timberfs's own detection is anchored. A template with
+no
+.B {time}
+at all is legal and warned about \(em those entries carry no timestamp of
+their own.
+.PP
+Only lines that start an entry are prefixed. A line carrying its own
+timestamp is left alone, and so is a line that arrives while an entry is
+open \(em an exception body, a stack frame. An entry that has gone quiet
+for
+.B \-\-idle
+milliseconds (default 100) is closed, which is how a stack trace stays one
+entry while the next message does not get swallowed into it.
+.PP
+Stores are found by their labels, never by a name assembled from them, and
+live in directories named after their own id: the readable name is in the
+manifest, where
+.B timberfs list
+shows it. A key matching several existing stores is refused \(em there is
+then no one store to write to.
+.PP
+Each attach writes a marker line naming the instance, its image, its
+entrypoint and its uuid: facts that change when a container is rebuilt, so
+they belong in the timeline rather than in labels that would claim today's
+values for all of history. It also records how much ring backlog followed
+it, which marks the seam.
+.PP
+Containers only, unless
+.B \-\-include\-vms
+\(em a VM's console is file\-backed (so reading it is not a drain) and
+carries the kernel's boot output rather than an application's stdout.
+Reaching the socket needs membership of the
+.B incus\-admin
+group.
 .SS otlp\-intake
 Receive OTLP/HTTP logs \(em the OpenTelemetry protocol every SDK and the
 Collector speak \(em and write each stream into its own store under

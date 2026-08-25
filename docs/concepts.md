@@ -236,11 +236,22 @@ schedule. Also what `query --follow` tails.
 **`--select`** — the store predicate a fleet view takes instead of a name:
 `list --select 'type=console,host=web01'`. Terms are ANDed; `key=value`,
 `key!=value`, `key=~regex`, `key!~regex` (regexes anchored at both ends); an
-absent label reads as the empty string, so `key!=` selects the stores that
-declare it. Matched on **provenance**, so two stores of one service are told
-apart by a label rather than by competing for a name. An empty result reports
-what it searched, because "matched nothing" and "nothing was searched" are
-different answers. → [receiving end](plans/receiving-end.md)
+absent key reads as the empty string, so `key!=` selects the stores that
+declare it. Matched against the **whole manifest** — labels, `name`, `id` and
+settings alike: a key label is unique and stable where a name is neither, but
+that is a difference in what a match *guarantees*, not in what you may ask
+for. The constraint that bites is elsewhere — a writer's lookup must land on
+exactly one store or none. An empty result reports what it searched, because
+"matched nothing" and "nothing was searched" are different answers.
+→ [receiving end](plans/receiving-end.md)
+
+**name** — what a store is *called*: a human-facing string it declares in its
+manifest, falling back to what its path calls it. Non-unique by design — two
+hosts' `gateway01-console` in one archive coexist, told apart by **identity** —
+so looking one up can be ambiguous, and that is reported rather than guessed.
+Shown by `list` in its own column and offered by `--names`; not a **label**,
+because it is not where the entries came from, but fully matchable like
+everything else in the manifest.
 
 **seqlock** — the counter a reader samples to know the rings and the grain it
 loaded are one generation. A pair straddling a head-drop would skip chunks that
