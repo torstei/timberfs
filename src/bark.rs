@@ -376,6 +376,46 @@ pub fn derived_map(source_bark: Option<&Map<String, Value>>, op: &str) -> Map<St
     map
 }
 
+/// Give an existing pair the identity it lacks, and report whether it
+/// needed one. Nothing else about the store is touched: a declaration it
+/// disagrees with is still left alone and warned about, because that is a
+/// property someone chose, where a missing identity is a store that is not
+/// yet a store.
+fn mint_missing_identity(dir: &Path, name: &str) -> anyhow::Result<Option<&'static str>> {
+    let existing = load(dir, name).unwrap_or_default();
+    if existing.get("id").and_then(|v| v.as_str()).is_some() {
+        return Ok(None);
+    }
+    // The pair may already carry one where the manifest was lost — the
+    // pair is the store, so that is the identity, not a fresh mint.
+    let rings = format::rings_path(dir, name);
+    let carried = fs::read(&rings)
+        .ok()
+        .and_then(|b| format::header_store_id(&b))
+        .map(|id| format::uuid_text(&id));
+    let mut map = existing;
+    let what = if let Some(id) = carried {
+        map.insert("id".to_string(), Value::String(id));
+        "recovered its identity from the index"
+    } else {
+        "had no identity; minted one"
+    };
+    // `save` mints identity for anything that still lacks one, and opening
+    // the store mirrors it into the header.
+    save(dir, name, &map)?;
+    let mut st = store::Store {
+        dir: dir.to_path_buf(),
+        cfg: store::Config {
+            chunk_size: 256 * 1024,
+            level: 3,
+            flush_age_ms: 5000,
+        },
+        files: std::collections::BTreeMap::new(),
+    };
+    st.create(name)?;
+    Ok(Some(what))
+}
+
 /// Rotate holds exclusive writer locks on its source, so it may mint the
 /// source's identity when missing — every rotation then leaves a complete
 /// lineage chain. (Export never writes its source: it is read-only.)
@@ -446,6 +486,14 @@ pub fn cmd_create(
         // CREATE IF NOT EXISTS: the store stands as it is, declaration
         // included — so say so when it declares something else.
         warn_declaration_drift(&dir, &name, &map);
+        // ...but identity is not a declaration, it is what makes the pair
+        // a store at all. A pair carrying none has not been created yet in
+        // the only sense that matters, so CREATE IF NOT EXISTS creates the
+        // missing part rather than reporting success at doing nothing.
+        if let Some(what) = mint_missing_identity(&dir, &name)? {
+            crate::note!("timberfs: {name} in {} {what}", dir.display());
+            return Ok(());
+        }
         crate::note!(
             "timberfs: {name} already exists in {}; nothing created",
             dir.display()

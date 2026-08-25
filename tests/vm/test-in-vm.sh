@@ -1740,6 +1740,38 @@ p = '$d/vmid.log.bark'
 m = json.load(open(p)); m['id'] = '$bark_id'
 json.dump(m, open(p,'w'), indent=1)"
 
+    # `create --if-not-exists` completes a pair that has no identity: it
+    # has not been created yet in the only sense that matters, so reporting
+    # "nothing created" at it would be reporting success at doing nothing.
+    local bare=/var/log/timberfs/vmbareid
+    rm -rf "$bare"
+    printf 'no manifest here\n' | timberfs append --into "$bare/vmbareid.log" --quiet 2>/dev/null || return 1
+    [ -e "$bare/vmbareid.log.bark" ] && { echo "bare append wrote a manifest?" >&2; return 1; }
+    timberfs create --if-not-exists "$bare/vmbareid.log" > /tmp/vmine.out 2>&1 || return 1
+    grep -q 'minted one' /tmp/vmine.out || { cat /tmp/vmine.out >&2; return 1; }
+    local minted
+    minted=$(jq -r .id "$bare/vmbareid.log.bark") || return 1
+    # ...and the pair carries it, not just the manifest.
+    python3 - "$bare/vmbareid.log.rings" "$minted" <<'PYMINT'
+import sys
+b = open(sys.argv[1], 'rb').read()[48:64]
+h = b.hex()
+got = '-'.join([h[0:8], h[8:12], h[12:16], h[16:20], h[20:32]])
+sys.exit(0 if got == sys.argv[2] else 1)
+PYMINT
+    [ $? -eq 0 ] || { echo "header did not get the minted id" >&2; return 1; }
+    # Idempotent: a second run has nothing to do.
+    timberfs create --if-not-exists "$bare/vmbareid.log" 2>&1 | grep -q 'nothing created' || return 1
+    # Manifest lost, pair intact: the identity is RECOVERED, not re-minted,
+    # because the pair is the store.
+    rm "$bare/vmbareid.log.bark"
+    timberfs create --if-not-exists "$bare/vmbareid.log" > /tmp/vmine2.out 2>&1 || return 1
+    grep -q 'recovered its identity from the index' /tmp/vmine2.out || { cat /tmp/vmine2.out >&2; return 1; }
+    [ "$(jq -r .id "$bare/vmbareid.log.bark")" = "$minted" ] \
+        || { echo "re-minted instead of recovering" >&2; return 1; }
+    # And the data is still there.
+    timberfs query "$bare/vmbareid.log" 2>/dev/null | grep -q 'no manifest here' || return 1
+
     # A derived artifact gets its OWN identity and records lineage —
     # carrying the source's would give two stores one id.
     timberfs export "$d/vmid.log" --into /tmp/vmid.timber >/dev/null 2>&1 || return 1
