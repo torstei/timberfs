@@ -898,9 +898,15 @@ Three things worth knowing before you enable it:
   is refused unless forced, and forcing it takes the console from the tap
   (which reconnects). `incus console --show-log` still works — it reads the
   ring, which is a different feed.
-- **The ring is a destructive drain.** The tap reads it exactly once, right
-  after attaching, to recover the backlog. Anything else polling it is taking
-  that backlog away from whoever looks next, which is why the tap does not poll.
+- **The ring is consumed, not preserved.** The tap reads it at attach to recover
+  the backlog, and then keeps consuming it as it streams — because the two feeds
+  are independent, so an attached tap would otherwise leave the ring filling with
+  a copy of what it has already written, and the next attach would replay it
+  (duplicating up to 128 KiB on every restart). So `incus console --show-log`
+  has nothing to show for a tapped instance. That is the trade: timberfs holds
+  that content instead, indexed, retained and queryable. `--keep-ring` opts out
+  and accepts the duplication; `--drain-every` (default 30s) bounds how much an
+  unclean kill can duplicate.
 - **Containers only**, unless `--include-vms`. A VM's console is file-backed
   and carries the kernel's boot output rather than an application's stdout.
 

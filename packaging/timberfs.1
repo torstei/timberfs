@@ -1493,6 +1493,23 @@ they belong in the timeline rather than in labels that would claim today's
 values for all of history. It also records how much ring backlog followed
 it, which marks the seam.
 .PP
+.PP
+⚠ The ring is CONSUMED as the tap streams, not left to accumulate. The two
+feeds are independent, so while a tap is attached the ring quietly fills
+with its own copy of what has already been written \(em and the next
+attach would replay it, duplicating up to 128 KiB on every restart. Each
+websocket read is the notification that the ring has grown, so this needs
+no timer and a silent instance costs nothing; the drain is rate\-limited
+by
+.B \-\-drain\-every
+(default 30s), which is also the bound on how much an UNCLEAN kill can
+duplicate. The cost is that
+.B incus console \-\-show\-log
+has nothing to show for a tapped instance, which is the point: timberfs
+now holds that content, indexed and retained.
+.B \-\-keep\-ring
+opts out and accepts the duplication.
+.PP
 Containers only, unless
 .B \-\-include\-vms
 \(em a VM's console is file\-backed (so reading it is not a drain) and
