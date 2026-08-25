@@ -376,6 +376,178 @@ pub fn derived_map(source_bark: Option<&Map<String, Value>>, op: &str) -> Map<St
     map
 }
 
+/// Which side of a disagreement to keep.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IdentitySide {
+    /// The `.rings` header — the backing pair, which IS the store.
+    Index,
+    /// The `.bark` manifest.
+    Manifest,
+}
+
+/// What the two sides say about a store's identity.
+fn identity_sides(dir: &Path, name: &str) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let manifest = try_load(dir, name)
+        .with_context(|| {
+            format!(
+                "the existing manifest is unreadable — fix or remove {} first",
+                format::bark_path(dir, name).display()
+            )
+        })?
+        .unwrap_or_default()
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let index = fs::read(format::rings_path(dir, name))
+        .ok()
+        .and_then(|b| format::header_store_id(&b))
+        .map(|id| format::uuid_text(&id));
+    Ok((manifest, index))
+}
+
+/// Report or repair a store's identity. A store's id is not a setting, so
+/// it is not `set`-table; but the three ways it can be BROKEN each have an
+/// obvious intended fix, and an operator who knows which one applies needs
+/// a way to say so. Without a flag this only reports, and exits non-zero
+/// when the store is not in one consistent state — so it is also the check
+/// a script runs.
+pub fn cmd_identity(store: &Path, mint: bool, keep: Option<IdentitySide>) -> anyhow::Result<()> {
+    let (dir, name) = resolve_backing(store)?;
+    if !format::rings_path(&dir, &name).exists() {
+        bail!("no timberfs log {name} in {}", dir.display());
+    }
+    if mint && keep.is_some() {
+        bail!("--mint makes an identity where there is none; --keep chooses between two. Not both");
+    }
+    let (manifest, index) = identity_sides(&dir, &name)?;
+
+    // Any write here touches the rings header, which a live writer also
+    // rewrites (head-drop). Repair is not a thing to race.
+    let _lock = if mint || keep.is_some() {
+        Some(
+            store::lock_file_exclusive(&dir, &name)?
+                .ok_or_else(|| anyhow::anyhow!("{name} has a live writer — stop it first"))?,
+        )
+    } else {
+        None
+    };
+
+    let chosen: Option<String> = match (mint, keep, &manifest, &index) {
+        (true, _, None, None) => None, // mint below
+        (true, _, _, _) => bail!(
+            "--mint is for a store with no identity at all; this one already has {}",
+            manifest.as_deref().or(index.as_deref()).unwrap_or("one")
+        ),
+        (_, Some(IdentitySide::Index), _, Some(id)) => Some(id.clone()),
+        (_, Some(IdentitySide::Index), _, None) => {
+            bail!("--keep index: the index carries no identity")
+        }
+        (_, Some(IdentitySide::Manifest), Some(id), _) => Some(id.clone()),
+        (_, Some(IdentitySide::Manifest), None, _) => {
+            bail!("--keep manifest: the manifest carries no identity")
+        }
+        (false, None, _, _) => {
+            // Report only.
+            println!("{name} — timberfs log in {}/", dir.display());
+            println!("  manifest  {}", manifest.as_deref().unwrap_or("none"));
+            println!("  index     {}", index.as_deref().unwrap_or("none"));
+            let (verdict, ok) = match (&manifest, &index) {
+                (Some(a), Some(b)) if a == b => ("consistent", true),
+                (Some(_), Some(_)) => (
+                    "DISAGREE — two identities for one store; \
+                     pick one with --keep index or --keep manifest",
+                    false,
+                ),
+                (Some(_), None) => (
+                    "manifest only — the index is stamped on the next write",
+                    true,
+                ),
+                (None, Some(_)) => (
+                    "index only — `create --if-not-exists` recovers it into the manifest",
+                    true,
+                ),
+                (None, None) => (
+                    "NONE — this pair is not a store; make it one with --mint \
+                     (or `create --if-not-exists`)",
+                    false,
+                ),
+            };
+            println!("  verdict   {verdict}");
+            if !ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+    };
+
+    let mut map = try_load(&dir, &name)?.unwrap_or_default();
+    match chosen {
+        // `save` mints identity for anything lacking one.
+        None => {
+            map.remove("id");
+        }
+        Some(id) => {
+            map.insert("id".to_string(), Value::String(id));
+        }
+    }
+    save(&dir, &name, &map)?;
+    // Opening the store mirrors the manifest into the header — but only
+    // where the header has none. A resolved DISAGREEMENT has to overwrite,
+    // so stamp it here rather than relying on that.
+    let settled = load(&dir, &name)
+        .and_then(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .ok_or_else(|| anyhow::anyhow!("the manifest did not take an identity"))?;
+    let bytes =
+        format::uuid_bytes(&settled).ok_or_else(|| anyhow::anyhow!("{settled:?} is not a uuid"))?;
+    let rings = fs::OpenOptions::new()
+        .write(true)
+        .open(format::rings_path(&dir, &name))?;
+    std::os::unix::fs::FileExt::write_all_at(&rings, &bytes, format::STORE_ID_OFF as u64)?;
+    rings.sync_all()?;
+    crate::note!("timberfs: {name} identity is now {settled} (manifest and index agree)");
+    Ok(())
+}
+
+/// Give an existing pair the identity it lacks, and report whether it
+/// needed one. Nothing else about the store is touched: a declaration it
+/// disagrees with is still left alone and warned about, because that is a
+/// property someone chose, where a missing identity is a store that is not
+/// yet a store.
+fn mint_missing_identity(dir: &Path, name: &str) -> anyhow::Result<Option<&'static str>> {
+    let existing = load(dir, name).unwrap_or_default();
+    if existing.get("id").and_then(|v| v.as_str()).is_some() {
+        return Ok(None);
+    }
+    // The pair may already carry one where the manifest was lost — the
+    // pair is the store, so that is the identity, not a fresh mint.
+    let rings = format::rings_path(dir, name);
+    let carried = fs::read(&rings)
+        .ok()
+        .and_then(|b| format::header_store_id(&b))
+        .map(|id| format::uuid_text(&id));
+    let mut map = existing;
+    let what = if let Some(id) = carried {
+        map.insert("id".to_string(), Value::String(id));
+        "recovered its identity from the index"
+    } else {
+        "had no identity; minted one"
+    };
+    // `save` mints identity for anything that still lacks one, and opening
+    // the store mirrors it into the header.
+    save(dir, name, &map)?;
+    let mut st = store::Store {
+        dir: dir.to_path_buf(),
+        cfg: store::Config {
+            chunk_size: 256 * 1024,
+            level: 3,
+            flush_age_ms: 5000,
+        },
+        files: std::collections::BTreeMap::new(),
+    };
+    st.create(name)?;
+    Ok(Some(what))
+}
+
 /// Rotate holds exclusive writer locks on its source, so it may mint the
 /// source's identity when missing — every rotation then leaves a complete
 /// lineage chain. (Export never writes its source: it is read-only.)
@@ -446,6 +618,14 @@ pub fn cmd_create(
         // CREATE IF NOT EXISTS: the store stands as it is, declaration
         // included — so say so when it declares something else.
         warn_declaration_drift(&dir, &name, &map);
+        // ...but identity is not a declaration, it is what makes the pair
+        // a store at all. A pair carrying none has not been created yet in
+        // the only sense that matters, so CREATE IF NOT EXISTS creates the
+        // missing part rather than reporting success at doing nothing.
+        if let Some(what) = mint_missing_identity(&dir, &name)? {
+            crate::note!("timberfs: {name} in {} {what}", dir.display());
+            return Ok(());
+        }
         crate::note!(
             "timberfs: {name} already exists in {}; nothing created",
             dir.display()
@@ -461,7 +641,15 @@ pub fn cmd_create(
     let _file_lock = store::lock_file_exclusive(&dir, &name)?
         .with_context(|| format!("{name} already has a writer"))?;
 
-    // The empty pair (rings header included), then the manifest.
+    // The manifest FIRST, then the empty pair: the rings header mirrors
+    // the store's identity, and `FileStore::open` reads it from the
+    // manifest — so a store created with anything declared carries its id
+    // in the pair from the very first byte, rather than from its first
+    // write. (A bare `create` declares nothing, writes no manifest, and so
+    // still has no identity; that is a separate question.)
+    if !map.is_empty() {
+        save(&dir, &name, &map)?;
+    }
     let mut st = store::Store {
         dir: dir.clone(),
         cfg: store::Config {
@@ -472,9 +660,6 @@ pub fn cmd_create(
         files: std::collections::BTreeMap::new(),
     };
     st.create(&name)?;
-    if !map.is_empty() {
-        save(&dir, &name, &map)?;
-    }
     crate::note!(
         "timberfs: created {}/{}{}{}{}",
         dir.display(),

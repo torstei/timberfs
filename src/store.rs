@@ -189,7 +189,11 @@ fn migrate_rings(dir: &Path, name: &str) -> io::Result<()> {
         Vec::with_capacity(format::RINGS_HEADER_LEN as usize + records.len() * format::RECORD_LEN);
     // A v1 file never carried the drop counters, so there is nothing
     // to migrate and zero is the honest answer.
-    idx.extend_from_slice(&format::rings_header(next_seq, format::Dropped::default()));
+    idx.extend_from_slice(&format::rings_header(
+        next_seq,
+        format::Dropped::default(),
+        manifest_store_id(dir, name),
+    ));
     for c in &records {
         idx.extend_from_slice(&c.to_bytes());
     }
@@ -377,11 +381,25 @@ struct StageBaseline {
     buffer_start: u64,
 }
 
+/// The identity a store's manifest declares, as raw bytes. The manifest
+/// is the source of truth and the header is its mirror, so this is what
+/// gets stamped — never a value read off the wire.
+fn manifest_store_id(dir: &Path, name: &str) -> Option<[u8; 16]> {
+    let bark = crate::bark::load(dir, name)?;
+    format::uuid_bytes(bark.get("id")?.as_str()?)
+}
+
 pub struct FileStore {
     dir: PathBuf,
     name: String,
     trunk: File,
     rings: File,
+    /// The store's own identity, mirrored from the manifest into the
+    /// `.rings` header so the backing PAIR carries it: lose the `.bark`
+    /// and the data still says what it is. None where the store has none
+    /// yet — every rewrite of the header must carry this forward, or
+    /// retention would erase identity.
+    store_id: Option<[u8; 16]>,
     /// Atomic-sink staging: baseline to commit from or roll back to.
     /// While staged, flushed chunks write trunk frames but hold their
     /// ring records in memory — readers see the store unchanged until
@@ -480,13 +498,51 @@ impl FileStore {
         let mut chunks = Vec::new();
         let mut next_seq = 0u64;
         let mut dropped = format::Dropped::default();
+        // The manifest is the source of truth; the header mirrors it. A
+        // store whose header predates this field gets it stamped on the
+        // next open, so existing stores migrate themselves with no command
+        // to run.
+        let mut store_id = manifest_store_id(dir, name);
         if rings.metadata()?.len() == 0 {
-            rings.write_all_at(&format::rings_header(0, format::Dropped::default()), 0)?;
+            rings.write_all_at(
+                &format::rings_header(0, format::Dropped::default(), store_id),
+                0,
+            )?;
         } else {
             chunks = format::read_index_file(&rings)?;
             next_seq = format::read_header_next_seq(&rings)?
                 .max(chunks.last().map(|c| c.seq + 1).unwrap_or(0));
             dropped = format::read_header_dropped(&rings)?;
+            let mut head = [0u8; format::RINGS_HEADER_LEN as usize];
+            let carried = match rings.read_exact_at(&mut head, 0) {
+                Ok(()) => format::header_store_id(&head),
+                Err(_) => None,
+            };
+            match (store_id, carried) {
+                // The header predates the field: stamp what the manifest
+                // declares, in place — the id is the only thing changing,
+                // and it sits past every field an older reader knows.
+                (Some(id), None) => {
+                    rings.write_all_at(&id, format::STORE_ID_OFF as u64)?;
+                }
+                // No manifest, but the pair carries an identity: the pair
+                // IS the store, so this is the answer.
+                (None, Some(id)) => store_id = Some(id),
+                (Some(mine), Some(theirs)) if mine != theirs => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{}: the manifest says the store is {} and its index says {} — \
+                             two identities for one store, so which cursors and followers \
+                             refer to cannot be decided here",
+                            rings_p.display(),
+                            format::uuid_text(&mine),
+                            format::uuid_text(&theirs)
+                        ),
+                    ));
+                }
+                _ => {}
+            }
         }
 
         let trunk_len = trunk.metadata()?.len();
@@ -623,6 +679,7 @@ impl FileStore {
             name: name.to_string(),
             trunk,
             rings,
+            store_id,
             chunks,
             comp_size,
             buffer,
@@ -1197,7 +1254,7 @@ impl FileStore {
             let mut idx = Vec::with_capacity(
                 RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN,
             );
-            idx.extend_from_slice(&format::rings_header(self.next_seq, dropped));
+            idx.extend_from_slice(&format::rings_header(self.next_seq, dropped, self.store_id));
             for c in &self.chunks[k..] {
                 let rec = ChunkRecord {
                     uncomp_start: c.uncomp_start - uncomp_cut,
@@ -1295,7 +1352,7 @@ impl FileStore {
             let mut idx = Vec::with_capacity(
                 RINGS_HEADER_LEN as usize + (self.chunks.len() - k) * RECORD_LEN,
             );
-            idx.extend_from_slice(&format::rings_header(self.next_seq, dropped));
+            idx.extend_from_slice(&format::rings_header(self.next_seq, dropped, self.store_id));
             for c in &self.chunks[k..] {
                 let rec = ChunkRecord {
                     uncomp_start: c.uncomp_start - uncomp_cut,
@@ -2398,7 +2455,7 @@ mod tests {
             seq: 0,
         };
         let mut idx = Vec::new();
-        idx.extend_from_slice(&format::rings_header(1, format::Dropped::default()));
+        idx.extend_from_slice(&format::rings_header(1, format::Dropped::default(), None));
         idx.extend_from_slice(&rec.to_bytes());
         fs::write(format::rings_path(dir, name), &idx).unwrap();
         rec
@@ -2407,7 +2464,7 @@ mod tests {
     fn write_empty_pair(dir: &Path, name: &str) {
         fs::write(
             format::rings_path(dir, name),
-            format::rings_header(0, format::Dropped::default()),
+            format::rings_header(0, format::Dropped::default(), None),
         )
         .unwrap();
         fs::write(format::trunk_path(dir, name), []).unwrap();
@@ -2630,9 +2687,25 @@ mod tests {
             fs::read(format::trunk_path(crashed.path(), name)).unwrap(),
             fs::read(format::trunk_path(baseline.path(), name)).unwrap(),
         );
+        // The two stores were created independently, so they carry
+        // different identities — the one thing about them that SHOULD
+        // differ. Mask it and the rest of the index must match byte for
+        // byte, which is what this test is about.
+        let mask = |p: std::path::PathBuf| {
+            let mut b = fs::read(p).unwrap();
+            b[format::STORE_ID_OFF..format::STORE_ID_OFF + 16].fill(0);
+            b
+        };
+        assert_ne!(
+            fs::read(format::rings_path(crashed.path(), name)).unwrap()
+                [format::STORE_ID_OFF..format::STORE_ID_OFF + 16],
+            fs::read(format::rings_path(baseline.path(), name)).unwrap()
+                [format::STORE_ID_OFF..format::STORE_ID_OFF + 16],
+            "two stores, two identities"
+        );
         assert_eq!(
-            fs::read(format::rings_path(crashed.path(), name)).unwrap(),
-            fs::read(format::rings_path(baseline.path(), name)).unwrap(),
+            mask(format::rings_path(crashed.path(), name)),
+            mask(format::rings_path(baseline.path(), name)),
         );
     }
 
@@ -2807,14 +2880,14 @@ mod tests {
         // carry no counters, and `header_dropped` must say so rather than
         // read whatever bytes happen to be there.
         assert_eq!(format::header_dropped(&[]), format::Dropped::default());
-        let short = &format::rings_header(7, format::Dropped::default())[..32];
+        let short = &format::rings_header(7, format::Dropped::default(), None)[..32];
         assert_eq!(format::header_dropped(short), format::Dropped::default());
         // A full header round-trips.
         let d = format::Dropped {
             uncomp_bytes: 9_000_000,
             comp_bytes: 600_000,
         };
-        let h = format::rings_header(4831, d);
+        let h = format::rings_header(4831, d, None);
         assert_eq!(format::header_dropped(&h), d);
         // ...and the field it shares the header with is untouched.
         assert_eq!(format::header_next_seq(&h), 4831);
