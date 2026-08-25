@@ -1167,23 +1167,27 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(|f| forest::resolve_source(f))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            query::cmd_query(
-                &files,
-                from,
-                to,
-                &has,
-                &any,
-                no_filename,
-                show_write_time,
-                by_write_time,
-                null_sep,
-                records,
-                follow,
-                tail,
-                max,
-                poll,
-                from_chunk,
-            )?;
+            // The flags BUILD a query rather than being one: the same
+            // value a `--query` document will deserialize into, so the
+            // two surfaces stay one question asked two ways.
+            query::cmd_query(&query::Query {
+                sources: files,
+                window: query::Window {
+                    from,
+                    to,
+                    from_chunk,
+                },
+                matching: query::Match { has, any },
+                limit: query::Limit { max, tail },
+                output: query::Output {
+                    no_filename,
+                    show_write_time,
+                    null_sep,
+                    records,
+                    by_write_time,
+                },
+                follow: query::Follow { follow, poll },
+            })?;
         }
         Command::Follower { command } => match command {
             FollowerCommand::Create {
