@@ -125,8 +125,13 @@ this a filesystem for logs rather than a rotation scheme.
 
 **identity** — a store's `.bark` `id`: a UUID minted on first write, constant
 across renames, moves and hosts. A follower records its store by identity, never
-by path — a store can move, and a path can come to hold a different store.
-→ [design](design.md#the-bark-manifest)
+by path — a store can move, and a path can come to hold a different store. It is
+the only value both stable and unique, so it is what a store IS, where the handle
+is what you call it and **provenance** is how you find it. `list` prints its
+leading 8 characters — a UUID's first group — and `info` takes that back, in full
+or as any prefix of 4 or more; an ambiguous prefix is refused rather than picked.
+`list --full-id` spells one out.
+→ [design](design.md#the-bark-manifest), [receiving end](plans/receiving-end.md)
 
 **intake** — a way in: plain text, the records stream, Fluentd Forward, OTLP, or
 frames. A store's path says what it *is*, never which intake wrote it.
@@ -169,7 +174,11 @@ caseless and a `--not-` form, plus `--any` for OR.
 
 **provenance** — the free-form facts you declare about a store (`host`,
 `service`, anything via `--set`), inherited by derived stores so an artifact
-still says where it came from. → `timberfs(1)` **PROVENANCE**
+still says where it came from. Mutable and non-unique by design, which is why
+they are what a fleet view **selects** on and never what identifies a store.
+Settings (`retain`, `index`, `wal`) are deliberately not provenance: selecting
+on an operational choice would be selecting on the wrong thing.
+→ **`--select`**, `timberfs(1)` **PROVENANCE**
 
 **`query`** — time-window reads: chunks selected by the index, then every entry
 verified against its own logline timestamp, so 13:37–13:38 never shows a 13:42
@@ -213,6 +222,15 @@ it arrives, fsynced on the once-a-second maintenance tick, so the crash-loss
 window shrinks from `--flush-age` to about a second while chunking keeps its own
 schedule. Also what `query --follow` tails.
 → [design](design.md#the-sap-write-ahead-sidecar)
+
+**`--select`** — the store predicate a fleet view takes instead of a name:
+`list --select 'type=console,host=web01'`. Terms are ANDed; `key=value`,
+`key!=value`, `key=~regex`, `key!~regex` (regexes anchored at both ends); an
+absent label reads as the empty string, so `key!=` selects the stores that
+declare it. Matched on **provenance**, so two stores of one service are told
+apart by a label rather than by competing for a name. An empty result reports
+what it searched, because "matched nothing" and "nothing was searched" are
+different answers. → [receiving end](plans/receiving-end.md)
 
 **seqlock** — the counter a reader samples to know the rings and the grain it
 loaded are one generation. A pair straddling a head-drop would skip chunks that

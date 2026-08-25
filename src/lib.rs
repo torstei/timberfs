@@ -32,6 +32,7 @@ pub mod receive;
 pub mod records;
 pub mod rotate;
 pub mod sap;
+pub mod select;
 pub mod serve;
 pub mod sink;
 pub mod store;

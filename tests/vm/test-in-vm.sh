@@ -1635,6 +1635,98 @@ PYEOF
         || { cat "$bark"; return 1; }
 }
 
+selection_is_by_label_not_by_name() {
+    # Two stores of one service, told apart only by a label — the case a
+    # store NAME cannot express, and the reason selection is the primitive.
+    local a=/var/log/timberfs/vmsel-a b=/var/log/timberfs/vmsel-b
+    rm -rf "$a" "$b"
+    timberfs create --set type=console --set service=vmsel --set host=vmhost \
+        "$a/vmsel-a.log" >/dev/null 2>&1 || return 1
+    timberfs create --set type=app --set service=vmsel --set host=vmhost \
+        "$b/vmsel-b.log" >/dev/null 2>&1 || return 1
+    printf 'console line\n' | timberfs append --into "$a/vmsel-a.log" --quiet 2>/dev/null || return 1
+    printf 'app line\n' | timberfs append --into "$b/vmsel-b.log" --quiet 2>/dev/null || return 1
+
+    local got
+    # Terms are ANDed; the same service resolves to two stores, and the
+    # label is what separates them.
+    got=$(timberfs list --names --select 'service=vmsel' 2>/dev/null | sort | tr '\n' ',')
+    [ "$got" = "vmsel-a,vmsel-b," ] || { echo "service=vmsel gave $got" >&2; return 1; }
+    got=$(timberfs list --names --select 'service=vmsel,type=console' 2>/dev/null)
+    [ "$got" = "vmsel-a" ] || { echo "type=console gave $got" >&2; return 1; }
+    # Anchored regex, and a negated term.
+    got=$(timberfs list --names --select 'service=~vms.*,type!=app' 2>/dev/null)
+    [ "$got" = "vmsel-a" ] || { echo "regex/negation gave $got" >&2; return 1; }
+    # Anchoring is not decoration: unanchored, `vms` would match here.
+    got=$(timberfs list --names --select 'service=~vms' 2>/dev/null)
+    [ -z "$got" ] || { echo "unanchored regex matched $got" >&2; return 1; }
+
+    # Matched nothing is a successful answer WITH coverage, not an error
+    # and not silence — "no results" must not read as "nothing searched".
+    got=$(timberfs list --names --select 'service=vmsel,type=nope' 2>/tmp/vmsel.err) || return 1
+    [ -z "$got" ] || return 1
+    grep -q 'examined' /tmp/vmsel.err || { cat /tmp/vmsel.err >&2; return 1; }
+
+    # A malformed predicate is refused before the walk, so it can never be
+    # mistaken for an empty result.
+    timberfs list --select 'service' >/dev/null 2>&1 && return 1
+
+    # `info` and `list` must agree on what a label IS: info kept its own
+    # reserved-key list and had drifted, leaking `wal` and the
+    # `timestamp_*`/`timberfs.store.*` keys into what reads as provenance.
+    timberfs info --json "$a/vmsel-a.log" > /tmp/vmsel.info 2>/dev/null || return 1
+    jq -e '.provenance | has("wal") == false and has("timestamp_utc") == false' \
+        /tmp/vmsel.info >/dev/null || { jq -c .provenance /tmp/vmsel.info; return 1; }
+    timberfs list --json /var/log/timberfs > /tmp/vmsel.list 2>/dev/null || return 1
+    jq -e --argjson p "$(jq -c .provenance /tmp/vmsel.info)" \
+        '.[] | select(.handle == "vmsel-a") | .labels == $p' /tmp/vmsel.list >/dev/null \
+        || { jq -c '.[] | select(.handle=="vmsel-a") | .labels' /tmp/vmsel.list; return 1; }
+}
+
+store_identity_is_printed_and_typeable() {
+    # A listing that prints an id owes a way to type it back in, or it is
+    # printing a token nothing accepts.
+    local a=/var/log/timberfs/vmsel-a
+    local id short
+    id=$(timberfs info --json "$a/vmsel-a.log" 2>/dev/null | jq -r .id) || return 1
+    [ "${#id}" = 36 ] || { echo "id was $id" >&2; return 1; }
+    short=${id:0:8}
+
+    # The table shows the leading 8 — a UUID's first group — and the
+    # LABELS column beside it; --full-id spells the whole thing out.
+    timberfs list /var/log/timberfs > /tmp/vmid.tab 2>/dev/null || return 1
+    # Identity leads the table: it is what a store IS, not a contingent
+    # fact like FOLLOWERS. A store that declares none reads as a dash.
+    head -1 /tmp/vmid.tab | grep -qE '^ID[[:space:]]+HANDLE[[:space:]]+FOREST' || { head -1 /tmp/vmid.tab >&2; return 1; }
+    head -1 /tmp/vmid.tab | grep -q 'ID' || { head -1 /tmp/vmid.tab >&2; return 1; }
+    head -1 /tmp/vmid.tab | grep -q 'LABELS' || { head -1 /tmp/vmid.tab >&2; return 1; }
+    grep -E "^$short[[:space:]]+vmsel-a[[:space:]]" /tmp/vmid.tab >/dev/null || { grep vmsel-a /tmp/vmid.tab >&2; return 1; }
+    timberfs list /var/log/timberfs --full-id 2>/dev/null | grep -qE "^$id[[:space:]]+vmsel-a[[:space:]]" || return 1
+
+    # Typeable: whole id, and the printed prefix.
+    timberfs info "$id" >/dev/null 2>&1 || return 1
+    timberfs info "$short" >/dev/null 2>&1 || return 1
+    # A handle is tried first, so a store can never be shadowed by another
+    # store's id.
+    timberfs info vmsel-a >/dev/null 2>&1 || return 1
+    # Too short to be an id: reported as a missing store, not resolved
+    # against every store that happens to start that way.
+    timberfs info "${id:0:3}" >/dev/null 2>&1 && return 1
+
+    # An id that prefixes several stores names none of them.
+    local b=/var/log/timberfs/vmsel-b
+    python3 - "$a/vmsel-a.log.bark" "$b/vmsel-b.log.bark" <<'PYID'
+import json, sys
+for i, p in enumerate(sys.argv[1:]):
+    m = json.load(open(p))
+    m["id"] = "deadbeef-aaaa-4bbb-8ccc-dddddddd%04d" % i
+    json.dump(m, open(p, "w"), indent=1)
+PYID
+    timberfs info deadbeef > /tmp/vmid.err 2>&1 && return 1
+    grep -q 'ambiguous' /tmp/vmid.err || { cat /tmp/vmid.err >&2; return 1; }
+    timberfs info deadbeef-aaaa-4bbb-8ccc-dddddddd0000 >/dev/null 2>&1 || return 1
+}
+
 catalogue_fields_are_a_projection_of_list() {
     # What a query API's catalogue endpoint needs, and all of it from
     # `list --json`: identity to join on, provenance to select on, coverage
@@ -1670,7 +1762,11 @@ catalogue_fields_are_a_projection_of_list() {
     printf 'no manifest here\n' | timberfs append --into /var/log/timberfs/vmbare/vmbare.log --quiet 2>/dev/null
     timberfs list --json /var/log/timberfs \
         | jq -e '.[] | select(.handle == "vmbare") | .id == null and (.labels | length == 0)' \
-            > /dev/null
+            > /dev/null || return 1
+    # ...and the human table still gives it an ID cell, as a dash: the
+    # column is structural, so a store with no identity is visible as one
+    # rather than absent from a column that quietly disappeared.
+    timberfs list /var/log/timberfs | grep -qE '^-[[:space:]]+vmbare[[:space:]]'
 }
 
 forward_intake_restart_survives() {
@@ -1703,6 +1799,8 @@ run_test "forward-intake: first record's container_id seeds the manifest" forwar
 run_test "forward-intake: a declaring sender seeds host; peer is recorded either way" forward_intake_seeds_host_and_peer
 run_test "forward-intake: service restart is a sender reconnect, no data lost" forward_intake_restart_survives
 run_test "catalogue: list --json carries identity, provenance and coverage" catalogue_fields_are_a_projection_of_list
+run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
+run_test "selection: the id list prints is the id info accepts" store_identity_is_printed_and_typeable
 
 # The OTLP/HTTP intake (timberfs-otlp.socket/.service) and its mirror,
 # the timber-otlp shipper. A python3 http.client driver posts the real
@@ -2246,7 +2344,7 @@ PYEOF
     # `list` grows the column because a listed store declares a directory.
     timberfs list /var/log/timberfs > /tmp/consumers.list 2>/dev/null || return 1
     head -1 /tmp/consumers.list | grep -q 'FOLLOWERS' || { cat /tmp/consumers.list; return 1; }
-    grep -E '^consumed[[:space:]]' /tmp/consumers.list | grep -q '2, ' \
+    grep -E '[[:space:]]consumed[[:space:]]' /tmp/consumers.list | grep -q '2, ' \
         || { cat /tmp/consumers.list; return 1; }
     # A store that declares nothing keeps a dash in the shared column.
     timberfs list --json /var/log/timberfs > /tmp/consumers.ljson 2>/dev/null || return 1
@@ -2272,7 +2370,7 @@ json.dump({"consumer": "dropped", "store": sid, "path": store,
           open(cdir + "/dropped.cursor", "w"))
 PYEOF
     timberfs info "$store" | grep -qE '^ +dropped +GAP' || { timberfs info "$store"; return 1; }
-    timberfs list /var/log/timberfs | grep -E '^consumed[[:space:]]' | grep -q 'GAP' || return 1
+    timberfs list /var/log/timberfs | grep -E '[[:space:]]consumed[[:space:]]' | grep -q 'GAP' || return 1
 
     # And the shipper says so on resume rather than silently restarting
     # from whatever is now oldest.
@@ -2564,7 +2662,7 @@ follower_store_side_view() {
 
     timberfs list "$PIPE_BACKING" > /tmp/f.slist 2>/dev/null || return 1
     head -1 /tmp/f.slist | grep -q 'FOLLOWERS' || { cat /tmp/f.slist; return 1; }
-    grep -E '^vmsrc[[:space:]]' /tmp/f.slist | grep -q '1, ' || { cat /tmp/f.slist; return 1; }
+    grep -E '[[:space:]]vmsrc[[:space:]]' /tmp/f.slist | grep -q '1, ' || { cat /tmp/f.slist; return 1; }
 }
 
 follower_retirement_is_two_commands() {
@@ -2881,7 +2979,7 @@ retain_unconsumed_views_agree() {
         || { cat /tmp/ru.info; return 1; }
     timberfs info --json "$RU_STORE" | jq -e '.retain_unconsumed == true' >/dev/null || return 1
     timberfs list "$PIPE_BACKING" > /tmp/ru.list 2>/dev/null || return 1
-    grep -E '^vmunconsumed[[:space:]]' /tmp/ru.list | grep -q 'unconsumed' \
+    grep -E '[[:space:]]vmunconsumed[[:space:]]' /tmp/ru.list | grep -q 'unconsumed' \
         || { cat /tmp/ru.list; return 1; }
     # And a rotated segment does NOT inherit it: an archive has no
     # followers, so inheriting would make it wait on a consumer that reads
@@ -2946,10 +3044,14 @@ forest_list_command() {
 
     local out names dir_names
     out=$(timberfs list) || return 1
-    echo "$out" | head -1 | grep -q '^HANDLE' || return 1
+    echo "$out" | head -1 | grep -qE '^ID[[:space:]]+HANDLE' || return 1
+    # Both stores here were made by a bare `append`, which declares
+    # nothing and so writes no manifest: the ID column is structural, so
+    # they show a dash rather than the column disappearing.
+    echo "$out" | grep -qE '^-[[:space:]]+web[[:space:]]' || return 1
     # a row for each, with a real (non-"empty") SPAN — both stores have data
-    echo "$out" | grep -E '^web[[:space:]]+default[[:space:]]' | grep -q ' \.\. ' || return 1
-    echo "$out" | grep -E '^db[[:space:]]+default[[:space:]]' | grep -q ' \.\. ' || return 1
+    echo "$out" | grep -E '[[:space:]]web[[:space:]]+default[[:space:]]' | grep -q ' \.\. ' || return 1
+    echo "$out" | grep -E '[[:space:]]db[[:space:]]+default[[:space:]]' | grep -q ' \.\. ' || return 1
 
     names=$(timberfs list --names | sort | tr '\n' ',')
     [ "$names" = "db,web," ] || return 1

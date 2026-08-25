@@ -54,6 +54,14 @@ the same log is later fed by a different route. It is also the name you query it
 by, since a store's handle is its file name minus `.log` (see below), so path,
 handle and `timberfs list` all say the same word.
 
+That holds while one thing owns a name. It stops holding as soon as two do —
+the same service logging over two routes, or two hosts' stores landing in one
+archive — because a name is a single slot and they compete for it. The name is
+metadata, not identity: what tells such stores apart is their **labels**, and
+`timberfs list --select 'type=console,host=web01'` is how you ask for them.
+Reach for a label before you reach for a longer name; a name that has grown a
+suffix to avoid a collision has just moved the collision.
+
 The directory is per store rather than per intake because a directory is the unit
 that matters: **any** writer operation (indexing, rotation) needs write
 permission on it, it is what carries the mount exclusion, and it is what one

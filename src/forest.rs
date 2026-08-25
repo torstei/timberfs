@@ -114,17 +114,9 @@ fn lookup_handle(handle: &str) -> anyhow::Result<PathBuf> {
     }
     match matches.len() {
         1 => Ok(matches.pop().unwrap().1),
-        0 => {
-            if forests.is_empty() {
-                bail!("no forests configured (see {FORESTS_DIR}/); pass a full path");
-            }
-            let searched = forests
-                .iter()
-                .map(|f| f.dir.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!("no store `{handle}` in any forest (searched: {searched}); pass a full path");
-        }
+        // No handle by that name: it may be an id, which is what `list`
+        // prints and what a follower cursor already keys on.
+        0 => lookup_id_prefix(handle, &forests),
         _ => {
             let candidates = matches
                 .iter()
@@ -133,10 +125,75 @@ fn lookup_handle(handle: &str) -> anyhow::Result<PathBuf> {
                 .join("\n");
             bail!(
                 "handle `{handle}` is ambiguous — it matches several stores:\n{candidates}\n\
-                 pass a full path to pick one"
+                 pass a full path or an id to pick one"
             );
         }
     }
+}
+
+/// Resolve a store by its `id`, in full or by a leading prefix — the form
+/// `list` prints. Tried only AFTER the handle lookup misses, so a store
+/// whose id happens to start like someone's handle can never shadow it.
+fn lookup_id_prefix(token: &str, forests: &[Forest]) -> anyhow::Result<PathBuf> {
+    // Four hex characters, git's minimum: short enough to type, long
+    // enough that a mistyped handle — which almost always carries a
+    // non-hex letter — is reported as a missing store instead of
+    // resolving to an unrelated one.
+    let id_shaped = token.len() >= 4 && token.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    if !id_shaped {
+        return Err(no_such_store(token, forests));
+    }
+    let want = token.to_ascii_lowercase();
+    let mut hits: Vec<(String, String, PathBuf, String)> = Vec::new();
+    for forest in forests {
+        for (handle, store) in scan_forest(&forest.dir) {
+            let Some(id) = store_id(&store) else { continue };
+            if id.starts_with(&want) {
+                hits.push((forest.name.clone(), handle, store, id));
+            }
+        }
+    }
+    match hits.len() {
+        1 => Ok(hits.pop().unwrap().2),
+        0 => Err(no_such_store(token, forests)),
+        // A prefix that names more than one store names none of them: the
+        // whole point of an id is that it is unambiguous, so widen it
+        // rather than pick.
+        _ => {
+            let candidates = hits
+                .iter()
+                .map(|(forest, handle, _, id)| format!("  {id}  {handle} ({forest})"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "id `{token}` is ambiguous — it is a prefix of several stores:\n{candidates}\n\
+                 use more of the id"
+            );
+        }
+    }
+}
+
+/// A store's declared `id`, or None where it has no manifest — which is a
+/// real state (a store appended to before manifests existed), not an error.
+fn store_id(store: &Path) -> Option<String> {
+    let (dir, name) = crate::query::resolve_backing(store).ok()?;
+    let bark = crate::bark::load(&dir, &name)?;
+    bark.get("id")?.as_str().map(str::to_string)
+}
+
+fn no_such_store(token: &str, forests: &[Forest]) -> anyhow::Error {
+    if forests.is_empty() {
+        return anyhow::anyhow!("no forests configured (see {FORESTS_DIR}/); pass a full path");
+    }
+    let searched = forests
+        .iter()
+        .map(|f| f.dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::anyhow!(
+        "no store `{token}` in any forest (searched: {searched}); \
+         pass a handle, an id, or a full path"
+    )
 }
 
 /// The forests for `timberfs list`: the given directories as ad-hoc forests
