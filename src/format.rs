@@ -277,13 +277,20 @@ pub fn header_store_id(buf: &[u8]) -> Option<[u8; 16]> {
 /// fact to report, never something to reshape into 16 bytes.
 pub fn uuid_bytes(s: &str) -> Option<[u8; 16]> {
     let hex: Vec<u8> = s.bytes().filter(|b| *b != b'-').collect();
-    if hex.len() != 32 || !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+    if hex.len() != 32 {
         return None;
     }
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
     let mut out = [0u8; 16];
-    for (i, pair) in hex.chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(pair).ok()?;
-        out[i] = u8::from_str_radix(text, 16).ok()?;
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = (nibble(hex[i * 2])? << 4) | nibble(hex[i * 2 + 1])?;
     }
     Some(out)
 }
