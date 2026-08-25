@@ -1676,27 +1676,16 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         .get("retain_unconsumed")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    const RESERVED: &[&str] = &[
-        "id",
-        "created",
-        "derived_from",
-        "derived_op",
-        "window_from",
-        "window_to",
-        "index",
-        "command",
-        "pattern",
-        "retain",
-        "retain_size",
-        "retain_unconsumed",
-        "cursors",
-    ];
-    let provenance: Vec<(String, String)> = bark
-        .iter()
-        .filter(|(k, _)| !RESERVED.contains(&k.as_str()))
+    // `bark` owns what its keys mean, so ask it rather than keeping a
+    // second list here: a view that re-guessed the split would drift, and
+    // this one had — leaking `wal`, the `timestamp_*` settings and the
+    // `timberfs.store.*` lineage into what reads as a label set. `list`
+    // has always used this; now the two agree.
+    let provenance: Vec<(String, String)> = crate::bark::provenance(&bark)
+        .into_iter()
         .map(|(k, v)| {
             (
-                k.clone(),
+                k,
                 v.as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| v.to_string()),

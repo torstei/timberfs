@@ -27,7 +27,19 @@ struct Row {
 /// `timberfs list [DIR ...]`: every store in every configured forest, or —
 /// when one or more directories are given — exactly the stores in those
 /// directories (ad-hoc; they need not be configured forests).
-pub fn cmd_list(dirs: &[PathBuf], names_only: bool, json: bool) -> anyhow::Result<()> {
+pub fn cmd_list(
+    dirs: &[PathBuf],
+    names_only: bool,
+    json: bool,
+    select: Option<&str>,
+) -> anyhow::Result<()> {
+    // Parse before scanning: a malformed predicate is a usage error, and
+    // reporting it after a full forest walk would read as "matched
+    // nothing".
+    let selector = match select {
+        Some(expr) => crate::select::Selector::parse(expr)?,
+        None => crate::select::Selector::all(),
+    };
     let forests = crate::forest::forests_for_list(dirs);
     if dirs.is_empty() && forests.is_empty() {
         crate::note!("timberfs: no forests configured (see /etc/timberfs/forests.d/)");
@@ -63,6 +75,20 @@ pub fn cmd_list(dirs: &[PathBuf], names_only: bool, json: bool) -> anyhow::Resul
     rows.sort_by(|a, b| {
         (a.forest.as_str(), a.handle.as_str()).cmp(&(b.forest.as_str(), b.handle.as_str()))
     });
+
+    // A selection owes coverage: an empty result has to say how much was
+    // searched, or "matched nothing" reads as "nothing was there".
+    if !selector.is_all() {
+        let examined = rows.len();
+        rows.retain(|r| selector.matches(&r.summary.labels));
+        if rows.is_empty() {
+            crate::note!(
+                "timberfs: no store matches `{}` ({examined} store(s) in {} forest(s) examined)",
+                select.unwrap_or("*"),
+                forests.len()
+            );
+        }
+    }
 
     if names_only {
         for r in &rows {

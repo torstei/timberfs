@@ -686,6 +686,11 @@ mod tests {
             ("retain_unconsumed", Value::Bool(true)),
             ("cursors", Value::String("/var/lib/timberfs".into())),
             ("timestamp_utc", Value::Bool(true)),
+            ("wal", Value::Bool(true)),
+            // One hop's bookkeeping, not provenance: under fan-in these
+            // name only ONE of the origins.
+            ("timberfs.store.id", Value::String("def".into())),
+            ("timberfs.store.path", Value::String("/var/log/x".into())),
             // ...and where the entries came from, which is.
             ("host", Value::String("apache01".into())),
             ("service", Value::String("apache".into())),

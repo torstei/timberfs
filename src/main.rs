@@ -435,6 +435,15 @@ enum Command {
         /// A JSON array of objects instead of the human table
         #[arg(long)]
         json: bool,
+        /// Select stores by their manifest LABELS rather than by name:
+        /// `--select 'type=console,host=web01'`. Comma-separated terms are
+        /// ANDed; `key=value`, `key!=value`, `key=~regex` and `key!~regex`
+        /// (regexes anchored at both ends); an absent label reads as the
+        /// empty string, so `key!=` selects the stores that declare it.
+        /// `*` is every store, as an omitted --select is. Quote a value
+        /// that must contain a comma
+        #[arg(long, value_name = "EXPR")]
+        select: Option<String>,
     },
     /// Build or rebuild the .grain token index for a log: one Bloom filter
     /// per chunk over every token in it (~1% false positives), letting
@@ -1122,8 +1131,13 @@ fn main() -> anyhow::Result<()> {
             let file = forest::resolve_source(&file)?;
             query::cmd_index(&file)?;
         }
-        Command::List { dirs, names, json } => {
-            list::cmd_list(&dirs, names, json)?;
+        Command::List {
+            dirs,
+            names,
+            json,
+            select,
+        } => {
+            list::cmd_list(&dirs, names, json, select.as_deref())?;
         }
         Command::Reindex { file } => {
             let file = forest::resolve_source(&file)?;

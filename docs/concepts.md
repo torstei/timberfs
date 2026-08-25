@@ -169,7 +169,11 @@ caseless and a `--not-` form, plus `--any` for OR.
 
 **provenance** — the free-form facts you declare about a store (`host`,
 `service`, anything via `--set`), inherited by derived stores so an artifact
-still says where it came from. → `timberfs(1)` **PROVENANCE**
+still says where it came from. Mutable and non-unique by design, which is why
+they are what a fleet view **selects** on and never what identifies a store.
+Settings (`retain`, `index`, `wal`) are deliberately not provenance: selecting
+on an operational choice would be selecting on the wrong thing.
+→ **`--select`**, `timberfs(1)` **PROVENANCE**
 
 **`query`** — time-window reads: chunks selected by the index, then every entry
 verified against its own logline timestamp, so 13:37–13:38 never shows a 13:42
@@ -213,6 +217,15 @@ it arrives, fsynced on the once-a-second maintenance tick, so the crash-loss
 window shrinks from `--flush-age` to about a second while chunking keeps its own
 schedule. Also what `query --follow` tails.
 → [design](design.md#the-sap-write-ahead-sidecar)
+
+**`--select`** — the store predicate a fleet view takes instead of a name:
+`list --select 'type=console,host=web01'`. Terms are ANDed; `key=value`,
+`key!=value`, `key=~regex`, `key!~regex` (regexes anchored at both ends); an
+absent label reads as the empty string, so `key!=` selects the stores that
+declare it. Matched on **provenance**, so two stores of one service are told
+apart by a label rather than by competing for a name. An empty result reports
+what it searched, because "matched nothing" and "nothing was searched" are
+different answers. → [receiving end](plans/receiving-end.md)
 
 **seqlock** — the counter a reader samples to know the rings and the grain it
 loaded are one generation. A pair straddling a head-drop would skip chunks that

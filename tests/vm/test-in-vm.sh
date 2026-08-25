@@ -1635,6 +1635,54 @@ PYEOF
         || { cat "$bark"; return 1; }
 }
 
+selection_is_by_label_not_by_name() {
+    # Two stores of one service, told apart only by a label — the case a
+    # store NAME cannot express, and the reason selection is the primitive.
+    local a=/var/log/timberfs/vmsel-a b=/var/log/timberfs/vmsel-b
+    rm -rf "$a" "$b"
+    timberfs create --set type=console --set service=vmsel --set host=vmhost \
+        "$a/vmsel-a.log" >/dev/null 2>&1 || return 1
+    timberfs create --set type=app --set service=vmsel --set host=vmhost \
+        "$b/vmsel-b.log" >/dev/null 2>&1 || return 1
+    printf 'console line\n' | timberfs append --into "$a/vmsel-a.log" --quiet 2>/dev/null || return 1
+    printf 'app line\n' | timberfs append --into "$b/vmsel-b.log" --quiet 2>/dev/null || return 1
+
+    local got
+    # Terms are ANDed; the same service resolves to two stores, and the
+    # label is what separates them.
+    got=$(timberfs list --names --select 'service=vmsel' 2>/dev/null | sort | tr '\n' ',')
+    [ "$got" = "vmsel-a,vmsel-b," ] || { echo "service=vmsel gave $got" >&2; return 1; }
+    got=$(timberfs list --names --select 'service=vmsel,type=console' 2>/dev/null)
+    [ "$got" = "vmsel-a" ] || { echo "type=console gave $got" >&2; return 1; }
+    # Anchored regex, and a negated term.
+    got=$(timberfs list --names --select 'service=~vms.*,type!=app' 2>/dev/null)
+    [ "$got" = "vmsel-a" ] || { echo "regex/negation gave $got" >&2; return 1; }
+    # Anchoring is not decoration: unanchored, `vms` would match here.
+    got=$(timberfs list --names --select 'service=~vms' 2>/dev/null)
+    [ -z "$got" ] || { echo "unanchored regex matched $got" >&2; return 1; }
+
+    # Matched nothing is a successful answer WITH coverage, not an error
+    # and not silence — "no results" must not read as "nothing searched".
+    got=$(timberfs list --names --select 'service=vmsel,type=nope' 2>/tmp/vmsel.err) || return 1
+    [ -z "$got" ] || return 1
+    grep -q 'examined' /tmp/vmsel.err || { cat /tmp/vmsel.err >&2; return 1; }
+
+    # A malformed predicate is refused before the walk, so it can never be
+    # mistaken for an empty result.
+    timberfs list --select 'service' >/dev/null 2>&1 && return 1
+
+    # `info` and `list` must agree on what a label IS: info kept its own
+    # reserved-key list and had drifted, leaking `wal` and the
+    # `timestamp_*`/`timberfs.store.*` keys into what reads as provenance.
+    timberfs info --json "$a/vmsel-a.log" > /tmp/vmsel.info 2>/dev/null || return 1
+    jq -e '.provenance | has("wal") == false and has("timestamp_utc") == false' \
+        /tmp/vmsel.info >/dev/null || { jq -c .provenance /tmp/vmsel.info; return 1; }
+    timberfs list --json /var/log/timberfs > /tmp/vmsel.list 2>/dev/null || return 1
+    jq -e --argjson p "$(jq -c .provenance /tmp/vmsel.info)" \
+        '.[] | select(.handle == "vmsel-a") | .labels == $p' /tmp/vmsel.list >/dev/null \
+        || { jq -c '.[] | select(.handle=="vmsel-a") | .labels' /tmp/vmsel.list; return 1; }
+}
+
 catalogue_fields_are_a_projection_of_list() {
     # What a query API's catalogue endpoint needs, and all of it from
     # `list --json`: identity to join on, provenance to select on, coverage
@@ -1703,6 +1751,7 @@ run_test "forward-intake: first record's container_id seeds the manifest" forwar
 run_test "forward-intake: a declaring sender seeds host; peer is recorded either way" forward_intake_seeds_host_and_peer
 run_test "forward-intake: service restart is a sender reconnect, no data lost" forward_intake_restart_survives
 run_test "catalogue: list --json carries identity, provenance and coverage" catalogue_fields_are_a_projection_of_list
+run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 
 # The OTLP/HTTP intake (timberfs-otlp.socket/.service) and its mirror,
 # the timber-otlp shipper. A python3 http.client driver posts the real
