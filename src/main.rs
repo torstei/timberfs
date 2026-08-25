@@ -444,6 +444,11 @@ enum Command {
         /// that must contain a comma
         #[arg(long, value_name = "EXPR")]
         select: Option<String>,
+        /// Print each store's whole id instead of the leading 8
+        /// characters. The short form is a prefix `info` accepts, so this
+        /// is for copying an id somewhere that wants all of it
+        #[arg(long)]
+        full_id: bool,
     },
     /// Build or rebuild the .grain token index for a log: one Bloom filter
     /// per chunk over every token in it (~1% false positives), letting
@@ -1136,8 +1141,9 @@ fn main() -> anyhow::Result<()> {
             names,
             json,
             select,
+            full_id,
         } => {
-            list::cmd_list(&dirs, names, json, select.as_deref())?;
+            list::cmd_list(&dirs, names, json, select.as_deref(), full_id)?;
         }
         Command::Reindex { file } => {
             let file = forest::resolve_source(&file)?;

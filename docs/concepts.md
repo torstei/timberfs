@@ -125,8 +125,13 @@ this a filesystem for logs rather than a rotation scheme.
 
 **identity** — a store's `.bark` `id`: a UUID minted on first write, constant
 across renames, moves and hosts. A follower records its store by identity, never
-by path — a store can move, and a path can come to hold a different store.
-→ [design](design.md#the-bark-manifest)
+by path — a store can move, and a path can come to hold a different store. It is
+the only value both stable and unique, so it is what a store IS, where the handle
+is what you call it and **provenance** is how you find it. `list` prints its
+leading 8 characters — a UUID's first group — and `info` takes that back, in full
+or as any prefix of 4 or more; an ambiguous prefix is refused rather than picked.
+`list --full-id` spells one out.
+→ [design](design.md#the-bark-manifest), [receiving end](plans/receiving-end.md)
 
 **intake** — a way in: plain text, the records stream, Fluentd Forward, OTLP, or
 frames. A store's path says what it *is*, never which intake wrote it.

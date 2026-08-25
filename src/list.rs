@@ -32,6 +32,7 @@ pub fn cmd_list(
     names_only: bool,
     json: bool,
     select: Option<&str>,
+    full_id: bool,
 ) -> anyhow::Result<()> {
     // Parse before scanning: a malformed predicate is a usage error, and
     // reporting it after a full forest walk would read as "matched
@@ -100,7 +101,7 @@ pub fn cmd_list(
         println!("{}", serde_json::to_string_pretty(&rows_to_json(&rows))?);
         return Ok(());
     }
-    print_table(&rows);
+    print_table(&rows, full_id);
     Ok(())
 }
 
@@ -153,9 +154,54 @@ fn span_text(s: &StoreSummary) -> String {
     }
 }
 
-const COLUMNS: [&str; 7] = [
-    "HANDLE", "FOREST", "SIZE", "SPAN", "WRITER", "INDEX", "RETAIN",
+const COLUMNS: [&str; 8] = [
+    "ID", "HANDLE", "FOREST", "SIZE", "SPAN", "WRITER", "INDEX", "RETAIN",
 ];
+
+/// How much of an `id` the table prints. A UUID's first group is exactly
+/// this long, so the short form ends on a boundary rather than mid-field —
+/// and `info` takes it back as a prefix, so what is printed is typeable.
+const SHORT_ID: usize = 8;
+
+/// Which CONTINGENT columns this listing has anything to put in. Each
+/// appears only when at least one row fills it, rather than taxing every
+/// table with a column of dashes.
+///
+/// `ID` is deliberately not among them. A store having no reader is
+/// ordinary; a store having no identity is not — it is what a store IS,
+/// so the column is structural and a table of dashes there is a finding
+/// rather than noise.
+#[derive(Clone, Copy, Debug)]
+struct Optional {
+    followers: bool,
+    labels: bool,
+    full_id: bool,
+}
+
+/// A store's labels as `k=v, k=v`, sorted so two runs of `list` order them
+/// the same way. Rendered through the same `stringify` a selector matches
+/// with, so what you read is what `--select` compares.
+fn labels_text(s: &StoreSummary) -> String {
+    if s.labels.is_empty() {
+        return "-".to_string();
+    }
+    s.labels
+        .iter()
+        .map(|(k, v)| format!("{k}={}", crate::select::stringify(v)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The id column: short by default, whole with `--full-id`. `-` where the
+/// store has no manifest and so declares no identity — a real state, not
+/// an error.
+fn id_text(s: &StoreSummary, full: bool) -> String {
+    match &s.id {
+        None => "-".to_string(),
+        Some(id) if full => id.clone(),
+        Some(id) => id.chars().take(SHORT_ID).collect(),
+    }
+}
 
 /// The FOLLOWERS column: how many readers hold a position in this store,
 /// and the worst of them — the one that decides how much of the store is
@@ -175,18 +221,30 @@ fn followers_text(s: &StoreSummary) -> String {
 /// Most stores have no followers, so the column appears when at least
 /// one row fills it rather than taxing every table with a column of
 /// dashes.
-fn columns(rows: &[Row]) -> Vec<&'static str> {
-    let mut cols = COLUMNS.to_vec();
-    if rows.iter().any(|r| r.summary.has_readers()) {
+fn columns(rows: &[Row]) -> (Vec<&'static str>, Optional) {
+    let opt = Optional {
+        followers: rows.iter().any(|r| r.summary.has_readers()),
+        labels: rows.iter().any(|r| !r.summary.labels.is_empty()),
+        full_id: false,
+    };
+    // Identity leads, then the name, then what the store is doing. The
+    // contingent columns are appended; labels go last, being the widest
+    // and the only column with no fixed shape.
+    let mut cols: Vec<&'static str> = COLUMNS.to_vec();
+    if opt.followers {
         cols.push("FOLLOWERS");
     }
-    cols
+    if opt.labels {
+        cols.push("LABELS");
+    }
+    (cols, opt)
 }
 
 /// One row's cells, in `columns` order — a pure function of a `Row`, so
 /// it (and the table it feeds) is unit-testable without touching disk.
-fn row_cells(r: &Row, with_followers: bool) -> Vec<String> {
-    let mut cells = vec![
+fn row_cells(r: &Row, opt: Optional) -> Vec<String> {
+    let mut cells = Vec::from([
+        id_text(&r.summary, opt.full_id),
         r.handle.clone(),
         r.forest.clone(),
         crate::rotate::human_bytes(r.summary.compressed_bytes),
@@ -199,9 +257,12 @@ fn row_cells(r: &Row, with_followers: bool) -> Vec<String> {
         .to_string(),
         if r.summary.indexed() { "grain" } else { "-" }.to_string(),
         retain_text(&r.summary),
-    ];
-    if with_followers {
+    ]);
+    if opt.followers {
         cells.push(followers_text(&r.summary));
+    }
+    if opt.labels {
+        cells.push(labels_text(&r.summary));
     }
     cells
 }
@@ -235,10 +296,10 @@ pub(crate) fn format_table(header: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
-fn print_table(rows: &[Row]) {
-    let cols = columns(rows);
-    let with_followers = cols.len() > COLUMNS.len();
-    let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, with_followers)).collect();
+fn print_table(rows: &[Row], full_id: bool) {
+    let (cols, mut opt) = columns(rows);
+    opt.full_id = full_id;
+    let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, opt)).collect();
     println!("{}", format_table(&cols, &data));
 }
 
@@ -407,6 +468,12 @@ mod tests {
         }
     }
 
+    /// The optional-column set `columns()` would compute for these rows,
+    /// so a test never pairs cells with a header it would not get.
+    fn opts(rows: &[Row]) -> Optional {
+        columns(rows).1
+    }
+
     fn row(handle: &str, forest: &str, summary: StoreSummary) -> Row {
         Row {
             handle: handle.to_string(),
@@ -468,7 +535,7 @@ mod tests {
             "default",
             summary(2048, Some((0, 1000)), WriterState::Idle, false, None, None),
         )];
-        assert_eq!(columns(&plain), COLUMNS.to_vec());
+        assert_eq!(columns(&plain).0, COLUMNS.to_vec());
 
         let mut declared = summary(2048, Some((0, 1000)), WriterState::Idle, false, None, None);
         declared.consumers = Some(survey(vec![("otlp", 0, 0, None)]));
@@ -480,13 +547,14 @@ mod tests {
                 summary(0, None, WriterState::Idle, false, None, None),
             ),
         ];
-        let cols = columns(&rows);
+        let (cols, _) = columns(&rows);
         assert_eq!(cols.last(), Some(&"FOLLOWERS"));
-        let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, true)).collect();
-        assert_eq!(data[0][7], "1, caught up");
+        let o = opts(&rows);
+        let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, o)).collect();
+        assert_eq!(data[0][8], "1, caught up");
         // A store with nothing reading it keeps a dash in the shared
         // column.
-        assert_eq!(data[1][7], "-");
+        assert_eq!(data[1][8], "-");
         let table = format_table(&cols, &data);
         assert!(table.lines().next().unwrap().contains("FOLLOWERS"));
     }
@@ -543,6 +611,64 @@ mod tests {
     }
 
     #[test]
+    fn the_id_column_is_a_prefix_info_accepts_and_full_id_is_the_whole_thing() {
+        let mut s = summary(1, Some((1, 2)), WriterState::Idle, false, None, None);
+        s.id = Some("5e86897c-4d6a-4c7e-a757-8cf846838bad".to_string());
+        // A UUID's first group is exactly SHORT_ID long, so the short form
+        // ends on a boundary instead of mid-field.
+        assert_eq!(id_text(&s, false), "5e86897c");
+        assert_eq!(id_text(&s, true), "5e86897c-4d6a-4c7e-a757-8cf846838bad");
+        // No manifest, no identity — a real state, and not an error.
+        s.id = None;
+        assert_eq!(id_text(&s, false), "-");
+    }
+
+    #[test]
+    fn optional_columns_appear_only_when_something_fills_them() {
+        // The rule FOLLOWERS already set: a table is not taxed with a
+        // column of dashes for a fact none of its rows has.
+        let bare = vec![row(
+            "bare",
+            "default",
+            summary(1, Some((1, 2)), WriterState::Idle, false, None, None),
+        )];
+        let (cols, o) = columns(&bare);
+        assert!(!o.labels && !o.followers);
+        // Identity is structural: present even for a store that declares
+        // none, where it reads as a dash.
+        assert_eq!(cols.first(), Some(&"ID"));
+        assert_eq!(row_cells(&bare[0], o)[0], "-");
+        assert_eq!(cols, COLUMNS.to_vec());
+        assert_eq!(row_cells(&bare[0], o).len(), cols.len());
+
+        let mut s = summary(1, Some((1, 2)), WriterState::Idle, false, None, None);
+        s.id = Some("abcdef01-0000-4000-8000-000000000000".to_string());
+        s.labels.insert("type".into(), "console".into());
+        let rich = vec![row("rich", "default", s)];
+        let (cols, o) = columns(&rich);
+        assert!(o.labels);
+        assert_eq!(cols.first(), Some(&"ID"), "identity leads");
+        assert_eq!(cols[1], "HANDLE");
+        assert_eq!(cols.last(), Some(&"LABELS"), "the widest column trails");
+        // Header and cells must stay in step, which is the bug a bool
+        // per optional column invites.
+        assert_eq!(row_cells(&rich[0], o).len(), cols.len());
+    }
+
+    #[test]
+    fn labels_render_sorted_and_the_way_a_selector_compares_them() {
+        let mut s = summary(1, Some((1, 2)), WriterState::Idle, false, None, None);
+        assert_eq!(labels_text(&s), "-");
+        s.labels.insert("type".into(), "console".into());
+        s.labels.insert("host".into(), "web01".into());
+        // Sorted, so two runs of `list` order them identically...
+        assert_eq!(labels_text(&s), "host=web01, type=console");
+        // ...and a non-string label reads as the text `--select` matches.
+        s.labels.insert("replicas".into(), 3.into());
+        assert!(labels_text(&s).contains("replicas=3"));
+    }
+
+    #[test]
     fn row_cells_reflect_writer_and_index_state() {
         let live = row(
             "nginx",
@@ -556,21 +682,22 @@ mod tests {
                 None,
             ),
         );
-        let cells = row_cells(&live, false);
-        assert_eq!(cells[0], "nginx");
-        assert_eq!(cells[1], "default");
-        assert_eq!(cells[4], "live");
-        assert_eq!(cells[5], "grain");
+        let cells = row_cells(&live, opts(std::slice::from_ref(&live)));
+        assert_eq!(cells[0], "-", "no manifest, no identity");
+        assert_eq!(cells[1], "nginx");
+        assert_eq!(cells[2], "default");
+        assert_eq!(cells[5], "live");
+        assert_eq!(cells[6], "grain");
 
         let idle = row(
             "db",
             "default",
             summary(0, None, WriterState::Idle, false, None, None),
         );
-        let cells = row_cells(&idle, false);
-        assert_eq!(cells[3], "empty");
-        assert_eq!(cells[4], "-");
+        let cells = row_cells(&idle, opts(std::slice::from_ref(&idle)));
+        assert_eq!(cells[4], "empty");
         assert_eq!(cells[5], "-");
+        assert_eq!(cells[6], "-");
     }
 
     #[test]
@@ -594,13 +721,14 @@ mod tests {
                 summary(0, None, WriterState::Idle, false, None, None),
             ),
         ];
-        let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, false)).collect();
+        let o = opts(&rows);
+        let data: Vec<Vec<String>> = rows.iter().map(|r| row_cells(r, o)).collect();
         let table = format_table(&COLUMNS, &data);
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), 3); // header + 2 rows
-        assert!(lines[0].starts_with("HANDLE"));
+        assert!(lines[0].starts_with("ID"));
         // the HANDLE column widens to fit the longest handle
-        assert!(lines[2].starts_with("a-very-long-handle-name"));
+        assert!(lines[2].contains("a-very-long-handle-name"));
     }
 
     #[test]

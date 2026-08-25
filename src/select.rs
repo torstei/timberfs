@@ -99,7 +99,7 @@ impl Selector {
 /// A label's value as text. Free-form keys may hold a non-string, and a
 /// selector compares text, so render one the same way `info` does rather
 /// than refusing to match it.
-fn stringify(v: &Value) -> String {
+pub(crate) fn stringify(v: &Value) -> String {
     v.as_str()
         .map(str::to_string)
         .unwrap_or_else(|| v.to_string())
