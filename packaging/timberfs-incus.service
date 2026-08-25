@@ -1,0 +1,71 @@
+# Systemd unit for the incus console intake.
+#
+# Not socket-activated and not templated: this one goes OUT to the incus
+# unix socket rather than being connected to, and one instance taps every
+# container in the project, following incus's lifecycle events so a
+# container started later is tapped too.
+#
+# Each console lands in its own store, found by its labels rather than by
+# a name built from them:
+#
+#   timberfs list --select 'type=console'
+#   timberfs query gateway01-console --follow
+#
+# Change the key, add a prefix, or narrow to some instances with a
+# drop-in:
+#
+#   systemctl edit timberfs-incus.service
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/bin/timberfs incus-intake --exit-on-upgrade \
+#         --into-dir /var/log/timberfs --index --retain 7d \
+#         --key type,incus.project,incus.instance,image
+#
+# ⚠ An instance's console is EXCLUSIVE. While this holds one, `incus
+# console <instance>` is refused unless forced — and forcing it takes the
+# console from this tap, which then reconnects.
+
+[Unit]
+Description=timberfs incus console intake
+Documentation=https://github.com/torstei/timberfs
+# incus.service is the socket's owner; without it there is nothing to tap.
+# Not Requires=: a restart of incus should not stop this, which reconnects
+# on its own.
+Wants=incus.service
+After=incus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/timberfs incus-intake --into-dir /var/log/timberfs --exit-on-upgrade
+StandardOutput=journal
+StandardError=journal
+
+# Reaching /var/lib/incus/unix.socket needs the incus-admin group: the
+# socket is root:incus-admin 0660. This is the whole privilege the tap
+# wants — it never writes to incus, only reads instances and attaches to
+# consoles.
+SupplementaryGroups=incus-admin
+
+# Owns /var/log/timberfs (0755), where it creates each console's store
+# directory. A confined instance is better given a root of its own
+# (--into-dir /var/log/timberfs/incus) than write permission on the
+# shared one.
+ReadWritePaths=/var/log/timberfs
+
+# Restart on anything, including the clean exit --exit-on-upgrade uses to
+# re-exec onto a newly installed binary.
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+# It talks to a unix socket and writes files; nothing here needs more.
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

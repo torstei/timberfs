@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use regex::Regex;
 
 use crate::incus::Instance;
@@ -280,6 +280,18 @@ pub fn timestamp_declaration(pieces: &[Piece]) -> Option<(String, String)> {
     Some((re, TIME_FMT.to_string()))
 }
 
+/// Whether an entry is open, and what opened it — which decides whether
+/// the next unstamped line continues it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Open {
+    None,
+    /// A line carrying its own timestamp. Everything unstamped after it
+    /// is its body: an exception, a stack frame, the rest of a banner.
+    ByStamp,
+    /// A line we stamped ourselves, having judged it an entry start.
+    ByPrefix,
+}
+
 /// Turns console bytes into stamped entries.
 ///
 /// The rule: a line that already carries its own leading timestamp starts
@@ -292,10 +304,13 @@ pub struct Stamper {
     prefix: Prefix,
     idle_ms: u64,
     iso: Regex,
-    open_entry: bool,
+    open_entry: Open,
     last_ms: i64,
     /// Bytes of a line not yet terminated by the console.
     partial: Vec<u8>,
+    /// True while feeding bytes whose arrival time says nothing about
+    /// when they were written.
+    timeless: bool,
 }
 
 impl Stamper {
@@ -307,10 +322,29 @@ impl Stamper {
             // "already stamped" here means "already an entry start"
             // there.
             iso: Regex::new(r"^\d{4}[.-]\d{2}[.-]\d{2}[T ]\d{2}:\d{2}:\d{2}").unwrap(),
-            open_entry: false,
+            open_entry: Open::None,
             last_ms: 0,
             partial: Vec::new(),
+            timeless: false,
         }
+    }
+
+    /// Feed bytes recovered from the ring buffer, which arrive in ONE
+    /// batch however long they took to be written. Arrival timing says
+    /// nothing here, so the idle gap cannot: every unstamped line starts
+    /// its own entry, and only a line that carries its own timestamp
+    /// still gathers the lines beneath it.
+    ///
+    /// Without this the whole backlog fuses into one entry, which is what
+    /// the first live run against a real container did.
+    pub fn push_recovered(&mut self, bytes: &[u8], now_ms: i64) -> Vec<u8> {
+        self.timeless = true;
+        let out = self.push(bytes, now_ms);
+        self.timeless = false;
+        // The live stream that follows is timed again, and nothing it
+        // sends continues a line recovered from the ring.
+        self.open_entry = Open::None;
+        out
     }
 
     /// Feed console bytes; returns the entries to append. Carriage returns
@@ -346,25 +380,34 @@ impl Stamper {
     }
 
     fn emit(&mut self, line: &[u8], now_ms: i64, out: &mut Vec<u8>) {
-        if self.open_entry && now_ms.saturating_sub(self.last_ms) > self.idle_ms as i64 {
-            self.open_entry = false;
+        if self.open_entry != Open::None
+            && now_ms.saturating_sub(self.last_ms) > self.idle_ms as i64
+        {
+            self.open_entry = Open::None;
         }
         self.last_ms = now_ms;
         let already_stamped = std::str::from_utf8(line)
             .map(|s| self.iso.is_match(s))
             .unwrap_or(false);
+        // Recovered bytes have no usable arrival time, so only a stamped
+        // line may gather what follows it.
+        let continues = match self.open_entry {
+            Open::None => false,
+            Open::ByStamp => true,
+            Open::ByPrefix => !self.timeless,
+        };
         if already_stamped {
             // The producer stamps its own lines. Prefixing would demote
             // its timestamp to payload AND make every continuation line
             // its own entry, which is how a stack trace stops coming back
             // whole.
-            self.open_entry = true;
-        } else if self.open_entry {
+            self.open_entry = Open::ByStamp;
+        } else if continues {
             // A continuation: an exception body, a stack frame, the rest
             // of a banner.
         } else {
             self.prefix.write(now_ms, out);
-            self.open_entry = true;
+            self.open_entry = Open::ByPrefix;
         }
         out.extend_from_slice(line);
     }
@@ -414,6 +457,442 @@ pub fn store_name(facts: &BTreeMap<String, String>, key: &[String]) -> String {
             format!("{host}-console")
         }
     }
+}
+
+// ------------------------------------------------------------ resolution
+
+/// Find the store this instance's console belongs in, creating it if it
+/// is not there yet, and return the name it lives under — which is its
+/// id, because the path is opaque and nothing should read it.
+///
+/// The lookup is the operator's `--key`, matched against every store's
+/// manifest. Exactly one match is used; none mints a store; SEVERAL is
+/// refused, and that refusal is not us policing the key — a key that
+/// merges instances is a legitimate choice, but two stores already
+/// wearing one key is a state nothing can write to, and creating a third
+/// would be worse.
+pub fn resolve_store(
+    into_dir: &std::path::Path,
+    key: &[String],
+    facts: &BTreeMap<String, String>,
+    opts: &IncusOpts,
+) -> anyhow::Result<String> {
+    let expr = key_selector(key, facts);
+    let sel = crate::select::Selector::parse(&expr)
+        .with_context(|| format!("the --key produced the selector {expr:?}"))?;
+    let dirs = [into_dir.to_path_buf()];
+    let mut found = crate::select::resolve(&dirs, &sel);
+    match found.len() {
+        1 => Ok(found.pop().unwrap().name),
+        0 => Ok(mint_store(into_dir, key, facts, opts, &expr)?),
+        _ => {
+            let names = found
+                .iter()
+                .map(|m| format!("  {} ({})", m.name, m.dir.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "{expr} matches {} stores, so there is no one store to write to:\n{names}\n\
+                 give --key more labels, or take the extra stores out of {}",
+                found.len(),
+                into_dir.display()
+            )
+        }
+    }
+}
+
+/// Write the manifest for a new store, and return the name it lives
+/// under. The id is minted HERE and the directory is named after it: the
+/// manifest must carry the id before the pair exists, because a pair whose
+/// two sides disagree is refused by every writer — including this one.
+fn mint_store(
+    into_dir: &std::path::Path,
+    key: &[String],
+    facts: &BTreeMap<String, String>,
+    opts: &IncusOpts,
+    routed_from: &str,
+) -> anyhow::Result<String> {
+    let id = crate::bark::new_uuid()?;
+    let dir = into_dir.join(&id);
+    std::fs::create_dir_all(&dir)?;
+    let mut map = serde_json::Map::new();
+    map.insert("id".into(), serde_json::Value::String(id.clone()));
+    map.insert(
+        "name".into(),
+        serde_json::Value::String(store_name(facts, key)),
+    );
+    for (k, v) in labels_for(key, facts) {
+        map.insert(k, serde_json::Value::String(v));
+    }
+    if opts.index {
+        map.insert("index".into(), serde_json::Value::Bool(true));
+    }
+    // The sap: an appender's crash window shrinks to a second, and
+    // `query --follow` can tail the console live, which is most of the
+    // point of tapping it in the first place.
+    map.insert("wal".into(), serde_json::Value::Bool(true));
+    if let Some(r) = &opts.retain {
+        map.insert("retain".into(), serde_json::Value::String(r.clone()));
+    }
+    if let Some(r) = &opts.retain_size {
+        map.insert("retain_size".into(), serde_json::Value::String(r.clone()));
+    }
+    // A prefix whose timestamp does not lead needs the store taught how to
+    // find it; the built-in detection is anchored.
+    if let Some((re, fmt)) = timestamp_declaration(&opts.prefix) {
+        map.insert("timestamp_regex".into(), serde_json::Value::String(re));
+        map.insert("timestamp_format".into(), serde_json::Value::String(fmt));
+    }
+    map.insert(
+        crate::bark::ROUTED_FROM.to_string(),
+        serde_json::Value::String(routed_from.to_string()),
+    );
+    crate::bark::save(&dir, &id, &map)?;
+    crate::note!(
+        "timberfs: {} has no store yet; created {}",
+        routed_from,
+        dir.join(&id).display()
+    );
+    Ok(id)
+}
+
+/// Everything the intake was told on the command line.
+pub struct IncusOpts {
+    pub socket: String,
+    pub project: String,
+    pub into_dir: std::path::PathBuf,
+    pub key: Vec<String>,
+    pub prefix: Vec<Piece>,
+    pub include_vms: bool,
+    pub only: Vec<String>,
+    pub retain: Option<String>,
+    pub retain_size: Option<String>,
+    pub index: bool,
+    pub idle_ms: u64,
+    pub mark_episodes: bool,
+    pub exit_on_upgrade: bool,
+}
+
+impl IncusOpts {
+    /// Is this instance one this intake should tap?
+    pub fn wants(&self, inst: &Instance) -> bool {
+        if !inst.is_running() {
+            return false;
+        }
+        // A VM's console is a different animal: file-backed, so reads are
+        // idempotent and there is no ring to lose, and it carries the
+        // kernel's boot output rather than an application's stdout.
+        if !inst.is_container() && !self.include_vms {
+            return false;
+        }
+        self.only.is_empty() || self.only.iter().any(|n| n == &inst.name)
+    }
+}
+
+// ------------------------------------------------------------- the tap
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Tap one instance's console until it closes, the store cannot be
+/// written, or `stop` is set. Returns Ok(()) on a clean end — a restart,
+/// a shutdown — so the supervisor can decide whether to come back.
+///
+/// The order here is the whole reliability argument. Attach FIRST, then
+/// drain the ring: the two feeds are independent, so what the ring still
+/// holds overlaps what the websocket has begun delivering rather than
+/// leaving a gap between them. Drain-then-attach would lose whatever the
+/// instance emitted in between.
+pub fn tap_instance(
+    incus: &crate::incus::Incus,
+    inst: &Instance,
+    server_name: &str,
+    opts: &IncusOpts,
+    intake: &Arc<Mutex<crate::intake::Intake>>,
+    stop: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let facts = facts(inst, server_name);
+    let console = incus.console_attach(&inst.name)?;
+    // From here every exit path must release the console, or a human
+    // running `incus console` is refused until this process dies.
+    let result = tap_attached(incus, inst, &facts, opts, intake, stop, &console);
+    if let Err(e) = incus.cancel_operation(&console.id) {
+        crate::note!("timberfs: {}: releasing the console: {e}", inst.name);
+    }
+    result
+}
+
+fn tap_attached(
+    incus: &crate::incus::Incus,
+    inst: &Instance,
+    facts: &BTreeMap<String, String>,
+    opts: &IncusOpts,
+    intake: &Arc<Mutex<crate::intake::Intake>>,
+    stop: &Arc<AtomicBool>,
+    console: &crate::incus::Console,
+) -> anyhow::Result<()> {
+    let mut ws = incus.console_stream(console)?;
+    // Only a container has the ring; a VM's console is a file, and reading
+    // it is not a drain.
+    let backlog = if inst.is_container() {
+        incus.console_drain(&inst.name).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let store = resolve_store(&opts.into_dir, &opts.key, facts, opts)?;
+    {
+        let mut g = intake.lock().unwrap();
+        crate::intake::ensure_store(
+            &mut g,
+            &store,
+            &format!("incus-intake {}", inst.name),
+            // The store either already existed (resolved by key) or was
+            // just minted with its manifest; either way this is not the
+            // moment to refuse it.
+            true,
+            "",
+            |_dir, _name| Ok(()),
+        )?;
+    }
+
+    let mut stamper = Stamper::new(Prefix::render(&opts.prefix, facts), opts.idle_ms);
+    let mut first = Vec::new();
+    if opts.mark_episodes {
+        let mut marker = Vec::new();
+        Prefix::render(&opts.prefix, facts).write(now_ms(), &mut marker);
+        marker.extend_from_slice(attach_marker(facts, backlog.len()).as_bytes());
+        marker.push(b'\n');
+        first.extend_from_slice(&marker);
+    }
+    if !backlog.is_empty() {
+        first.extend(stamper.push_recovered(&backlog, now_ms()));
+    }
+    if !first.is_empty() {
+        append(intake, &store, &first)?;
+    }
+
+    while !stop.load(Ordering::Relaxed) {
+        match ws.read() {
+            Ok(Some(bytes)) => {
+                let out = stamper.push(&bytes, now_ms());
+                if !out.is_empty() {
+                    append(intake, &store, &out)?;
+                }
+            }
+            // The console closed: the instance stopped or restarted. Not
+            // an error — the supervisor decides whether to come back.
+            Ok(None) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    let tail = stamper.flush(now_ms());
+    if !tail.is_empty() {
+        append(intake, &store, &tail)?;
+    }
+    Ok(())
+}
+
+fn append(
+    intake: &Arc<Mutex<crate::intake::Intake>>,
+    store: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let mut g = intake.lock().unwrap();
+    let cfg = g.cfg;
+    let Some(f) = g.file(store) else {
+        bail!("{store} is not open");
+    };
+    let ms = u64::try_from(now_ms()).unwrap_or(0);
+    f.append_windowed(bytes, ms, ms, &cfg)?;
+    Ok(())
+}
+
+// ------------------------------------------------------- the supervisor
+
+/// How long to wait before re-attaching after a console ends. An instance
+/// that is restarting is not ready the instant its old console closes, and
+/// a tight retry loop against a container that will not start is just a
+/// busy wait on a daemon socket.
+const REATTACH_MS: u64 = 1_000;
+const REATTACH_MAX_MS: u64 = 30_000;
+
+/// Run the intake: tap every instance the options want, follow incus's
+/// lifecycle events so the set stays current, and keep going until
+/// SIGTERM.
+pub fn run(opts: IncusOpts) -> anyhow::Result<()> {
+    let incus = crate::incus::Incus::new(&opts.socket, &opts.project);
+    let server_name = incus.server_name().context(
+        "asking incus its name — is the socket readable?          (it is root:incus-admin, so this usually means group membership)",
+    )?;
+    if timestamp_declaration(&opts.prefix).is_none()
+        && !opts.prefix.contains(&Piece::Time)
+        && !opts.prefix.is_empty()
+    {
+        crate::note!(
+            "timberfs: --prefix has no {{time}}, so entries carry no timestamp of their own              and a query has only the write time to go on"
+        );
+    }
+
+    std::fs::create_dir_all(&opts.into_dir)?;
+    let cfg = crate::store::Config {
+        chunk_size: 256 * 1024,
+        level: 3,
+        flush_age_ms: 5000,
+    };
+    let intake = Arc::new(Mutex::new(crate::intake::Intake::new(
+        &opts.into_dir,
+        cfg,
+        (),
+    )));
+    let stop = Arc::new(AtomicBool::new(false));
+    crate::append::install_signal_handlers();
+    let maintenance = crate::intake::spawn_maintenance(
+        Arc::clone(&intake),
+        Arc::clone(&stop),
+        opts.exit_on_upgrade,
+        |_, _| {},
+    );
+
+    let opts = Arc::new(opts);
+    let running: Arc<Mutex<std::collections::BTreeSet<String>>> =
+        Arc::new(Mutex::new(Default::default()));
+
+    // The instances that are already up, then whatever the event stream
+    // says about them from here on.
+    for inst in incus.instances()? {
+        if opts.wants(&inst) {
+            spawn_tap(&incus, inst, &server_name, &opts, &intake, &stop, &running);
+        }
+    }
+
+    watch_lifecycle(&incus, &server_name, &opts, &intake, &stop, &running);
+    stop.store(true, Ordering::Relaxed);
+    let _ = maintenance.join();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_tap(
+    incus: &crate::incus::Incus,
+    inst: Instance,
+    server_name: &str,
+    opts: &Arc<IncusOpts>,
+    intake: &Arc<Mutex<crate::intake::Intake>>,
+    stop: &Arc<AtomicBool>,
+    running: &Arc<Mutex<std::collections::BTreeSet<String>>>,
+) {
+    {
+        let mut g = running.lock().unwrap();
+        // The console is exclusive, so a second tap of one instance would
+        // only take it away from the first.
+        if !g.insert(inst.name.clone()) {
+            return;
+        }
+    }
+    let socket = opts.socket.clone();
+    let project = opts.project.clone();
+    let server_name = server_name.to_string();
+    let opts = Arc::clone(opts);
+    let intake = Arc::clone(intake);
+    let stop = Arc::clone(stop);
+    let running = Arc::clone(running);
+    let _ = incus;
+    std::thread::spawn(move || {
+        let incus = crate::incus::Incus::new(&socket, &project);
+        let mut backoff = REATTACH_MS;
+        while !stop.load(Ordering::Relaxed) {
+            // Re-read the instance each time: an image or an entrypoint
+            // may have changed under a restart, and those go in the next
+            // attach marker.
+            let inst = match incus.instance(&inst.name) {
+                Ok(i) => i,
+                Err(_) => break,
+            };
+            if !opts.wants(&inst) {
+                break;
+            }
+            match tap_instance(&incus, &inst, &server_name, &opts, &intake, &stop) {
+                // A clean end is a restart or a shutdown: come back
+                // promptly, because the console of the new instance is
+                // already filling its ring.
+                Ok(()) => backoff = REATTACH_MS,
+                Err(e) => {
+                    crate::note!("timberfs: {}: {e}", inst.name);
+                    backoff = (backoff * 2).min(REATTACH_MAX_MS);
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(backoff));
+        }
+        running.lock().unwrap().remove(&inst.name);
+    });
+}
+
+/// Follow incus's lifecycle events. A tap that only enumerated instances
+/// at startup would never see a container created afterwards, and one that
+/// polled would take its poll interval to notice.
+#[allow(clippy::too_many_arguments)]
+fn watch_lifecycle(
+    incus: &crate::incus::Incus,
+    server_name: &str,
+    opts: &Arc<IncusOpts>,
+    intake: &Arc<Mutex<crate::intake::Intake>>,
+    stop: &Arc<AtomicBool>,
+    running: &Arc<Mutex<std::collections::BTreeSet<String>>>,
+) {
+    while !stop.load(Ordering::Relaxed) && !crate::append::stopping() {
+        let mut ws = match incus.events() {
+            Ok(w) => w,
+            Err(e) => {
+                crate::note!("timberfs: incus events: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(REATTACH_MS));
+                continue;
+            }
+        };
+        loop {
+            if crate::append::stopping() {
+                return;
+            }
+            match ws.read() {
+                Ok(Some(bytes)) => {
+                    for line in bytes.split(|b| *b == b'\n') {
+                        let Some(name) = started_instance(line) else {
+                            continue;
+                        };
+                        let Ok(inst) = incus.instance(&name) else {
+                            continue;
+                        };
+                        if opts.wants(&inst) {
+                            spawn_tap(incus, inst, server_name, opts, intake, stop, running);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// The name of an instance a lifecycle event says is now up, if any.
+/// `instance-restarted` arrives as ONE event rather than a stop and a
+/// start, so it has to be handled alongside them or a restarted container
+/// is never re-tapped.
+pub fn started_instance(line: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let md = v.get("metadata")?;
+    let action = md.get("action")?.as_str()?;
+    if !matches!(action, "instance-started" | "instance-restarted") {
+        return None;
+    }
+    Some(md.get("name")?.as_str()?.to_string())
 }
 
 #[cfg(test)]
@@ -639,6 +1118,49 @@ mod tests {
         assert_eq!(
             facts(&bare, "sourcream").get("host").map(String::as_str),
             Some("sourcream")
+        );
+    }
+    #[test]
+    fn ring_backlog_lines_do_not_fuse_into_one_entry() {
+        // The ring hands over everything at once, however long it took to
+        // be written, so arrival time says nothing and the idle gap
+        // cannot speak. The first live run against a real container fused
+        // four independent lines into one entry exactly here.
+        let pieces = parse_prefix("{time} ", &known_facts()).unwrap();
+        let mut s = Stamper::new(Prefix::render(&pieces, &base()), 100);
+        let out =
+            String::from_utf8(s.push_recovered(b"LIVE-1 hello\nLIVE-2 hello\nLIVE-3 hello\n", 0))
+                .unwrap();
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("1970-")).count(),
+            3,
+            "each recovered line is its own entry: {out}"
+        );
+
+        // A line that carries its OWN stamp still gathers what follows,
+        // because that judgement never depended on arrival timing.
+        let mut s = Stamper::new(Prefix::render(&pieces, &base()), 100);
+        let out = String::from_utf8(s.push_recovered(
+            b"2026-08-25T06:38:36.200+02:00 ERROR failed\njava.lang.IllegalStateException\n\tat com.x(X.java:1)\n",
+            0,
+        ))
+        .unwrap();
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("1970-")).count(),
+            0,
+            "{out}"
+        );
+
+        // ...and the live stream that follows never continues a recovered
+        // line: they are different episodes of the same console.
+        let mut s = Stamper::new(Prefix::render(&pieces, &base()), 100);
+        let mut out = s.push_recovered(b"from the ring\n", 0);
+        out.extend(s.push(b"from the wire\n", 1));
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("1970-")).count(),
+            2,
+            "{text}"
         );
     }
 }

@@ -862,6 +862,52 @@ ship, so a replica trails its source by one chunk flush — the live edge
 belongs to `query --follow` on the source itself. The verb names
 (`frames-intake`, `frames-send`) are provisional.
 
+### Tapping incus consoles — `timberfs-incus.service`
+
+The one intake that goes *out* rather than being connected to: it opens the
+local incus unix socket, attaches to each instance's live console, and follows
+incus's lifecycle events so an instance started later is tapped too.
+
+```sh
+systemctl enable --now timberfs-incus.service
+timberfs list --select 'type=console'
+```
+
+The socket is `root:incus-admin 0660`, so the unit carries
+`SupplementaryGroups=incus-admin`. That is the whole privilege it wants — it
+reads instances and attaches to consoles, and never writes to incus.
+
+Stores are found by their **labels**, and which labels is yours to choose:
+
+```ini
+# systemctl edit timberfs-incus.service
+[Service]
+ExecStart=
+ExecStart=/usr/bin/timberfs incus-intake --exit-on-upgrade     --into-dir /var/log/timberfs --index --retain 7d     --key type,incus.project,incus.instance
+```
+
+`--key` defaults to one store per instance. Add `image` for one per image
+version; give only `type` to put every console on the host in one store — and
+then `--prefix '{time} {incus.instance} '`, so its lines say which instance
+wrote them, since labels are per store and cannot. Whatever `--key` names is
+written as a label, so a store is always findable by the key that made it.
+
+Three things worth knowing before you enable it:
+
+- **A console is exclusive.** While the tap holds one, `incus console <name>`
+  is refused unless forced, and forcing it takes the console from the tap
+  (which reconnects). `incus console --show-log` still works — it reads the
+  ring, which is a different feed.
+- **The ring is a destructive drain.** The tap reads it exactly once, right
+  after attaching, to recover the backlog. Anything else polling it is taking
+  that backlog away from whoever looks next, which is why the tap does not poll.
+- **Containers only**, unless `--include-vms`. A VM's console is file-backed
+  and carries the kernel's boot output rather than an application's stdout.
+
+*This is not where an application's own logs belong.* Something that can emit
+OTLP should, into `timberfs-otlp.socket` above. The console is for what arrives
+when the application's logger is already dead.
+
 ### Shipping a store out — `timberfs-otlp@.service`
 
 The other direction: read one store's entry stream and post it to an OTLP/HTTP

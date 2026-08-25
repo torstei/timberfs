@@ -51,7 +51,7 @@ pub fn load(dir: &Path, name: &str) -> Option<Map<String, Value>> {
 }
 
 /// A random UUIDv4, dependency-free (we are Linux-only anyway).
-fn new_uuid() -> anyhow::Result<String> {
+pub fn new_uuid() -> anyhow::Result<String> {
     let mut b = [0u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
