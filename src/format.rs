@@ -198,7 +198,8 @@ impl ChunkRecord {
 /// 24..32  next_seq        — the chunk-number high-water mark
 /// 32..40  dropped_uncomp  — uncompressed bytes that have LEFT the store
 /// 40..48  dropped_comp    — the same, compressed
-/// 48..64  reserved, zero
+/// 48..64  store id        — the 16 raw bytes of the store's UUID, or
+///                           all-zero where it has none
 /// ```
 ///
 /// `header_len` is what makes the reserved space usable: without it a
@@ -210,6 +211,22 @@ impl ChunkRecord {
 /// records must be interpreted sets a bit instead, so an older reader stops
 /// rather than guessing. The cost of both is 64 bytes per store, once.
 ///
+/// The **store id** is the first tenant of that reserved space, and it is
+/// what the space was reserved for: an OPTIONAL field whose absence reads
+/// as zero, needing no `incompat_flags` bit, because a reader that does not
+/// know about it is not misled by ignoring it. It lives here rather than in
+/// the `.bark` alone because the backing PAIR is the store — lose the
+/// manifest and the data should still say what it is — and rather than in
+/// the trunk because the trunk has no header and its HEAD is the mutable
+/// end: retention's head-drop collapses from offset 0, so a leading
+/// identity frame is exactly what it would eat first.
+///
+/// ⚠ The id written here is always the store's OWN, read from its manifest.
+/// It must never be copied from a sender or a source: replication and
+/// `export` mint a fresh identity at the destination and record lineage in
+/// `derived_from`, so carrying a source's id across would give two stores
+/// one identity and silently rebind every cursor keyed on it.
+///
 /// `next_seq` exists for one case: retention can drop EVERY chunk, and a
 /// store whose record set is empty would otherwise restart numbering at 0
 /// and hand a fresh chunk a number some cursor already considers consumed.
@@ -217,7 +234,11 @@ impl ChunkRecord {
 /// so it only ever forbids reuse, and only the paths that rewrite the whole
 /// file (head-drop) keep it current. On the append path the last record is
 /// the better source, so nothing extra is written there.
-pub fn rings_header(next_seq: u64, dropped: Dropped) -> [u8; RINGS_HEADER_LEN as usize] {
+pub fn rings_header(
+    next_seq: u64,
+    dropped: Dropped,
+    id: Option<[u8; 16]>,
+) -> [u8; RINGS_HEADER_LEN as usize] {
     let mut h = [0u8; RINGS_HEADER_LEN as usize];
     h[0..8].copy_from_slice(RINGS_MAGIC);
     h[8..16].copy_from_slice(&RINGS_HEADER_LEN.to_le_bytes());
@@ -225,7 +246,60 @@ pub fn rings_header(next_seq: u64, dropped: Dropped) -> [u8; RINGS_HEADER_LEN as
     h[24..32].copy_from_slice(&next_seq.to_le_bytes());
     h[32..40].copy_from_slice(&dropped.uncomp_bytes.to_le_bytes());
     h[40..48].copy_from_slice(&dropped.comp_bytes.to_le_bytes());
+    if let Some(id) = id {
+        h[STORE_ID_OFF..STORE_ID_OFF + 16].copy_from_slice(&id);
+    }
     h
+}
+
+/// Where the store id sits in a v2 header.
+pub const STORE_ID_OFF: usize = 48;
+
+/// The store id a `.rings` header carries, or None where it carries none:
+/// a v1 header, a header too short to reach the field, or the all-zero
+/// that means "not set". An id of all zeros is not representable, which
+/// is what makes zero a safe absent.
+pub fn header_store_id(buf: &[u8]) -> Option<[u8; 16]> {
+    if buf.len() < STORE_ID_OFF + 16 || &buf[..8] != RINGS_MAGIC {
+        return None;
+    }
+    // A header may declare itself shorter than the field it would contain.
+    let declared = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+    if declared < (STORE_ID_OFF + 16) as u64 {
+        return None;
+    }
+    let id: [u8; 16] = buf[STORE_ID_OFF..STORE_ID_OFF + 16].try_into().ok()?;
+    (id != [0u8; 16]).then_some(id)
+}
+
+/// A hyphenated UUID as its 16 raw bytes. None for anything that is not
+/// one — an id is minted by us, so a manifest holding something else is a
+/// fact to report, never something to reshape into 16 bytes.
+pub fn uuid_bytes(s: &str) -> Option<[u8; 16]> {
+    let hex: Vec<u8> = s.bytes().filter(|b| *b != b'-').collect();
+    if hex.len() != 32 || !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, pair) in hex.chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).ok()?;
+        out[i] = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The hyphenated form of 16 raw bytes — the spelling `.bark` holds and
+/// `list` prints, so the two views of one identity are comparable as text.
+pub fn uuid_text(b: &[u8; 16]) -> String {
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// What has LEFT this store over its whole life — an optional header field,
@@ -472,7 +546,7 @@ mod tests {
 
     #[test]
     fn the_header_this_version_writes_round_trips() {
-        let h = rings_header(42, Dropped::default());
+        let h = rings_header(42, Dropped::default(), None);
         assert_eq!(&h[..8], RINGS_MAGIC);
         assert_eq!(
             u64::from_le_bytes(h[8..16].try_into().unwrap()),
@@ -483,6 +557,61 @@ mod tests {
         // The reserved tail is zero, so a later version can tell "absent"
         // from "set" without a flag for every optional addition.
         assert!(h[32..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn the_header_carries_the_store_id_and_zero_means_none() {
+        let id = uuid_bytes("0d01f72b-cc35-4da6-aa3a-77a6ced1b996").unwrap();
+        let h = rings_header(7, Dropped::default(), Some(id));
+        assert_eq!(header_store_id(&h), Some(id));
+        assert_eq!(uuid_text(&id), "0d01f72b-cc35-4da6-aa3a-77a6ced1b996");
+        // Absent reads as zero, which is safe precisely because an
+        // all-zero UUID is not something we ever mint.
+        assert_eq!(
+            header_store_id(&rings_header(7, Dropped::default(), None)),
+            None
+        );
+        // The id sits past every field an older reader knows, so adding it
+        // changes nothing else in the header.
+        let plain = rings_header(7, Dropped::default(), None);
+        assert_eq!(h[..STORE_ID_OFF], plain[..STORE_ID_OFF]);
+    }
+
+    #[test]
+    fn a_header_that_cannot_hold_an_id_reports_none_rather_than_reading_past_itself() {
+        let h = rings_header(7, Dropped::default(), Some([9u8; 16]));
+        // Truncated to the v1-compatible minimum: the field is not there.
+        assert_eq!(header_store_id(&h[..RINGS_HEADER_MIN as usize]), None);
+        // A header DECLARING itself shorter than the field must not be
+        // read past its own declaration, even when the bytes happen to be
+        // present — that declaration is what lets the header grow.
+        let mut short = h;
+        short[8..16].copy_from_slice(&32u64.to_le_bytes());
+        assert_eq!(header_store_id(&short), None);
+        // Not a rings file at all.
+        assert_eq!(header_store_id(&[0u8; 64]), None);
+    }
+
+    #[test]
+    fn only_a_real_uuid_becomes_sixteen_bytes() {
+        assert!(uuid_bytes("0d01f72b-cc35-4da6-aa3a-77a6ced1b996").is_some());
+        // Hyphens are cosmetic, so the unhyphenated spelling is the same id.
+        assert_eq!(
+            uuid_bytes("0d01f72bcc354da6aa3a77a6ced1b996"),
+            uuid_bytes("0d01f72b-cc35-4da6-aa3a-77a6ced1b996")
+        );
+        // An id is minted by us: anything else in a manifest is a fact to
+        // report, never something to reshape into 16 bytes.
+        assert!(uuid_bytes("").is_none());
+        assert!(uuid_bytes("not-a-uuid").is_none());
+        assert!(
+            uuid_bytes("0d01f72b-cc35-4da6-aa3a-77a6ced1b99").is_none(),
+            "short"
+        );
+        assert!(
+            uuid_bytes("zd01f72b-cc35-4da6-aa3a-77a6ced1b996").is_none(),
+            "non-hex"
+        );
     }
 
     #[test]

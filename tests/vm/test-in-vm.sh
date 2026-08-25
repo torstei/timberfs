@@ -1683,6 +1683,72 @@ selection_is_by_label_not_by_name() {
         || { jq -c '.[] | select(.handle=="vmsel-a") | .labels' /tmp/vmsel.list; return 1; }
 }
 
+store_identity_lives_in_the_backing_pair() {
+    # The `.bark` is a sidecar; the backing PAIR is the store. Identity
+    # therefore lives in the .rings header too, so losing the manifest does
+    # not lose what the store IS.
+    local d=/var/log/timberfs/vmid
+    rm -rf "$d"
+    timberfs create --index --retain-size 16K --set host=vmhost "$d/vmid.log" >/dev/null 2>&1 || return 1
+    local bark_id hdr_id
+    bark_id=$(jq -r .id "$d/vmid.log.bark") || return 1
+    hdr_id=$(python3 -c "
+b = open('$d/vmid.log.rings','rb').read()[48:64]
+h = b.hex()
+print('NONE' if b == bytes(16) else '-'.join([h[0:8],h[8:12],h[12:16],h[16:20],h[20:32]]))")
+    # Declared at create, so the pair carries it from the first byte.
+    [ "$bark_id" = "$hdr_id" ] || { echo "bark=$bark_id header=$hdr_id" >&2; return 1; }
+
+    # Retention rewrites the whole rings file. Identity must survive that,
+    # or retention would quietly erase what the store is.
+    python3 -c "
+import base64, os, sys
+for _ in range(3000):
+    sys.stdout.write('2026-08-25T10:00:00Z ' + base64.b64encode(os.urandom(48)).decode() + '\n')" \
+        | timberfs append --into "$d/vmid.log" --chunk-size 1024 --quiet 2>/dev/null || return 1
+    local dropped after
+    dropped=$(timberfs info --json "$d/vmid.log" | jq -r .dropped_chunks)
+    [ "$dropped" -gt 0 ] || { echo "head-drop never ran (dropped=$dropped)" >&2; return 1; }
+    after=$(python3 -c "
+b = open('$d/vmid.log.rings','rb').read()[48:64]
+h = b.hex()
+print('NONE' if b == bytes(16) else '-'.join([h[0:8],h[8:12],h[12:16],h[16:20],h[20:32]]))")
+    [ "$after" = "$bark_id" ] || { echo "retention lost the id: $after" >&2; return 1; }
+
+    # A header written before this field existed is stamped from the
+    # manifest on the next open: existing stores migrate themselves.
+    python3 -c "
+f = open('$d/vmid.log.rings','r+b'); f.seek(48); f.write(bytes(16)); f.close()"
+    printf 'after the wipe\n' | timberfs append --into "$d/vmid.log" --quiet 2>/dev/null || return 1
+    after=$(python3 -c "
+b = open('$d/vmid.log.rings','rb').read()[48:64]
+h = b.hex()
+print('NONE' if b == bytes(16) else '-'.join([h[0:8],h[8:12],h[12:16],h[16:20],h[20:32]]))")
+    [ "$after" = "$bark_id" ] || { echo "no self-migration: $after" >&2; return 1; }
+
+    # Two identities for one store is refused, not resolved by picking.
+    python3 -c "
+import json
+p = '$d/vmid.log.bark'
+m = json.load(open(p)); m['id'] = 'ffffffff-0000-4000-8000-000000000000'
+json.dump(m, open(p,'w'), indent=1)"
+    printf 'x\n' | timberfs append --into "$d/vmid.log" > /tmp/vmid2.err 2>&1 && return 1
+    grep -q 'two identities for one store' /tmp/vmid2.err || { cat /tmp/vmid2.err >&2; return 1; }
+    python3 -c "
+import json
+p = '$d/vmid.log.bark'
+m = json.load(open(p)); m['id'] = '$bark_id'
+json.dump(m, open(p,'w'), indent=1)"
+
+    # A derived artifact gets its OWN identity and records lineage —
+    # carrying the source's would give two stores one id.
+    timberfs export "$d/vmid.log" --into /tmp/vmid.timber >/dev/null 2>&1 || return 1
+    local bid
+    bid=$(tar -xOf /tmp/vmid.timber --wildcards '*.bark' | jq -r .id)
+    [ "$bid" != "$bark_id" ] || { echo "bundle reused the source id" >&2; return 1; }
+    tar -xOf /tmp/vmid.timber --wildcards '*.bark' | jq -e --arg s "$bark_id" '.derived_from == $s' >/dev/null
+}
+
 store_identity_is_printed_and_typeable() {
     # A listing that prints an id owes a way to type it back in, or it is
     # printing a token nothing accepts.
@@ -1801,6 +1867,7 @@ run_test "forward-intake: service restart is a sender reconnect, no data lost" f
 run_test "catalogue: list --json carries identity, provenance and coverage" catalogue_fields_are_a_projection_of_list
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 run_test "selection: the id list prints is the id info accepts" store_identity_is_printed_and_typeable
+run_test "identity: the backing pair carries the store id, and retention keeps it" store_identity_lives_in_the_backing_pair
 
 # The OTLP/HTTP intake (timberfs-otlp.socket/.service) and its mirror,
 # the timber-otlp shipper. A python3 http.client driver posts the real

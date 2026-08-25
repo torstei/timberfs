@@ -260,9 +260,16 @@ pub fn cmd_export(
     let mut rings_bytes = Vec::with_capacity(
         format::RINGS_HEADER_LEN as usize + out_records.len() * format::RECORD_LEN,
     );
+    // The bundle's OWN identity, minted by `with_identity` above — never
+    // the source's: a derived artifact records lineage in `derived_from`,
+    // and copying the id would give two stores one identity.
     rings_bytes.extend_from_slice(&format::rings_header(
         out_records.len() as u64,
         format::Dropped::default(),
+        derived_bark
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(format::uuid_bytes),
     ));
     for r in &out_records {
         rings_bytes.extend_from_slice(&r.to_bytes());

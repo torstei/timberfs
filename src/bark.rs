@@ -461,7 +461,15 @@ pub fn cmd_create(
     let _file_lock = store::lock_file_exclusive(&dir, &name)?
         .with_context(|| format!("{name} already has a writer"))?;
 
-    // The empty pair (rings header included), then the manifest.
+    // The manifest FIRST, then the empty pair: the rings header mirrors
+    // the store's identity, and `FileStore::open` reads it from the
+    // manifest — so a store created with anything declared carries its id
+    // in the pair from the very first byte, rather than from its first
+    // write. (A bare `create` declares nothing, writes no manifest, and so
+    // still has no identity; that is a separate question.)
+    if !map.is_empty() {
+        save(&dir, &name, &map)?;
+    }
     let mut st = store::Store {
         dir: dir.clone(),
         cfg: store::Config {
@@ -472,9 +480,6 @@ pub fn cmd_create(
         files: std::collections::BTreeMap::new(),
     };
     st.create(&name)?;
-    if !map.is_empty() {
-        save(&dir, &name, &map)?;
-    }
     crate::note!(
         "timberfs: created {}/{}{}{}{}",
         dir.display(),
