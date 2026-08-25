@@ -183,6 +183,54 @@ fn unquote(v: &str) -> String {
         .to_string()
 }
 
+/// One store a selector matched: enough to open it, and the labels it
+/// matched on so a caller can say WHY it matched.
+#[derive(Debug)]
+pub struct Match {
+    /// The store's handle — its file name minus `.log`.
+    pub handle: String,
+    /// The backing directory holding the pair.
+    pub dir: std::path::PathBuf,
+    /// The store's name within that directory.
+    pub name: String,
+    pub labels: Map<String, Value>,
+}
+
+/// Every store in the given forests (or all configured ones) whose labels
+/// satisfy `sel`, in a stable order.
+///
+/// Deliberately lighter than what `list` builds for a row: a readdir per
+/// forest and ONE manifest read per store, with no index or follower
+/// registry touched. Selection is a lookup, and a lookup that also parsed
+/// every store's index would be too expensive to put in a writer's path —
+/// which is where this is headed.
+pub fn resolve(dirs: &[std::path::PathBuf], sel: &Selector) -> Vec<Match> {
+    let mut out = Vec::new();
+    for forest in crate::forest::forests_for_list(dirs) {
+        if !forest.dir.is_dir() {
+            continue;
+        }
+        for (handle, path) in crate::forest::scan_forest(&forest.dir) {
+            let Ok((dir, name)) = crate::query::resolve_backing(&path) else {
+                continue;
+            };
+            let labels = crate::bark::load(&dir, &name)
+                .map(|m| crate::bark::provenance(&m))
+                .unwrap_or_default();
+            if sel.matches(&labels) {
+                out.push(Match {
+                    handle,
+                    dir,
+                    name,
+                    labels,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| (a.dir.as_path(), a.name.as_str()).cmp(&(b.dir.as_path(), b.name.as_str())));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

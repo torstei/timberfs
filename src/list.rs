@@ -78,10 +78,22 @@ pub fn cmd_list(
     });
 
     // A selection owes coverage: an empty result has to say how much was
-    // searched, or "matched nothing" reads as "nothing was there".
+    // searched, or "matched nothing" reads as "nothing was there". The
+    // predicate is applied through the same `select::resolve` a writer
+    // uses to pick a store, so the two can never disagree about what a
+    // selector means.
     if !selector.is_all() {
         let examined = rows.len();
-        rows.retain(|r| selector.matches(&r.summary.labels));
+        let matched: std::collections::HashSet<(PathBuf, String)> =
+            crate::select::resolve(dirs, &selector)
+                .into_iter()
+                .map(|m| (m.dir, m.name))
+                .collect();
+        rows.retain(|r| {
+            crate::query::resolve_backing(&r.path)
+                .ok()
+                .is_some_and(|(d, n)| matched.contains(&(d, n)))
+        });
         if rows.is_empty() {
             crate::note!(
                 "timberfs: no store matches `{}` ({examined} store(s) in {} forest(s) examined)",
