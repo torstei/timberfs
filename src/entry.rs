@@ -54,6 +54,11 @@ pub struct EntrySink {
     limit: Option<EntryLimit>,
     display: String,
 
+    /// Entries this sink DROPPED because the shared cap was already
+    /// reached. Nonzero proves more existed than was emitted — the
+    /// difference between "that was all" and "your limit stopped me",
+    /// which a count alone cannot tell.
+    pub suppressed: u64,
     line: Vec<u8>,
     entry: Vec<u8>,
     entry_ts: Option<u64>,
@@ -87,6 +92,7 @@ impl EntrySink {
             framing,
             limit,
             display: display.to_string(),
+            suppressed: 0,
             line: Vec::new(),
             entry: Vec::new(),
             entry_ts: None,
@@ -189,6 +195,7 @@ impl EntrySink {
         // hold entries past the limit).
         if let Some((count, max)) = &self.limit {
             if count.get() >= *max {
+                self.suppressed += 1;
                 return Ok(());
             }
             count.set(count.get() + 1);
