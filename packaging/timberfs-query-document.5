@@ -23,7 +23,7 @@ sugar for the common shapes.
 .nf
 {
   "v": "1.0-EXPERIMENTAL",
-  "stores": { "paths": [ { "file_path": "/var/log/timberfs/a/a.log" } ] },
+  "stores": { "select": [ { "key": "type", "op": "=", "value": "console" } ] },
   "window": { "axis": "logline", "from": 1787727600000, "to": null,
               "from_chunk": null },
   "match":  { "all": [ { "has": "ERROR" } ],
@@ -58,18 +58,41 @@ and
 are simply different strings.
 .TP
 .B stores
-Which stores to read.
-.B paths
-names them directly. A label
+Which stores to read, as a
 .B select
-and a
+predicate over their labels \(em the same one
+.B \-\-select
+takes, in structured form: a list of
+.BR key ", " op ", " value
+objects, ANDed, where
+.B op
+is
+.BR = ", " != ", " =~ " or " !~ .
+An absent label reads as the empty string, so
+.B "service="
+selects the stores that do not declare one.
+.RS
+.PP
+There is deliberately NO way to name a store by file path. A path is the
+worst key a query can use: it is not stable across a move, it is not
+unique across forests, and it says nothing about what the store holds. A
+store is identified by what it IS \(em its labels \(em and the path is an
+implementation detail of where a forest happens to keep it.
+.PP
+An empty or omitted
+.B select
+is every store, which is how a caller enumerates: the same request with
+no predicate, not a second verb.
+.PP
+A
 .B forests
-list are both coming, and are ABSENT rather than present\-and\-refused: a
-contract that names a member the code ignores is the failure this
-format's strictness exists to prevent. Adding an optional member later is
-allowed within
+list belongs here and is ABSENT rather than present\-and\-refused: a
+contract that names a member the code ignores is the failure this format's
+strictness exists to prevent. Adding an optional member later is allowed
+within
 .BR v=1 ,
 so there is nothing to reserve.
+.RE
 .TP
 .B window
 .B axis
@@ -134,7 +157,29 @@ not a bare name, because the options are orthogonal to the kind. Kinds:
 (the typed stream \(em see
 .BR timberfs\-records (5)),
 .B chunks
-(compressed chunks verbatim, nothing decompressed at either end).
+(compressed chunks verbatim, nothing decompressed at either end),
+.B stores
+(the matched stores themselves, with no entries read).
+.RS
+.PP
+.B stores
+answers the store half of the document and stops there \(em what a fleet
+view needs before it knows which store to read, and what an enumeration
+is. Because it reads no entries, the members that describe entries
+(\c
+.BR window ", " match ", " max ", " tail )
+are REFUSED with it rather than ignored.
+.PP
+.B window.axis
+and the kind are not fully independent:
+.B write
+time with an entry kind, or
+.B logline
+time with
+.BR chunks ,
+name an axis the answer cannot honour, and are refused rather than
+accepted and dropped.
+.RE
 .SH OMISSION WIDENS
 A member left out
 .B widens

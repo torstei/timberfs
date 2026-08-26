@@ -498,7 +498,39 @@ pub struct Follow {
     pub poll: Option<f64>,
 }
 
+impl Query {
+    /// Is this search coherent? The rules that decide it belong to the
+    /// QUERY, not to the command that runs one — a caller building a
+    /// query from a document needs to know it will work before handing
+    /// it over, and a documented example that cannot run is worse than
+    /// no example.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let (Some(f), Some(t)) = (self.window.from, self.window.to) {
+            if f > t {
+                bail!("the window starts after it ends");
+            }
+        }
+        let following = self.follow.follow || self.limit.tail.is_some();
+        if self.window.from_chunk.is_some() && !following {
+            bail!(
+                "a chunk number is a resume position, and only a FOLLOWING read moves \
+                 forward from one — a windowed query selects by the timestamps the \
+                 lines carry"
+            );
+        }
+        if following && !self.matching.is_empty() {
+            bail!(
+                "the token index selects whole chunks offline and does not compose with a \
+                 following read (there is nothing to skip — every new chunk must be read); \
+                 filter the live stream instead, or run a windowed query"
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
+    q.validate()?;
     let files = &q.sources[..];
     let (from, to, from_chunk) = (q.window.from, q.window.to, q.window.from_chunk);
     let (has, any) = (&q.matching.has[..], &q.matching.any[..]);
@@ -513,28 +545,15 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     } = q.output;
     let from_ms = from.unwrap_or(0);
     let to_ms = to.unwrap_or(u64::MAX);
-    if from_ms > to_ms {
-        bail!("--from is after --to");
-    }
     // Follow / tail is its own read path: a poll loop over newly-committed
     // chunks rather than the one-shot windowed scan. --has/--any select whole
     // chunks via the offline .grain index, which neither composes with a live
     // stream (there is nothing to skip — every new chunk must be read) nor
     // filters at line granularity; filter a follow with a pipe instead.
-    if from_chunk.is_some() && !(follow || tail.is_some()) {
-        bail!(
-            "--from-chunk is a resume position, and only --follow reads forward from one \
-             (a windowed query selects by the timestamps the lines carry)"
-        );
-    }
     if follow || tail.is_some() {
-        if !has.is_empty() || !any.is_empty() {
-            bail!(
-                "--has/--any select whole chunks via the offline index and don't compose \
-                 with --follow/--tail; filter the live stream with a pipe (e.g. | grep), \
-                 or run a windowed query for offline chunk-skipping"
-            );
-        }
+        // The has/follow and from-chunk rules live on `Query::validate`,
+        // which ran above: one implementation, so the flags and a
+        // document cannot come to disagree about what is coherent.
         return query_follow(
             files,
             from,

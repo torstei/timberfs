@@ -3,10 +3,13 @@
   "stores": {
     "select": [
       {
-        "key": "name",
+        "key": "type",
         "op": "=",
-        "value": "app"
+        "value": "console"
       }
     ]
+  },
+  "response_format": {
+    "kind": "stores"
   }
 }

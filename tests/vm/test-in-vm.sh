@@ -1770,6 +1770,101 @@ selection_is_by_label_not_by_name() {
         || { jq -c '.[] | select(.handle=="vmsel-a") | .labels' /tmp/vmsel.list; return 1; }
 }
 
+a_query_document_selects_stores_and_can_answer_with_them() {
+    # The document is the same question the flags ask, so it selects
+    # stores by LABEL — there is no path member to fall back to — and it
+    # can stop at the stores rather than always reading entries.
+    local a=/var/log/timberfs/vmqd-a b=/var/log/timberfs/vmqd-b
+    rm -rf "$a" "$b"
+    timberfs create --set type=console --set service=vmqd --set host=vmhost \
+        "$a/vmqd-a.log" >/dev/null 2>&1 || return 1
+    timberfs create --set type=app --set service=vmqd --set host=vmhost \
+        "$b/vmqd-b.log" >/dev/null 2>&1 || return 1
+    printf '2026-08-26T10:00:00Z ERROR console boom\n' \
+        | timberfs append --into "$a/vmqd-a.log" --quiet 2>/dev/null || return 1
+    printf '2026-08-26T10:00:00Z ERROR app boom\n' \
+        | timberfs append --into "$b/vmqd-b.log" --quiet 2>/dev/null || return 1
+
+    local got
+    # A predicate over labels, read as entries.
+    cat > /tmp/vmqd.json <<'JSON'
+{ "v": "1.0-EXPERIMENTAL",
+  "stores": { "select": [ {"key":"service","op":"=","value":"vmqd"},
+                          {"key":"type","op":"=","value":"console"} ] },
+  "window": { "axis": "logline" },
+  "match": { "all": [ {"has":"ERROR"} ] },
+  "response_format": { "kind": "loglines", "options": { "no_filename": true } } }
+JSON
+    got=$(timberfs query --query /tmp/vmqd.json 2>/tmp/vmqd.err)
+    [ "$got" = "2026-08-26T10:00:00Z ERROR console boom" ] || {
+        echo "doc read gave '$got'" >&2
+        cat /tmp/vmqd.err >&2
+        return 1
+    }
+
+    # The same document from stdin, so a generator need not write a file.
+    got=$(timberfs query --query - < /tmp/vmqd.json 2>/dev/null)
+    [ "$got" = "2026-08-26T10:00:00Z ERROR console boom" ] || return 1
+
+    # kind:stores answers with the stores themselves and reads no entries.
+    cat > /tmp/vmqd-stores.json <<'JSON'
+{ "v": "1.0-EXPERIMENTAL",
+  "stores": { "select": [ {"key":"service","op":"=","value":"vmqd"} ] },
+  "response_format": { "kind": "stores" } }
+JSON
+    timberfs query --query /tmp/vmqd-stores.json > /tmp/vmqd.stores 2>/dev/null || return 1
+    got=$(jq -r '[.[] | select(.labels.service == "vmqd") | .name] | sort | join(",")' \
+        /tmp/vmqd.stores)
+    [ "$got" = "vmqd-a,vmqd-b" ] || { echo "kind:stores gave '$got'" >&2; return 1; }
+    # It carries the identity a follower would key on, not just a name.
+    jq -e '.[] | select(.name == "vmqd-a") | .id | test("^[0-9a-f-]{36}$")' \
+        /tmp/vmqd.stores >/dev/null || { jq -c '.[0]' /tmp/vmqd.stores; return 1; }
+
+    # Enumeration is that same request with no predicate, not a second verb.
+    printf '{"v":"1.0-EXPERIMENTAL","stores":{},"response_format":{"kind":"stores"}}\n' \
+        > /tmp/vmqd-all.json
+    timberfs query --query /tmp/vmqd-all.json 2>/dev/null \
+        | jq -e 'length >= 2' >/dev/null || return 1
+
+    # A member the answer cannot honour is REFUSED, never ignored: a
+    # document that parses and quietly does something else is the failure
+    # this format's strictness exists to prevent.
+    printf '{"v":"1.0-EXPERIMENTAL","stores":{},"match":{"all":[{"has":"x"}]},"response_format":{"kind":"stores"}}\n' \
+        > /tmp/vmqd-bad.json
+    timberfs query --query /tmp/vmqd-bad.json >/dev/null 2>&1 && return 1
+    # ...as is an axis the kind cannot answer on.
+    printf '{"v":"1.0-EXPERIMENTAL","stores":{},"window":{"axis":"write"},"response_format":{"kind":"loglines"}}\n' \
+        > /tmp/vmqd-axis.json
+    timberfs query --query /tmp/vmqd-axis.json >/dev/null 2>&1 && return 1
+    # ...and a store named by path, which this format deliberately lacks.
+    printf '{"v":"1.0-EXPERIMENTAL","stores":{"paths":[{"file_path":"%s/vmqd-a.log"}]}}\n' "$a" \
+        > /tmp/vmqd-path.json
+    timberfs query --query /tmp/vmqd-path.json >/dev/null 2>&1 && return 1
+
+    # --dump-json is the bridge between the two surfaces: the flags name a
+    # store by PATH, the document by IDENTITY, and the translation has to
+    # find the same store again or the surfaces have drifted.
+    timberfs query "$a/vmqd-a.log" --has ERROR --no-filename --dump-json \
+        > /tmp/vmqd-rt.json 2>/dev/null || return 1
+    jq -e --arg id "$(timberfs info --json "$a/vmqd-a.log" | jq -r .id)" \
+        '.stores.select == [{"key":"id","op":"=","value":$id}]' \
+        /tmp/vmqd-rt.json >/dev/null \
+        || { jq -c .stores /tmp/vmqd-rt.json; return 1; }
+    got=$(timberfs query --query /tmp/vmqd-rt.json 2>/dev/null)
+    [ "$got" = "2026-08-26T10:00:00Z ERROR console boom" ] \
+        || { echo "round-trip gave '$got'" >&2; cat /tmp/vmqd-rt.json >&2; return 1; }
+
+    # Several stores become an alternation over their ids, because the
+    # predicate is a conjunction — ugly to read, exact, and it round-trips.
+    timberfs query "$a/vmqd-a.log" "$b/vmqd-b.log" --no-filename \
+        --dump-json > /tmp/vmqd-rt2.json 2>/dev/null || return 1
+    jq -e '.stores.select | length == 1 and .[0].op == "=~"' \
+        /tmp/vmqd-rt2.json >/dev/null || { jq -c .stores /tmp/vmqd-rt2.json; return 1; }
+    got=$(timberfs query --query /tmp/vmqd-rt2.json 2>/dev/null | sort | tr '\n' ',')
+    [ "$got" = "2026-08-26T10:00:00Z ERROR app boom,2026-08-26T10:00:00Z ERROR console boom," ] \
+        || { echo "two-store round-trip gave '$got'" >&2; return 1; }
+}
+
 identity_reports_and_repairs_the_three_broken_states() {
     # An id is a fact, not a setting, so `set` will not touch it. But it
     # can be broken in three ways, each with an obvious intended fix, and
@@ -2111,6 +2206,7 @@ run_test "forward-intake: service restart is a sender reconnect, no data lost" f
 run_test "catalogue: list --json carries identity, provenance and coverage" catalogue_fields_are_a_projection_of_list
 run_test "records: stream-end says whether a cap stopped it, exactly" stream_end_says_whether_a_cap_stopped_it
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
+run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares
 run_test "incus-intake: unit installed; options checked before anything opens" incus_intake_is_installed_and_validates_its_options
 run_test "selection: the id list prints is the id info accepts" store_identity_is_printed_and_typeable

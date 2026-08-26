@@ -1184,8 +1184,16 @@ fn main() -> anyhow::Result<()> {
             // A document, or the flags that build the same value: one
             // question asked two ways, never two dialects of it.
             if let Some(doc) = query_doc {
-                let q = querydoc::read(&doc)?.to_query()?;
-                query::cmd_query(&q)?;
+                let doc = querydoc::read(&doc)?;
+                // Listing stores and reading entries are the same
+                // document asking for different answers, so the kind
+                // decides which one runs.
+                if doc.lists_stores() {
+                    doc.to_query()?; // its refusals still apply
+                    list::cmd_list(&[], false, true, Some(&doc.store_selector()), false)?;
+                    return Ok(());
+                }
+                query::cmd_query(&doc.to_query()?)?;
                 return Ok(());
             }
             let q = query::Query {
@@ -1209,7 +1217,7 @@ fn main() -> anyhow::Result<()> {
             if dump_json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&querydoc::Document::of(&q))?
+                    serde_json::to_string_pretty(&querydoc::Document::of(&q)?)?
                 );
                 return Ok(());
             }
