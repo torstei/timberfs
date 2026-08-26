@@ -1,7 +1,27 @@
 {
   "v": "1.0-EXPERIMENTAL",
-  "stores": { "paths": [ { "file_path": "/var/log/timberfs/app/app.log" } ] },
-  "window": { "axis": "logline", "from": 1787727600000, "to": 1787731200000 },
-  "match": { "all": [ { "has": "ERROR" } ] },
-  "max": { "entries": 100 }
+  "stores": {
+    "select": [
+      {
+        "key": "name",
+        "op": "=",
+        "value": "app"
+      }
+    ]
+  },
+  "window": {
+    "axis": "logline",
+    "from": 1787727600000,
+    "to": 1787731200000
+  },
+  "match": {
+    "all": [
+      {
+        "has": "ERROR"
+      }
+    ]
+  },
+  "max": {
+    "entries": 100
+  }
 }

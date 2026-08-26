@@ -185,6 +185,11 @@
           "const": "records"
         },
         {
+          "description": "Which stores matched and what they are — no entries at all.\nListing is not a different question from searching: it is the\nsame document asking for a different answer.",
+          "type": "string",
+          "const": "stores"
+        },
+        {
           "description": "Compressed chunks, verbatim — nothing decompressed at either end.\n⚠ Chunks do not align to a window, so the answer is a SUPERSET of\nwhat was asked for and the response must say what window it\nactually widened to.",
           "type": "string",
           "const": "chunks"
@@ -221,30 +226,40 @@
         "kind"
       ]
     },
-    "StorePath": {
+    "Stores": {
+      "description": "Which stores to read: a predicate over what they declare.\n\nThere is deliberately no way to name a store by PATH. A path is\nneither unique-and-stable (its identity is) nor a way to find things\n(its labels are) — it is where the store happens to sit, and it is\nheading towards being opaque. A generator that keys on it is coupled\nto a layout that is meant to stop meaning anything.\n\nEnumerating is not a separate idea: it is this predicate with nothing\nin it. An absent or empty `select` is every store.\n\nThe predicate is a CONJUNCTION, so naming several specific stores is\nan alternation over their ids — `id=~(A|B)`, which is what\n`--dump-json` writes. Ugly to read, exact, and it round-trips; if\nthat becomes a real irritation the fix is OR in the selector, not a\nsecond way to name a store.",
       "type": "object",
       "properties": {
-        "file_path": {
+        "select": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Term"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Term": {
+      "description": "One term of the store predicate, matched against the whole manifest —\nlabels, `name`, `id` and settings alike.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "op": {
+          "description": "`=`, `!=`, `=~` or `!~`; regexes anchored at both ends.",
+          "type": "string"
+        },
+        "value": {
           "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
-        "file_path"
+        "key",
+        "op",
+        "value"
       ]
-    },
-    "Stores": {
-      "description": "Which stores to read.\n\nOnly what works: a label `select` and a `forests` list are both\ncoming, and both are ABSENT rather than present-and-refused. A member\nthe contract advertises but the code ignores is the failure this\nformat's strictness exists to prevent — and adding an optional member\nlater is allowed within v1, so there is nothing to reserve.",
-      "type": "object",
-      "properties": {
-        "paths": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/StorePath"
-          }
-        }
-      },
-      "additionalProperties": false
     }
   }
 }

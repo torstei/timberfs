@@ -80,26 +80,40 @@ pub struct Document {
     pub response_format: Option<ResponseFormat>,
 }
 
-/// Which stores to read.
+/// Which stores to read: a predicate over what they declare.
 ///
-/// Only what works: a label `select` and a `forests` list are both
-/// coming, and both are ABSENT rather than present-and-refused. A member
-/// the contract advertises but the code ignores is the failure this
-/// format's strictness exists to prevent — and adding an optional member
-/// later is allowed within v1, so there is nothing to reserve.
+/// There is deliberately no way to name a store by PATH. A path is
+/// neither unique-and-stable (its identity is) nor a way to find things
+/// (its labels are) — it is where the store happens to sit, and it is
+/// heading towards being opaque. A generator that keys on it is coupled
+/// to a layout that is meant to stop meaning anything.
+///
+/// Enumerating is not a separate idea: it is this predicate with nothing
+/// in it. An absent or empty `select` is every store.
+///
+/// The predicate is a CONJUNCTION, so naming several specific stores is
+/// an alternation over their ids — `id=~(A|B)`, which is what
+/// `--dump-json` writes. Ugly to read, exact, and it round-trips; if
+/// that becomes a real irritation the fix is OR in the selector, not a
+/// second way to name a store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Stores {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub paths: Vec<StorePath>,
+    pub select: Vec<Term>,
 }
 
+/// One term of the store predicate, matched against the whole manifest —
+/// labels, `name`, `id` and settings alike.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct StorePath {
-    pub file_path: String,
+pub struct Term {
+    pub key: String,
+    /// `=`, `!=`, `=~` or `!~`; regexes anchored at both ends.
+    pub op: String,
+    pub value: String,
 }
 
 /// Which axis a window is measured on.
@@ -203,6 +217,10 @@ pub enum Kind {
     /// The typed record stream: entries with their timestamps and chunk
     /// windows attached.
     Records,
+    /// Which stores matched and what they are — no entries at all.
+    /// Listing is not a different question from searching: it is the
+    /// same document asking for a different answer.
+    Stores,
     /// Compressed chunks, verbatim — nothing decompressed at either end.
     /// ⚠ Chunks do not align to a window, so the answer is a SUPERSET of
     /// what was asked for and the response must say what window it
@@ -232,20 +250,95 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// The sources of a query, as a predicate naming exactly those stores.
+///
+/// One store is an equality on its id; several are an anchored
+/// alternation, because the predicate is a conjunction and `id=A AND
+/// id=B` matches nothing. Generated rather than typed, so its ugliness
+/// costs a reader little — and if it comes to matter, OR in the selector
+/// is the fix, not a second way to name a store.
+fn sources_as_identity(sources: &[std::path::PathBuf]) -> anyhow::Result<Vec<Term>> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    for p in sources {
+        let (dir, name) = crate::query::resolve_backing(p)?;
+        let id = crate::bark::load(&dir, &name)
+            .and_then(|b| b.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no identity, so a document cannot name it — \
+                     `timberfs identity {} --mint` gives it one",
+                    p.display(),
+                    p.display()
+                )
+            })?;
+        ids.push(id);
+    }
+    let value = if ids.len() == 1 {
+        return Ok(vec![Term {
+            key: "id".into(),
+            op: "=".into(),
+            value: ids.pop().unwrap(),
+        }]);
+    } else {
+        format!("({})", ids.join("|"))
+    };
+    Ok(vec![Term {
+        key: "id".into(),
+        op: "=~".into(),
+        value,
+    }])
+}
+
+/// The stores a predicate names. An empty predicate is every store —
+/// enumerating is not a different question from searching, it is this one
+/// with nothing in it.
+fn selector_expr(stores: &Stores) -> String {
+    if stores.select.is_empty() {
+        "*".to_string()
+    } else {
+        stores
+            .select
+            .iter()
+            .map(|t| {
+                let v = &t.value;
+                if v.contains(',') || v.contains('"') {
+                    format!("{}{}\"{}\"", t.key, t.op, v.replace('"', ""))
+                } else {
+                    format!("{}{}{}", t.key, t.op, v)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn resolve_stores(stores: &Stores) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let expr = selector_expr(stores);
+    let sel = crate::select::Selector::parse(&expr)
+        .with_context(|| format!("`stores.select` produced the selector {expr:?}"))?;
+    Ok(crate::select::resolve(&[], &sel)
+        .into_iter()
+        .map(|m| m.dir.join(&m.name))
+        .collect())
+}
+
 impl Document {
     /// The document a `Query` describes.
-    pub fn of(q: &Query) -> Document {
+    ///
+    /// The sources become a predicate over their IDENTITIES. What the
+    /// caller typed — a path, a handle — is how a person names a store,
+    /// not how a document does: the document says which store, and the
+    /// store says where it is. A store with no identity cannot be named
+    /// this way, and that is an error rather than a path smuggled back in.
+    pub fn of(q: &Query) -> anyhow::Result<Document> {
         let windowed = q.window.from.is_some() || q.window.to.is_some();
-        Document {
+        Ok(Document {
             v: VERSION.to_string(),
             stores: Stores {
-                paths: q
-                    .sources
-                    .iter()
-                    .map(|p| StorePath {
-                        file_path: p.display().to_string(),
-                    })
-                    .collect(),
+                select: sources_as_identity(&q.sources)?,
             },
             window: if windowed || q.window.from_chunk.is_some() {
                 Some(DocWindow {
@@ -297,7 +390,21 @@ impl Document {
                     null_separated: q.output.null_sep,
                 },
             }),
-        }
+        })
+    }
+
+    /// Does this document ask for stores rather than entries? Listing is
+    /// the same question with a different answer, so it is a response
+    /// kind rather than a second document type.
+    pub fn lists_stores(&self) -> bool {
+        self.response_format
+            .as_ref()
+            .is_some_and(|f| f.kind == Kind::Stores)
+    }
+
+    /// The store predicate as a `--select` expression.
+    pub fn store_selector(&self) -> String {
+        selector_expr(&self.stores)
     }
 
     /// The `Query` this document describes.
@@ -325,13 +432,49 @@ impl Document {
             kind: Kind::Loglines,
             options: FormatOptions::default(),
         });
+        if self.lists_stores() {
+            // A store listing has no entries, so members that describe
+            // entries have nothing to act on. Ignoring them would be the
+            // failure this format refuses everywhere else.
+            for (name, present) in [
+                ("window", self.window.is_some()),
+                ("match", self.matching.is_some()),
+                ("max", self.max.is_some()),
+                ("tail", self.tail.is_some()),
+            ] {
+                if present {
+                    bail!(
+                        "`{name}` describes entries, and `response_format.kind: \"stores\"` \
+                         answers with stores — drop one or the other"
+                    );
+                }
+            }
+        }
+        // The axis and the response kind are not independent yet, and
+        // saying so is better than accepting a document whose axis is
+        // then ignored — which is the "parses and does nothing" failure
+        // the absent members were removed for.
+        //
+        // Underneath, ONE flag (`--by-write-time`) decides both: raw
+        // chunks ARE the write-axis read, and there is no write-axis
+        // read that yields entries. The document keeps the two members
+        // apart because they are two questions; until the read path can
+        // answer them separately, they have to agree.
+        let axis = self.window.as_ref().map(|w| w.axis);
+        match (axis, fmt.kind) {
+            (Some(Axis::Logline) | None, Kind::Chunks) => bail!(
+                "`chunks` are selected on the write axis and carry no entry parsing, \
+                 so they need `window.axis: \"write\"` — say which axis you meant"
+            ),
+            (_, Kind::Stores) => {}
+            (Some(Axis::Write), Kind::Loglines | Kind::Records) => bail!(
+                "the write axis yields raw chunks today, so it needs \
+                 `response_format.kind: \"chunks\"`; for entries, ask on the logline axis"
+            ),
+            _ => {}
+        }
         Ok(Query {
-            sources: self
-                .stores
-                .paths
-                .iter()
-                .map(|p| std::path::PathBuf::from(&p.file_path))
-                .collect(),
+            sources: resolve_stores(&self.stores)?,
             window: Window {
                 from: self.window.as_ref().and_then(|w| w.from),
                 to: self.window.as_ref().and_then(|w| w.to),
@@ -383,7 +526,11 @@ mod tests {
 
     fn q() -> Query {
         Query {
-            sources: vec!["/var/log/timberfs/a/a.log".into()],
+            // No sources: "every store". Naming one would need a real
+            // store on disk, because a document names stores by their
+            // IDENTITY and only a store can supply that — which is the
+            // point, and is covered end to end in the VM suite.
+            sources: vec![],
             window: Window {
                 from: Some(1_000),
                 to: Some(2_000),
@@ -409,31 +556,86 @@ mod tests {
     }
 
     #[test]
-    fn a_query_survives_the_round_trip() {
-        // The guarantee that keeps the two surfaces one question: what the
-        // flags build must serialize and come back identical, or the
-        // document is a second dialect.
+    fn everything_but_the_stores_survives_the_round_trip() {
+        // What the flags build must come back identical, or the document
+        // is a second dialect. The STORES half is deliberately not here:
+        // a document names them by identity, only a real store can supply
+        // one, and an empty predicate means EVERY store where an empty
+        // source list means none — so that half is exercised end to end
+        // in the VM suite, against stores that exist.
         let before = q();
-        let doc = Document::of(&before);
+        let doc = Document::of(&before).unwrap();
         let after = doc.to_query().unwrap();
-        assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        for (name, a, b) in [
+            (
+                "window",
+                format!("{:?}", before.window),
+                format!("{:?}", after.window),
+            ),
+            (
+                "match",
+                format!("{:?}", before.matching),
+                format!("{:?}", after.matching),
+            ),
+            (
+                "limit",
+                format!("{:?}", before.limit),
+                format!("{:?}", after.limit),
+            ),
+            (
+                "output",
+                format!("{:?}", before.output),
+                format!("{:?}", after.output),
+            ),
+        ] {
+            assert_eq!(a, b, "{name} did not survive");
+        }
         // ...and the document itself round-trips through JSON.
         let text = serde_json::to_string(&doc).unwrap();
         assert_eq!(serde_json::from_str::<Document>(&text).unwrap(), doc);
     }
 
     #[test]
+    fn a_store_cannot_be_named_by_its_path() {
+        // A path is neither a store's identity nor a way to find one. It
+        // is where the store happens to sit, and it is heading towards
+        // being opaque — a generator keyed on it is coupled to a layout
+        // that is meant to stop meaning anything.
+        let e = serde_json::from_str::<Document>(
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[{"file_path":"/x"}]}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("paths"), "{e}");
+    }
+
+    #[test]
+    fn enumerating_is_a_search_with_nothing_in_it() {
+        // Not a separate idea needing its own member: an absent or empty
+        // predicate is every store.
+        let doc: Document =
+            serde_json::from_str(r#"{"v":"1.0-EXPERIMENTAL","stores":{}}"#).unwrap();
+        assert!(doc.stores.select.is_empty());
+        let with: Document = serde_json::from_str(
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"type","op":"=","value":"console"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(with.stores.select.len(), 1);
+        assert_eq!(with.stores.select[0].key, "type");
+    }
+
+    #[test]
     fn a_misspelled_member_is_refused_not_ignored() {
         // The failure this exists to stop: `"form"` silently ignored means
         // an unbounded search returning results that look right.
-        let bad = r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[{"file_path":"/x"}]},
+        let bad = r#"{"v":"1.0-EXPERIMENTAL","stores":{},
                       "window":{"axis":"logline","form":1}}"#;
         let e = serde_json::from_str::<Document>(bad)
             .unwrap_err()
             .to_string();
         assert!(e.contains("form"), "{e}");
         // A member at the top level, too.
-        let bad = r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[]},"limits":{"entries":1}}"#;
+        let bad = r#"{"v":"1.0-EXPERIMENTAL","stores":{},"limits":{"entries":1}}"#;
         assert!(serde_json::from_str::<Document>(bad).is_err());
     }
 
@@ -441,17 +643,16 @@ mod tests {
     fn the_axis_is_required() {
         // Optional, it would be omitted, and the document would inherit
         // the CLI's defect of an axis that switches with the mode.
-        let no_axis = r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[]},"window":{"from":1}}"#;
+        let no_axis = r#"{"v":"1.0-EXPERIMENTAL","stores":{},"window":{"from":1}}"#;
         assert!(serde_json::from_str::<Document>(no_axis).is_err());
         let with_axis =
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[]},"window":{"axis":"write","from":1}}"#;
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"window":{"axis":"write","from":1}}"#;
         assert!(serde_json::from_str::<Document>(with_axis).is_ok());
     }
 
     #[test]
     fn an_unknown_version_is_refused_rather_than_guessed_at() {
-        let doc: Document =
-            serde_json::from_str(r#"{"v":"0.9-OLD","stores":{"paths":[]}}"#).unwrap();
+        let doc: Document = serde_json::from_str(r#"{"v":"0.9-OLD","stores":{}}"#).unwrap();
         let e = doc.to_query().unwrap_err().to_string();
         assert!(e.contains("1.0-EXPERIMENTAL"), "{e}");
     }
@@ -460,10 +661,8 @@ mod tests {
     fn an_omitted_member_widens_rather_than_empties() {
         // The semantics the whole format rests on. A document naming only
         // stores is "every entry of those stores".
-        let doc: Document = serde_json::from_str(
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[{"file_path":"/x"}]}}"#,
-        )
-        .unwrap();
+        let doc: Document =
+            serde_json::from_str(r#"{"v":"1.0-EXPERIMENTAL","stores":{}}"#).unwrap();
         let q = doc.to_query().unwrap();
         assert!(q.window.from.is_none() && q.window.to.is_none());
         assert!(q.matching.is_empty());
@@ -473,7 +672,7 @@ mod tests {
     #[test]
     fn max_and_tail_together_are_refused() {
         let doc: Document = serde_json::from_str(
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[]},
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},
                 "max":{"entries":1},"tail":{"entries":1}}"#,
         )
         .unwrap();
@@ -487,27 +686,27 @@ mod tests {
         // would hide the cost. Refused by the SHAPE now rather than at
         // conversion, which is what makes it visible in the schema.
         assert!(serde_json::from_str::<Document>(
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[]},"max":{}}"#
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":{}}"#
         )
         .is_err());
         assert!(serde_json::from_str::<Document>(
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[]},"max":10}"#
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":10}"#
         )
         .is_err());
     }
 
     #[test]
     fn a_member_the_code_would_ignore_is_not_in_the_contract() {
-        // `forests`, `select` and `none` all parsed and were then either
-        // refused or — worse — silently dropped. A contract that names a
-        // member the code ignores is the failure strictness exists to
-        // prevent, so they are absent until they work. Adding an optional
-        // member later is allowed within v1; advertising a lie is not.
+        // A contract that names a member the code ignores is the failure
+        // strictness exists to prevent, so a member is absent until it
+        // works. `paths` is absent for a different reason: a path is
+        // neither a store's identity nor a way to find one, so naming a
+        // store by it is refused outright rather than supported.
         for doc in [
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[],"select":[{"key":"a","op":"=","value":"b"}]}}"#,
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[],"forests":[{"file_path":"/x"}]}}"#,
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[]},"match":{"none":[{"has":"x"}]}}"#,
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[]},"max":{"entries":1,"scope":"store"}}"#,
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{"paths":[{"file_path":"/x"}]}}"#,
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{"forests":[{"file_path":"/x"}]}}"#,
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"match":{"none":[{"has":"x"}]}}"#,
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":{"entries":1,"scope":"store"}}"#,
         ] {
             assert!(
                 serde_json::from_str::<Document>(doc).is_err(),
@@ -600,10 +799,51 @@ mod tests {
         // know whether a compatible build exists — during the
         // experimental phase it does not, and the error has to say so
         // rather than reading like a transient problem to retry.
-        let doc: Document =
-            serde_json::from_str(r#"{"v":"0.9-OLD","stores":{"paths":[]}}"#).unwrap();
+        let doc: Document = serde_json::from_str(r#"{"v":"0.9-OLD","stores":{}}"#).unwrap();
         let e = doc.to_query().unwrap_err().to_string();
         assert!(e.contains("1.0-EXPERIMENTAL"), "{e}");
         assert!(e.contains("EXPERIMENTAL"), "{e}");
+    }
+    #[test]
+    fn the_axis_and_the_kind_have_to_agree() {
+        // `axis` was REQUIRED and then dropped on the floor: a document
+        // asking for the write axis got logline semantics with nothing
+        // saying so. Underneath, one flag decides both, so until the read
+        // path separates them the document refuses the combinations it
+        // cannot honour rather than silently picking one.
+        let doc = |w: &str, k: &str| -> anyhow::Result<Query> {
+            let text = format!(r#"{{"v":"1.0-EXPERIMENTAL","stores":{{}}{w}{k}}}"#);
+            serde_json::from_str::<Document>(&text).unwrap().to_query()
+        };
+        // The pair that works, and is what --by-write-time is.
+        assert!(doc(
+            r#","window":{"axis":"write"}"#,
+            r#","response_format":{"kind":"chunks"}"#
+        )
+        .is_ok());
+        // Entries on the logline axis: the ordinary read.
+        assert!(doc(r#","window":{"axis":"logline"}"#, "").is_ok());
+        assert!(doc("", "").is_ok(), "no window at all is the logline read");
+        // Chunks without saying which axis: refused, because the answer
+        // would be selected on an axis the caller did not name.
+        let e = doc("", r#","response_format":{"kind":"chunks"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("write"), "{e}");
+        assert!(doc(
+            r#","window":{"axis":"logline"}"#,
+            r#","response_format":{"kind":"chunks"}"#
+        )
+        .is_err());
+        // The write axis with entry output: no such read exists yet.
+        let e = doc(r#","window":{"axis":"write"}"#, "")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("chunks"), "{e}");
+        assert!(doc(
+            r#","window":{"axis":"write"}"#,
+            r#","response_format":{"kind":"records"}"#
+        )
+        .is_err());
     }
 }
