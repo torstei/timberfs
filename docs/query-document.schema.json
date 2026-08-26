@@ -89,15 +89,40 @@
       "description": "A bound, which must say WHAT it counts: `entries` needs a full read\nand decompression where chunks and bytes are nearly free from the\nindex, so a bare number would hide the cost. `entries` is the only\nunit this build counts, and is therefore required rather than\noptional-and-then-refused; when another arrives it becomes one of\nseveral, which relaxes the contract rather than breaking it.\n\nA `scope` (total versus per-store) belongs here and is absent until\nthere is more than one to choose between — the difference matters, but\na field with a single legal value is noise, and adding it later is\nadditive.",
       "type": "object",
       "properties": {
+        "chunks": {
+          "description": "Chunks. Nearly free — the index alone answers it, and nothing is\ndecompressed to count. The unit to bound a chunk-granular search\nin, since an entry count there caps entries nobody asked about.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "entries": {
-          "type": "integer",
+          "description": "Entries. Needs a full read: chunks are decompressed and framed to\nknow where one entry ends.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "entries"
+      "additionalProperties": false
+    },
+    "DocGranularity": {
+      "description": "Whether a predicate names entries or chunks.",
+      "oneOf": [
+        {
+          "description": "The entries that actually contain the terms. What a reader almost\nalways means. The token index still skips chunks it can prove are\nirrelevant, so this is not the slow option — it is the same read\nwith the survivors judged one entry at a time.",
+          "type": "string",
+          "const": "entries"
+        },
+        {
+          "description": "The chunks that MAY contain them, emitted whole — a superset, and\nthe cheapest thing the store can answer, because the index alone\ndecides it and nothing is decompressed to find out. Ask for this\nwhen the next stage does its own matching.",
+          "type": "string",
+          "const": "chunks"
+        }
       ]
     },
     "DocMatch": {
@@ -115,9 +140,16 @@
           "items": {
             "$ref": "#/$defs/Predicate"
           }
+        },
+        "granularity": {
+          "description": "What these predicates SELECT, and it is REQUIRED for the same\nreason `window.axis` is: the two answers differ by orders of\nmagnitude, and a default is an assumption the next reader makes\nwrongly. This member exists because the format shipped without it\nand called itself an entry predicate while selecting chunks.",
+          "$ref": "#/$defs/DocGranularity"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "granularity"
+      ]
     },
     "DocWindow": {
       "type": "object",

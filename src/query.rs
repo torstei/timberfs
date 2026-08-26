@@ -459,11 +459,39 @@ pub struct Window {
 pub struct Match {
     pub has: Vec<String>,
     pub any: Vec<String>,
+    /// What the predicate SELECTS. The token index can only ever skip
+    /// whole chunks, so these are two different answers to the same
+    /// terms and the difference is not small: on a 1.2 GiB store, a term
+    /// in five entries selects 398 chunks and 325k lines.
+    pub granularity: Granularity,
+}
+
+/// Whether a predicate names chunks or entries.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Granularity {
+    /// Chunks that may contain the terms, emitted WHOLE. Cheap — the
+    /// index alone answers it, nothing is decompressed to decide — and
+    /// the answer is a superset. What `--has` has always meant.
+    #[default]
+    Chunks,
+    /// The entries that actually contain them. The index still skips
+    /// chunks it can prove are irrelevant; the survivors are then judged
+    /// one entry at a time.
+    Entries,
 }
 
 impl Match {
     pub fn is_empty(&self) -> bool {
         self.has.is_empty() && self.any.is_empty()
+    }
+
+    /// The entry-level predicates, when the caller asked for entries.
+    /// `None` leaves the read chunk-granular.
+    pub fn entry_preds(&self) -> anyhow::Result<Option<crate::grep::EntryPreds>> {
+        if self.granularity != Granularity::Entries || self.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::grep::EntryPreds::new(&self.has, &self.any)?))
     }
 }
 
@@ -474,6 +502,12 @@ impl Match {
 pub struct Limit {
     pub max: Option<u64>,
     pub tail: Option<u64>,
+    /// The same two bounds counted in CHUNKS. A separate field rather
+    /// than a unit tag because the read paths differ: an entry bound
+    /// needs decompression and framing to know where to stop, a chunk
+    /// bound is answered from the index without reading anything.
+    pub max_chunks: Option<u64>,
+    pub tail_chunks: Option<u64>,
 }
 
 /// What comes out. Every field here shapes the OUTPUT rather than
@@ -518,11 +552,19 @@ impl Query {
                  lines carry"
             );
         }
-        if following && !self.matching.is_empty() {
+        // A CHUNK predicate is the token index, which has nothing to skip
+        // on a live stream. An ENTRY predicate is just a filter, and
+        // filtering a tail is exactly what a live search is — so the
+        // refusal applies to the first and not the second.
+        if following
+            && !self.matching.is_empty()
+            && self.matching.granularity == Granularity::Chunks
+        {
             bail!(
-                "the token index selects whole chunks offline and does not compose with a \
-                 following read (there is nothing to skip — every new chunk must be read); \
-                 filter the live stream instead, or run a windowed query"
+                "a chunk predicate is the token index, which selects whole chunks offline \
+                 and has nothing to skip on a following read (every new chunk must be \
+                 read). Ask for entries instead, filter the live stream, or run a windowed \
+                 query"
             );
         }
         Ok(())
@@ -534,7 +576,12 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     let files = &q.sources[..];
     let (from, to, from_chunk) = (q.window.from, q.window.to, q.window.from_chunk);
     let (has, any) = (&q.matching.has[..], &q.matching.any[..]);
+    // The index selects chunks; these judge the entries inside them.
+    // Absent, the read stays chunk-granular — every entry of every chunk
+    // the index let through comes out.
+    let entry_preds = q.matching.entry_preds()?;
     let (max, tail) = (q.limit.max, q.limit.tail);
+    let (max_chunks, tail_chunks) = (q.limit.max_chunks, q.limit.tail_chunks);
     let (follow, poll) = (q.follow.follow, q.follow.poll);
     let Output {
         no_filename,
@@ -550,7 +597,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     // chunks via the offline .grain index, which neither composes with a live
     // stream (there is nothing to skip — every new chunk must be read) nor
     // filters at line granularity; filter a follow with a pipe instead.
-    if follow || tail.is_some() {
+    if follow || tail.is_some() || tail_chunks.is_some() {
         // The has/follow and from-chunk rules live on `Query::validate`,
         // which ran above: one implementation, so the flags and a
         // document cannot come to disagree about what is coherent.
@@ -563,9 +610,11 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             null_sep,
             records,
             tail,
+            tail_chunks,
             follow,
             max,
             poll,
+            entry_preds,
         );
     }
     let windowed = from.is_some() || to.is_some();
@@ -574,7 +623,16 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     // is inside it) or when the framing needs entries (-0, annotation), or
     // a --max cap (counting entries needs entry parsing).
     // --by-write-time is the raw escape hatch: chunk dump, no parsing.
-    if !by_write_time && (windowed || null_sep || show_write_time || records || max.is_some()) {
+    // An entry predicate needs entry parsing, exactly as --max does: the
+    // raw path emits chunk bytes and has nothing to judge.
+    if !by_write_time
+        && (windowed
+            || null_sep
+            || show_write_time
+            || records
+            || max.is_some()
+            || entry_preds.is_some())
+    {
         return query_entries(
             files,
             from_ms,
@@ -582,6 +640,8 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             windowed,
             has,
             any,
+            entry_preds,
+            max_chunks,
             no_filename,
             show_write_time,
             null_sep,
@@ -590,9 +650,9 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
         );
     }
     if files.len() == 1 {
-        return query_single(&files[0], from_ms, to_ms, has, any);
+        return query_single(&files[0], from_ms, to_ms, has, any, max_chunks);
     }
-    query_multi(files, from_ms, to_ms, has, any, no_filename)
+    query_multi(files, from_ms, to_ms, has, any, no_filename, max_chunks)
 }
 
 /// The default read path: select chunks by the write-time rings (widened
@@ -608,6 +668,8 @@ fn query_entries(
     windowed: bool,
     has: &[String],
     any: &[String],
+    entry_preds: Option<crate::grep::EntryPreds>,
+    max_chunks: Option<u64>,
     no_filename: bool,
     show_write_time: bool,
     null_sep: bool,
@@ -706,7 +768,8 @@ fn query_entries(
                 framing,
                 limit.clone(),
                 &f.display().to_string(),
-            ),
+            )
+            .with_preds(entry_preds.clone()),
         });
     }
 
@@ -732,6 +795,20 @@ fn query_entries(
         for a in any {
             write!(out, "\x1fany={a}")?;
         }
+        // WHAT those predicates selected. A consumer that cannot tell a
+        // chunk sweep from an entry search cannot tell a superset from an
+        // answer — which is the defect this field exists to close.
+        if !has.is_empty() || !any.is_empty() {
+            write!(
+                out,
+                "\x1fgranularity={}",
+                if entry_preds.is_some() {
+                    "entries"
+                } else {
+                    "chunks"
+                }
+            )?;
+        }
         write!(out, "\x1fsources={}", files.len())?;
         out.write_all(b"\0")?;
         for (f, s) in files.iter().zip(&srcs) {
@@ -747,6 +824,7 @@ fn query_entries(
     }
     // K-way interleave by chunk write windows across files (within-file
     // order preserved), same as the raw fleet view.
+    let mut chunks_out = 0u64;
     loop {
         let mut best: Option<usize> = None;
         for (i, s) in srcs.iter().enumerate() {
@@ -775,6 +853,13 @@ fn query_entries(
             if count.get() >= *m {
                 break;
             }
+        }
+        // A chunk cap counts what was EMITTED, across sources, so a
+        // fleet view of three stores capped at 5 chunks reads five, not
+        // fifteen.
+        chunks_out += 1;
+        if max_chunks.is_some_and(|m| chunks_out >= m) {
+            break;
         }
     }
     let (mut emitted, mut dropped) = (0u64, 0u64);
@@ -950,9 +1035,11 @@ fn query_follow(
     null_sep: bool,
     records: bool,
     tail: Option<u64>,
+    tail_chunks: Option<u64>,
     follow: bool,
     max: Option<u64>,
     poll: Option<f64>,
+    entry_preds: Option<crate::grep::EntryPreds>,
 ) -> anyhow::Result<()> {
     let multi = files.len() > 1 && !no_filename;
     // Framing needs entries; plain text streams raw bytes (no one-entry lag).
@@ -1104,7 +1191,13 @@ fn query_follow(
         let chunks = source.records.clone();
         // Where to begin: an entry-count tail, a write-time --from, or (the
         // default) the current end — following only genuinely new chunks.
-        let start = if let Some(n) = tail {
+        let start = if let Some(n) = tail_chunks {
+            // A chunk tail costs nothing: the index knows how many there
+            // are, so the last N is arithmetic and no chunk is read to
+            // find the boundary. That cheapness IS the reason the unit
+            // exists.
+            chunks.len().saturating_sub(n as usize)
+        } else if let Some(n) = tail {
             // --tail N counts log ENTRIES (a stamped line and its continuation
             // lines) the same way in text and framed output, falling back to
             // lines only when the store has no parseable timestamps. Probe the
@@ -1145,18 +1238,21 @@ fn query_follow(
             None
         };
         let mut sink = if framed {
-            Some(crate::entry::EntrySink::new(
-                extractor,
-                None,
-                crate::entry::Framing {
-                    null_sep,
-                    show_write: show_write_time,
-                    records,
-                    label: label.clone(),
-                },
-                limit.clone(),
-                &f.display().to_string(),
-            ))
+            Some(
+                crate::entry::EntrySink::new(
+                    extractor,
+                    None,
+                    crate::entry::Framing {
+                        null_sep,
+                        show_write: show_write_time,
+                        records,
+                        label: label.clone(),
+                    },
+                    limit.clone(),
+                    &f.display().to_string(),
+                )
+                .with_preds(entry_preds.clone()),
+            )
         } else {
             None
         };
@@ -1330,6 +1426,7 @@ fn query_single(
     to_ms: u64,
     has: &[String],
     any: &[String],
+    max_chunks: Option<u64>,
 ) -> anyhow::Result<()> {
     let mut source = open_source(file)?;
     let (selected, in_window) = select_chunks(
@@ -1347,6 +1444,12 @@ fn query_single(
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut uncomp_total = 0u64;
+    // A chunk cap needs no parsing at all here: stop after N have gone
+    // out. This is the path where the unit is genuinely free.
+    let selected: Vec<_> = match max_chunks {
+        Some(n) => selected.iter().take(n as usize).copied().collect(),
+        None => selected.clone(),
+    };
     for (_, c) in &selected {
         if let Some(data) = read_chunk(file, &guard, &mut source, *c)? {
             out.write_all(&data)?;
@@ -1382,6 +1485,7 @@ fn query_multi(
     has: &[String],
     any: &[String],
     no_filename: bool,
+    max_chunks: Option<u64>,
 ) -> anyhow::Result<()> {
     struct Src {
         path: PathBuf,
@@ -1427,7 +1531,13 @@ fn query_multi(
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    // Counted across sources: a fleet view capped at 5 chunks reads five
+    // in time order, not five per store.
+    let mut chunks_out = 0u64;
     loop {
+        if max_chunks.is_some_and(|m| chunks_out >= m) {
+            break;
+        }
         let next = srcs
             .iter()
             .enumerate()
@@ -1441,6 +1551,7 @@ fn query_multi(
         let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
             continue; // retained away by a race between selection and read
         };
+        chunks_out += 1;
         if no_filename {
             out.write_all(&data)?;
         } else {

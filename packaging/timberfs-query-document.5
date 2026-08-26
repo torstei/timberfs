@@ -26,10 +26,11 @@ sugar for the common shapes.
   "stores": { "select": [ { "key": "type", "op": "=", "value": "console" } ] },
   "window": { "axis": "logline", "from": 1787727600000, "to": null,
               "from_chunk": null },
-  "match":  { "all": [ { "has": "ERROR" } ],
+  "match":  { "granularity": "entries",
+              "all": [ { "has": "ERROR" } ],
               "any": [ { "has": "timeout" } ] },
   "max":    { "entries": 1000 },
-  "tail":   { "entries": 100 },
+  "tail":   { "chunks": 10 },
   "response_format": { "kind": "loglines",
                        "options": { "no_filename": true } }
 }
@@ -116,7 +117,7 @@ is a resume position by chunk number: exact, where a timestamp can match
 two chunks that share a boundary millisecond.
 .TP
 .B match
-Entry predicates, flat.
+Predicates, flat.
 .B all
 must all match and at least one of
 .B any
@@ -127,23 +128,97 @@ yet. A
 .B has
 predicate is a word\-anchored phrase, which is the form that can ride the
 token index and so skip chunks unread.
+.RS
+.PP
+.B granularity
+says what they SELECT, and it is
+.B REQUIRED
+whenever
+.B match
+is present \(em for the same reason
+.B window.axis
+is, and it exists because this format shipped without it:
+.PP
+.TP 12
+.B entries
+The entries that actually contain the terms. What a reader almost always
+means. The index still skips chunks it can prove are irrelevant, so this
+is not the slow option \(em it is the same read with the survivors judged
+one entry at a time. An entry is a stamped line and its continuation
+lines, so a stack trace matches or does not match as a whole.
+.TP
+.B chunks
+The chunks that MAY contain them, emitted
+.BR whole .
+A superset, and the cheapest thing a store can answer: the index alone
+decides it and nothing is decompressed to find out. Ask for it when the
+next stage does its own matching.
+.PP
+The difference is not small. On a 1.2 GiB store a term appearing in five
+entries selects 398 chunks and 325,767 lines.
+.PP
+.B entries
+with
+.B "response_format.kind: chunks"
+is refused: compressed chunks move verbatim, so nothing decompresses them
+to judge an entry. The response echoes the granularity it applied, so a
+consumer can tell a superset from an answer.
+.RE
 .TP
 .BR max ", " tail
 .B max
 caps forward from the start;
 .B tail
 takes the last N. They are different operations rather than one with a
-sign, so giving both is refused. Each needs a
-.B unit
-\(em
+sign, so giving both is refused. Each needs
+.B exactly one unit,
+because "stop after 10" of WHAT decides both the answer and its cost:
+.RS
+.TP 12
 .B entries
-today \(em because "stop after 10" of WHAT decides the cost:
-.B entries
-needs a full read and decompression, where chunks and bytes are nearly
-free from the index. A
+A full read \(em chunks are decompressed and framed to know where one
+entry ends.
+.TP
+.B chunks
+Nearly free: the index knows how many there are, so a
+.B tail
+of N is arithmetic and no chunk is read to find the boundary. This is the
+unit to bound a
+.B chunk\-granular
+search in \(em an entry count there caps entries nobody asked about, so
+"the first 5 entries" of a chunk sweep can easily contain none of the
+matches.
+.PP
+Neither unit nor both is refused rather than guessed at. A
+.B bytes
+unit belongs here and is absent until something produces one; a
 .B scope
-(total versus per\-store) belongs here and is absent until there is more
-than one to choose between.
+(total versus per\-store) likewise. Counts are totals across stores, so a
+fleet view capped at 5 chunks reads five in time order, not five per
+store.
+.RE
+.SS ⚠ There is no paging yet
+.B stream\-end
+says whether a cap stopped the read
+.RB ( status=limited ,
+naming which one), so a client can always tell a truncated answer from a
+complete one. It cannot yet ask for the NEXT N.
+.PP
+Do not build paging on what is there.
+.B window.from_chunk
+is a resume position for a FOLLOWING read and is refused on a windowed
+one; a timestamp cannot separate two entries inside a chunk, nor two
+chunks that share a boundary millisecond; and an entry's
+.B chunk=
+in the records stream names the chunk it sits in, not where in it \(em so
+resuming from that chunk re-delivers everything before it.
+.PP
+The position paging needs already exists in this project, as a
+follower's cursor: a chunk number plus the entries already delivered from
+that chunk, resolved against retention so a dropped anchor is REPORTED
+rather than silently clamped. Exposing it here is additive within
+.BR v=1 .
+Until then, a bound is for "show me some", not for walking a result set.
 .TP
 .B response_format
 A

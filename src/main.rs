@@ -1278,8 +1278,23 @@ fn main() -> anyhow::Result<()> {
                     to,
                     from_chunk,
                 },
-                matching: query::Match { has, any },
-                limit: query::Limit { max, tail },
+                // The flags are the chunk sweep, and have always been:
+                // `--has` selects chunks via the token index. Entry
+                // granularity is the document's, and `timber-filter` is
+                // its command-line equivalent.
+                matching: query::Match {
+                    has,
+                    any,
+                    granularity: query::Granularity::Chunks,
+                },
+                // --max/--tail count entries; the flags have no chunk
+                // bound, which is the document's.
+                limit: query::Limit {
+                    max,
+                    tail,
+                    max_chunks: None,
+                    tail_chunks: None,
+                },
                 output: query::Output {
                     no_filename,
                     show_write_time,

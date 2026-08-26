@@ -49,6 +49,10 @@ pub struct EntrySink {
     extractor: Extractor,
     /// Logline window to verify entries against; None = framing only.
     window: Option<(u64, u64)>,
+    /// Predicates every emitted entry must satisfy. None = the search is
+    /// chunk-granular, so whatever the index let through is emitted
+    /// whole.
+    preds: Option<crate::grep::EntryPreds>,
     framing: Framing,
     /// Optional total-entries cap (--max), shared across sibling sinks.
     limit: Option<EntryLimit>,
@@ -89,6 +93,7 @@ impl EntrySink {
         EntrySink {
             extractor,
             window,
+            preds: None,
             framing,
             limit,
             display: display.to_string(),
@@ -106,6 +111,13 @@ impl EntrySink {
             offset_sum_ms: 0,
             offset_n: 0,
         }
+    }
+
+    /// Judge every emitted entry against these predicates, on top of the
+    /// window. Absent, the search stays chunk-granular.
+    pub fn with_preds(mut self, preds: Option<crate::grep::EntryPreds>) -> EntrySink {
+        self.preds = preds;
+        self
     }
 
     /// Feed one chunk's decompressed bytes with the chunk's write window
@@ -178,12 +190,16 @@ impl EntrySink {
         if self.entry.is_empty() {
             return Ok(());
         }
-        let keep = match (self.window, self.entry_ts) {
+        let in_window = match (self.window, self.entry_ts) {
             (Some((from, to)), Some(ts)) => ts >= from && ts <= to,
             // No stamp on the entry: include — never hide what we cannot
             // place in time (the read-side "missing means scan").
             _ => true,
         };
+        // The entry predicate is judged on the WHOLE entry, so a term in
+        // a stack frame keeps the frame's entry — matching a line would
+        // return the frame without the line that says what threw.
+        let keep = in_window && self.preds.as_ref().is_none_or(|p| p.keep(&self.entry));
         let entry = std::mem::take(&mut self.entry);
         let ts = self.entry_ts.take();
         if !keep {
