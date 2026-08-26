@@ -48,7 +48,10 @@ timber-filter --has req-8f3a collector/*.log       # which hosts saw it?
 
 A **forest** (`/var/log/timberfs` by default) lets a bare handle stand in for a
 path, so `timberfs query nginx` works from anywhere and `timberfs list` shows
-what is there.
+what is there. `timberfs forest create /srv/archive` declares another — a
+second disk, an archive — and it is the only timberfs command whose argument is
+a path: everything else names a store, and a store is found by what it
+declares.
 
 *Why not a log cluster:* this answers the two questions that dominate an
 incident — a time window, and where an id appears — against files you already

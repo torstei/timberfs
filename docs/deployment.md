@@ -146,6 +146,24 @@ timberfs query nginx --from 13:42 --to 13:43
 timberfs info  nginx
 ```
 
+Declare another forest — a second disk, an archive — with `timberfs forest
+create`, which creates the directory and writes the `.conf`:
+
+```sh
+timberfs forest create /srv/archive              # named `archive`
+timberfs forest list                             # what is declared, and usable
+```
+
+It is idempotent, so provisioning may run it every boot, and it refuses a
+directory that overlaps an existing forest — a forest is scanned at its root
+and one level deep, so a forest inside a forest would make the stores between
+them members of both, and their handles unresolvable. `timberfs forest remove`
+un-declares one and never touches data.
+
+`timberfs forest list` is also the check worth running before a write path goes
+live: a directory that is `MISSING` or `READONLY` otherwise shows up as "store
+not found", later, in another process.
+
 The handle is the `.rings` file name minus `.rings` and a single trailing
 `.log`, so both a flat `nginx.rings` and a nested `nginx/nginx.log.rings`
 resolve as `nginx`. Full paths always win and nothing existing changes; edit

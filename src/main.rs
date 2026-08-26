@@ -462,6 +462,15 @@ enum Command {
         #[arg(long)]
         full_id: bool,
     },
+    /// Declare where stores live. A forest is a directory timberfs
+    /// searches, and it is the ONE thing a timberfs command names by
+    /// path — every other argument names a store, and a store is found
+    /// by what it declares. Declaring one here means the config file in
+    /// /etc/timberfs/forests.d stops being the interface
+    Forest {
+        #[command(subcommand)]
+        command: ForestCommand,
+    },
     /// Report or repair a store's identity — the id that makes a backing
     /// pair a store. Without a flag it only reports, and exits non-zero
     /// when the two sides do not agree or there is no identity at all, so
@@ -780,6 +789,48 @@ enum Command {
 enum IdentitySideArg {
     Index,
     Manifest,
+}
+
+#[derive(Subcommand)]
+enum ForestCommand {
+    /// Declare a directory as a forest: create it if needed and write
+    /// its config. Idempotent, so provisioning may run it on every boot.
+    /// Refuses a directory that is already a forest, or that nests with
+    /// one — a forest is scanned one level deep, so overlapping forests
+    /// would make the stores between them members of both
+    Create {
+        /// The directory stores under this forest live in. Made
+        /// absolute against the current directory if it is not already,
+        /// because daemons read this config from a different one
+        dir: PathBuf,
+        /// The forest's name: [A-Za-z0-9_.-], defaults to the
+        /// directory's last component. It names the config file and
+        /// appears in every ambiguity message
+        #[arg(long)]
+        name: Option<String>,
+        /// Print what would be declared and written, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// What is declared, and whether it is usable: store count, and
+    /// whether the directory is missing or unwritable — the failure that
+    /// otherwise surfaces as "store not found" somewhere far away
+    List {
+        /// One forest name per line, for scripts
+        #[arg(long)]
+        names: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Un-declare a forest. The directory and every store in it are left
+    /// exactly as they are — this removes the declaration, never data
+    Remove {
+        /// The forest's name, as `timberfs forest list` prints it
+        name: String,
+        /// Print what would be removed, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1223,6 +1274,13 @@ fn main() -> anyhow::Result<()> {
             }
             query::cmd_query(&q)?;
         }
+        Command::Forest { command } => match command {
+            ForestCommand::Create { dir, name, dry_run } => {
+                forest::cmd_create(&dir, name.as_deref(), dry_run)?
+            }
+            ForestCommand::List { names, json } => forest::cmd_list(json, names)?,
+            ForestCommand::Remove { name, dry_run } => forest::cmd_remove(&name, dry_run)?,
+        },
         Command::Follower { command } => match command {
             FollowerCommand::Create {
                 name,

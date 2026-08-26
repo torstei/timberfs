@@ -1865,6 +1865,73 @@ JSON
         || { echo "two-store round-trip gave '$got'" >&2; return 1; }
 }
 
+a_forest_is_declared_by_a_command_not_by_hand_editing() {
+    # A forest is the one thing a timberfs command names by path, and
+    # until now the only way to declare one was to write the .conf. This
+    # is that, against the real /etc — including the default.conf the
+    # package ships, which every check here has to coexist with.
+    local d=/srv/vmforest
+    rm -rf "$d" /etc/timberfs/forests.d/vmforest.conf
+
+    # The package's own forest is declared and usable.
+    timberfs forest list --json > /tmp/vmf.json 2>/dev/null || return 1
+    jq -e '.[] | select(.dir == "/var/log/timberfs")
+                 | .exists == true and .writable == true' /tmp/vmf.json >/dev/null \
+        || { cat /tmp/vmf.json; return 1; }
+
+    # Declare a second one: the directory is created and the conf written.
+    timberfs forest create "$d" --name vmforest >/dev/null 2>&1 || return 1
+    [ -d "$d" ] || { echo "directory not created" >&2; return 1; }
+    grep -q "^DIR=$d\$" /etc/timberfs/forests.d/vmforest.conf \
+        || { cat /etc/timberfs/forests.d/vmforest.conf >&2; return 1; }
+    # ...and what was written is what gets READ back.
+    timberfs forest list --names 2>/dev/null | grep -qx vmforest || return 1
+
+    # Idempotent, so provisioning may run it on every boot.
+    timberfs forest create "$d" --name vmforest >/dev/null 2>&1 || return 1
+    [ "$(ls /etc/timberfs/forests.d/*.conf | wc -l)" = 2 ] || return 1
+
+    # A store in the new forest is reachable by its bare handle, which is
+    # the whole point of declaring one.
+    timberfs create --set type=app --set service=vmf "$d/vmf/vmf.log" >/dev/null 2>&1 \
+        || return 1
+    printf '2026-08-26T09:00:00Z vmf line\n' \
+        | timberfs append --into "$d/vmf/vmf.log" --quiet 2>/dev/null || return 1
+    local got
+    got=$(timberfs query vmf --no-filename 2>/dev/null)
+    [ "$got" = "2026-08-26T09:00:00Z vmf line" ] \
+        || { echo "handle lookup gave '$got'" >&2; return 1; }
+    timberfs forest list 2>/dev/null | grep -E "^vmforest +1 +ok" >/dev/null \
+        || { timberfs forest list; return 1; }
+
+    # Every overlap is refused, because a forest is scanned one level deep
+    # and a store with two forests has an unresolvable handle.
+    timberfs forest create "$d" --name second >/dev/null 2>&1 && return 1
+    timberfs forest create "$d/inside" >/dev/null 2>&1 && return 1
+    timberfs forest create /srv --name parent >/dev/null 2>&1 && return 1
+    # Re-pointing a name would strand every store under it.
+    timberfs forest create /srv/other --name vmforest >/dev/null 2>&1 && return 1
+    # A refused create leaves nothing behind — not even the directory.
+    [ ! -d "$d/inside" ] && [ ! -d /srv/other ] || return 1
+    [ "$(ls /etc/timberfs/forests.d/*.conf | wc -l)" = 2 ] || return 1
+
+    # MISSING is reported rather than the forest being silently skipped:
+    # this is the check that catches an unwritable write path early.
+    mv "$d" "$d.moved"
+    timberfs forest list 2>/dev/null | grep -E "^vmforest +0 +MISSING" >/dev/null \
+        || { timberfs forest list; mv "$d.moved" "$d"; return 1; }
+    mv "$d.moved" "$d"
+
+    # remove un-declares and keeps the data, so it can never be the
+    # command that loses a store.
+    timberfs forest remove vmforest >/dev/null 2>&1 || return 1
+    [ ! -e /etc/timberfs/forests.d/vmforest.conf ] || return 1
+    [ -f "$d/vmf/vmf.log.rings" ] || { echo "remove took the data" >&2; return 1; }
+    timberfs forest remove vmforest >/dev/null 2>&1 && return 1
+
+    rm -rf "$d"
+}
+
 identity_reports_and_repairs_the_three_broken_states() {
     # An id is a fact, not a setting, so `set` will not touch it. But it
     # can be broken in three ways, each with an obvious intended fix, and
@@ -2207,6 +2274,7 @@ run_test "catalogue: list --json carries identity, provenance and coverage" cata
 run_test "records: stream-end says whether a cap stopped it, exactly" stream_end_says_whether_a_cap_stopped_it
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
+run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares
 run_test "incus-intake: unit installed; options checked before anything opens" incus_intake_is_installed_and_validates_its_options
 run_test "selection: the id list prints is the id info accepts" store_identity_is_printed_and_typeable
