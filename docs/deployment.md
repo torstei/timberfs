@@ -74,7 +74,7 @@ reports them rather than picking.
 The directory is per store rather than per intake because a directory is the unit
 that matters: **any** writer operation (indexing, rotation) needs write
 permission on it, it is what carries the mount exclusion, and it is what one
-owner can be given. Grouping stores is still a `STORE_DIR` / `--into-dir` away —
+owner can be given. Grouping stores is still a `STORE_DIR` / `--forest` away —
 by *subject*, the axis timberfs cannot know:
 
 ```ini
@@ -107,7 +107,7 @@ history is split across two paths.
 STORE_DIR=/var/log/timberfs/text
 ```
 
-For the two network intakes, keep the old `--into-dir` in the drop-in that
+For the two network intakes, keep the old destination in the drop-in that
 already overrides their `ExecStart`; a stock install has none, so add one
 (`systemctl edit timberfs-forward.service`) or accept the move. Note that the
 old layout put every one of an intake's stores in ONE directory, which the
@@ -731,7 +731,7 @@ a drop-in:
 # systemctl edit timberfs-forward.service — Docker hosts: mint stores per tag
 [Service]
 ExecStart=
-ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs \
+ExecStart=/usr/bin/timberfs forward-intake --forest default \
     --exit-on-upgrade --auto-create
 ```
 
@@ -758,7 +758,7 @@ authentication or negotiation phase and this receiver adding none of its own:
 
 - **No TLS, no handshake** — bind it to loopback or a private network only
   (override the address with a drop-in, see below); anything that can reach
-  the listening address can write to any store under `--into-dir`, and with
+  the listening address can write to any store in the forest it writes to, and with
   `--auto-create` can create new ones there.
 - **No `CompressedPackedForward` (gzip)** — refused; the connection is logged
   and closed rather than silently dropping data.
@@ -833,7 +833,7 @@ systemctl edit timberfs-frames.socket
 systemctl edit timberfs-frames.service
   [Service]
   ExecStart=
-  ExecStart=/usr/bin/timberfs frames-intake --into-dir /var/log/timberfs \
+  ExecStart=/usr/bin/timberfs frames-intake --forest default \
       --route service --replica --index --auto-create --exit-on-upgrade
 
 systemctl enable --now timberfs-frames.socket
@@ -901,7 +901,7 @@ Stores are found by their **labels**, and which labels is yours to choose:
 # systemctl edit timberfs-incus.service
 [Service]
 ExecStart=
-ExecStart=/usr/bin/timberfs incus-intake --exit-on-upgrade     --into-dir /var/log/timberfs --index --retain 7d     --key type,incus.project,incus.instance
+ExecStart=/usr/bin/timberfs incus-intake --exit-on-upgrade     --forest default --index --retain 7d     --key type,incus.project,incus.instance
 ```
 
 `--key` defaults to one store per instance. Add `image` for one per image
@@ -1159,9 +1159,11 @@ Generators must match or lag the timberfs they talk to, never lead it.
   network intakes are not templated, so systemd can only own their root
   (`LogsDirectory=timberfs`): with `--auto-create` such a receiver creates each
   store directory itself and therefore needs write permission on that root, so
-  a confined instance is better given a root of its own (`--into-dir
-  /var/log/timberfs/docker`). Without `--auto-create` it creates nothing — the
-  operator pre-creates each store, wherever its owner should be.
+  a confined instance is better given a **forest** of its own — a *sibling*,
+  not a subdirectory, since forests may not nest (`timberfs forest create
+  /srv/docker-logs`, then `--forest docker-logs`). Without `--auto-create` it
+  creates nothing — the operator pre-creates each store, wherever its owner
+  should be.
 - **The FIFO** is created `root:root 0660`. A non-root producer cannot write it
   until you set the socket's group to one that user belongs to (`SocketGroup=`);
   there is no sane default, because the producer's identity is site-specific.

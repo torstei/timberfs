@@ -590,6 +590,78 @@ pub fn cmd_list(json: bool, names_only: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The directory a declared forest names. Unknown names are an error
+/// that LISTS what is declared: a forest name is a small closed set an
+/// operator chose, so the answer to a typo is the set itself.
+pub fn dir_of(name: &str) -> anyhow::Result<PathBuf> {
+    let forests = load_forests();
+    if let Some(f) = forests.iter().find(|f| f.name == name) {
+        return Ok(f.dir.clone());
+    }
+    bail!("{}", no_such_forest(name, &forests));
+}
+
+/// Where an intake writes: a declared forest by NAME, or a raw directory.
+///
+/// A forest is the answer, and `--into-dir` is kept working because it is
+/// the only way to write into a directory that is NOT a forest — a
+/// confined instance given a root of its own, say. The two are exclusive:
+/// a command that took both would have to pick, and picking silently is
+/// how a service ends up writing somewhere nobody expects.
+pub fn into_dir(forest: Option<&str>, dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match (forest, dir) {
+        (Some(name), None) => dir_of(name),
+        (None, Some(dir)) => {
+            eprintln!(
+                "timberfs: warning: --into-dir {} is deprecated — name a forest with \
+                 `--forest NAME` instead ({}). A directory that is not a forest still \
+                 needs this flag; declare it with `timberfs forest create` if it should \
+                 be one",
+                dir.display(),
+                declared_names(&load_forests())
+            );
+            Ok(dir)
+        }
+        (Some(_), Some(_)) => bail!(
+            "--forest and --into-dir both name where to write, so give one: \
+             --forest for a declared forest, --into-dir for a directory that is not one"
+        ),
+        (None, None) => {
+            let forests = load_forests();
+            bail!(
+                "no destination — give `--forest NAME` ({}), or `--into-dir DIR` for a \
+                 directory that is not a forest",
+                declared_names(&forests)
+            )
+        }
+    }
+}
+
+fn no_such_forest(name: &str, forests: &[Forest]) -> String {
+    if forests.is_empty() {
+        return format!(
+            "no forest named `{name}`, and none is declared — \
+             `timberfs forest create DIR` declares one"
+        );
+    }
+    format!(
+        "no forest named `{name}` — declared: {}",
+        declared_names(forests)
+    )
+}
+
+fn declared_names(forests: &[Forest]) -> String {
+    if forests.is_empty() {
+        "none declared".to_string()
+    } else {
+        forests
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// The configured forests as `create`/`remove` see them: the config
 /// files, NEVER the environment override. A forest is declared on disk,
 /// and an env var that hides it for one process must not make `create`

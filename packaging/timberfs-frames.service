@@ -13,7 +13,7 @@
 #   systemctl edit timberfs-frames.service
 #     [Service]
 #     ExecStart=
-#     ExecStart=/usr/bin/timberfs frames-intake --into-dir /var/log/timberfs \
+#     ExecStart=/usr/bin/timberfs frames-intake --forest default \
 #         --route service --replica --index --auto-create --exit-on-upgrade
 [Unit]
 Description=timberfs native replication intake
@@ -23,7 +23,7 @@ After=timberfs-frames.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs frames-intake --into-dir /var/log/timberfs --replica --exit-on-upgrade
+ExecStart=/usr/bin/timberfs frames-intake --forest default --replica --exit-on-upgrade
 StandardOutput=journal
 StandardError=journal
 LogsDirectory=timberfs

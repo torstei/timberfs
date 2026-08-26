@@ -14,7 +14,7 @@
 #     [Service]
 #     ExecStart=
 #     ExecStart=/usr/bin/timberfs forward-intake --exit-on-upgrade \
-#         --into-dir /var/log/timberfs --retain 30d
+#         --forest default --retain 30d
 #
 # This is socket-activated: enable the .socket, not this unit.
 
@@ -26,7 +26,7 @@ After=timberfs-forward.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs --exit-on-upgrade
+ExecStart=/usr/bin/timberfs forward-intake --forest default --exit-on-upgrade
 # NOT StandardInput=socket: unlike the FIFO log-intake pair (which reads a
 # single accepted connection straight off stdin), this is a listen socket
 # accepting many connections, handed over the standard LISTEN_FDS/LISTEN_PID
@@ -37,7 +37,10 @@ StandardError=journal
 # Owns /var/log/timberfs (0755) — the directory this receiver creates each
 # tag's own store directory in. With --auto-create that means write
 # permission on it, so a confined instance (a User= drop-in) is better given
-# a root of its own: --into-dir /var/log/timberfs/docker, say. Without
+# a forest of its own — a SIBLING, not a subdirectory: forests may not nest,
+# because a store inside two of them has an unresolvable handle. Declare it
+# with `timberfs forest create /srv/docker-logs` and point --forest at it.
+# Without
 # --auto-create the receiver creates nothing and needs none: the operator
 # pre-creates each store, wherever that store's owner should be.
 LogsDirectory=timberfs

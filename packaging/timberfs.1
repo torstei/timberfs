@@ -36,8 +36,8 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .I DEST
 .br
 .B timberfs frames\-intake
-.B \-\-into\-dir
-.I DIR
+.B \-\-forest
+.I NAME
 .RB [ \-\-replica ]
 .RB [ \-\-auto\-create ]
 .br
@@ -93,13 +93,13 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .RI [ NAME ]
 .br
 .B timberfs forward\-intake
-.B \-\-into\-dir
-.I DIR
+.B \-\-forest
+.I NAME
 .RI [ options ]
 .br
 .B timberfs otlp\-intake
-.B \-\-into\-dir
-.I DIR
+.B \-\-forest
+.I NAME
 .RI [ options ]
 .SH DESCRIPTION
 .B timberfs
@@ -1362,8 +1362,8 @@ and a second
 .B run
 of the same follower is refused.
 .SS forward\-intake
-.B timberfs forward\-intake \-\-into\-dir
-.I DIR
+.B timberfs forward\-intake \-\-forest
+.I NAME
 receives the Fluentd Forward protocol v1 over TCP \(em the wire protocol of
 Docker's
 .B fluentd
@@ -1415,9 +1415,14 @@ Address to listen on (default
 Ignored under systemd socket activation (LISTEN_PID/LISTEN_FDS set), which
 takes the already\-bound listener instead.
 .TP
-.BI \-\-into\-dir " DIR"
-Root directory: one store per tag, each in its own directory,
+.BI \-\-forest " NAME"
+The forest to write into, as
+.B timberfs forest list
+names it: one store per tag, each in its own directory,
 .IB DIR/TAG / TAG .log\fR.
+See
+.B WHERE AN INTAKE WRITES
+below.
 Stores are pre\-created by the operator by default (see
 .BR \-\-auto\-create ),
 in which case nothing is created here and no write permission on
@@ -1463,7 +1468,7 @@ unit sets it.
 The verb name is provisional.
 .SS incus\-intake
 .B timberfs incus\-intake
-.BI \-\-into\-dir " DIR"
+.BI \-\-forest " NAME"
 .RB [ \-\-socket
 .IR PATH ]
 .RB [ \-\-project
@@ -1589,8 +1594,9 @@ Reaching the socket needs membership of the
 group.
 .SS otlp\-intake
 Receive OTLP/HTTP logs \(em the OpenTelemetry protocol every SDK and the
-Collector speak \(em and write each stream into its own store under
-.IR \-\-into\-dir .
+Collector speak \(em and write each stream into its own store in the
+forest named by
+.IR \-\-forest .
 The mirror of
 .BR timber\-otlp (1),
 which ships the same wire format out.
@@ -1658,10 +1664,15 @@ the OTLP/HTTP port). systemd socket activation on fd 3 is used instead when
 .BR LISTEN_PID / LISTEN_FDS
 name this process.
 .TP
-.BI \-\-into\-dir " DIR"
-Root directory: one store per stream, each in its own directory named after
-the route value,
+.BI \-\-forest " NAME"
+The forest to write into, as
+.B timberfs forest list
+names it: one store per stream, each in its own directory named after the
+route value,
 .IB DIR/NAME / NAME .log\fR.
+See
+.B WHERE AN INTAKE WRITES
+below.
 .TP
 .BI \-\-route " ATTR"
 Resource attribute whose value names the store (default
@@ -1695,8 +1706,8 @@ destination's
 VERBATIM and a record in its
 .IR .rings ,
 so nothing is decompressed at either end and the store is byte-identical
-to its source. One store per stream under
-.BR \-\-into\-dir ,
+to its source. One store per stream in the forest named by
+.BR \-\-forest ,
 named by
 .B \-\-route
 as the other intakes name theirs. Blocking, one thread per connection, no
@@ -2235,6 +2246,55 @@ does not show it.
 moves where the declarations are read from and written to, for a test or
 an install that is not rooted at
 .IR / .
+.SH WHERE AN INTAKE WRITES
+The four intakes \(em
+.BR forward\-intake ", " otlp\-intake ", " incus\-intake " and " frames\-intake
+\(em create stores as data arrives, so each one has to be told where. That
+is a
+.B forest:
+.PP
+.nf
+timberfs otlp\-intake \-\-forest default
+.fi
+.PP
+.B \-\-forest
+takes a name, as
+.B timberfs forest list
+gives it, and an unknown one is an error that lists what IS declared \(em a
+forest name is a small closed set an operator chose, so the answer to a
+typo is the set itself.
+.PP
+.B \-\-into\-dir
+.I DIR
+is the older form and is
+.BR DEPRECATED :
+it still works, and it warns. It remains the only way to write into a
+directory that is
+.B not
+a forest. Giving both is refused rather than one being picked.
+.SS A confined intake gets a SIBLING forest
+An intake with
+.B \-\-auto\-create
+needs write permission on wherever it writes, so a confined instance (a
+.B User=
+drop-in) is better given a forest of its own than write permission on the
+shared one. That forest is a
+.BR sibling ,
+not a subdirectory:
+.PP
+.nf
+timberfs forest create /srv/otel\-logs
+timberfs otlp\-intake \-\-forest otel\-logs
+.fi
+.PP
+Forests may not
+.B nest
+\(em a forest is scanned at its root and one directory deep, so a store
+inside two of them has a handle that resolves to neither \(em and
+.B forest create
+refuses one that overlaps another. A subdirectory of an existing forest is
+therefore not a forest, and reaching it needs the deprecated
+.BR \-\-into\-dir .
 .SH SHELL COMPLETION
 The package ships completion scripts for
 .B bash
@@ -2438,7 +2498,7 @@ is what a writer needs permission on, so one store can be given one owner.
 Point an intake's
 .B STORE_DIR
 or
-.B \-\-into\-dir
+.B \-\-forest
 somewhere else to group stores by subject, one owner and one place per
 group. What stays intake\-specific is intake configuration \(em
 .IB /etc/timberfs/text- instance .conf\fR,

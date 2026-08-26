@@ -126,7 +126,7 @@ The mirror of the adapter case, for applications that already speak OTLP. Point
 them at a collector, fan out: everything to timberfs, the warm subset onward.
 
 ```sh
-timberfs otlp-intake --into-dir /var/log/timberfs --auto-create &
+timberfs otlp-intake --forest default --auto-create &
 ```
 
 ```yaml
@@ -176,7 +176,7 @@ use. One store per tag, minted on sight in the Docker-host mode, and a `chunk`
 id is acked only once durable:
 
 ```sh
-timberfs forward-intake --into-dir /var/log/timberfs --auto-create &
+timberfs forward-intake --forest default --auto-create &
 
 docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 \
     --log-opt tag={{.Name}} --log-opt fluentd-async=true \
@@ -198,7 +198,7 @@ ring is a *destructive drain* — so `incus console --show-log` and any collecto
 polling it are taking the backlog from each other.
 
 ```sh
-timberfs incus-intake --into-dir /var/log/timberfs --index --retain 7d
+timberfs incus-intake --forest default --index --retain 7d
 ```
 
 That attaches to each running instance's live console, drains the ring once
@@ -231,7 +231,7 @@ tier, a queue behind one) can sit in the middle or replace either end.
 
 ```sh
 # on the central host
-timberfs otlp-intake --into-dir /var/log/timberfs
+timberfs otlp-intake --forest default
 
 # on each edge host
 timber-otlp --follow --cursor /var/lib/timberfs/edge.cursor \
@@ -249,7 +249,7 @@ native wire skips all of it and copies the compressed chunks:
 
 ```sh
 # on the central host
-timberfs frames-intake --into-dir /var/log/timberfs --route service     --replica --index --auto-create
+timberfs frames-intake --forest default --route service     --replica --index --auto-create
 
 # on each edge host
 timberfs frames-send backing/app.log --endpoint central:4319

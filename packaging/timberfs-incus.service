@@ -18,7 +18,7 @@
 #     [Service]
 #     ExecStart=
 #     ExecStart=/usr/bin/timberfs incus-intake --exit-on-upgrade \
-#         --into-dir /var/log/timberfs --index --retain 7d \
+#         --forest default --index --retain 7d \
 #         --key type,incus.project,incus.instance,image
 #
 # ⚠ An instance's console is EXCLUSIVE. While this holds one, `incus
@@ -36,7 +36,7 @@ After=incus.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs incus-intake --into-dir /var/log/timberfs --exit-on-upgrade
+ExecStart=/usr/bin/timberfs incus-intake --forest default --exit-on-upgrade
 StandardOutput=journal
 StandardError=journal
 
@@ -47,9 +47,11 @@ StandardError=journal
 SupplementaryGroups=incus-admin
 
 # Owns /var/log/timberfs (0755), where it creates each console's store
-# directory. A confined instance is better given a root of its own
-# (--into-dir /var/log/timberfs/incus) than write permission on the
-# shared one.
+# directory. A confined instance is better given a forest of its own than
+# write permission on the shared one — a SIBLING forest, not a subdirectory:
+# forests may not nest, because a store inside two of them has an
+# unresolvable handle. `timberfs forest create /srv/incus-consoles`, then
+# --forest incus-consoles.
 ReadWritePaths=/var/log/timberfs
 
 # Restart on anything, including the clean exit --exit-on-upgrade uses to

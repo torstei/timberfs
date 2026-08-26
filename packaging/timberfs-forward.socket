@@ -8,7 +8,7 @@
 # Listens on loopback only by default: Forward v1 has no handshake/auth
 # phase and this receiver adds no TLS (see the module doc comment in
 # src/forward.rs and docs/deployment.md), so anything reachable on the
-# listening address can write to any store under --into-dir. Override the
+# listening address can write to any store in the forest it writes to. Override the
 # address (e.g. to bind a private/internal interface for a remote Docker
 # host) with a drop-in:
 #
