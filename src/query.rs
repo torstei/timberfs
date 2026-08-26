@@ -1667,6 +1667,15 @@ pub struct StoreSummary {
     /// `retain_unconsumed`: the third axis is declared on this store, so
     /// its retaining followers' positions hold the head back.
     pub retain_unconsumed: bool,
+    /// Lineage: what some other command derived this store FROM, and how.
+    /// Read here rather than in one command's own JSON, so both surfaces
+    /// report the same thing.
+    pub derived_from: Option<String>,
+    pub derived_op: Option<String>,
+    pub window_from: Option<String>,
+    pub window_to: Option<String>,
+    pub command: Option<String>,
+    pub pattern: Option<String>,
     /// The store's REGISTERED followers, furthest behind first. Empty is
     /// a real and complete answer here — the registry names every
     /// follower of every store, so "none" means none, where an absent
@@ -1862,6 +1871,12 @@ pub fn summarize_store(
             .and_then(|b| b.get("retain_unconsumed"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        derived_from: get("derived_from"),
+        derived_op: get("derived_op"),
+        window_from: get("window_from"),
+        window_to: get("window_to"),
+        command: get("command"),
+        pattern: get("pattern"),
         followers,
         consumers: crate::cursor::survey(dir, name, bark, records),
         writer,
@@ -1952,6 +1967,12 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     // 0 because it selects a window out of the MIDDLE, so a bundle's
     // numbering carries no history and reporting one would be a lie.
     let mut numbering: Option<Numbering> = None;
+    // Kept whole, because `info --json` emits the SAME object `list --json`
+    // does and that object is built from a summary. A bundle gets one too:
+    // it is a store, it just has no writer, no sap and no cursors.
+    // Both branches below set it; declared here so the human rendering
+    // that follows can still take the summary apart.
+    let store_json: serde_json::Value;
     let (
         chunks,
         logical,
@@ -1978,6 +1999,56 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         }
         // A `.timber` bundle is a snapshot, not a live writer state:
         // it never carries a sap.
+        let bark = handle.bark.clone().unwrap_or_default();
+        let g = |k: &str| bark.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let synthesized = StoreSummary {
+            chunks,
+            logical_bytes: logical,
+            compressed_bytes: compressed,
+            first_write_ms: (chunks > 0).then_some(min_ms),
+            last_write_ms: (chunks > 0).then_some(max_ms),
+            rings_bytes: 0,
+            // A bundle's chunks are renumbered from 0 by `export`, which
+            // takes a window out of the middle — so its numbering carries
+            // no history and reporting one would be a lie.
+            chunk_seq: None,
+            next_seq: 0,
+            dropped: crate::format::Dropped::default(),
+            grain: None,
+            index_declared: bark.get("index").and_then(|v| v.as_bool()).unwrap_or(false),
+            wal_declared: false,
+            sap_pending_bytes: None,
+            id: g("id"),
+            created: g("created"),
+            origin_id: crate::bark::origin_id(&bark),
+            declared_name: g("name"),
+            labels: crate::bark::provenance(&bark),
+            retain: g("retain"),
+            retain_size: g("retain_size"),
+            retain_unconsumed: bark
+                .get("retain_unconsumed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            derived_from: g("derived_from"),
+            derived_op: g("derived_op"),
+            window_from: g("window_from"),
+            window_to: g("window_to"),
+            command: g("command"),
+            pattern: g("pattern"),
+            followers: Vec::new(),
+            consumers: None,
+            writer: WriterState::Idle,
+        };
+        store_json = store_value(
+            &synthesized,
+            // The directory holding it, as for a pair — `path` is the
+            // bundle itself.
+            input.parent().unwrap_or(Path::new(".")),
+            input,
+            crate::forest::handle_of_logical(&name),
+            crate::store_json::Kind::Bundle,
+            std::fs::metadata(input).map(|m| m.len()).ok(),
+        );
         (
             chunks, logical, compressed, min_ms, max_ms, None, None, None, false, None,
         )
@@ -2005,6 +2076,16 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             dropped: s.dropped,
             total_chunks: s.dropped_chunks(),
         });
+        // The same handle `list` shows: a store cannot be called one thing
+        // by one command and another by the next.
+        store_json = store_value(
+            &s,
+            &dir,
+            input,
+            crate::forest::handle_of_logical(&base),
+            crate::store_json::Kind::Pair,
+            None,
+        );
         consumers = s.consumers;
         followers = s.followers;
         (
@@ -2022,133 +2103,12 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     };
 
     if json {
-        let mut o = serde_json::Map::new();
-        let mut put = |k: &str, v: serde_json::Value| {
-            o.insert(k.to_string(), v);
-        };
-        put("name", name.clone().into());
-        put("kind", if bundled { "bundle" } else { "pair" }.into());
-        if let Some(id) = &id {
-            put("id", id.clone().into());
-        }
-        if let Some(c) = &created {
-            put("created", c.clone().into());
-        }
-        if let Some(d) = &derived_from {
-            put("derived_from", d.clone().into());
-        }
-        if let Some(d) = &derived_op {
-            put("derived_op", d.clone().into());
-        }
-        if let Some(w) = &window_from {
-            put("window_from", w.clone().into());
-        }
-        if let Some(w) = &window_to {
-            put("window_to", w.clone().into());
-        }
-        if let Some(c) = &command {
-            put("command", c.clone().into());
-        }
-        if let Some(pt) = &pattern {
-            put("pattern", pt.clone().into());
-        }
-        if let Some(r) = &retain {
-            put("retain", r.clone().into());
-        }
-        if let Some(r) = &retain_size {
-            put("retain_size", r.clone().into());
-        }
-        if retain_unconsumed {
-            put("retain_unconsumed", true.into());
-        }
-        put("index_declared", index_declared.into());
-        put("wal_declared", wal_declared.into());
-        if let Some(p) = sap_pending {
-            put("sap_pending_bytes", p.into());
-        }
-        put(
-            "provenance",
-            serde_json::Value::Object(
-                provenance
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                    .collect(),
-            ),
-        );
-        put("chunks", chunks.into());
-        put("logical_bytes", logical.into());
-        put("compressed_bytes", compressed.into());
-        if compressed > 0 {
-            put(
-                "ratio",
-                ((logical as f64 / compressed as f64 * 10.0).round() / 10.0).into(),
-            );
-        }
-        if chunks > 0 {
-            put("first_write_ms", min_ms.into());
-            put("last_write_ms", max_ms.into());
-        }
-        if let Some(b) = rings_bytes {
-            put("rings_bytes", b.into());
-        }
-        if let Some((b, n)) = grain {
-            put("grain_bytes", b.into());
-            put("grain_chunks", n.into());
-        }
-        if let Some(b) = bundle_bytes {
-            put("bundle_bytes", b.into());
-        }
-        if let Some(w) = &writer {
-            put("writer", w.clone().into());
-        }
-        if let Some(Numbering {
-            held: seq,
-            next_seq: next,
-            dropped,
-            total_chunks,
-        }) = numbering
-        {
-            put("next_seq", next.into());
-            // One count and one size, both plain integers. The count is
-            // exact — the numbering always knows it. The size is a FLOOR:
-            // it covers the drops a binary that records them performed, so
-            // a store that dropped under an older one is missing that
-            // earlier loss forever. Zero is the floor of a set nothing has
-            // measured, not a stand-in for unknown, so there is nothing
-            // nullable here.
-            put("dropped_chunks", total_chunks.into());
-            put("dropped_bytes", dropped.comp_bytes.into());
-            put("dropped_uncompressed_bytes", dropped.uncomp_bytes.into());
-            match seq {
-                Some((first, last)) => {
-                    put("first_seq", first.into());
-                    put("last_seq", last.into());
-                }
-                None => {
-                    put("first_seq", serde_json::Value::Null);
-                    put("last_seq", serde_json::Value::Null);
-                }
-            }
-        }
-        if !bundled {
-            // Always an array for a pair, never null: the registry knows
-            // every follower of every store, so empty means empty. Absent
-            // for a bundle, where the question does not arise.
-            put(
-                "followers",
-                serde_json::Value::Array(followers.iter().map(crate::follower::to_json).collect()),
-            );
-        }
-        if let Some(sv) = &consumers {
-            put("cursors_dir", sv.dir.display().to_string().into());
-            put("consumers", consumers_json(sv));
-            put("held_bytes", sv.held_bytes().into());
-            put("cursors_superseded", true.into());
-            if sv.unreadable > 0 {
-                put("cursors_unreadable", sv.unreadable.into());
-            }
-        }
-        println!("{}", serde_json::to_string_pretty(&o)?);
+        // One shape for every surface that emits a store. This was a
+        // hand-rolled map beside `list`'s own hand-rolled map: 39 keys
+        // between them, 10 shared, the same data under different names —
+        // and `name` holding the FILE's name here and the store's name
+        // there, which no consumer could join across.
+        println!("{}", serde_json::to_string_pretty(&store_json)?);
         return Ok(());
     }
 
@@ -2793,4 +2753,26 @@ mod tests {
         assert_eq!(resume_at(&records, &Some((key(&records[0]), 0))), Some(1));
         assert_eq!(resume_at(&records, &Some((key(&records[1]), 1))), Some(2));
     }
+}
+
+/// A store as JSON, for `info --json`. The SAME object `list --json` emits
+/// per row — see `store_json` for why there is no second shape. `forest` is
+/// absent here because `info` did not reach the store through one.
+fn store_value(
+    s: &StoreSummary,
+    dir: &Path,
+    path: &Path,
+    handle: &str,
+    kind: crate::store_json::Kind,
+    bundle_bytes: Option<u64>,
+) -> serde_json::Value {
+    let loc = crate::store_json::Location {
+        forest: None,
+        handle: handle.to_string(),
+        dir: dir.display().to_string(),
+        path: path.display().to_string(),
+        kind,
+        bundle_bytes,
+    };
+    serde_json::to_value(crate::store_json::Store::new(s, &loc)).unwrap_or(serde_json::Value::Null)
 }

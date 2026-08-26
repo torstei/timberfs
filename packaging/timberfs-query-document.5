@@ -240,7 +240,20 @@ not a bare name, because the options are orthogonal to the kind. Kinds:
 .B stores
 answers the store half of the document and stops there \(em what a fleet
 view needs before it knows which store to read, and what an enumeration
-is. Because it reads no entries, the members that describe entries
+is. Each match is a
+.B store object,
+exactly the one
+.B "timberfs info \-\-json"
+and
+.B "timberfs list \-\-json"
+emit \(em see
+.B THE STORE OBJECT
+in
+.BR timberfs (1).
+That object is NOT covered by this format's
+.B EXPERIMENTAL
+marker: the search may change under a caller, the stores it answers with
+will not. Because it reads no entries, the members that describe entries
 (\c
 .BR window ", " match ", " max ", " tail )
 are REFUSED with it rather than ignored.

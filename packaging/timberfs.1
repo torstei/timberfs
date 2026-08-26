@@ -917,8 +917,13 @@ Works identically on backing pairs and read-only
 .B .timber
 bundles \(em a bundle is a snapshot, so nothing holds a position in one.
 .B \-\-json
-prints the same facts as one JSON object for scripting. Read-only and
-safe against live writers.
+prints one
+.B store object
+\(em the same object
+.B list \-\-json
+emits per row, described under
+.B THE STORE OBJECT
+below. Read-only and safe against live writers.
 .SS identity
 .B timberfs identity
 .I FILE
@@ -1084,48 +1089,14 @@ Bare handles only, one per line, no header or columns \(em what shell
 completion consumes.
 .TP
 .B \-\-json
-A JSON array of objects
-.RI ( handle ", " forest ", " dir ", " path ", " size_bytes ", "
-.IR from_ms ", " to_ms ", " writer_live ", " indexed ", " retain ", "
-.IR retain_size ", " id ", " created ", " labels ", " first_seq ", "
-.IR last_seq ", " next_seq ", " dropped_chunks ", " dropped_bytes ", "
-.IR dropped_uncompressed_bytes ", " followers ", "
-.IR cursors_dir ", " consumers ", " held_bytes )
-instead of the human table.
-.I id
-is the store's durable identity, or
-.B null
-for a store with no manifest \(em what anything holding a position against
-it records, and never a path.
-.I labels
-is the manifest's provenance, verbatim (see
-.BR PROVENANCE ).
-The
-.I \%*_seq
-and
-.I dropped_*
-fields carry the same names and meanings as
-.BR info \(aqs ,
-deliberately: a consumer reading both must not have to remember which shape
-each chose. See
-.B WHAT A STORE HAS DROPPED
-for what they mean and when to distrust them.
-.I followers
-is always an array \(em the registry knows every follower of every
-store, so empty means empty.
-.I cursors_dir
-and
-.I consumers
-carry the superseded key, and are
-.B null
-when the store declares no directory, while
-.I consumers
-is an empty array when it declares one that holds no position in this
-store \(em the same distinction the table's
-.I \-
-and
-.I 0
-make.
+An array of
+.B store objects
+\(em exactly the object
+.B info \-\-json
+emits for a single store, described under
+.B THE STORE OBJECT
+below \(em instead of the human table. The two surfaces emit ONE shape, so
+a consumer reading both never has to remember which one chose what.
 .PP
 No forests configured and no
 .I DIR
@@ -2822,6 +2793,125 @@ zstd \-dc logs\-backing/app.log.trunk > app.log.recovered
 .fi
 .SH EXIT STATUS
 0 on success, non-zero on any error (2 for command-line usage errors).
+.SH THE STORE OBJECT
+One JSON shape for a store, wherever one is emitted:
+.B "info \-\-json"
+writes it,
+.B "list \-\-json"
+an array of it, and the query document's
+.B "kind: \(dqstores\(dq"
+the same array (see
+.BR timberfs\-query\-document (5)).
+There is no per\-surface projection, because a projection is how a third
+arrangement of the same facts appears next time.
+.PP
+⚠ Before this was one shape,
+.B info
+and
+.B list
+had 39 keys between them and shared 10 \(em the same data under different
+names, and
+.B name
+holding the FILE's name in one and the store's own name in the other. A
+consumer could not join the two.
+.SS Absent means absent
+An optional field is
+.BR omitted ,
+never written as
+.BR null :
+test for the key. One rule for the whole object.
+.PP
+What carries meaning is
+.B absent
+versus
+.BR empty .
+.B followers
+absent means the question does not arise \(em a
+.B .timber
+bundle is a snapshot \(em where an empty array means none are registered.
+.B consumers
+absent means no cursor directory is declared, empty that one is declared
+with nobody reading it.
+.SS Fields
+.TP
+.B Identity
+.I id
+(absent only for a store with no manifest, which a plain
+.B append
+writes),
+.IR created ,
+.I name
+\(em what the store CALLS itself: its declared name, or its handle when it
+declares none, never the file's name \(em
+.I handle
+(the path's own word for it, which an opaque path makes a uuid), and
+.I origin_id
+(the store these entries came from, one hop back).
+.TP
+.B Where it was found
+.I forest
+(absent for
+.BR info ,
+which does not reach a store through one),
+.IR dir ", " path ", and " kind
+.RB ( pair " or " bundle ).
+.TP
+.B Labels
+.I labels
+\(em the manifest's provenance, verbatim, nested so a free\-form key can
+never collide with a field of this object. See
+.BR PROVENANCE .
+.TP
+.B What it holds
+.IR chunks ", " logical_bytes
+(uncompressed),
+.I compressed_bytes
+(on disk),
+.IR first_write_ms " and " last_write_ms .
+.TP
+.B Numbering
+.IR first_seq ", " last_seq
+(absent for a store holding nothing),
+.IR next_seq ", and " dropped_chunks ", " dropped_bytes ", "
+.IR dropped_uncompressed_bytes .
+See
+.BR "WHAT A STORE HAS DROPPED" .
+.TP
+.B Sidecars
+.I index_declared
+says the manifest DECLARES a token index, which is not the same as holding
+one:
+.I grain_chunks
+says how much of the store one covers and
+.I grain_bytes
+how big it is. A single
+.B indexed
+boolean once conflated the two. Also
+.IR wal_declared ", " sap_pending_bytes ", " rings_bytes " and " bundle_bytes .
+.TP
+.B Declared policy
+.IR retain ", " retain_size ", " retain_unconsumed .
+See
+.BR RETENTION .
+.TP
+.B Lineage
+For a store another command derived:
+.IR derived_from ", " derived_op ", " window_from ", " window_to ", "
+.IR command ", " pattern .
+.TP
+.B Who is touching it
+.I writer
+names the holder and is ABSENT when nobody holds it \(em presence IS
+liveness, so no separate boolean can disagree with it.
+.I followers
+lists registered followers (see
+.BR FOLLOWERS ).
+.IR cursors_dir ", " consumers ", " held_bytes ", " cursors_unreadable
+and
+.I cursors_superseded
+carry the older cursor view that
+.B followers
+supersedes.
 .SH SEE ALSO
 .BR timber\-filter (1),
 .BR timber\-otlp (1),

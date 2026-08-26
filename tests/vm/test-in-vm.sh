@@ -1758,16 +1758,32 @@ selection_is_by_label_not_by_name() {
     # mistaken for an empty result.
     timberfs list --select 'service' >/dev/null 2>&1 && return 1
 
-    # `info` and `list` must agree on what a label IS: info kept its own
-    # reserved-key list and had drifted, leaking `wal` and the
-    # `timestamp_*`/`timberfs.store.*` keys into what reads as provenance.
+    # `info --json` and `list --json` emit the SAME OBJECT — not merely
+    # agreeing values under different names, which is what this test used
+    # to assert. `forest` is the one allowed difference: `info` did not
+    # reach the store through one.
     timberfs info --json "$a/vmsel-a.log" > /tmp/vmsel.info 2>/dev/null || return 1
-    jq -e '.provenance | has("wal") == false and has("timestamp_utc") == false' \
-        /tmp/vmsel.info >/dev/null || { jq -c .provenance /tmp/vmsel.info; return 1; }
     timberfs list --json /var/log/timberfs > /tmp/vmsel.list 2>/dev/null || return 1
-    jq -e --argjson p "$(jq -c .provenance /tmp/vmsel.info)" \
-        '.[] | select(.handle == "vmsel-a") | .labels == $p' /tmp/vmsel.list >/dev/null \
-        || { jq -c '.[] | select(.handle=="vmsel-a") | .labels' /tmp/vmsel.list; return 1; }
+    jq -c '.[] | select(.handle == "vmsel-a")' /tmp/vmsel.list > /tmp/vmsel.row
+    jq -e --slurpfile row /tmp/vmsel.row \
+        '. as $i | ($row[0] | del(.forest)) == ($i | del(.forest))' /tmp/vmsel.info >/dev/null \
+        || {
+            echo "info and list disagree:" >&2
+            diff <(jq -S 'del(.forest)' /tmp/vmsel.info) \
+                 <(jq -S 'del(.forest)' /tmp/vmsel.row) >&2
+            return 1
+        }
+
+    # Labels are what the manifest declares, and no more: `info` once kept
+    # its own reserved-key list and had drifted, leaking `wal` and the
+    # `timestamp_*` keys into what reads as provenance.
+    jq -e '.labels | has("wal") == false and has("timestamp_utc") == false' \
+        /tmp/vmsel.info >/dev/null || { jq -c .labels /tmp/vmsel.info; return 1; }
+
+    # The names that used to differ between the two are gone for good.
+    jq -e 'has("provenance") or has("size_bytes") or has("from_ms")
+           or has("writer_live") or has("indexed") | not' \
+        /tmp/vmsel.info >/dev/null || return 1
 }
 
 a_query_document_selects_stores_and_can_answer_with_them() {
@@ -2327,7 +2343,7 @@ catalogue_fields_are_a_projection_of_list() {
            and .labels.service == "apache"
            and .labels["service.name"] == "apache"
            and .dropped_chunks == 0 and .dropped_bytes == 0
-           and (.from_ms | type == "number")' /tmp/cat.json > /dev/null \
+           and (.first_write_ms | type == "number")' /tmp/cat.json > /dev/null \
         || { jq -c '.[] | select(.handle == "vmcat")' /tmp/cat.json; return 1; }
 
     # Settings are NOT labels: selecting on `retain_size` or `index` would
@@ -3666,7 +3682,7 @@ forest_list_command() {
     exec 9>/tmp/list-live.fifo
     sleep 0.5
     timberfs list --json 2>/dev/null \
-        | jq -e '.[] | select(.handle=="live") | .writer_live == true' >/dev/null 2>&1 \
+        | jq -e '.[] | select(.handle=="live") | has("writer")' >/dev/null 2>&1 \
         || echo "note: live-writer race missed for WRITER=live (non-fatal)"
     exec 9>&-
     wait "$live_pid" 2>/dev/null
