@@ -760,21 +760,43 @@ fn query_entries(
     }
     let (mut emitted, mut dropped) = (0u64, 0u64);
     let (mut read, mut total) = (0usize, 0usize);
+    // Did a cap stop this short of the answer? Two exact signals, and
+    // neither fires when the data merely happened to equal the cap:
+    // an entry the sink DROPPED because the count was already there, and
+    // chunks left unread because the loop broke on the cap rather than
+    // running out. A count alone cannot tell "that was all" from "your
+    // limit stopped me", and a consumer that cannot tell will present a
+    // truncated answer as a complete one.
+    let mut limited = srcs.iter().any(|s| s.pos < s.chunks.len());
     for s in &mut srcs {
         s.sink.finish(&mut out)?;
         emitted += s.sink.emitted;
         dropped += s.sink.filtered_out;
+        limited |= s.sink.suppressed > 0;
         read += s.chunks.len();
         total += s.total_chunks;
     }
     if records {
+        // `status` and `limit` are new fields in v=1, which that format
+        // permits: consumers ignore keys they do not know.
+        let status = if limited { "limited" } else { "exhausted" };
         write!(
             out,
-            "\x1estream-end\x1fentries={emitted}\x1fdropped={dropped}\x1fchunks_read={read}\x1fchunks_total={total}"
+            "\x1estream-end\x1fentries={emitted}\x1fdropped={dropped}\x1fchunks_read={read}\x1fchunks_total={total}\x1fstatus={status}"
         )?;
+        if limited {
+            write!(out, "\x1flimit=max.entries")?;
+        }
         out.write_all(b"\0")?;
     }
     out.flush()?;
+    // The same thing `status=limited` tells a program, told to a person:
+    // a count alone reads as the whole answer, and this one is not.
+    if limited {
+        if let Some(m) = max {
+            crate::note!("timberfs: stopped at --max {m}; more entries matched than were shown");
+        }
+    }
     if windowed {
         crate::note!(
             "timberfs: {emitted} entr{} in the window; {read} of {total} chunk(s) read{}",

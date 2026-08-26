@@ -1983,6 +1983,60 @@ PYID
     timberfs info deadbeef-aaaa-4bbb-8ccc-dddddddd0000 >/dev/null 2>&1 || return 1
 }
 
+stream_end_says_whether_a_cap_stopped_it() {
+    # `entries=2` is the same number whether that was everything or
+    # whether --max stopped it, so a consumer reading the count alone
+    # presents a truncated answer as a complete one. `status` closes
+    # that, and has to be exact at the boundary or it is just noise.
+    local d=/var/log/timberfs/vmcap
+    rm -rf "$d"
+    timberfs create --index "$d/vmcap.log" > /tmp/vmcap.err 2>&1 \
+        || { echo "create: $(cat /tmp/vmcap.err)" >&2; return 1; }
+    local n; n=$(date -u +%Y-%m-%dT%H:%M:%S)
+    local i
+    # A small chunk size so the cap can land on a chunk BOUNDARY as well
+    # as mid-chunk — the boundary is the case that a "dropped an entry"
+    # signal alone would miss, and it is covered by construction rather
+    # than by asserting a chunk count this test does not otherwise need.
+    for i in $(seq 1 20); do printf '%sZ INFO line %02d\n' "$n" "$i"; done \
+        | timberfs append --into "$d/vmcap.log" --chunk-size 64 --quiet > /tmp/vmcap.err 2>&1 \
+        || { echo "append: $(cat /tmp/vmcap.err)" >&2; return 1; }
+
+    status_of() {
+        timberfs query "$d/vmcap.log" --records "$@" 2>/dev/null \
+            | tr '\0' '\n' | grep -a 'stream-end' \
+            | tr '\037' '\n' | grep -a '^status=' | cut -d= -f2
+    }
+    local got
+    # Short of the data, and one short of it: limited either way.
+    for i in 3 19; do
+        got=$(status_of --max $i)
+        [ "$got" = limited ] || { echo "--max $i gave '$got', wanted limited" >&2; return 1; }
+    done
+    # EXACTLY the data, and more than it: exhausted. A naive
+    # `emitted == max` check calls the first of these limited, which
+    # would make the field noise.
+    for i in 20 25; do
+        got=$(status_of --max $i)
+        [ "$got" = exhausted ] || { echo "--max $i gave '$got', wanted exhausted" >&2; return 1; }
+    done
+    got=$(status_of)
+    [ "$got" = exhausted ] || { echo "no cap gave '$got'" >&2; return 1; }
+
+    # ...and it names WHICH bound, so a client can decide whether to
+    # widen or to paginate.
+    timberfs query "$d/vmcap.log" --records --max 3 2>/dev/null | tr '\0' '\n' \
+        | grep -aq 'limit=max.entries' || { echo "no limit= field" >&2; return 1; }
+
+    # A person gets told too: a count alone reads as the whole answer.
+    timberfs query "$d/vmcap.log" --max 3 2>&1 >/dev/null | grep -q 'more entries matched' \
+        || { echo "no note when limited" >&2; return 1; }
+    if timberfs query "$d/vmcap.log" --max 25 2>&1 >/dev/null | grep -q 'more entries matched'; then
+        echo "noted a limit on a complete answer" >&2
+        return 1
+    fi
+}
+
 catalogue_fields_are_a_projection_of_list() {
     # What a query API's catalogue endpoint needs, and all of it from
     # `list --json`: identity to join on, provenance to select on, coverage
@@ -2055,6 +2109,7 @@ run_test "forward-intake: first record's container_id seeds the manifest" forwar
 run_test "forward-intake: a declaring sender seeds host; peer is recorded either way" forward_intake_seeds_host_and_peer
 run_test "forward-intake: service restart is a sender reconnect, no data lost" forward_intake_restart_survives
 run_test "catalogue: list --json carries identity, provenance and coverage" catalogue_fields_are_a_projection_of_list
+run_test "records: stream-end says whether a cap stopped it, exactly" stream_end_says_whether_a_cap_stopped_it
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares
 run_test "incus-intake: unit installed; options checked before anything opens" incus_intake_is_installed_and_validates_its_options

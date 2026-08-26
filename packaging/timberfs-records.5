@@ -116,8 +116,27 @@ Last record of every complete stream. Fields:
 .B chunks_read
 /
 .B chunks_total
-(work done vs store size; present when known). Its PRESENCE is the
-completeness marker:
+(work done vs store size; present when known),
+.B status
+\(em
+.B exhausted
+when everything in the selection was read, or
+.B limited
+when a bound the CALLER set stopped it short, in which case
+.B limit
+names which one (today only
+.BR max.entries ).
+The two are not distinguishable from
+.B entries
+alone: a count reads as the whole answer either way, and a consumer that
+cannot tell will present a truncated result as a complete one.
+.B limited
+is reported only when more actually remained \(em an entry the sink
+dropped because the cap was already reached, or chunks left unread because
+the read stopped on it \(em so a selection that merely happened to equal
+the cap still reports
+.BR exhausted .
+Its PRESENCE is the completeness marker:
 a consumer that reaches end-of-input without seeing
 .B stream-end
 must treat the stream as truncated (the producer died, or the pipe
