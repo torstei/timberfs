@@ -806,6 +806,53 @@ slop at each edge. The intended workflow is to let
 do the coarse seek into a huge file, then trim exactly with
 .BR timber\-filter (1)
 on the timestamps the log lines carry anyway.
+.SS The same search, as a document
+A search is a value, and a whole one can be handed over as JSON instead
+of assembled from flags \(em which is what a tool, a client library or a
+query server needs.
+.TP
+.BI \-\-query " FILE"
+Read the whole search from a JSON document (\c
+.B \-
+for stdin) rather than from flags. The two are one question asked two
+ways, not two dialects of it. A member this build does not know is an
+.BR error ,
+never a silently wider search: a misspelled
+.B form
+for
+.B from
+must not become an unbounded query that looks like it worked.
+.TP
+.B \-\-dump\-json
+Print the document these flags describe, and exit \(em what
+.B \-\-query
+reads back. The quickest way to learn the format, and the only
+description of it that cannot drift:
+.PP
+.nf
+.RS
+timberfs query app.log \-\-from 13:42 \-\-has ERROR \-\-max 10 \-\-dump\-json
+timberfs query ... \-\-dump\-json | timberfs query \-\-query \-
+.RE
+.fi
+.PP
+Note what the round trip does to the store: the flags name it by
+.BR path ,
+and the document names it by
+.B identity
+(its id), because a path is neither unique nor stable and says nothing
+about what the store holds. In the document a store is chosen by a label
+.BR predicate ,
+and there is no way to name one by path at all.
+.PP
+The format, its strictness rule, its versioning and its members are
+.BR timberfs\-query\-document (5),
+with a JSON Schema at
+.IR /usr/share/doc/timberfs/query\-document.schema.json .
+⚠ It is
+.B EXPERIMENTAL
+and says so in every document: expect it to be broken in place while it
+settles, and upgrade a generator together with the timberfs it talks to.
 .SS searching
 Matching lives in its own tool:
 .BR timber\-filter (1),
@@ -936,8 +983,16 @@ below), or \(em when one or more
 .I DIR
 arguments are given \(em exactly the stores in those directories
 (ad-hoc; they need not be configured forests). Columns:
-.B HANDLE
-(the forest handle),
+.B ID
+(the first 8 characters of the store's id \(em a prefix
+.B info
+accepts;
+.B \-\-full\-id
+prints all of it),
+.B NAME
+(the name the store DECLARES, falling back to its forest handle when it
+declares none \(em which is what lets a store have an opaque path and a
+readable name),
 .B FOREST
 (the config filename minus
 .IR .conf ,
@@ -964,7 +1019,10 @@ and
 (declared
 .BR retain / retain_size ,
 else
-.IR \- ).
+.IR \- ),
+and
+.B LABELS
+(what the store declares about itself, truncated to fit).
 A
 .B FOLLOWERS
 column is added when at least one listed store has something to say
@@ -981,6 +1039,45 @@ The same handle found in two forests shows up as two rows \(em
 .B list
 is how an ambiguity that handle resolution would refuse to guess at
 becomes visible, not something it hides.
+.TP
+.BI \-\-select " EXPR"
+List only the stores whose manifest satisfies
+.IR EXPR ,
+the same predicate the query document takes. Comma-separated terms are
+ANDed;
+.BR key=value ", " key!=value ", " key=~regex " and " key!~regex
+(regexes anchored at both ends). An absent label reads as the empty
+string, so
+.B key=
+selects the stores that do NOT declare it and
+.B key!=
+the ones that do.
+.B *
+is every store, as an omitted
+.B \-\-select
+is. Quote a value that must contain a comma.
+.RS
+.PP
+It matches the WHOLE manifest, not labels alone \(em a name, an id and a
+setting are as matchable as a label. Nothing is held back for being the
+wrong KIND of fact: a label is unique and stable where a name is neither,
+but that is a difference in what a match GUARANTEES, not in what you are
+allowed to ask.
+.RE
+.TP
+.BI \-\-forest " NAME"
+Only this forest, by the name
+.B timberfs forest list
+gives it; repeatable. Without it every configured forest is listed.
+Conflicts with a
+.I DIR
+argument, which is the ad-hoc form of the same thing.
+.TP
+.B \-\-full\-id
+Print each store's whole id instead of the leading 8 characters. The
+short form is a prefix
+.B info
+accepts, so this is for copying an id somewhere that wants all of it.
 .TP
 .B \-\-names
 Bare handles only, one per line, no header or columns \(em what shell
@@ -1503,12 +1600,13 @@ a
 \(em what it returns is gone from it, including for a human running
 .B incus console \-\-show\-log
 \(em and everything drained in one poll would carry that poll's timestamp,
-collapsing write\-time granularity to the poll interval. The ring is
-drained
-.B once,
-immediately after attaching, so the backlog the instance produced before
-the tap arrived is recovered; attaching first means that backlog overlaps
-the live feed rather than leaving a gap between them.
+collapsing write\-time granularity to the poll interval. So the tap
+attaches FIRST and then drains, which both recovers the backlog the
+instance produced before the tap arrived and makes that backlog overlap
+the live feed rather than leaving a gap between them. Draining continues
+for as long as the tap is attached \(em see
+.B \-\-drain\-every
+below for why, and what it costs.
 .PP
 ⚠ An instance's console is
 .BR exclusive .
@@ -1584,6 +1682,14 @@ has nothing to show for a tapped instance, which is the point: timberfs
 now holds that content, indexed and retained.
 .B \-\-keep\-ring
 opts out and accepts the duplication.
+.PP
+Each attach writes a
+.B marker
+line carrying the instance's image, entrypoint and uuid \(em facts that
+change when a container is rebuilt, so they belong in the timeline rather
+than in labels, which would claim today's values for all of history.
+.B \-\-no\-marker
+suppresses it.
 .PP
 Containers only, unless
 .B \-\-include\-vms
@@ -1749,6 +1855,11 @@ Record what the far end has ACKNOWLEDGED, so
 .B retain_unconsumed
 knows what has left this box. Not a resume point: the receiver's coverage
 is what a resume reads.
+.TP
+.BI \-\-timeout " DUR"
+Socket read/write timeout (default 30s). A replication run that stalls
+mid-stream fails and is re-run \(em the receiver's position is
+authoritative, so a re-run resumes rather than re-sending.
 .TP
 .B \-\-no\-sidecars
 Ship no
@@ -2714,7 +2825,8 @@ zstd \-dc logs\-backing/app.log.trunk > app.log.recovered
 .SH SEE ALSO
 .BR timber\-filter (1),
 .BR timber\-otlp (1),
-.BR timberfs-records (5)
+.BR timberfs\-records (5),
+.BR timberfs\-query\-document (5)
 .br
 .BR fusermount3 (1),
 .BR zstd (1),

@@ -1617,6 +1617,50 @@ mod cli_tests {
         }
     }
 
+    /// Every subcommand FLAG must appear in the man page too. The
+    /// subcommand check above passes as soon as `.SS query` exists, so a
+    /// flag added to a documented subcommand reaches nothing: `--query`
+    /// and `--dump-json` shipped that way, and so did `list --select`,
+    /// `frames-send --timeout` and `incus-intake --no-marker`. Presence
+    /// anywhere in the page is enough — this catches ABSENCE, which is
+    /// the failure nothing else sees.
+    ///
+    /// Omissions are allowed but must be stated here, so leaving one out
+    /// is a decision somebody made rather than something nobody noticed.
+    #[test]
+    fn every_flag_is_in_the_man_page() {
+        // (subcommand, flag, why it is deliberately absent)
+        let allowed: &[(&str, &str, &str)] = &[];
+        let man = include_str!("../packaging/timberfs.1");
+        // roff escapes a leading hyphen as `\-`, so `--select` is written
+        // `\-\-select`. Compare against the page with those undone.
+        let plain = man.replace("\\-", "-");
+        let mut missing = Vec::new();
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name().to_string();
+            if name == "help" {
+                continue;
+            }
+            for arg in sub.get_arguments() {
+                let Some(long) = arg.get_long() else { continue };
+                if long == "help" || long == "version" {
+                    continue;
+                }
+                if allowed.iter().any(|(s, f, _)| *s == name && *f == long) {
+                    continue;
+                }
+                if !plain.contains(&format!("--{long}")) {
+                    missing.push(format!("{name} --{long}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these flags appear nowhere in packaging/timberfs.1: {missing:?}\n\
+             Document them, or add them to this test's allowlist with a reason."
+        );
+    }
+
     /// Every subcommand must be reachable from the prose docs too, not
     /// only the man page. The failures this catches are ABSENCES: a
     /// capability that landed and never reached a surface, which is how

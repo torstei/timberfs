@@ -223,6 +223,10 @@ logs, replaying an incident window into a backend — are in
 The full command reference — every flag, `import`/`export`/`rotate`, retention,
 forests, `.timber` bundles, and the records stream — is in the man pages:
 `man timberfs`, `man timber-filter`, `man timber-otlp`, and `man timberfs-records`.
+A search can also be handed over as a JSON document rather than assembled from
+flags (`timberfs query --query FILE`, and `--dump-json` to see the document any
+set of flags describes): `man timberfs-query-document`, with a JSON Schema at
+`/usr/share/doc/timberfs/query-document.schema.json`.
 
 When a term wants a definition rather than a tour — chunk, entry, follower,
 forest, the two clocks — **[Concepts](docs/concepts.md)** indexes the
