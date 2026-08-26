@@ -3,26 +3,27 @@
   "stores": {
     "select": [
       {
-        "key": "name",
+        "key": "type",
         "op": "=",
         "value": "app"
       }
     ]
   },
   "window": {
-    "axis": "logline",
-    "from": 1787727600000,
-    "to": 1787731200000
+    "axis": "write"
   },
   "match": {
-    "granularity": "entries",
+    "granularity": "chunks",
     "all": [
       {
-        "has": "ERROR"
+        "has": "req-8f3a"
       }
     ]
   },
   "max": {
-    "entries": 100
+    "chunks": 20
+  },
+  "response_format": {
+    "kind": "chunks"
   }
 }

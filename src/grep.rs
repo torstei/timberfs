@@ -134,3 +134,62 @@ pub fn command_line() -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// The predicates an ENTRY is judged against, as opposed to the token
+/// index's chunk-level pushdown. `all` must all match; when `any` is
+/// present at least one of it must.
+///
+/// This is the exact half of a two-stage search: the index skips chunks
+/// that cannot contain a term, and then every surviving entry is judged
+/// here. Skipping is an optimisation; THIS is the meaning.
+///
+/// Only word-anchored phrases today, which is what the query document
+/// can express. `timber-filter` carries the fuller set (substring,
+/// regex, caseless, negated) and the two should converge when the
+/// document grows them — the semantics here are deliberately identical
+/// to its `--has`/`--any` so they cannot answer differently.
+#[derive(Debug, Clone)]
+pub struct EntryPreds {
+    all: Vec<regex::bytes::Regex>,
+    any: Option<regex::bytes::Regex>,
+}
+
+impl EntryPreds {
+    /// Compile word-anchored phrases. `all` must all match an entry, and
+    /// at least one of `any` must when any are given.
+    pub fn new(all: &[String], any: &[String]) -> anyhow::Result<EntryPreds> {
+        let compile = |t: &String| {
+            regex::bytes::RegexBuilder::new(&word_pattern(t))
+                .multi_line(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("bad phrase {t:?}: {e}"))
+        };
+        let all = all
+            .iter()
+            .map(compile)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // One alternation rather than N regexes: `any` is a disjunction,
+        // and the engine is better at that than a loop is.
+        let any = if any.is_empty() {
+            None
+        } else {
+            let alt = any
+                .iter()
+                .map(|t| word_pattern(t))
+                .collect::<Vec<_>>()
+                .join("|");
+            Some(
+                regex::bytes::RegexBuilder::new(&alt)
+                    .multi_line(true)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("bad phrase set: {e}"))?,
+            )
+        };
+        Ok(EntryPreds { all, any })
+    }
+
+    pub fn keep(&self, entry: &[u8]) -> bool {
+        self.all.iter().all(|r| r.is_match(entry))
+            && self.any.as_ref().is_none_or(|r| r.is_match(entry))
+    }
+}

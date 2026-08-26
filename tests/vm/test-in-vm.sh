@@ -1792,7 +1792,7 @@ a_query_document_selects_stores_and_can_answer_with_them() {
   "stores": { "select": [ {"key":"service","op":"=","value":"vmqd"},
                           {"key":"type","op":"=","value":"console"} ] },
   "window": { "axis": "logline" },
-  "match": { "all": [ {"has":"ERROR"} ] },
+  "match": { "granularity": "entries", "all": [ {"has":"ERROR"} ] },
   "response_format": { "kind": "loglines", "options": { "no_filename": true } } }
 JSON
     got=$(timberfs query --query /tmp/vmqd.json 2>/tmp/vmqd.err)
@@ -1829,7 +1829,7 @@ JSON
     # A member the answer cannot honour is REFUSED, never ignored: a
     # document that parses and quietly does something else is the failure
     # this format's strictness exists to prevent.
-    printf '{"v":"1.0-EXPERIMENTAL","stores":{},"match":{"all":[{"has":"x"}]},"response_format":{"kind":"stores"}}\n' \
+    printf '{"v":"1.0-EXPERIMENTAL","stores":{},"match":{"granularity":"entries","all":[{"has":"x"}]},"response_format":{"kind":"stores"}}\n' \
         > /tmp/vmqd-bad.json
     timberfs query --query /tmp/vmqd-bad.json >/dev/null 2>&1 && return 1
     # ...as is an axis the kind cannot answer on.
@@ -1968,6 +1968,78 @@ an_intake_writes_into_a_forest_by_name() {
 
     timberfs forest remove vmintake >/dev/null 2>&1
     rm -rf "$d"
+}
+
+a_match_selects_what_it_says_it_selects() {
+    # The defect 0.22.0 shipped: `match` called itself an entry predicate
+    # and selected CHUNKS, so a term in one entry returned every entry of
+    # every chunk that might hold it. Asserted on real behaviour, because
+    # the round-trip tests that existed all passed while it was wrong.
+    local d=/var/log/timberfs/vmgran
+    rm -rf "$d"
+    timberfs create --set index=true "$d/vmgran.log" >/dev/null 2>&1 || return 1
+    # Four chunks; the needle is in the third and nowhere else.
+    local c i
+    for c in 1 2 3 4; do
+        for i in $(seq 1 50); do
+            printf '2026-08-26T1%d:%02d:00Z INFO chunk %d line %d\n' "$c" "$i" "$c" "$i"
+        done > /tmp/vmgran.$c
+        [ "$c" = 3 ] && printf '2026-08-26T13:51:00Z ERROR vmgranneedle here\n' >> /tmp/vmgran.$c
+        timberfs append --into "$d/vmgran.log" --quiet < /tmp/vmgran.$c 2>/dev/null || return 1
+    done
+    [ "$(timberfs index "$d/vmgran.log" 2>/dev/null | grep -c '^ ')" = 4 ] || {
+        timberfs index "$d/vmgran.log"; return 1; }
+
+    doc() { cat > /tmp/vmgran.json <<JSON
+{ "v":"1.0-EXPERIMENTAL", "stores":{"select":[{"key":"name","op":"=","value":"vmgran"}]},
+  "window":{"axis":"$2"}, $1
+  "response_format":{"kind":"$3","options":{"no_filename":true}} }
+JSON
+    }
+    local n
+    # entries: the one that matches, and nothing else.
+    doc '"match":{"granularity":"entries","all":[{"has":"vmgranneedle"}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 1 ] || { echo "entries gave $n lines, want 1" >&2; return 1; }
+    # chunks: the whole chunk it sits in — a superset, and that is the point.
+    doc '"match":{"granularity":"chunks","all":[{"has":"vmgranneedle"}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 51 ] || { echo "chunks gave $n lines, want 51" >&2; return 1; }
+
+    # Saying nothing is refused: the granularity has no default, because a
+    # default is the assumption that shipped wrong.
+    printf '{"v":"1.0-EXPERIMENTAL","stores":{},"match":{"all":[{"has":"x"}]}}\n' > /tmp/vmgran-bare.json
+    timberfs query --query /tmp/vmgran-bare.json >/dev/null 2>&1 && return 1
+
+    # Entries cannot be judged inside chunks nothing decompresses.
+    doc '"match":{"granularity":"entries","all":[{"has":"vmgranneedle"}]},' write chunks
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
+
+    # The response says which granularity it applied, so a consumer can
+    # tell a superset from an answer.
+    doc '"match":{"granularity":"chunks","all":[{"has":"vmgranneedle"}]},' logline records
+    timberfs query --query /tmp/vmgran.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep -q '^stream-start.*granularity=chunks' \
+        || { echo "stream-start did not declare the granularity" >&2; return 1; }
+
+    # A bound names its unit, and a chunk bound reads chunks.
+    doc '"max":{"chunks":2},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 100 ] || { echo "max.chunks=2 gave $n lines, want 100" >&2; return 1; }
+    # The LAST chunk, which is the 50-line one — the needle's chunk has 51.
+    doc '"tail":{"chunks":1},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 50 ] || { echo "tail.chunks=1 gave $n lines, want 50" >&2; return 1; }
+    doc '"max":{"entries":3},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 3 ] || { echo "max.entries=3 gave $n lines, want 3" >&2; return 1; }
+    # Neither unit, or both, is refused rather than picked between.
+    doc '"max":{},' logline loglines
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
+    doc '"max":{"entries":3,"chunks":2},' logline loglines
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
+
+    rm -rf "$d" /tmp/vmgran.*
 }
 
 identity_reports_and_repairs_the_three_broken_states() {
@@ -2312,6 +2384,7 @@ run_test "catalogue: list --json carries identity, provenance and coverage" cata
 run_test "records: stream-end says whether a cap stopped it, exactly" stream_end_says_whether_a_cap_stopped_it
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
+run_test "query document: match and bounds name their granularity" a_match_selects_what_it_says_it_selects
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
 run_test "forest: an intake writes into a forest by name; --into-dir warns" an_intake_writes_into_a_forest_by_name
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares

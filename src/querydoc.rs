@@ -161,10 +161,34 @@ pub struct DocWindow {
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DocMatch {
+    /// What these predicates SELECT, and it is REQUIRED for the same
+    /// reason `window.axis` is: the two answers differ by orders of
+    /// magnitude, and a default is an assumption the next reader makes
+    /// wrongly. This member exists because the format shipped without it
+    /// and called itself an entry predicate while selecting chunks.
+    pub granularity: DocGranularity,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub all: Vec<Predicate>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub any: Vec<Predicate>,
+}
+
+/// Whether a predicate names entries or chunks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum DocGranularity {
+    /// The entries that actually contain the terms. What a reader almost
+    /// always means. The token index still skips chunks it can prove are
+    /// irrelevant, so this is not the slow option — it is the same read
+    /// with the survivors judged one entry at a time.
+    #[default]
+    Entries,
+    /// The chunks that MAY contain them, emitted whole — a superset, and
+    /// the cheapest thing the store can answer, because the index alone
+    /// decides it and nothing is decompressed to find out. Ask for this
+    /// when the next stage does its own matching.
+    Chunks,
 }
 
 /// One predicate. Exactly one matcher is set; the shape leaves room for
@@ -193,7 +217,34 @@ pub struct Predicate {
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Bound {
-    pub entries: u64,
+    /// Entries. Needs a full read: chunks are decompressed and framed to
+    /// know where one entry ends.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub entries: Option<u64>,
+    /// Chunks. Nearly free — the index alone answers it, and nothing is
+    /// decompressed to count. The unit to bound a chunk-granular search
+    /// in, since an entry count there caps entries nobody asked about.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub chunks: Option<u64>,
+}
+
+impl Bound {
+    /// Exactly one unit, named. "Stop after 10" of WHAT decides both the
+    /// answer and its cost, so neither a missing unit nor two of them is
+    /// something to pick between on the caller's behalf.
+    fn one(&self, member: &str) -> anyhow::Result<()> {
+        match (self.entries, self.chunks) {
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            (None, None) => bail!(
+                "`{member}` needs a unit: `entries` (a full read) or `chunks` (free from \
+                 the index) — \"stop after 10\" of what?"
+            ),
+            (Some(_), Some(_)) => bail!(
+                "`{member}` names both `entries` and `chunks`; they are different \
+                 questions with different costs, so give one"
+            ),
+        }
+    }
 }
 
 /// What comes back. A kind plus options rather than a bare name, because
@@ -361,6 +412,10 @@ impl Document {
                 None
             },
             matching: (!q.matching.is_empty()).then(|| DocMatch {
+                granularity: match q.matching.granularity {
+                    crate::query::Granularity::Entries => DocGranularity::Entries,
+                    crate::query::Granularity::Chunks => DocGranularity::Chunks,
+                },
                 all: q
                     .matching
                     .has
@@ -374,8 +429,8 @@ impl Document {
                     .map(|h| Predicate { has: h.clone() })
                     .collect(),
             }),
-            max: q.limit.max.map(|n| Bound { entries: n }),
-            tail: q.limit.tail.map(|n| Bound { entries: n }),
+            max: bound_of(q.limit.max, q.limit.max_chunks),
+            tail: bound_of(q.limit.tail, q.limit.tail_chunks),
             response_format: Some(ResponseFormat {
                 kind: if q.output.by_write_time {
                     Kind::Chunks
@@ -473,7 +528,23 @@ impl Document {
             ),
             _ => {}
         }
-        Ok(Query {
+        if let Some(b) = &self.max {
+            b.one("max")?;
+        }
+        if let Some(b) = &self.tail {
+            b.one("tail")?;
+        }
+        if let Some(m) = &self.matching {
+            if m.granularity == DocGranularity::Entries && fmt.kind == Kind::Chunks {
+                bail!(
+                    "`response_format.kind: \"chunks\"` moves compressed chunks verbatim, so \
+                     nothing decompresses them to judge an entry — ask for \
+                     `granularity: \"chunks\"` and accept the superset, or for entries in a \
+                     kind that has them"
+                );
+            }
+        }
+        let q = Query {
             sources: resolve_stores(&self.stores)?,
             window: Window {
                 from: self.window.as_ref().and_then(|w| w.from),
@@ -491,10 +562,16 @@ impl Document {
                     .as_ref()
                     .map(|m| m.any.iter().map(|p| p.has.clone()).collect())
                     .unwrap_or_default(),
+                granularity: match self.matching.as_ref().map(|m| m.granularity) {
+                    Some(DocGranularity::Chunks) | None => crate::query::Granularity::Chunks,
+                    Some(DocGranularity::Entries) => crate::query::Granularity::Entries,
+                },
             },
             limit: Limit {
-                max: self.max.as_ref().map(|b| b.entries),
-                tail: self.tail.as_ref().map(|b| b.entries),
+                max: self.max.as_ref().and_then(|b| b.entries),
+                max_chunks: self.max.as_ref().and_then(|b| b.chunks),
+                tail_chunks: self.tail.as_ref().and_then(|b| b.chunks),
+                tail: self.tail.as_ref().and_then(|b| b.entries),
             },
             output: Output {
                 no_filename: fmt.options.no_filename,
@@ -504,7 +581,13 @@ impl Document {
                 by_write_time: fmt.kind == Kind::Chunks,
             },
             follow: Follow::default(),
-        })
+        };
+        // A document that parses can still describe an impossible search
+        // (a window that ends before it starts, a chunk predicate on a
+        // following read). Checking here means `to_query` yields a query
+        // that RUNS, rather than one that fails later somewhere else.
+        q.validate()?;
+        Ok(q)
     }
 }
 
@@ -518,6 +601,15 @@ pub fn read(path: &str) -> anyhow::Result<Document> {
     serde_json::from_str(&text).context(
         "the query document is not valid JSON, or names a member this timberfs does not know",
     )
+}
+
+/// The bound a `Query`'s two counters describe. They are exclusive by
+/// construction — nothing sets both — so this picks whichever is set.
+fn bound_of(entries: Option<u64>, chunks: Option<u64>) -> Option<Bound> {
+    match (entries, chunks) {
+        (None, None) => None,
+        _ => Some(Bound { entries, chunks }),
+    }
 }
 
 #[cfg(test)]
@@ -539,10 +631,13 @@ mod tests {
             matching: Match {
                 has: vec!["ERROR".into()],
                 any: vec!["timeout".into(), "refused".into()],
+                granularity: crate::query::Granularity::Entries,
             },
             limit: Limit {
                 max: Some(100),
                 tail: None,
+                max_chunks: None,
+                tail_chunks: None,
             },
             output: Output {
                 no_filename: true,
@@ -680,15 +775,96 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_without_a_unit_is_refused() {
-        // "stop after 10" of WHAT: entries need a full read where chunks
-        // and bytes are nearly free from the index, so a bare number
-        // would hide the cost. Refused by the SHAPE now rather than at
-        // conversion, which is what makes it visible in the schema.
+    fn a_match_says_what_it_selects_and_will_not_assume() {
+        // The defect this member exists for: the format shipped calling
+        // `match` an entry predicate while SELECTING CHUNKS, so a term in
+        // one entry returned every entry of every chunk that might hold
+        // it. Nothing caught it, because every test asserted the document
+        // round-trips and none asserted that a match matches.
+        //
+        // Omitting it is refused by the shape — `granularity` has no
+        // serde default, so a document that does not say cannot parse.
         assert!(serde_json::from_str::<Document>(
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":{}}"#
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"match":{"all":[{"has":"ERROR"}]}}"#
         )
         .is_err());
+
+        for (g, want) in [
+            ("entries", crate::query::Granularity::Entries),
+            ("chunks", crate::query::Granularity::Chunks),
+        ] {
+            let d: Document = serde_json::from_str(&format!(
+                r#"{{"v":"1.0-EXPERIMENTAL","stores":{{}},
+                    "window":{{"axis":"logline"}},
+                    "match":{{"granularity":"{g}","all":[{{"has":"ERROR"}}]}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(d.to_query().unwrap().matching.granularity, want);
+        }
+
+        // Entries cannot be judged inside chunks that never get
+        // decompressed, so the combination is refused rather than
+        // silently answered with the superset.
+        let d: Document = serde_json::from_str(
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"window":{"axis":"write"},
+                "match":{"granularity":"entries","all":[{"has":"ERROR"}]},
+                "response_format":{"kind":"chunks"}}"#,
+        )
+        .unwrap();
+        assert!(d.to_query().unwrap_err().to_string().contains("verbatim"));
+    }
+
+    #[test]
+    fn an_entry_predicate_composes_with_a_following_read_where_a_chunk_one_cannot() {
+        // The index has nothing to skip on a live stream, which is why a
+        // CHUNK predicate is refused there. An entry predicate is just a
+        // filter, and filtering a tail is what a live search IS.
+        let doc = |g: &str| -> anyhow::Result<crate::query::Query> {
+            let d: Document = serde_json::from_str(&format!(
+                r#"{{"v":"1.0-EXPERIMENTAL","stores":{{}},
+                    "window":{{"axis":"logline"}},
+                    "match":{{"granularity":"{g}","all":[{{"has":"ERROR"}}]}},
+                    "tail":{{"entries":10}}}}"#
+            ))
+            .unwrap();
+            d.to_query()
+        };
+        assert!(doc("entries").is_ok());
+        let e = doc("chunks").unwrap_err().to_string();
+        assert!(e.contains("token index"), "{e}");
+    }
+
+    #[test]
+    fn a_bound_needs_exactly_one_unit() {
+        // "stop after 10" of WHAT: entries need a full read where chunks
+        // are nearly free from the index, so a bare number would hide the
+        // cost. Both units at once is two questions, not a refinement.
+        //
+        // ⚠ Checked at conversion, not by the SHAPE, because both members
+        // are optional so that either may be given. A JSON Schema
+        // validator therefore cannot catch these two on its own — the
+        // schema says so in the description, and timberfs refuses them.
+        let bad = [
+            (
+                r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":{}}"#,
+                "needs a unit",
+            ),
+            (
+                r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":{"entries":5,"chunks":2}}"#,
+                "both",
+            ),
+            (
+                r#"{"v":"1.0-EXPERIMENTAL","stores":{},"tail":{}}"#,
+                "needs a unit",
+            ),
+        ];
+        for (doc, want) in bad {
+            let d: Document = serde_json::from_str(doc).unwrap();
+            let e = d.to_query().unwrap_err().to_string();
+            assert!(e.contains(want), "{doc} gave {e}");
+        }
+        // A bare number is still refused by the shape: a bound is an
+        // object, and nothing about that changed.
         assert!(serde_json::from_str::<Document>(
             r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":10}"#
         )
