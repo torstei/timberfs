@@ -1529,7 +1529,7 @@ forward_intake_enable_auto_create() {
     cat > /etc/systemd/system/timberfs-forward.service.d/auto-create.conf <<'EOF'
 [Service]
 ExecStart=
-ExecStart=/usr/bin/timberfs forward-intake --into-dir /var/log/timberfs --exit-on-upgrade --auto-create
+ExecStart=/usr/bin/timberfs forward-intake --forest default --exit-on-upgrade --auto-create
 EOF
     systemctl daemon-reload
     systemctl restart timberfs-forward.service
@@ -1932,6 +1932,44 @@ a_forest_is_declared_by_a_command_not_by_hand_editing() {
     rm -rf "$d"
 }
 
+an_intake_writes_into_a_forest_by_name() {
+    # An intake creates stores as data arrives, so it has to be told
+    # where. That is a forest NAME now; --into-dir still works and warns,
+    # because a directory that is not a forest has no other way in.
+    local d=/srv/vmintake
+    rm -rf "$d" /etc/timberfs/forests.d/vmintake.conf
+    timberfs forest create "$d" --name vmintake >/dev/null 2>&1 || return 1
+
+    # An unknown name is an error that LISTS what is declared — the typo
+    # answer that a bare "not found" cannot give.
+    timberfs otlp-intake --forest nope >/tmp/vmi.out 2>/tmp/vmi.err && return 1
+    grep -q "no forest named .nope" /tmp/vmi.err || { cat /tmp/vmi.err >&2; return 1; }
+    grep -q "vmintake" /tmp/vmi.err || { cat /tmp/vmi.err >&2; return 1; }
+
+    # Neither flag is a usage error naming both ways out.
+    timberfs frames-intake >/dev/null 2>/tmp/vmi.err && return 1
+    grep -q -- "--forest" /tmp/vmi.err && grep -q -- "--into-dir" /tmp/vmi.err \
+        || { cat /tmp/vmi.err >&2; return 1; }
+
+    # Both is refused rather than one being picked silently.
+    timberfs otlp-intake --forest vmintake --into-dir /tmp >/dev/null 2>&1 && return 1
+
+    # --into-dir still works, and says it is deprecated.
+    timberfs forward-intake --into-dir /nonexistent-vmi >/dev/null 2>/tmp/vmi.err && return 1
+    grep -qi "into-dir.*deprecated" /tmp/vmi.err || { cat /tmp/vmi.err >&2; return 1; }
+
+    # `list --forest` is scoped to that one forest. The write path itself
+    # is covered by the four intake suites, which now run through
+    # `--forest default` via the units the package ships.
+    timberfs create --set service=vmi "$d/vmi/vmi.log" >/dev/null 2>&1 || return 1
+    timberfs list --forest vmintake --names 2>/dev/null | grep -qx vmi || return 1
+    [ "$(timberfs list --forest vmintake --names 2>/dev/null | wc -l)" = 1 ] \
+        || { timberfs list --forest vmintake; return 1; }
+
+    timberfs forest remove vmintake >/dev/null 2>&1
+    rm -rf "$d"
+}
+
 identity_reports_and_repairs_the_three_broken_states() {
     # An id is a fact, not a setting, so `set` will not touch it. But it
     # can be broken in three ways, each with an obvious intended fix, and
@@ -2275,6 +2313,7 @@ run_test "records: stream-end says whether a cap stopped it, exactly" stream_end
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
+run_test "forest: an intake writes into a forest by name; --into-dir warns" an_intake_writes_into_a_forest_by_name
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares
 run_test "incus-intake: unit installed; options checked before anything opens" incus_intake_is_installed_and_validates_its_options
 run_test "selection: the id list prints is the id info accepts" store_identity_is_printed_and_typeable

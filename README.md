@@ -57,7 +57,7 @@ timberfs info backing/app.log                  # vital signs: size, ratio, time 
 timberfs identity backing/app.log              # is the store's id sound? (repairs with --mint/--keep)
 timberfs query backing/app.log --from 2026-08-26 --has ERROR --dump-json   # the search, as a document
 timberfs query --query search.json             # ...and run one back
-timberfs incus-intake --into-dir /var/log/timberfs   # tap incus container consoles
+timberfs incus-intake --forest default   # tap incus container consoles
 timberfs query backing/app.log --from "2026-07-10 13:40" --to "2026-07-10 14:10"
 timber-filter --has ERROR backing/app.log --from 2026-07-10  # word-match, index-fast
 timber-filter --has req-8f3a backing/app.log                  # request id, no time bound
@@ -148,7 +148,7 @@ acked only once durable in the
 (at-least-once, like the socket intake above):
 
 ```sh
-timberfs forward-intake --into-dir /var/log/timberfs &
+timberfs forward-intake --forest default &
 
 docker run --log-driver=fluentd --log-opt fluentd-address=127.0.0.1:24224 \
     --log-opt tag={{.Name}} --log-opt fluentd-async=true \
@@ -173,7 +173,7 @@ into the store's `.bark`, and each `LogRecord` becomes one entry; the HTTP 200
 is sent only once the batch is fsynced:
 
 ```sh
-timberfs otlp-intake --into-dir /var/log/timberfs --auto-create &
+timberfs otlp-intake --forest default --auto-create &
 ```
 
 ```yaml
@@ -390,7 +390,7 @@ chunks, verbatim:
 
 ```sh
 # on the archive
-timberfs frames-intake --into-dir /var/log/timberfs --listen 0.0.0.0:4319 \
+timberfs frames-intake --forest default --listen 0.0.0.0:4319 \
     --route service --auto-create --replica --index
 
 # on the node

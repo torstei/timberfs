@@ -7,7 +7,7 @@
 # Listens on loopback only by default: this receiver adds no TLS and OTLP
 # carries no authentication of its own (see the module doc comment in
 # src/otlp_intake.rs and docs/deployment.md), so anything reachable on the
-# listening address can write to any store under --into-dir. Override the
+# listening address can write to any store in the forest it writes to. Override the
 # address (e.g. to bind a private interface for a remote collector) with a
 # drop-in:
 #

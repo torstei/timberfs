@@ -440,6 +440,10 @@ enum Command {
         /// forests). Default: every configured forest
         #[arg(num_args = 0..)]
         dirs: Vec<PathBuf>,
+        /// Only this forest, by the name `timberfs forest list` gives it
+        /// (repeatable). Without it, every configured forest is listed
+        #[arg(long = "forest", value_name = "NAME", conflicts_with = "dirs")]
+        forests: Vec<String>,
         /// Bare handles only, one per line, no header or columns (what
         /// shell completion consumes)
         #[arg(long, conflicts_with = "json")]
@@ -553,9 +557,14 @@ enum Command {
         /// instead when LISTEN_PID/LISTEN_FDS name this process)
         #[arg(long, default_value = "127.0.0.1:24224")]
         listen: String,
-        /// Backing directory: one store per Forward tag, named <tag>.log
-        #[arg(long = "into-dir", value_name = "DIR")]
-        into_dir: PathBuf,
+        /// The forest to write into, as `timberfs forest list` names it:
+        /// one store per Forward tag, named <tag>.log
+        #[arg(long, value_name = "NAME")]
+        forest: Option<String>,
+        /// Backing directory. DEPRECATED in favour of --forest; still
+        /// the way to write into a directory that is NOT a forest
+        #[arg(long = "into-dir", value_name = "DIR", conflicts_with = "forest")]
+        into_dir: Option<PathBuf>,
         /// Record field holding the log line; falls back to the whole
         /// record as compact JSON when missing or not a string
         #[arg(long, default_value = "log")]
@@ -595,9 +604,14 @@ enum Command {
         /// instead when LISTEN_PID/LISTEN_FDS name this process)
         #[arg(long, default_value = "127.0.0.1:4319")]
         listen: String,
-        /// Backing directory: one store per stream
-        #[arg(long = "into-dir", value_name = "DIR")]
-        into_dir: PathBuf,
+        /// The forest to write into, as `timberfs forest list` names it:
+        /// one store per stream
+        #[arg(long, value_name = "NAME")]
+        forest: Option<String>,
+        /// Backing directory. DEPRECATED in favour of --forest; still
+        /// the way to write into a directory that is NOT a forest
+        #[arg(long = "into-dir", value_name = "DIR", conflicts_with = "forest")]
+        into_dir: Option<PathBuf>,
         /// The label whose value names the store
         #[arg(long, default_value = "service", value_name = "LABEL")]
         route: String,
@@ -662,10 +676,15 @@ enum Command {
     /// when the app's own logging is already dead.
     #[command(name = "incus-intake")]
     IncusIntake {
-        /// Backing directory: each store lives in its own directory named
-        /// after its id, with the readable name in its manifest
-        #[arg(long = "into-dir", value_name = "DIR")]
-        into_dir: PathBuf,
+        /// The forest to write into, as `timberfs forest list` names it:
+        /// each store lives in its own directory named after its id, with the
+        /// readable name in its manifest
+        #[arg(long, value_name = "NAME")]
+        forest: Option<String>,
+        /// Backing directory. DEPRECATED in favour of --forest; still
+        /// the way to write into a directory that is NOT a forest
+        #[arg(long = "into-dir", value_name = "DIR", conflicts_with = "forest")]
+        into_dir: Option<PathBuf>,
         /// The incus unix socket
         #[arg(long, default_value = incus::DEFAULT_SOCKET)]
         socket: String,
@@ -750,9 +769,14 @@ enum Command {
         /// instead when LISTEN_PID/LISTEN_FDS name this process)
         #[arg(long, default_value = "127.0.0.1:4318")]
         listen: String,
-        /// Backing directory: one store per stream, named <route value>.log
-        #[arg(long = "into-dir", value_name = "DIR")]
-        into_dir: PathBuf,
+        /// The forest to write into, as `timberfs forest list` names it:
+        /// one store per stream, named <route value>.log
+        #[arg(long, value_name = "NAME")]
+        forest: Option<String>,
+        /// Backing directory. DEPRECATED in favour of --forest; still
+        /// the way to write into a directory that is NOT a forest
+        #[arg(long = "into-dir", value_name = "DIR", conflicts_with = "forest")]
+        into_dir: Option<PathBuf>,
         /// Resource attribute whose value names the store; absent on a
         /// batch, OTel's own unknown_service is used
         #[arg(long, default_value = "service.name", value_name = "ATTR")]
@@ -1336,6 +1360,7 @@ fn main() -> anyhow::Result<()> {
             query::cmd_info(&file, json)?;
         }
         Command::IncusIntake {
+            forest,
             into_dir,
             socket,
             project,
@@ -1352,6 +1377,7 @@ fn main() -> anyhow::Result<()> {
             no_marker,
             exit_on_upgrade,
         } => {
+            let into_dir = forest::into_dir(forest.as_deref(), into_dir)?;
             let known = incus_intake::known_facts();
             incus_intake::run(incus_intake::IncusOpts {
                 socket,
@@ -1388,11 +1414,22 @@ fn main() -> anyhow::Result<()> {
         }
         Command::List {
             dirs,
+            forests,
             names,
             json,
             select,
             full_id,
         } => {
+            // A forest NAME resolves to its directory, so `list` keeps
+            // taking one list of directories and gains no second path.
+            let dirs = if forests.is_empty() {
+                dirs
+            } else {
+                forests
+                    .iter()
+                    .map(|n| forest::dir_of(n))
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            };
             list::cmd_list(&dirs, names, json, select.as_deref(), full_id)?;
         }
         Command::Reindex { file } => {
@@ -1423,6 +1460,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ForwardIntake {
             listen,
+            forest,
             into_dir,
             payload_key,
             retain,
@@ -1431,6 +1469,7 @@ fn main() -> anyhow::Result<()> {
             auto_create,
             exit_on_upgrade,
         } => {
+            let into_dir = forest::into_dir(forest.as_deref(), into_dir)?;
             forward::cmd_forward_intake(
                 &listen,
                 &into_dir,
@@ -1446,6 +1485,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::FramesIntake {
             listen,
+            forest,
             into_dir,
             route,
             auto_create,
@@ -1455,7 +1495,7 @@ fn main() -> anyhow::Result<()> {
             exit_on_upgrade,
         } => timberfs::frames::cmd_intake(&timberfs::frames::IntakeOpts {
             listen,
-            into_dir,
+            into_dir: forest::into_dir(forest.as_deref(), into_dir)?,
             route,
             auto_create,
             replica,
@@ -1509,6 +1549,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::OtlpIntake {
             listen,
+            forest,
             into_dir,
             route,
             retain,
@@ -1518,6 +1559,7 @@ fn main() -> anyhow::Result<()> {
             max_body,
             exit_on_upgrade,
         } => {
+            let into_dir = forest::into_dir(forest.as_deref(), into_dir)?;
             let max_body = timberfs::append::parse_size_bytes(&max_body)? as usize;
             otlp_intake::cmd_otlp_intake(
                 &listen,

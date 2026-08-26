@@ -20,7 +20,7 @@
 #     [Service]
 #     ExecStart=
 #     ExecStart=/usr/bin/timberfs otlp-intake --exit-on-upgrade \
-#         --into-dir /var/log/timberfs --retain 30d --index
+#         --forest default --retain 30d --index
 #
 # This is socket-activated: enable the .socket, not this unit.
 
@@ -32,7 +32,7 @@ After=timberfs-otlp.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs otlp-intake --into-dir /var/log/timberfs --exit-on-upgrade
+ExecStart=/usr/bin/timberfs otlp-intake --forest default --exit-on-upgrade
 # NOT StandardInput=socket: this is a listen socket accepting many
 # connections, handed over the standard LISTEN_FDS/LISTEN_PID protocol at
 # fd 3 (SD_LISTEN_FDS_START).
@@ -42,7 +42,10 @@ StandardError=journal
 # Owns /var/log/timberfs (0755) — the directory this receiver creates each
 # stream's own store directory in. With --auto-create that means write
 # permission on it, so a confined instance (a User= drop-in) is better given
-# a root of its own: --into-dir /var/log/timberfs/otel, say. Without
+# a forest of its own — a SIBLING, not a subdirectory: forests may not nest,
+# because a store inside two of them has an unresolvable handle. Declare it
+# with `timberfs forest create /srv/otel-logs` and point --forest at it.
+# Without
 # --auto-create the receiver creates nothing and needs none: the operator
 # pre-creates each store, wherever that store's owner should be.
 LogsDirectory=timberfs

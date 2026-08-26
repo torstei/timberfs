@@ -20,8 +20,9 @@ _timberfs() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
-    local subcommands="mount create set append import export query info index list reindex trim rotate follower forward-intake otlp-intake"
+    local subcommands="mount create set append import export query info index list identity reindex trim rotate forest follower forward-intake otlp-intake incus-intake frames-intake frames-send"
     local follower_verbs="create list status update delete run"
+    local forest_verbs="create list remove"
 
     if [ "$COMP_CWORD" -le 1 ]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -29,6 +30,26 @@ _timberfs() {
     fi
 
     cmd="${COMP_WORDS[1]}"
+
+    # `forest` has its own verb layer. `create` takes a DIRECTORY — the one
+    # argument in timberfs that is a path on purpose — and `remove` takes a
+    # declared name.
+    if [ "$cmd" = forest ]; then
+        if [ "$COMP_CWORD" -le 2 ]; then
+            COMPREPLY=($(compgen -W "$forest_verbs" -- "$cur"))
+            return 0
+        fi
+        case "${COMP_WORDS[2]}" in
+        create) COMPREPLY=($(compgen -d -- "$cur")) ;;
+        remove)
+            local fnames
+            fnames=$(timberfs forest list --names 2>/dev/null)
+            COMPREPLY=($(compgen -W "$fnames" -- "$cur"))
+            ;;
+        *) COMPREPLY=() ;;
+        esac
+        return 0
+    fi
 
     # `follower` has its own verb layer, and its own names to complete.
     if [ "$cmd" = follower ]; then
@@ -51,6 +72,14 @@ _timberfs() {
             ;;
         *) COMPREPLY=() ;;
         esac
+        return 0
+    fi
+
+    # --forest takes a declared forest name, and nothing else.
+    if [ "$prev" = --forest ]; then
+        local fnames
+        fnames=$(timberfs forest list --names 2>/dev/null)
+        COMPREPLY=($(compgen -W "$fnames" -- "$cur"))
         return 0
     fi
 
