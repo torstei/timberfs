@@ -83,9 +83,11 @@ the follower writes, `follower.lock` held while it runs.
 → [README](../README.md#followers-who-is-reading-and-how-far-behind)
 
 **forest** — a directory searched for stores by a short **handle**, so `timberfs
-query nginx` needs no path. Configured by `/etc/timberfs/forests.d/*.conf`; a
-bare token that names no store on disk is the only thing it applies to.
-→ `timberfs(1)` **FORESTS**
+query nginx` needs no path. Declared with `timberfs forest create`, which writes
+`/etc/timberfs/forests.d/*.conf`; a bare token that names no store on disk is
+the only thing it applies to. It is also the only thing a timberfs command names
+by **path** — every other argument names a store, and a store is found by what
+it declares. → `timberfs(1)` **FORESTS**
 
 **`forward-intake`** — the Fluentd Forward v1 receiver: what Docker's `fluentd`
 log driver, Fluent Bit and the fluent-logger libraries already speak. Every tag

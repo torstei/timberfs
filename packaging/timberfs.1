@@ -1122,6 +1122,76 @@ Show what would move without changing anything.
 .TP
 .B \-\-fail\-on\-empty
 Error when nothing rotates instead of attesting the empty result.
+.SS forest
+Declare where stores live. A
+.I forest
+is a directory
+.B timberfs
+searches, and it is the ONE thing a
+.B timberfs
+command names by
+.B path
+\(em every other argument names a
+.IR store ,
+and a store is found by what it declares. See
+.B FORESTS
+below.
+.PP
+Declaring a forest here means
+.I /etc/timberfs/forests.d
+stops being the interface: the file is still what gets read, and reading
+or hand-editing it keeps working, but nothing has to be hand-edited to
+get a forest.
+.TP
+.B timberfs forest create DIR [\-\-name N] [\-\-dry\-run]
+Create
+.I DIR
+if it is not there, and declare it. A relative
+.I DIR
+is made absolute against the current directory, because the daemons that
+read this config have a different one.
+.I \-\-name
+defaults to
+.IR DIR 's
+last component and is constrained to
+.B [A\-Za\-z0\-9_.\-]
+\(em it is the config file's name, and it appears in every ambiguity
+message.
+.RS
+.PP
+Idempotent: re-declaring the same directory under the same name is a
+no-op, so provisioning may run it on every boot.
+.PP
+Three things are refused rather than written, all of them the same
+problem \(em a store with two forests to belong to:
+.B the same directory under a second name;
+.B a directory that is inside an existing forest;
+and
+.B a directory that contains one.
+A forest is scanned at its root AND one directory deep, so any of those
+makes the stores between them members of both, and a handle that matches
+two stores cannot be resolved. Re-pointing an existing name is refused
+too:
+.B remove
+it first, deliberately, since every store under it would be stranded.
+.RE
+.TP
+.B timberfs forest list [\-\-names] [\-\-json]
+What is declared, and whether it is
+.B usable:
+the store count, and whether the directory is
+.B MISSING
+or
+.BR READONLY .
+That last part is the point \(em an undeclared or unwritable forest
+otherwise surfaces as "store not found" somewhere far away, at write
+time, in another process.
+.TP
+.B timberfs forest remove NAME [\-\-dry\-run]
+Un-declare a forest. The directory and every store in it are left
+exactly as they are; the path and the store count are printed so an
+operator who did mean to delete the data knows where it is. This removes
+a declaration, never data.
 .SS follower
 Manage a store's
 .IR followers :
@@ -2110,7 +2180,14 @@ unchanged \(em a forest is consulted only for a bare token (no
 .BR / )
 that names no store on disk.
 .PP
-Forests are configured by
+Forests are declared with
+.B timberfs forest create
+(and listed with
+.BR "timberfs forest list" ),
+which writes the configuration described next \(em so the file is what
+gets read, not what has to be written.
+.PP
+That configuration is
 .IR /etc/timberfs/forests.d/*.conf ,
 one forest per file, the same
 .B KEY=VALUE
@@ -2146,10 +2223,18 @@ Each forest's root and its immediate subdirectories are scanned. A
 handle that matches no store, or more than one, is an error that names
 what was searched and asks for a full path.
 .PP
-The environment variable
+Two environment variables override this.
 .B TIMBERFS_FORESTS
 (colon-separated absolute directories) replaces the configuration
-entirely \(em for tests and one-off use.
+entirely, so a process with it set cannot see a declared forest at all \(em
+.B forest create
+warns when it is set, because otherwise the write succeeds and
+.B forest list
+does not show it.
+.B TIMBERFS_FORESTS_DIR
+moves where the declarations are read from and written to, for a test or
+an install that is not rooted at
+.IR / .
 .SH SHELL COMPLETION
 The package ships completion scripts for
 .B bash
