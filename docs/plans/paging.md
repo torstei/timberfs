@@ -36,7 +36,7 @@ handed to the next request:
   "max": { "entries": 100 },
   "cursor": [ { "id": "S1", "chunk": 10, "n": 20 },
               { "id": "S2", "chunk": 20, "n": 40 },
-              { "id": "S3", "done": true } ] }
+              { "id": "S3", "chunk": 3,  "n": 50 } ] }
 ```
 
 Keeping it out of the search is what makes the search reusable, and it is also
@@ -66,8 +66,9 @@ source|path=/var/log/timberfs/m/m.log|kept=0|total=4
 ```
 
 `kept=0` means the token index proved no chunk could match, so nothing was
-decompressed. That store is finished for this window at zero cost, and saying
-so in the cursor saves the whole scan next time.
+decompressed. The position is still the end of what existed — the search
+COVERED those chunks, it just did not have to read them. Recording that costs
+nothing and saves the whole scan next time.
 
 Consequence to decide deliberately: **the cursor is O(stores examined)**. Five
 is nothing; five thousand is five thousand entries on every page. Worth
@@ -90,6 +91,30 @@ position is not known yet. The position therefore wants a second per-store
 record at the end rather than a field on this one. That keeps the early "here
 is what I am about to read" signal and is additive, since `timberfs-records(5)`
 requires consumers to ignore unknown record kinds as well as unknown keys.
+
+## Every entry carries a position; there is no `done`
+
+S3 produced no hits, so it is tempting to record it as finished. That is wrong,
+and not only in the subtle two-clocks way: **something can append to S3 between
+the two pages.** A store with nothing to say at 12:05 may have plenty by 12:06,
+and a consumer that trusts `done` skips it for the rest of the walk.
+
+So a cursor entry is uniformly `{ id, chunk, n }`. A store scanned to the end
+records the position it reached — the last chunk that existed, fully consumed —
+and the next page resumes at the chunk after it, which is either new data or
+nothing. `Cursor` already behaves this way: `n` is the delivered prefix of the
+chunk it stands in, `advance` restarts `n` on a new chunk, and `resolve` clamps
+to the ends of the store.
+
+That leaves no separate "finished" state to represent, to go stale, or to be
+believed. Exhaustion is not a fact about a store; it is a fact about a store AT
+A MOMENT, and a position is how you say that.
+
+WRITE-axis exhaustion really is permanent — write time only moves forward, so a
+chunk written after `to` can never enter the window. But the position already
+expresses it, and chunk selection already skips chunks whose write window falls
+outside the range, so a flag would save nothing and could still be believed on
+the wrong axis.
 
 ## `n` counts entries, positionally
 
@@ -145,25 +170,28 @@ stable and goes stale. It follows decision 1: per-store scope makes "start at
 the beginning" harmless, because a new store's budget is its own and its
 entries are not claimed to be ordered against another store's.
 
-### 3. Does "done" survive a late entry?
+### 3. Do later pages stay in logline order?
 
-Not necessarily. A store scanned to the end of a 12:00–15:00 window is finished
-as it was, but timberfs's two clocks mean an entry stamped 14:00 can arrive in
-a chunk written at 15:30. So `done: true` on the logline axis is a statement
-about the store at the time it was read.
+No — and this is a property to state rather than a decision to make. It is what
+carrying positions instead of `done` buys.
 
-Either a paging session pins what it saw and is honestly a snapshot, or it
-re-examines and stops being a stable walk. On the WRITE axis the question does
-not arise: write time only moves forward, so "past the end of the window" is
-permanent. That asymmetry is worth stating in whatever ships, because a client
-cannot infer it.
+Resuming S3 after its recorded position reads whatever arrived since. On the
+logline axis those chunks can hold an entry stamped 14:00 that arrived in a
+chunk written at 15:30, so a match inside the original window can surface on
+page 3 that logically belongs beside page 1. Declaring S3 finished would not
+have found it at all, so this is the better failure.
+
+What stays open is only whether a walk is a snapshot: pinning the store set
+(decision 1) also pins how much of this a caller sees. A client needing logline
+order across pages has to sort the union itself, which it can — every entry
+carries its own timestamp.
 
 ## What to build first
 
 1. `id=` on the `source` record — useful alone, and the join key everything
    else needs.
-2. A closing per-store record carrying id, position and whether that store is
-   finished.
+2. A closing per-store record carrying id and the position reached — for every
+   store examined, including the ones that matched nothing.
 3. `cursor` in the request, with `scope: "per_store"` required on the bound.
 
 Each is additive within `v=1`. None of it is urgent: `status=limited` already
