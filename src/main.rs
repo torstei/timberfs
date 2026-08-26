@@ -1,6 +1,6 @@
 use timberfs::{
     append, bark, export, follow, follower, forest, forward, fs, grain, import, incus,
-    incus_intake, list, note, otlp_intake, query, rotate, sink, store,
+    incus_intake, list, note, otlp_intake, query, querydoc, rotate, sink, store,
 };
 
 use std::path::PathBuf;
@@ -312,8 +312,9 @@ enum Command {
     /// files directly (works with or without an active mount)
     Query {
         /// Backing file(s) or .timber bundle(s); several are interleaved
-        /// by chunk time-windows with grep-style "path:" line prefixes
-        #[arg(required = true, num_args = 1..)]
+        /// by chunk time-windows with grep-style "path:" line prefixes.
+        /// A `--query` document names its own stores instead
+        #[arg(required_unless_present = "query", num_args = 0..)]
         files: Vec<PathBuf>,
         /// Start of the time window (RFC3339, 'YYYY-MM-DD [HH:MM[:SS]]'
         /// — a bare date is midnight, dotted dates work too,
@@ -378,6 +379,17 @@ enum Command {
         /// and --by-write-time (raw chunks have no entry count).
         #[arg(long, value_name = "N", conflicts_with_all = ["tail", "by_write_time"])]
         max: Option<u64>,
+        /// Read the whole search from a JSON document instead of from
+        /// flags (`-` for stdin). The same value the flags build, so the
+        /// two are one question asked two ways — and a member this
+        /// timberfs does not know is an error, never a silently wider
+        /// search
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["from", "to", "has", "any", "follow", "tail", "max", "from_chunk"])]
+        query: Option<String>,
+        /// Print the search these flags describe as a JSON document, and
+        /// exit. What `--query` reads back
+        #[arg(long)]
+        dump_json: bool,
         /// Seconds between looks for new data (--follow only). Default:
         /// 0.2 when the store has a live write-ahead sidecar to tail
         /// (`wal=true`), where the poll IS the latency, and 1 otherwise,
@@ -1162,15 +1174,21 @@ fn main() -> anyhow::Result<()> {
             max,
             poll,
             from_chunk,
+            query: query_doc,
+            dump_json,
         } => {
             let files = files
                 .iter()
                 .map(|f| forest::resolve_source(f))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            // The flags BUILD a query rather than being one: the same
-            // value a `--query` document will deserialize into, so the
-            // two surfaces stay one question asked two ways.
-            query::cmd_query(&query::Query {
+            // A document, or the flags that build the same value: one
+            // question asked two ways, never two dialects of it.
+            if let Some(doc) = query_doc {
+                let q = querydoc::read(&doc)?.to_query()?;
+                query::cmd_query(&q)?;
+                return Ok(());
+            }
+            let q = query::Query {
                 sources: files,
                 window: query::Window {
                     from,
@@ -1187,7 +1205,15 @@ fn main() -> anyhow::Result<()> {
                     by_write_time,
                 },
                 follow: query::Follow { follow, poll },
-            })?;
+            };
+            if dump_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&querydoc::Document::of(&q))?
+                );
+                return Ok(());
+            }
+            query::cmd_query(&q)?;
         }
         Command::Follower { command } => match command {
             FollowerCommand::Create {

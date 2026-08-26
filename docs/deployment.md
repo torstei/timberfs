@@ -1106,6 +1106,33 @@ arrives as a label rather than as a handle. A view spanning hops therefore keys
 on provenance and never on the handle. `man timberfs`, section PROVENANCE, has
 the full table.
 
+## Handing timberfs a search as a document
+
+`timberfs query --query FILE|-` reads a whole search as JSON — which stores, what
+window, what to match, and in what form the answer comes. It is the same value the
+flags build, so the two cannot drift into being two dialects of one question, and
+`--dump-json` prints the document any set of flags describes:
+
+```sh
+timberfs query /var/log/timberfs/app/app.log     --from 2026-08-26 --has ERROR --max 10 --dump-json > search.json
+timberfs query --query search.json
+```
+
+That round trip is the intended way to learn the format. The document is meant to be
+*generated* — by a tool, a client library, or eventually a query server — and the
+flags are the human sugar over the common shapes.
+
+Two rules a generator has to know, both documented in `timberfs-query-document(5)`:
+an **omitted member widens** the search rather than emptying it, and an **unknown
+member is an error** rather than being ignored. The second is the opposite of the
+rule for the records *response* format, deliberately: a consumer should tolerate a
+producer that grew a field, but a request that tolerates a typo does something other
+than what was asked.
+
+It also means **forward compatibility is not possible**: a newer timberfs reads an
+older document, but an older one refuses a document using a member added after it.
+Generators must match or lag the timberfs they talk to, never lead it.
+
 ## Ownership and permissions
 
 - **The store directory** is created by `LogsDirectory=timberfs/%i` in the

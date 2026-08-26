@@ -1,0 +1,201 @@
+.TH TIMBERFS\-QUERY\-DOCUMENT 5 "2026" "timberfs" "File Formats"
+.SH NAME
+timberfs\-query\-document \- a whole timberfs search, as JSON
+.SH SYNOPSIS
+.nf
+timberfs query \-\-query FILE
+timberfs query \-\-query \-            # from stdin
+timberfs query ... \-\-dump\-json      # the document these flags describe
+.fi
+.SH DESCRIPTION
+A query document says what to search, over what window, for what, and in
+what form the answer should come. It is the same value the command\-line
+flags build \(em one question asked two ways, not two dialects of it \(em
+and
+.B \-\-dump\-json
+prints the document any set of flags describes, which is the quickest way
+to learn the format and the only description of it that cannot drift.
+.PP
+The document is meant to be generated. It is the input a tool, a client
+library or a query server hands to timberfs, and the flags are the human
+sugar for the common shapes.
+.SH GRAMMAR
+.nf
+{
+  "v": 1,
+  "stores": {
+    "paths":   [ { "file_path": "/var/log/timberfs/a/a.log" } ],
+    "forests": [ { "file_path": "/var/log/timberfs" } ]
+  },
+  "window": { "axis": "logline", "from": 1787727600000, "to": null,
+              "from_chunk": null },
+  "match":  { "all":  [ { "has": "ERROR" } ],
+              "any":  [ { "has": "timeout" } ],
+              "none": [ { "has": "healthcheck" } ] },
+  "max":    { "entries": 1000, "scope": "total" },
+  "tail":   { "entries": 100,  "scope": "total" },
+  "response_format": { "kind": "loglines",
+                       "options": { "no_filename": true } }
+}
+.fi
+.PP
+Only
+.B v
+and
+.B stores
+are required.
+.SH MEMBERS
+.TP
+.B v
+The document version. See
+.B VERSIONING
+below; this is not decoration.
+.TP
+.B stores
+Which stores to read.
+.B paths
+names them directly.
+.B select
+\(em a label predicate, as
+.B timberfs list \-\-select
+takes \(em is reserved and currently refused with a message saying so,
+rather than accepted and ignored.
+.B forests
+are objects rather than bare strings so a forest can grow attributes of
+its own without the shape changing.
+.TP
+.B window
+.B axis
+is
+.B logline
+(the timestamps the lines themselves carry) or
+.B write
+(when the data arrived), and it is
+.B REQUIRED.
+The flags do not make you choose \(em
+.B \-\-from
+means logline time in a windowed read and write time under
+.B \-\-follow
+\(em and that is a defect this format deliberately does not inherit.
+.B from
+and
+.B to
+are milliseconds since the epoch.
+.B from_chunk
+is a resume position by chunk number: exact, where a timestamp can match
+two chunks that share a boundary millisecond.
+.TP
+.B match
+Entry predicates, flat.
+.B all
+must all match, at least one of
+.B any
+must, and none of
+.B none
+may. A
+.B has
+predicate is a word\-anchored phrase, which is the form that can ride the
+token index and so skip chunks unread.
+.TP
+.BR max ", " tail
+.B max
+caps forward from the start;
+.B tail
+takes the last N. They are different operations rather than one with a
+sign, so giving both is refused. Each needs a
+.B unit
+\(em
+.B entries
+today \(em because "stop after 10" of WHAT decides the cost:
+.B entries
+needs a full read and decompression, where chunks and bytes are nearly
+free from the index. The
+.B scope
+is
+.B total
+(the engine may stop the moment it is satisfied, anywhere) or
+.B store
+(per matching store: answers "which stores", at the cost of touching all
+of them).
+.TP
+.B response_format
+A
+.B kind
+plus
+.BR options ,
+not a bare name, because the options are orthogonal to the kind. Kinds:
+.B loglines
+(the log as a person reads it),
+.B records
+(the typed stream \(em see
+.BR timberfs\-records (5)),
+.B chunks
+(compressed chunks verbatim, nothing decompressed at either end).
+.SH OMISSION WIDENS
+A member left out
+.B widens
+the search rather than emptying it. A document naming only
+.B stores
+is "every entry of those stores". This is the single rule a generator must
+get right: invert it and a member somebody forgot returns nothing, which
+looks exactly like a correct empty result.
+.SH STRICTNESS
+An unknown member is an
+.BR error .
+A misspelled
+.B "form"
+for
+.B "from"
+must not become a silently unbounded search \(em a query language that
+ignores a typo returns wrong results that look right, and laxness cannot
+be tightened once callers depend on it. The refusal names the members
+that were expected, so the error doubles as a description of the format.
+.PP
+⚠ This is the OPPOSITE of the rule in
+.BR timberfs\-records (5),
+and deliberately so. That format is a
+.B response:
+a consumer should tolerate a producer that grew a field, so unknown keys
+are ignored there. This one is a
+.B request,
+where tolerating an unknown key means doing something other than what was
+asked. Same project, two formats, opposite rules, each right for its
+direction.
+.SH VERSIONING
+Within
+.B v=1
+new
+.B optional
+members may appear, and existing members never change meaning or type.
+Anything that changes what an existing member means, or adds a required
+one, is
+.BR v=2 .
+A document whose
+.B v
+this build does not know is refused rather than partly interpreted.
+.PP
+⚠ Because unknown members are refused,
+.B forward compatibility is not possible.
+A newer timberfs reads an older document, but an older timberfs
+.B rejects
+a document using a member added after it. Generators must therefore match
+or lag the timberfs they talk to, never lead it. The refusal names the
+version this build speaks, so a client can detect the mismatch and say
+something useful rather than retrying.
+.SH EXAMPLES
+The document for a search you already know how to express:
+.PP
+.nf
+timberfs query /var/log/timberfs/app/app.log \\
+    \-\-from 2026\-08\-26 \-\-has ERROR \-\-max 10 \-\-dump\-json
+.fi
+.PP
+and the same search, run from it:
+.PP
+.nf
+timberfs query \-\-query search.json
+timberfs query ... \-\-dump\-json | timberfs query \-\-query \-
+.fi
+.SH SEE ALSO
+.BR timberfs (1),
+.BR timberfs\-records (5)
