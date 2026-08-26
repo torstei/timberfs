@@ -1,7 +1,7 @@
 {
-  "v": 1,
+  "v": "1.0-EXPERIMENTAL",
   "stores": { "paths": [ { "file_path": "/var/log/timberfs/app/app.log" } ] },
   "window": { "axis": "logline", "from": 1787727600000, "to": 1787731200000 },
   "match": { "all": [ { "has": "ERROR" } ] },
-  "max": { "entries": 100, "scope": "total" }
+  "max": { "entries": 100 }
 }

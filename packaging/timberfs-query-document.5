@@ -22,18 +22,14 @@ sugar for the common shapes.
 .SH GRAMMAR
 .nf
 {
-  "v": 1,
-  "stores": {
-    "paths":   [ { "file_path": "/var/log/timberfs/a/a.log" } ],
-    "forests": [ { "file_path": "/var/log/timberfs" } ]
-  },
+  "v": "1.0-EXPERIMENTAL",
+  "stores": { "paths": [ { "file_path": "/var/log/timberfs/a/a.log" } ] },
   "window": { "axis": "logline", "from": 1787727600000, "to": null,
               "from_chunk": null },
-  "match":  { "all":  [ { "has": "ERROR" } ],
-              "any":  [ { "has": "timeout" } ],
-              "none": [ { "has": "healthcheck" } ] },
-  "max":    { "entries": 1000, "scope": "total" },
-  "tail":   { "entries": 100,  "scope": "total" },
+  "match":  { "all": [ { "has": "ERROR" } ],
+              "any": [ { "has": "timeout" } ] },
+  "max":    { "entries": 1000 },
+  "tail":   { "entries": 100 },
   "response_format": { "kind": "loglines",
                        "options": { "no_filename": true } }
 }
@@ -47,22 +43,33 @@ are required.
 .SH MEMBERS
 .TP
 .B v
-The document version. See
-.B VERSIONING
-below; this is not decoration.
+The format version, a
+.B string
+matched
+.B exactly
+against the one this build accepts. A string rather than a number so the
+warning travels in the document: a generator that writes
+.B 1.0\-EXPERIMENTAL
+has typed the word. Its structure is meaningful to people and opaque to
+timberfs \(em there is no parsing and no ordering, so
+.B "1.0"
+and
+.B "1"
+are simply different strings.
 .TP
 .B stores
 Which stores to read.
 .B paths
-names them directly.
+names them directly. A label
 .B select
-\(em a label predicate, as
-.B timberfs list \-\-select
-takes \(em is reserved and currently refused with a message saying so,
-rather than accepted and ignored.
+and a
 .B forests
-are objects rather than bare strings so a forest can grow attributes of
-its own without the shape changing.
+list are both coming, and are ABSENT rather than present\-and\-refused: a
+contract that names a member the code ignores is the failure this
+format's strictness exists to prevent. Adding an optional member later is
+allowed within
+.BR v=1 ,
+so there is nothing to reserve.
 .TP
 .B window
 .B axis
@@ -88,11 +95,12 @@ two chunks that share a boundary millisecond.
 .B match
 Entry predicates, flat.
 .B all
-must all match, at least one of
+must all match and at least one of
 .B any
-must, and none of
+must. A
 .B none
-may. A
+list belongs here and is absent for the same reason: no flag produces one
+yet. A
 .B has
 predicate is a word\-anchored phrase, which is the form that can ride the
 token index and so skip chunks unread.
@@ -109,14 +117,10 @@ sign, so giving both is refused. Each needs a
 today \(em because "stop after 10" of WHAT decides the cost:
 .B entries
 needs a full read and decompression, where chunks and bytes are nearly
-free from the index. The
+free from the index. A
 .B scope
-is
-.B total
-(the engine may stop the moment it is satisfied, anywhere) or
-.B store
-(per matching store: answers "which stores", at the cost of touching all
-of them).
+(total versus per\-store) belongs here and is absent until there is more
+than one to choose between.
 .TP
 .B response_format
 A
@@ -162,26 +166,42 @@ where tolerating an unknown key means doing something other than what was
 asked. Same project, two formats, opposite rules, each right for its
 direction.
 .SH VERSIONING
-Within
-.B v=1
-new
-.B optional
-members may appear, and existing members never change meaning or type.
-Anything that changes what an existing member means, or adds a required
-one, is
-.BR v=2 .
+⚠ While the accepted version string carries
+.BR EXPERIMENTAL ,
+.B the format may be broken in place without the string changing.
+A superseded version is not kept working; expect a generator and the
+timberfs it talks to to be upgraded together.
+.PP
+That costs less than it sounds, because strictness does most of the
+detecting already. Against a build that has moved on, an old generator
+gets a specific error rather than a wrong answer: a removed or renamed
+member is an
+.BR "unknown field" ,
+a newly required one is a
+.BR "missing field" ,
+a changed type is a type error.
+.PP
+The one change that earns a new version string even here is the one
+nothing catches:
+.B a member that keeps its name and its type but changes meaning
+\(em
+.B from
+in seconds where it was milliseconds,
+.B entries
+counting chunks. That parses, and answers a different question than the
+caller asked, with nothing anywhere saying so.
+.PP
 A document whose
 .B v
-this build does not know is refused rather than partly interpreted.
+this build does not accept is refused rather than partly interpreted, and
+the refusal names both strings and whether the accepted one is
+experimental.
 .PP
-⚠ Because unknown members are refused,
-.B forward compatibility is not possible.
-A newer timberfs reads an older document, but an older timberfs
-.B rejects
-a document using a member added after it. Generators must therefore match
-or lag the timberfs they talk to, never lead it. The refusal names the
-version this build speaks, so a client can detect the mismatch and say
-something useful rather than retrying.
+When the format settles the string loses its marker, and the ordinary rule
+starts: within a version, new members are
+.B optional
+and existing members never change meaning or type; anything else is a new
+version.
 .SH EXAMPLES
 The document for a search you already know how to express:
 .PP
@@ -196,6 +216,15 @@ and the same search, run from it:
 timberfs query \-\-query search.json
 timberfs query ... \-\-dump\-json | timberfs query \-\-query \-
 .fi
+.SH THE SCHEMA
+A JSON Schema for this document is published at
+.I /usr/share/doc/timberfs/query\-document.schema.json
+and in the repository as
+.IR docs/query\-document.schema.json .
+It is a committed file rather than something a build produces, so a change
+to the contract appears in a diff and is reviewed; a test fails if it and
+the code disagree. It describes only what is IMPLEMENTED \(em members that
+do not work yet are absent from both.
 .SH SEE ALSO
 .BR timberfs (1),
 .BR timberfs\-records (5)

@@ -52,6 +52,10 @@ zstd = "0.13"
 [profile.release]
 lto = true
 
+[dev-dependencies]
+jsonschema = "0.51.0"
+schemars = "1.2.2"
+
 # Debian packaging (build with `cargo deb`, needs `cargo install cargo-deb`)
 [package.metadata.deb]
 maintainer = "Torstein Tauno Svendsen <torstei@gmail.com>"
@@ -90,6 +94,7 @@ assets = [
     ["packaging/timber-otlp.1", "usr/share/man/man1/", "644"],
     ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
     ["packaging/timberfs-query-document.5", "usr/share/man/man5/", "644"],
+    ["docs/query-document.schema.json", "usr/share/doc/timberfs/", "644"],
     ["packaging/timberfs-completion.bash", "usr/share/bash-completion/completions/timberfs", "644"],
     ["packaging/timberfs-completion.zsh", "usr/share/zsh/vendor-completions/_timberfs", "644"],
     ["packaging/timber-filter-completion.bash", "usr/share/bash-completion/completions/timber-filter", "644"],
