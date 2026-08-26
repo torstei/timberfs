@@ -549,6 +549,11 @@ mod tests {
     /// internals is how you end up with neither.
     #[test]
     fn the_committed_schema_matches_the_types() {
+        // One stable path, describing THE VERSION THIS BUILD ACCEPTS
+        // rather than "the format": when a build accepts more than one,
+        // there is a schema per version and this name follows the current
+        // one. Said in the man page too, so nobody bookmarks it expecting
+        // a fixed target.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/docs/query-document.schema.json"

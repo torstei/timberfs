@@ -225,6 +225,14 @@ It is a committed file rather than something a build produces, so a change
 to the contract appears in a diff and is reviewed; a test fails if it and
 the code disagree. It describes only what is IMPLEMENTED \(em members that
 do not work yet are absent from both.
+.PP
+⚠ It describes
+.B the version this build accepts,
+not "the format". A build that accepts more than one version will publish
+one schema per version, and this path will name the current one \(em so
+treat it as a moving target and read
+.B v
+from it rather than assuming which version you have.
 .SH SEE ALSO
 .BR timberfs (1),
 .BR timberfs\-records (5)
