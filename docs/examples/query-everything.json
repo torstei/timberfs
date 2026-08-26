@@ -1,0 +1,4 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "stores": { "paths": [ { "file_path": "/var/log/timberfs/app/app.log" } ] }
+}

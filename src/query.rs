@@ -418,24 +418,99 @@ pub fn select_chunks(
 /// keeps the OUTPUT exactly inside the asked window.
 pub(crate) const WIDEN_MS: u64 = 60_000;
 
-#[allow(clippy::too_many_arguments)]
-pub fn cmd_query(
-    files: &[std::path::PathBuf],
-    from: Option<u64>,
-    to: Option<u64>,
-    has: &[String],
-    any: &[String],
-    no_filename: bool,
-    show_write_time: bool,
-    by_write_time: bool,
-    null_sep: bool,
-    records: bool,
-    follow: bool,
-    tail: Option<u64>,
-    max: Option<u64>,
-    poll: Option<f64>,
-    from_chunk: Option<u64>,
-) -> anyhow::Result<()> {
+/// A whole search, as one value.
+///
+/// The point of grouping these rather than passing fifteen parameters is
+/// that a search becomes a THING — one that a caller can build, hand
+/// around, and (next) serialize. The CLI flags build one of these; a
+/// `--query` document will deserialize into the same one, so the two
+/// surfaces cannot drift into being two dialects of the same question.
+/// The grouping deliberately mirrors the shape that document will have.
+#[derive(Debug, Default, Clone)]
+pub struct Query {
+    /// The stores to read. Paths today; a label selection resolves to
+    /// these.
+    pub sources: Vec<std::path::PathBuf>,
+    pub window: Window,
+    pub matching: Match,
+    pub limit: Limit,
+    pub output: Output,
+    pub follow: Follow,
+}
+
+/// Where to start and stop.
+#[derive(Debug, Default, Clone)]
+pub struct Window {
+    /// Both are LOGLINE time in a windowed read and WRITE time under
+    /// follow — the axis switches with the mode rather than being chosen,
+    /// which is a known defect the document format is meant not to
+    /// inherit. Grouped here so there is one place to put the axis when
+    /// it becomes explicit.
+    pub from: Option<u64>,
+    pub to: Option<u64>,
+    /// A resume position by chunk NUMBER: exact, where a timestamp can
+    /// match two chunks sharing a boundary millisecond.
+    pub from_chunk: Option<u64>,
+}
+
+/// Which entries. Only the index-riding predicates live here; the richer
+/// vocabulary is `timber-filter`'s.
+#[derive(Debug, Default, Clone)]
+pub struct Match {
+    pub has: Vec<String>,
+    pub any: Vec<String>,
+}
+
+impl Match {
+    pub fn is_empty(&self) -> bool {
+        self.has.is_empty() && self.any.is_empty()
+    }
+}
+
+/// How much. `max` caps forward from the start and `tail` takes the last
+/// N — different operations, not one with a sign, which is why they
+/// conflict rather than compose.
+#[derive(Debug, Default, Clone)]
+pub struct Limit {
+    pub max: Option<u64>,
+    pub tail: Option<u64>,
+}
+
+/// What comes out. Every field here shapes the OUTPUT rather than
+/// selecting anything, which is why they group together and why the
+/// document's response format will be a kind plus options rather than a
+/// bare name.
+#[derive(Debug, Default, Clone)]
+pub struct Output {
+    pub no_filename: bool,
+    pub show_write_time: bool,
+    pub null_sep: bool,
+    pub records: bool,
+    /// The raw escape hatch: chunks selected by write time, no entry
+    /// parsing and no logline filtering.
+    pub by_write_time: bool,
+}
+
+/// Reading forward as data arrives.
+#[derive(Debug, Default, Clone)]
+pub struct Follow {
+    pub follow: bool,
+    pub poll: Option<f64>,
+}
+
+pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
+    let files = &q.sources[..];
+    let (from, to, from_chunk) = (q.window.from, q.window.to, q.window.from_chunk);
+    let (has, any) = (&q.matching.has[..], &q.matching.any[..]);
+    let (max, tail) = (q.limit.max, q.limit.tail);
+    let (follow, poll) = (q.follow.follow, q.follow.poll);
+    let Output {
+        no_filename,
+        show_write_time,
+        null_sep,
+        records,
+        by_write_time,
+    } = q.output;
     let from_ms = from.unwrap_or(0);
     let to_ms = to.unwrap_or(u64::MAX);
     if from_ms > to_ms {
@@ -2453,6 +2528,39 @@ mod numbering_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_omitted_field_means_unbounded_not_empty() {
+        // The semantics a `--query` document inherits: a member left out
+        // widens the search rather than emptying it. `Default` is
+        // therefore "every entry of every named store", which is what an
+        // absent window, absent predicates and absent limits must mean —
+        // get this backwards in the document format and an omitted field
+        // silently returns nothing.
+        let q = Query::default();
+        assert!(q.window.from.is_none() && q.window.to.is_none());
+        assert!(q.matching.is_empty(), "no predicate = match everything");
+        assert!(q.limit.max.is_none() && q.limit.tail.is_none());
+        assert!(!q.follow.follow);
+        // ...and the output default is the plain log view, not a framing
+        // that a consumer has to opt out of.
+        assert!(!q.output.records && !q.output.null_sep && !q.output.by_write_time);
+    }
+
+    #[test]
+    fn max_and_tail_are_different_operations() {
+        // Not one bound with a sign: `max` caps forward from the start,
+        // `tail` takes the last N. They conflict at the CLI for that
+        // reason, and the document format has to keep them apart.
+        let mut q = Query::default();
+        q.limit.max = Some(10);
+        q.limit.tail = Some(10);
+        assert_ne!(
+            (q.limit.max, None::<u64>),
+            (None, q.limit.tail),
+            "if these were interchangeable the format could merge them"
+        );
+    }
 
     fn chunk(uncomp_start: u64, len: u64, first: u64, last: u64) -> ChunkRecord {
         ChunkRecord {

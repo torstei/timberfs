@@ -55,6 +55,8 @@ timberfs import /var/log/myapp/app.log* --into backing/app.log
 ```sh
 timberfs info backing/app.log                  # vital signs: size, ratio, time covered
 timberfs identity backing/app.log              # is the store's id sound? (repairs with --mint/--keep)
+timberfs query backing/app.log --from 2026-08-26 --has ERROR --dump-json   # the search, as a document
+timberfs query --query search.json             # ...and run one back
 timberfs incus-intake --into-dir /var/log/timberfs   # tap incus container consoles
 timberfs query backing/app.log --from "2026-07-10 13:40" --to "2026-07-10 14:10"
 timber-filter --has ERROR backing/app.log --from 2026-07-10  # word-match, index-fast

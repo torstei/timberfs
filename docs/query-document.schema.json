@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Document",
+  "type": "object",
+  "properties": {
+    "match": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DocMatch"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "max": {
+      "description": "A cap counting forward from the start.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Bound"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "response_format": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResponseFormat"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stores": {
+      "$ref": "#/$defs/Stores"
+    },
+    "tail": {
+      "description": "The last N. A different operation from `max`, not the same one with\na sign, which is why they conflict rather than compose.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Bound"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "v": {
+      "description": "The format version, matched exactly against `VERSION`. Carries\nits own stability marker while the format is still being learned.\n\nPublished as a `const` so the schema states the accepted string\nrather than merely \"a string\" — a generator validating against the\ncontract should learn the version from it, not from prose.",
+      "type": "string",
+      "const": "1.0-EXPERIMENTAL"
+    },
+    "window": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DocWindow"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "stores"
+  ],
+  "$defs": {
+    "Axis": {
+      "description": "Which axis a window is measured on.\n\nRequired, with no default, on purpose. The CLI's `--from` means\nlogline time in a windowed read and write time under `--follow` — the\naxis switches with the mode instead of being chosen, which is a known\ndefect. Made optional here it would be omitted, and the document would\ninherit the same ambiguity.",
+      "oneOf": [
+        {
+          "description": "The timestamps the lines themselves carry.",
+          "type": "string",
+          "const": "logline"
+        },
+        {
+          "description": "When the data arrived.",
+          "type": "string",
+          "const": "write"
+        }
+      ]
+    },
+    "Bound": {
+      "description": "A bound, which must say WHAT it counts: `entries` needs a full read\nand decompression where chunks and bytes are nearly free from the\nindex, so a bare number would hide the cost. `entries` is the only\nunit this build counts, and is therefore required rather than\noptional-and-then-refused; when another arrives it becomes one of\nseveral, which relaxes the contract rather than breaking it.\n\nA `scope` (total versus per-store) belongs here and is absent until\nthere is more than one to choose between — the difference matters, but\na field with a single legal value is noise, and adding it later is\nadditive.",
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "entries"
+      ]
+    },
+    "DocMatch": {
+      "description": "Entry predicates. Flat, mirroring the flags: `all` must all match and\nat least one of `any` must. A `none` list belongs here too and is\nabsent for the same reason as `select`: `query` has no flag that\nproduces one, and a member the contract names but the code drops is\nworse than one it does not name yet. Arbitrary boolean\ntrees would be expressible in JSON but not in flags, and then the CLI\ncould not reproduce a server's query — that waits for a version 2.",
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Predicate"
+          }
+        },
+        "any": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Predicate"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DocWindow": {
+      "type": "object",
+      "properties": {
+        "axis": {
+          "$ref": "#/$defs/Axis"
+        },
+        "from": {
+          "description": "Milliseconds since the epoch. Absent = unbounded on that side; an\nomitted member WIDENS the search rather than emptying it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "from_chunk": {
+          "description": "A resume position by chunk NUMBER: exact, where a timestamp can\nmatch two chunks that share a boundary millisecond.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "to": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "axis"
+      ]
+    },
+    "FormatOptions": {
+      "type": "object",
+      "properties": {
+        "no_filename": {
+          "type": "boolean"
+        },
+        "null_separated": {
+          "type": "boolean"
+        },
+        "show_write_time": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Kind": {
+      "oneOf": [
+        {
+          "description": "The log as a person reads it.",
+          "type": "string",
+          "const": "loglines"
+        },
+        {
+          "description": "The typed record stream: entries with their timestamps and chunk\nwindows attached.",
+          "type": "string",
+          "const": "records"
+        },
+        {
+          "description": "Compressed chunks, verbatim — nothing decompressed at either end.\n⚠ Chunks do not align to a window, so the answer is a SUPERSET of\nwhat was asked for and the response must say what window it\nactually widened to.",
+          "type": "string",
+          "const": "chunks"
+        }
+      ]
+    },
+    "Predicate": {
+      "description": "One predicate. Exactly one matcher is set; the shape leaves room for\n`substring` and `regex` without changing it.",
+      "type": "object",
+      "properties": {
+        "has": {
+          "description": "A word-anchored phrase, which is the form that can ride the token\nindex and so skip chunks.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "has"
+      ]
+    },
+    "ResponseFormat": {
+      "description": "What comes back. A kind plus options rather than a bare name, because\nthe flags it stands for are orthogonal to it: `no_filename`,\n`show_write_time` and NUL separation shape any of the kinds.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/Kind"
+        },
+        "options": {
+          "$ref": "#/$defs/FormatOptions"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "StorePath": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "file_path"
+      ]
+    },
+    "Stores": {
+      "description": "Which stores to read.\n\nOnly what works: a label `select` and a `forests` list are both\ncoming, and both are ABSENT rather than present-and-refused. A member\nthe contract advertises but the code ignores is the failure this\nformat's strictness exists to prevent — and adding an optional member\nlater is allowed within v1, so there is nothing to reserve.",
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StorePath"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

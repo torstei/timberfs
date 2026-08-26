@@ -190,6 +190,16 @@ Settings (`retain`, `index`, `wal`) are deliberately not provenance: selecting
 on an operational choice would be selecting on the wrong thing.
 → **`--select`**, `timberfs(1)` **PROVENANCE**
 
+**query document** — a whole search as JSON: which stores, what window, what
+to match, and in what form the answer comes. `query --query FILE|-` reads one;
+`query --dump-json` prints the document a set of flags describes, which is both
+the fastest way to learn it and the one description that cannot drift. The same
+value the flags build, so the two are one question asked two ways. An omitted
+member **widens** the search rather than emptying it; an unknown member is an
+error, unlike the response format's rule — a request that tolerates a typo does
+something other than what was asked.
+→ `timberfs-query-document(5)`, [examples](examples/)
+
 **`query`** — time-window reads: chunks selected by the index, then every entry
 verified against its own logline timestamp, so 13:37–13:38 never shows a 13:42
 line. `--follow` tails the live edge. → [design](design.md#semantics)

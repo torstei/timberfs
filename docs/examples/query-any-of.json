@@ -1,0 +1,7 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "stores": { "paths": [ { "file_path": "/var/log/timberfs/app/app.log" } ] },
+  "window": { "axis": "write", "from_chunk": 4812 },
+  "match": { "any": [ { "has": "timeout" }, { "has": "refused" } ] },
+  "response_format": { "kind": "records", "options": { "no_filename": true } }
+}

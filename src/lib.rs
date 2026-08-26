@@ -30,6 +30,7 @@ pub mod otlp;
 pub mod otlp_intake;
 pub mod protobuf;
 pub mod query;
+pub mod querydoc;
 pub mod receive;
 pub mod records;
 pub mod rotate;

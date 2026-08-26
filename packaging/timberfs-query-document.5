@@ -1,0 +1,238 @@
+.TH TIMBERFS\-QUERY\-DOCUMENT 5 "2026" "timberfs" "File Formats"
+.SH NAME
+timberfs\-query\-document \- a whole timberfs search, as JSON
+.SH SYNOPSIS
+.nf
+timberfs query \-\-query FILE
+timberfs query \-\-query \-            # from stdin
+timberfs query ... \-\-dump\-json      # the document these flags describe
+.fi
+.SH DESCRIPTION
+A query document says what to search, over what window, for what, and in
+what form the answer should come. It is the same value the command\-line
+flags build \(em one question asked two ways, not two dialects of it \(em
+and
+.B \-\-dump\-json
+prints the document any set of flags describes, which is the quickest way
+to learn the format and the only description of it that cannot drift.
+.PP
+The document is meant to be generated. It is the input a tool, a client
+library or a query server hands to timberfs, and the flags are the human
+sugar for the common shapes.
+.SH GRAMMAR
+.nf
+{
+  "v": "1.0-EXPERIMENTAL",
+  "stores": { "paths": [ { "file_path": "/var/log/timberfs/a/a.log" } ] },
+  "window": { "axis": "logline", "from": 1787727600000, "to": null,
+              "from_chunk": null },
+  "match":  { "all": [ { "has": "ERROR" } ],
+              "any": [ { "has": "timeout" } ] },
+  "max":    { "entries": 1000 },
+  "tail":   { "entries": 100 },
+  "response_format": { "kind": "loglines",
+                       "options": { "no_filename": true } }
+}
+.fi
+.PP
+Only
+.B v
+and
+.B stores
+are required.
+.SH MEMBERS
+.TP
+.B v
+The format version, a
+.B string
+matched
+.B exactly
+against the one this build accepts. A string rather than a number so the
+warning travels in the document: a generator that writes
+.B 1.0\-EXPERIMENTAL
+has typed the word. Its structure is meaningful to people and opaque to
+timberfs \(em there is no parsing and no ordering, so
+.B "1.0"
+and
+.B "1"
+are simply different strings.
+.TP
+.B stores
+Which stores to read.
+.B paths
+names them directly. A label
+.B select
+and a
+.B forests
+list are both coming, and are ABSENT rather than present\-and\-refused: a
+contract that names a member the code ignores is the failure this
+format's strictness exists to prevent. Adding an optional member later is
+allowed within
+.BR v=1 ,
+so there is nothing to reserve.
+.TP
+.B window
+.B axis
+is
+.B logline
+(the timestamps the lines themselves carry) or
+.B write
+(when the data arrived), and it is
+.B REQUIRED.
+The flags do not make you choose \(em
+.B \-\-from
+means logline time in a windowed read and write time under
+.B \-\-follow
+\(em and that is a defect this format deliberately does not inherit.
+.B from
+and
+.B to
+are milliseconds since the epoch.
+.B from_chunk
+is a resume position by chunk number: exact, where a timestamp can match
+two chunks that share a boundary millisecond.
+.TP
+.B match
+Entry predicates, flat.
+.B all
+must all match and at least one of
+.B any
+must. A
+.B none
+list belongs here and is absent for the same reason: no flag produces one
+yet. A
+.B has
+predicate is a word\-anchored phrase, which is the form that can ride the
+token index and so skip chunks unread.
+.TP
+.BR max ", " tail
+.B max
+caps forward from the start;
+.B tail
+takes the last N. They are different operations rather than one with a
+sign, so giving both is refused. Each needs a
+.B unit
+\(em
+.B entries
+today \(em because "stop after 10" of WHAT decides the cost:
+.B entries
+needs a full read and decompression, where chunks and bytes are nearly
+free from the index. A
+.B scope
+(total versus per\-store) belongs here and is absent until there is more
+than one to choose between.
+.TP
+.B response_format
+A
+.B kind
+plus
+.BR options ,
+not a bare name, because the options are orthogonal to the kind. Kinds:
+.B loglines
+(the log as a person reads it),
+.B records
+(the typed stream \(em see
+.BR timberfs\-records (5)),
+.B chunks
+(compressed chunks verbatim, nothing decompressed at either end).
+.SH OMISSION WIDENS
+A member left out
+.B widens
+the search rather than emptying it. A document naming only
+.B stores
+is "every entry of those stores". This is the single rule a generator must
+get right: invert it and a member somebody forgot returns nothing, which
+looks exactly like a correct empty result.
+.SH STRICTNESS
+An unknown member is an
+.BR error .
+A misspelled
+.B "form"
+for
+.B "from"
+must not become a silently unbounded search \(em a query language that
+ignores a typo returns wrong results that look right, and laxness cannot
+be tightened once callers depend on it. The refusal names the members
+that were expected, so the error doubles as a description of the format.
+.PP
+⚠ This is the OPPOSITE of the rule in
+.BR timberfs\-records (5),
+and deliberately so. That format is a
+.B response:
+a consumer should tolerate a producer that grew a field, so unknown keys
+are ignored there. This one is a
+.B request,
+where tolerating an unknown key means doing something other than what was
+asked. Same project, two formats, opposite rules, each right for its
+direction.
+.SH VERSIONING
+⚠ While the accepted version string carries
+.BR EXPERIMENTAL ,
+.B the format may be broken in place without the string changing.
+A superseded version is not kept working; expect a generator and the
+timberfs it talks to to be upgraded together.
+.PP
+That costs less than it sounds, because strictness does most of the
+detecting already. Against a build that has moved on, an old generator
+gets a specific error rather than a wrong answer: a removed or renamed
+member is an
+.BR "unknown field" ,
+a newly required one is a
+.BR "missing field" ,
+a changed type is a type error.
+.PP
+The one change that earns a new version string even here is the one
+nothing catches:
+.B a member that keeps its name and its type but changes meaning
+\(em
+.B from
+in seconds where it was milliseconds,
+.B entries
+counting chunks. That parses, and answers a different question than the
+caller asked, with nothing anywhere saying so.
+.PP
+A document whose
+.B v
+this build does not accept is refused rather than partly interpreted, and
+the refusal names both strings and whether the accepted one is
+experimental.
+.PP
+When the format settles the string loses its marker, and the ordinary rule
+starts: within a version, new members are
+.B optional
+and existing members never change meaning or type; anything else is a new
+version.
+.SH EXAMPLES
+The document for a search you already know how to express:
+.PP
+.nf
+timberfs query /var/log/timberfs/app/app.log \\
+    \-\-from 2026\-08\-26 \-\-has ERROR \-\-max 10 \-\-dump\-json
+.fi
+.PP
+and the same search, run from it:
+.PP
+.nf
+timberfs query \-\-query search.json
+timberfs query ... \-\-dump\-json | timberfs query \-\-query \-
+.fi
+.SH THE SCHEMA
+A JSON Schema for this document is published at
+.I /usr/share/doc/timberfs/query\-document.schema.json
+and in the repository as
+.IR docs/query\-document.schema.json .
+It is a committed file rather than something a build produces, so a change
+to the contract appears in a diff and is reviewed; a test fails if it and
+the code disagree. It describes only what is IMPLEMENTED \(em members that
+do not work yet are absent from both.
+.PP
+⚠ It describes
+.B the version this build accepts,
+not "the format". A build that accepts more than one version will publish
+one schema per version, and this path will name the current one \(em so
+treat it as a moving target and read
+.B v
+from it rather than assuming which version you have.
+.SH SEE ALSO
+.BR timberfs (1),
+.BR timberfs\-records (5)

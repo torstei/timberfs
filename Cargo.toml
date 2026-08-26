@@ -38,12 +38,23 @@ fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
 libc = "0.2"
 regex = "1"
 rmpv = "1"
+# derive only: the query document is a WIRE format, and `deny_unknown_fields`
+# in one line beats a hand-written validator that has to remember to reject a
+# misspelled member. serde_derive is already in the tree via serde_core, so
+# this enables a feature rather than adding a crate. Deserialization here is
+# into statically known types — no payload-chosen types, so none of the
+# polymorphic-deserialization class of problem applies.
+serde = { version = "1", features = ["derive"] }
 tar = "0.4"
 serde_json = "1"
 zstd = "0.13"
 
 [profile.release]
 lto = true
+
+[dev-dependencies]
+jsonschema = "0.51.0"
+schemars = "1.2.2"
 
 # Debian packaging (build with `cargo deb`, needs `cargo install cargo-deb`)
 [package.metadata.deb]
@@ -82,6 +93,8 @@ assets = [
     ["packaging/timber-filter.1", "usr/share/man/man1/", "644"],
     ["packaging/timber-otlp.1", "usr/share/man/man1/", "644"],
     ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
+    ["packaging/timberfs-query-document.5", "usr/share/man/man5/", "644"],
+    ["docs/query-document.schema.json", "usr/share/doc/timberfs/", "644"],
     ["packaging/timberfs-completion.bash", "usr/share/bash-completion/completions/timberfs", "644"],
     ["packaging/timberfs-completion.zsh", "usr/share/zsh/vendor-completions/_timberfs", "644"],
     ["packaging/timber-filter-completion.bash", "usr/share/bash-completion/completions/timber-filter", "644"],
