@@ -3,6 +3,13 @@
   "title": "Document",
   "type": "object",
   "properties": {
+    "cursor": {
+      "description": "Where a previous answer stopped, per store. One entry for every\nstore that answer EXAMINED, including the ones that matched\nnothing — leave those out and the next page re-scans them from the\nstart of the window, which on a fleet is most of the cost.\n\nThe response's `position` records are exactly this shape, so a\nclient hands back what it was given.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Position"
+      }
+    },
     "match": {
       "anyOf": [
         {
@@ -233,6 +240,29 @@
           "type": "string",
           "const": "chunks"
         }
+      ]
+    },
+    "Position": {
+      "description": "Where one store was left off. The offset is absolute on that store's\nTAPE — what has ever left it, plus where the next undelivered entry\nsits in what remains — so retention cannot move it, and it cannot\ncollide the way a timestamp does: on a fleet whose entries share a\nsecond, paging by clock loses everything that shared the last one.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The store, by identity. Never by path.",
+          "type": "string"
+        },
+        "offset": {
+          "description": "Resume just here. Absent means that store delivered nothing, so\nthe next read starts where the window does — not at zero.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id"
       ]
     },
     "Predicate": {

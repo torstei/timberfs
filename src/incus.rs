@@ -346,7 +346,7 @@ pub struct Instance {
     pub status: String,
     /// The cluster member running it, or empty when unclustered.
     pub location: String,
-    /// `image.id`, e.g. `visena-gateway:0.0.2-LOCAL`. Episodic — it
+    /// `image.id`, e.g. `acme-gateway:0.0.2-LOCAL`. Episodic — it
     /// changes when the instance is rebuilt, so it belongs in the log's
     /// timeline rather than in the store's labels.
     pub image: String,
