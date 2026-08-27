@@ -35,6 +35,7 @@ are not covered by that — those are the same objects `info --json` and
 | [query-any-of.json](query-any-of.json) | `any` — at least one of several terms. |
 | [query-exclude-noise.json](query-exclude-noise.json) | **`none`** — entries that do NOT contain something, with `substring` and `regex` alongside `has`. The predicate set says what you want to ask; whether the token index can help is timberfs's problem. |
 | [query-everything.json](query-everything.json) | The smallest legal document. An omitted member WIDENS the search rather than emptying it, so this is "every entry of that store". |
+| [query-deadline.json](query-deadline.json) | **`deadline`** — bound how LONG rather than how much. A fleet read is slow because it READS a lot, not because it matches a lot, so no count bounds the wait. Unlike a timeout in the caller it is *answered*: the `position` records say which stores finished, which one it stopped inside, and which were never opened. |
 
 ## Reading cheaply
 

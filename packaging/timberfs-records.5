@@ -183,12 +183,18 @@ when everything in the selection was read, or
 when a bound the CALLER set stopped it short, in which case
 .B limit
 names WHICH one \(em
-.B max.entries
+.BR max.entries ,
+.B max.chunks
 or
-.BR max.chunks .
+.BR deadline .
 It names the bound that actually fired; it once said
 .B max.entries
-whatever had.
+whatever had. A
+.B deadline
+is the one bound whose effect is not reproducible: the same request run
+twice can stop in different places, so a consumer must read the per-store
+.B position
+records rather than assume the shape of the answer.
 The two are not distinguishable from
 .B entries
 alone: a count reads as the whole answer either way, and a consumer that

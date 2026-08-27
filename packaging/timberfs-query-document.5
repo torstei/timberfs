@@ -255,6 +255,68 @@ records say which, and the
 resumes there.
 .RE
 .TP
+.B deadline
+How LONG the search may take:
+.BR "{ \(dqms\(dq: 5000 }" .
+It COMPOSES with
+.BR max ,
+rather than conflicting with it, because they bound different things \(em
+a fleet read is slow because it READS a lot, not because it matches a
+lot, so no count bounds the wait.
+.RS
+.PP
+The point is that it is answered rather than abandoned. A timeout in the
+caller drops the connection and everything that had already arrived on
+it; a deadline returns the work done, and the response says exactly how
+far it got:
+.PP
+.TP 4
+\(bu
+a store read to the end has
+.B chunks_read
+equal to
+.BR chunks_selected ;
+.TP
+\(bu
+the store the deadline stopped inside has fewer, and a
+.B position
+to resume from;
+.TP
+\(bu
+a store selected but never opened has
+.B chunks_read=0
+beside a non\-zero
+.BR chunks_selected ;
+.TP
+\(bu
+and a store the deadline reached before SELECTION did has no
+.B source
+record at all, though
+.B stream\-start
+still counts it in
+.BR sources .
+.PP
+.B stream\-end
+carries
+.B limit=deadline
+with
+.BR status=limited .
+Hand the positions back as a
+.B cursor
+and the next request continues.
+.PP
+Zero is refused: it reads as \(lqanswer instantly\(rq and means \(lqread
+nothing\(rq. To ask what a search WOULD cover, use
+.B response_format.kind: \(dqstores\(dq
+instead.
+.PP
+⚠ Only a
+.B records
+answer can report that the deadline fired. On the other kinds it still
+applies \(em it bounds work, not framing \(em but the marker is a note on
+standard error, and a relay is unlikely to carry that.
+.RE
+.TP
 .B cursor
 Where a previous answer stopped, per store: a list of
 .BR id / offset
