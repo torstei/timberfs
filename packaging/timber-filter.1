@@ -216,6 +216,25 @@ timber\-filter \-\-records \-\-has ERROR app.log | timber\-filter \-\-substring 
 timber\-filter \-\-records old.log \-\-quiet | timber\-filter \-\-quiet   # cat: text=records=text
 .RE
 .fi
+.SH THE SAME PREDICATES AS THE QUERY DOCUMENT
+The predicate algebra here and the
+.B match
+member of
+.BR timberfs\-query\-document (5)
+are ONE implementation, so the same predicate gives the same answer
+through either surface \(em a
+.B \-\-not\-has
+and a
+.B none
+entry cannot come to disagree.
+.PP
+The division of labour: this tool is the command line for entry
+predicates, and the document is what a program hands to timberfs. The
+document additionally chooses whether its predicates select ENTRIES or
+whole CHUNKS, which the flags do not \(em
+.B timberfs query \-\-has
+has always been the chunk sweep, and this tool has always been the exact
+filter.
 .SH SEE ALSO
 .BR timberfs (1),
 .BR timberfs\-records (5),

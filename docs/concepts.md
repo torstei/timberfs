@@ -200,7 +200,8 @@ value the flags build, so the two are one question asked two ways. An omitted
 member **widens** the search rather than emptying it; an unknown member is an
 error, unlike the response format's rule — a request that tolerates a typo does
 something other than what was asked.
-→ `timberfs-query-document(5)`, [examples](examples/)
+→ `timberfs-query-document(5)`, [examples](examples/) (installed at
+`/usr/share/doc/timberfs/query-examples/`)
 
 **`query`** — time-window reads: chunks selected by the index, then every entry
 verified against its own logline timestamp, so 13:37–13:38 never shows a 13:42

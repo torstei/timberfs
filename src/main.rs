@@ -387,7 +387,9 @@ enum Command {
         #[arg(long, value_name = "FILE", conflicts_with_all = ["from", "to", "has", "any", "follow", "tail", "max", "from_chunk"])]
         query: Option<String>,
         /// Print the search these flags describe as a JSON document, and
-        /// exit. What `--query` reads back
+        /// exit. What `--query` reads back. Refused with `--follow`: a
+        /// following read holds a stream open, where a document describes
+        /// one search
         #[arg(long)]
         dump_json: bool,
         /// Seconds between looks for new data (--follow only). Default:
@@ -1678,6 +1680,50 @@ mod cli_tests {
             missing.is_empty(),
             "these flags appear nowhere in packaging/timberfs.1: {missing:?}\n\
              Document them, or add them to this test's allowlist with a reason."
+        );
+    }
+
+    /// Every long flag that takes a VALUE must be known to the bash
+    /// completion, so the word after it gets file completion rather than
+    /// the store handles a positional would get. This list had fallen
+    /// SIXTEEN flags behind before the test existed — `--query <TAB>`
+    /// offered store names where a file was wanted.
+    #[test]
+    fn every_value_flag_is_known_to_the_completion() {
+        let comp = include_str!("../packaging/timberfs-completion.bash");
+        // The block listing them, so a mention anywhere else in the
+        // script (a dedicated handler, a comment) does not count as
+        // covered by accident.
+        let start = comp
+            .find("Every long flag that takes a VALUE")
+            .expect("the value-flag block moved or was renamed");
+        let block = &comp[start..start + comp[start..].find("esac").unwrap()];
+        // A flag with its own handler is covered by that instead.
+        let handled_elsewhere = ["--forest"];
+        let mut missing = Vec::new();
+        for sub in Cli::command().get_subcommands() {
+            for arg in sub.get_arguments() {
+                let Some(long) = arg.get_long() else { continue };
+                // Takes a value = not a bare switch.
+                if matches!(arg.get_action(), clap::ArgAction::SetTrue)
+                    || long == "help"
+                    || long == "version"
+                    || handled_elsewhere.contains(&format!("--{long}").as_str())
+                {
+                    continue;
+                }
+                let flag = format!("--{long}");
+                if !block.contains(&flag) {
+                    missing.push(flag);
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "the bash completion does not know these value-taking flags, so the word after \
+             each gets store-handle completion instead of a file: {missing:?}"
         );
     }
 
