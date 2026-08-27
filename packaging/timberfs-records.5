@@ -86,11 +86,19 @@ An
 .B entry
 carries
 .B src
-(a path) rather than an id, because a path is unique WITHIN one response
-and a uuid on every entry is not worth its bytes. Join an entry to its
-store through the
+(the path, which is also the prefix text output puts on each line) and
+.B id
+(the store's identity), under the same condition: both appear only where
+an entry needs attributing \(em a read of one store attributes nothing,
+because there is nothing to tell apart.
+.PP
+Both, rather than the path alone, because this is a PIPELINE format: a
+stage that drops or rewrites
 .B source
-records, which carry both.
+records would otherwise leave entries keyed by a path, which is neither
+stable nor unique outside the response that produced it. An entry record
+should say where it came from without depending on another record
+surviving.
 .TP
 .B entry
 Announces the next record: its verbatim payload. Fields:

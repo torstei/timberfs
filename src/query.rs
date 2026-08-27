@@ -778,6 +778,10 @@ fn query_entries(
             } else {
                 None
             },
+            // Only where an entry is attributed at all, and only in a
+            // record stream: the path is the human-readable half and this
+            // is the durable one.
+            store_id: (multi && records).then(|| store_id_of(&source)).flatten(),
         };
         srcs.push(Src {
             path: f.clone(),
@@ -1316,6 +1320,9 @@ fn query_follow(
                         show_write: show_write_time,
                         records,
                         label: label.clone(),
+                        store_id: (label.is_some() && records)
+                            .then(|| store_id_of(&source))
+                            .flatten(),
                     },
                     limit.clone(),
                     &f.display().to_string(),
@@ -2844,4 +2851,14 @@ fn store_value(
         bundle_bytes,
     };
     serde_json::to_value(crate::store_json::Store::new(s, &loc)).unwrap_or(serde_json::Value::Null)
+}
+
+/// The store's declared id, as bytes for a record field. Absent for a
+/// store with no manifest, which a plain `append` writes.
+fn store_id_of(h: &SourceHandle) -> Option<Vec<u8>> {
+    h.bark
+        .as_ref()
+        .and_then(|b| b.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.as_bytes().to_vec())
 }

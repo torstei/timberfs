@@ -41,6 +41,12 @@ pub struct Framing {
     /// Multi-file "path:" prefix — per line in text mode, once per record
     /// in -0 mode.
     pub label: Option<Vec<u8>>,
+    /// The store's IDENTITY, emitted beside `src` in a record stream.
+    /// `src` is the path, which is also the text-mode prefix a human
+    /// reads; this is what survives a move and what a position is
+    /// recorded against. Present under the same condition as `label`:
+    /// wherever an entry is attributed at all, it is attributed durably.
+    pub store_id: Option<Vec<u8>>,
 }
 
 /// One file's entry stream. The output writer is passed per call so
@@ -265,6 +271,10 @@ impl EntrySink {
                 out.write_all(b"\x1fsrc=")?;
                 out.write_all(label)?;
             }
+            if let Some(id) = &self.framing.store_id {
+                out.write_all(b"\x1fid=")?;
+                out.write_all(id)?;
+            }
             out.write_all(b"\0")?;
             out.write_all(&entry)?;
             out.write_all(b"\0")?;
@@ -386,6 +396,7 @@ mod tests {
                 records: true,
                 show_write: false,
                 label: None,
+                store_id: None,
             },
             None,
             "test",

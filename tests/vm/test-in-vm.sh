@@ -2221,6 +2221,34 @@ JSON
         || { timberfs query --query /tmp/vmex.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
                 | grep '^source' >&2; return 1; }
 
+    # An ENTRY says where it came from durably too, not only by path: the
+    # records stream is a pipeline format, so a stage that rewrites the
+    # source records must not strand entries with an unstable key.
+    local d2=/var/log/timberfs/vmex2
+    rm -rf "$d2"
+    timberfs create --set service=vmex2 "$d2/vmex2.log" >/dev/null 2>&1 || return 1
+    printf '2026-08-26T12:00:00Z ERROR vmex req-8f3a\n' \
+        | timberfs append --into "$d2/vmex2.log" --quiet 2>/dev/null || return 1
+    local id2
+    id2=$(timberfs info --json "$d2/vmex2.log" 2>/dev/null | jq -r .id)
+    cat > /tmp/vmex2.json <<'JSON'
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"name","op":"=~","value":"vmex2?"}]},
+  "window":{"axis":"logline"},"match":{"granularity":"entries","all":[{"has":"vmex"}]},
+  "response_format":{"kind":"records"} }
+JSON
+    timberfs query --query /tmp/vmex2.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^entry' | grep -q "id=$id2" || {
+            echo "an attributed entry carries no identity:" >&2
+            timberfs query --query /tmp/vmex2.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+                | grep '^entry' >&2
+            return 1; }
+    # A single-store read attributes nothing — there is nothing to tell
+    # apart, so neither src nor id is added.
+    timberfs query --query /tmp/vmex.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^entry' | grep -qE 'src=|id=' && {
+            echo "single-store read attributed an entry it need not" >&2; return 1; }
+    rm -rf "$d2" /tmp/vmex2.json
+
     # A following read is a process holding a stream open, not a search.
     # REFUSED rather than silently dropped, which is how a caller ends up
     # running a different query than the one it printed.
