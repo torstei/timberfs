@@ -620,7 +620,7 @@ pub fn tap_instance(
     opts: &IncusOpts,
     intake: &Arc<Mutex<crate::intake::Intake>>,
     stop: &Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let facts = facts(inst, server_name);
     let console = incus.console_attach(&inst.name)?;
     // From here every exit path must release the console, or a human
@@ -640,7 +640,7 @@ fn tap_attached(
     intake: &Arc<Mutex<crate::intake::Intake>>,
     stop: &Arc<AtomicBool>,
     console: &crate::incus::Console,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let mut ws = incus.console_stream(console)?;
     // Only a container has the ring; a VM's console is a file, and reading
     // it is not a drain.
@@ -667,18 +667,23 @@ fn tap_attached(
     }
 
     let mut stamper = Stamper::new(Prefix::render(&opts.prefix, facts), opts.idle_ms);
-    let mut first = Vec::new();
+    // The marker is held back until something is actually collected. It
+    // marks a SEAM IN CONTENT — where a gap, if any, is — so writing one
+    // for an attach that turns out to collect nothing records our own
+    // retrying instead: a store whose whole contents are "console
+    // attached" every thirty seconds, which is what an unattachable
+    // console produced for two days.
+    let mut pending_marker = Vec::new();
     if opts.mark_episodes {
-        let mut marker = Vec::new();
-        Prefix::render(&opts.prefix, facts).write(now_ms(), &mut marker);
-        marker.extend_from_slice(attach_marker(facts, backlog.len()).as_bytes());
-        marker.push(b'\n');
-        first.extend_from_slice(&marker);
+        Prefix::render(&opts.prefix, facts).write(now_ms(), &mut pending_marker);
+        pending_marker.extend_from_slice(attach_marker(facts, backlog.len()).as_bytes());
+        pending_marker.push(b'\n');
     }
     if !backlog.is_empty() {
+        // The ring HAD content, so this episode has collected something
+        // whatever the websocket goes on to do.
+        let mut first = std::mem::take(&mut pending_marker);
         first.extend(stamper.push_recovered(&backlog, now_ms()));
-    }
-    if !first.is_empty() {
         append(intake, &store, &first)?;
     }
 
@@ -698,13 +703,42 @@ fn tap_attached(
     // cannot remove anything from the websocket's queue.
     let consume_ring = inst.is_container() && !opts.keep_ring;
     let mut last_drain = now_ms();
-    while !stop.load(Ordering::Relaxed) {
-        match ws.read() {
-            Ok(Some(bytes)) => {
+    let mut delivered = 0usize;
+    // What the console said, kept for the diagnostic below. An attach
+    // that incus refuses is not silent: it answers over the console
+    // stream, in its own words, and those words are the answer to "why".
+    let mut heard: Vec<u8> = Vec::new();
+    // Output from the first seconds, written once the episode proves it
+    // is one.
+    let mut held: Vec<u8> = Vec::new();
+    let began = std::time::Instant::now();
+    while !stopping(stop) {
+        match ws.read_frame()? {
+            // Nothing within the read timeout. The loop's own `stop`
+            // check is the point: a silent console must not pin its
+            // thread against a shutdown.
+            crate::incus::Frame::Idle => {}
+            crate::incus::Frame::Data(bytes) => {
+                delivered += bytes.len();
+                heard.extend_from_slice(&bytes);
                 let now = now_ms();
                 let out = stamper.push(&bytes, now);
                 if !out.is_empty() {
-                    append(intake, &store, &out)?;
+                    if began.elapsed() < MIN_EPISODE {
+                        // Held, not dropped. An attach incus refuses
+                        // answers over this same stream in its own words,
+                        // and recording that as console output fills the
+                        // store with our retrying. Nothing is lost by
+                        // waiting: the episode's flush below writes
+                        // whatever is held, so a container that prints
+                        // its dying words and vanishes still keeps them.
+                        held.extend_from_slice(&out);
+                    } else {
+                        let mut w = std::mem::take(&mut pending_marker);
+                        w.extend_from_slice(&std::mem::take(&mut held));
+                        w.extend_from_slice(&out);
+                        append(intake, &store, &w)?;
+                    }
                 }
                 if consume_ring && now.saturating_sub(last_drain) >= opts.drain_every_ms as i64 {
                     last_drain = now;
@@ -717,15 +751,22 @@ fn tap_attached(
             }
             // The console closed: the instance stopped or restarted. Not
             // an error — the supervisor decides whether to come back.
-            Ok(None) => break,
-            Err(e) => return Err(e),
+            crate::incus::Frame::Closed => break,
         }
     }
     let tail = stamper.flush(now_ms());
-    if !tail.is_empty() {
-        append(intake, &store, &tail)?;
+    held.extend_from_slice(&tail);
+    // A refusal is incus talking, not the container: report it and record
+    // nothing. Anything else held is the container's, and is written.
+    if let Some(why) = refusal(&heard) {
+        bail!("{why}");
     }
-    Ok(())
+    if !held.is_empty() {
+        let mut w = std::mem::take(&mut pending_marker);
+        w.extend_from_slice(&held);
+        append(intake, &store, &w)?;
+    }
+    Ok(delivered)
 }
 
 fn append(
@@ -749,6 +790,57 @@ fn append(
 /// that is restarting is not ready the instant its old console closes, and
 /// a tight retry loop against a container that will not start is just a
 /// busy wait on a daemon socket.
+/// Is a shutdown under way? BOTH the signal and the flag the main thread
+/// sets, so a tap notices SIGTERM itself rather than waiting to be told.
+fn stopping(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Relaxed) || crate::append::stopping()
+}
+
+/// Sleep, but wake for a shutdown. The granularity only has to be short
+/// against a person watching `systemctl stop`.
+fn sleep_until_stopped(stop: &AtomicBool, ms: u64) {
+    let step = 100;
+    let mut left = ms;
+    while left > 0 && !stopping(stop) {
+        let n = left.min(step);
+        std::thread::sleep(std::time::Duration::from_millis(n));
+        left -= n;
+    }
+}
+
+/// incus answering "no" over the console stream rather than in the HTTP
+/// reply. A refused attach still opens the websocket, and what comes
+/// down it is incus's own error — which is the operator's answer, and
+/// which used to be recorded silently into the store instead of said.
+///
+/// Matched narrowly: an `Error:` line, the shape incus's CLI prints, and
+/// only for a short answer. A container's own output can contain the
+/// word, and losing a crash log to a heuristic would defeat the purpose
+/// of collecting consoles at all.
+fn refusal(heard: &[u8]) -> Option<String> {
+    if heard.len() > 512 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(heard);
+    // The WHOLE of it must be one `Error:` line. A container's output is
+    // not one line and then end-of-stream inside two seconds, and this is
+    // the direction that must not be wrong: a crash log withheld because
+    // it happened to start with the word is the failure that matters,
+    // where a refusal recorded as content is only noise.
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let line = lines.next()?.trim();
+    if lines.next().is_some() || !line.starts_with("Error: ") {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+/// Shorter than this and the console was handed straight back rather
+/// than ended: not an episode, so it backs off instead of reattaching at
+/// once. Comfortably longer than an attach costs, comfortably shorter
+/// than any real episode.
+const MIN_EPISODE: std::time::Duration = std::time::Duration::from_secs(2);
+
 const REATTACH_MS: u64 = 1_000;
 const REATTACH_MAX_MS: u64 = 30_000;
 
@@ -792,17 +884,39 @@ pub fn run(opts: IncusOpts) -> anyhow::Result<()> {
     let opts = Arc::new(opts);
     let running: Arc<Mutex<std::collections::BTreeSet<String>>> =
         Arc::new(Mutex::new(Default::default()));
+    // Held so shutdown can wait for them; see the join below.
+    let taps: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // The instances that are already up, then whatever the event stream
     // says about them from here on.
     for inst in incus.instances()? {
         if opts.wants(&inst) {
-            spawn_tap(&incus, inst, &server_name, &opts, &intake, &stop, &running);
+            spawn_tap(
+                &incus,
+                inst,
+                &server_name,
+                &opts,
+                &intake,
+                &stop,
+                &running,
+                &taps,
+            );
         }
     }
 
-    watch_lifecycle(&incus, &server_name, &opts, &intake, &stop, &running);
+    watch_lifecycle(&incus, &server_name, &opts, &intake, &stop, &running, &taps);
     stop.store(true, Ordering::Relaxed);
+    // WAIT for the taps. Each releases its console on the way out, and
+    // returning from here would exit the process and kill them where they
+    // stand — which is how every console came to be left reserved in
+    // incus after a restart, refusing the next attach AND a human running
+    // `incus console` until an operator deleted the operations by hand.
+    //
+    // Safe to wait on now that a read times out rather than blocking
+    // forever: a tap notices `stop` within that timeout wherever it is.
+    for h in taps.lock().unwrap().drain(..) {
+        let _ = h.join();
+    }
     let _ = maintenance.join();
     Ok(())
 }
@@ -816,6 +930,7 @@ fn spawn_tap(
     intake: &Arc<Mutex<crate::intake::Intake>>,
     stop: &Arc<AtomicBool>,
     running: &Arc<Mutex<std::collections::BTreeSet<String>>>,
+    taps: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) {
     {
         let mut g = running.lock().unwrap();
@@ -833,10 +948,10 @@ fn spawn_tap(
     let stop = Arc::clone(stop);
     let running = Arc::clone(running);
     let _ = incus;
-    std::thread::spawn(move || {
+    let h = std::thread::spawn(move || {
         let incus = crate::incus::Incus::new(&socket, &project);
         let mut backoff = REATTACH_MS;
-        while !stop.load(Ordering::Relaxed) {
+        while !stopping(&stop) {
             // Re-read the instance each time: an image or an entrypoint
             // may have changed under a restart, and those go in the next
             // attach marker.
@@ -847,23 +962,50 @@ fn spawn_tap(
             if !opts.wants(&inst) {
                 break;
             }
+            let began = std::time::Instant::now();
             match tap_instance(&incus, &inst, &server_name, &opts, &intake, &stop) {
-                // A clean end is a restart or a shutdown: come back
-                // promptly, because the console of the new instance is
-                // already filling its ring.
-                Ok(()) => backoff = REATTACH_MS,
+                // An episode that LASTED and then ended is a restart or a
+                // shutdown: come back promptly, because the console of
+                // the new instance is already filling its ring.
+                Ok(_) if began.elapsed() >= MIN_EPISODE => backoff = REATTACH_MS,
+                // One that ended almost at once is not an episode: the
+                // console was taken and handed straight back. Judged by
+                // DURATION rather than by bytes, because such a console
+                // often does deliver a little — a greeting, a ring
+                // replay — and counting bytes would reset the backoff
+                // every time and hammer on.
+                //
+                // Reattaching at REATTACH_MS here means an incus
+                // operation per container per SECOND for as long as the
+                // condition lasts, which is a load problem stacked on top
+                // of whatever caused it.
+                Ok(_) => {
+                    if backoff == REATTACH_MS {
+                        crate::note!(
+                            "timberfs: {}: the console closed immediately; backing off. \
+                             `incus console {}` will say why",
+                            inst.name,
+                            inst.name
+                        );
+                    }
+                    backoff = (backoff * 2).min(REATTACH_MAX_MS);
+                }
                 Err(e) => {
                     crate::note!("timberfs: {}: {e}", inst.name);
                     backoff = (backoff * 2).min(REATTACH_MAX_MS);
                 }
             }
-            if stop.load(Ordering::Relaxed) {
+            if stopping(&stop) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(backoff));
+            // Interruptible: a tap asleep in its reattach backoff would
+            // otherwise hold the shutdown for up to REATTACH_MAX_MS, and
+            // a stop that takes half a minute per host reads as a hang.
+            sleep_until_stopped(&stop, backoff);
         }
         running.lock().unwrap().remove(&inst.name);
     });
+    taps.lock().unwrap().push(h);
 }
 
 /// Follow incus's lifecycle events. A tap that only enumerated instances
@@ -877,6 +1019,7 @@ fn watch_lifecycle(
     intake: &Arc<Mutex<crate::intake::Intake>>,
     stop: &Arc<AtomicBool>,
     running: &Arc<Mutex<std::collections::BTreeSet<String>>>,
+    taps: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) {
     while !stop.load(Ordering::Relaxed) && !crate::append::stopping() {
         let mut ws = match incus.events() {
@@ -891,8 +1034,9 @@ fn watch_lifecycle(
             if crate::append::stopping() {
                 return;
             }
-            match ws.read() {
-                Ok(Some(bytes)) => {
+            match ws.read_frame() {
+                Ok(crate::incus::Frame::Idle) => {}
+                Ok(crate::incus::Frame::Data(bytes)) => {
                     for line in bytes.split(|b| *b == b'\n') {
                         let Some(name) = started_instance(line) else {
                             continue;
@@ -901,11 +1045,11 @@ fn watch_lifecycle(
                             continue;
                         };
                         if opts.wants(&inst) {
-                            spawn_tap(incus, inst, server_name, opts, intake, stop, running);
+                            spawn_tap(incus, inst, server_name, opts, intake, stop, running, taps);
                         }
                     }
                 }
-                Ok(None) => break,
+                Ok(crate::incus::Frame::Closed) => break,
                 Err(_) => break,
             }
         }
@@ -928,6 +1072,33 @@ pub fn started_instance(line: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// incus answers a refused attach over the console stream itself.
+    /// Telling that from the container's own output matters both ways: a
+    /// refusal recorded as console content fills the store with our
+    /// retrying, and a crash log mistaken for a refusal is the one thing
+    /// this intake exists to keep.
+    #[test]
+    fn a_refusal_is_incus_talking_not_the_container() {
+        // What incus actually sent, verbatim from rc-app01.
+        assert_eq!(
+            refusal(b"Error: Failed running forkconsole: \"attaching to the container failed\"\n")
+                .as_deref(),
+            Some("Error: Failed running forkconsole: \"attaching to the container failed\"")
+        );
+
+        // A container's own output is NOT a refusal, however alarming.
+        assert!(refusal(b"2026-08-27 ERROR java.lang.OutOfMemoryError\n").is_none());
+        assert!(refusal(b"Error: connection refused\n  at Foo.bar(Foo.java:1)\n").is_none());
+        assert!(refusal(b"").is_none());
+
+        // Length is the backstop: a real console burst is not a one-line
+        // answer, so anything substantial is the container's whatever it
+        // starts with.
+        let mut big = b"Error: Failed running forkconsole\n".to_vec();
+        big.extend(std::iter::repeat_n(b'x', 600));
+        assert!(refusal(&big).is_none(), "a long stream is the container's");
+    }
+
     use super::*;
 
     fn f(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

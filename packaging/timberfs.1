@@ -1579,6 +1579,15 @@ for as long as the tap is attached \(em see
 .B \-\-drain\-every
 below for why, and what it costs.
 .PP
+⚠ A console session that has just been released cannot always be
+re-taken at once: on incus 7 an attach too soon after one completes
+IMMEDIATELY, delivering nothing. A tap therefore backs off exponentially
+when an episode ends within seconds of starting, rather than reattaching
+at its normal pace \(em a fixed retry never gives the daemon the moment
+it needs, so it re-races indefinitely and floods it with operations.
+Judged by DURATION, not by bytes: such a session often does deliver a
+little first.
+.PP
 ⚠ An instance's console is
 .BR exclusive .
 While this holds one,
