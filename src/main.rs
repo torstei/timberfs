@@ -384,7 +384,7 @@ enum Command {
         /// two are one question asked two ways — and a member this
         /// timberfs does not know is an error, never a silently wider
         /// search
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["from", "to", "has", "any", "follow", "tail", "max", "from_chunk"])]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["from", "to", "has", "any", "follow", "tail", "max", "from_chunk", "deadline"])]
         query: Option<String>,
         /// Print the search these flags describe as a JSON document, and
         /// exit. What `--query` reads back. Refused with `--follow`: a
@@ -407,6 +407,15 @@ enum Command {
         /// oldest chunk it has
         #[arg(long, value_name = "N", requires = "follow", conflicts_with_all = ["from", "tail"])]
         from_chunk: Option<u64>,
+        /// Give up after this many seconds and answer with what was read.
+        /// A bound on how LONG rather than how much: a fleet read is slow
+        /// because it READS a lot, not because it matches a lot, so --max
+        /// does not bound the wait. Unlike a timeout in the caller, the
+        /// answer survives — stores read whole are whole, the one it
+        /// stopped in carries a position to resume from, and the ones it
+        /// never reached say so. Refused with --follow, which does not end
+        #[arg(long, value_name = "SECS", conflicts_with = "follow")]
+        deadline: Option<f64>,
     },
     /// Manage the followers of a store: registered readers, each with a
     /// name, a type, a `retaining` flag and a durable position. A
@@ -1251,6 +1260,7 @@ fn main() -> anyhow::Result<()> {
             max,
             poll,
             from_chunk,
+            deadline,
             query: query_doc,
             dump_json,
         } => {
@@ -1305,6 +1315,7 @@ fn main() -> anyhow::Result<()> {
                     tail,
                     max_chunks: None,
                     tail_chunks: None,
+                    deadline_ms: deadline.map(|s| (s * 1000.0).max(0.0) as u64),
                 },
                 output: query::Output {
                     no_filename,

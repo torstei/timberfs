@@ -85,6 +85,11 @@ pub struct Document {
     /// a sign, which is why they conflict rather than compose.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tail: Option<Bound>,
+    /// How long the search may take. Composes with `max` rather than
+    /// conflicting: they bound different things, and a fleet read is slow
+    /// because it READS a lot, not because it matches a lot.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub deadline: Option<Deadline>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_format: Option<ResponseFormat>,
 }
@@ -328,6 +333,21 @@ pub struct Bound {
     pub chunks: Option<u64>,
 }
 
+/// A bound on TIME rather than on volume.
+///
+/// Why the service and not the client: a client-side timeout drops the
+/// connection and everything that had already arrived with it. A deadline
+/// is answered — the stores read completely are complete, the one it
+/// stopped in has a position to resume from, and the ones never reached
+/// say so.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Deadline {
+    /// Milliseconds, as every other time in this document is.
+    pub ms: u64,
+}
+
 impl Bound {
     /// Exactly one unit, named. "Stop after 10" of WHAT decides both the
     /// answer and its cost, so neither a missing unit nor two of them is
@@ -546,6 +566,7 @@ impl Document {
             }),
             max: bound_of(q.limit.max, q.limit.max_chunks),
             tail: bound_of(q.limit.tail, q.limit.tail_chunks),
+            deadline: q.limit.deadline_ms.map(|ms| Deadline { ms }),
             response_format: Some(ResponseFormat {
                 kind: if q.output.by_write_time {
                     Kind::Chunks
@@ -714,6 +735,7 @@ impl Document {
                 max_chunks: self.max.as_ref().and_then(|b| b.chunks),
                 tail_chunks: self.tail.as_ref().and_then(|b| b.chunks),
                 tail: self.tail.as_ref().and_then(|b| b.entries),
+                deadline_ms: self.deadline.as_ref().map(|d| d.ms),
             },
             output: Output {
                 no_filename: fmt.options.no_filename,
@@ -790,6 +812,7 @@ mod tests {
                 tail: None,
                 max_chunks: None,
                 tail_chunks: None,
+                deadline_ms: Some(5_000),
             },
             output: Output {
                 no_filename: true,

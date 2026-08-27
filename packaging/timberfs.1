@@ -756,6 +756,40 @@ backwards (see THE TWO CLOCKS). A number older than anything the store
 still holds starts at the oldest chunk it has \(em only the caller knows
 its position was dropped, so only the caller can report it.
 .TP
+.BI \-\-deadline " SECS"
+Give up after
+.I SECS
+and answer with what was read. A bound on how LONG rather than how much:
+a fleet read is slow because it READS a lot, not because it matches a
+lot, so
+.B \-\-max
+does not bound the wait. Conflicts with
+.BR \-\-follow ,
+which does not end.
+.RS
+.PP
+Unlike a timeout in the caller \(em which drops the connection and
+everything that had already arrived on it \(em the answer survives and
+says what it covers. Stores read to the end are complete; the one the
+deadline stopped in reports a
+.B position
+to resume from; a store selected but never opened comes back with
+.BR chunks_read=0
+beside a non\-zero
+.BR chunks_selected ,
+and one the deadline reached before SELECTION did has no
+.B source
+record at all, though
+.B stream\-start
+still counted it. Hand the positions back as a
+.B cursor
+to go on.
+.PP
+Only the framed modes can say any of that. On the raw chunk\-dump path
+the deadline still applies, and a note on standard error is the only
+marker there is.
+.RE
+.TP
 .BI \-\-poll " SECS"
 Seconds between looks for new data
 .RB ( \-\-follow

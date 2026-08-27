@@ -534,6 +534,12 @@ pub struct Limit {
     /// bound is answered from the index without reading anything.
     pub max_chunks: Option<u64>,
     pub tail_chunks: Option<u64>,
+    /// How LONG the read may take, in milliseconds. The other bounds cap
+    /// how much comes back; a fleet read is slow because it READS a lot,
+    /// not because it matches a lot, so neither of them bounds the wait.
+    /// Answered with whatever was gathered, which is what a client-side
+    /// timeout cannot do — it drops the connection and everything on it.
+    pub deadline_ms: Option<u64>,
 }
 
 /// What comes out. Every field here shapes the OUTPUT rather than
@@ -569,6 +575,25 @@ impl Query {
             if f > t {
                 bail!("the window starts after it ends");
             }
+        }
+        // Zero reads as "answer instantly" and means "read nothing" — a
+        // generator's arithmetic escaping into the request rather than
+        // anything anybody asks for. Which stores a search covers is a
+        // response kind, not a deadline of nought.
+        if self.limit.deadline_ms == Some(0) {
+            bail!(
+                "a deadline of zero would read nothing; ask for the stores a search \
+                 selects if that is the question"
+            );
+        }
+        // A deadline bounds a search. A follow does not end, and "stop
+        // following after N seconds" is a different request that would
+        // want its own member rather than this one reinterpreted.
+        if self.follow.follow && self.limit.deadline_ms.is_some() {
+            bail!(
+                "a deadline bounds a search, and a following read does not end; to stop \
+                 following after a while, bound the process rather than the query"
+            );
         }
         let following = self.follow.follow || self.limit.tail.is_some();
         if self.window.from_chunk.is_some() && !following {
@@ -612,6 +637,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     let entry_preds = q.matching.entry_preds()?;
     let (max, tail) = (q.limit.max, q.limit.tail);
     let (max_chunks, tail_chunks) = (q.limit.max_chunks, q.limit.tail_chunks);
+    let deadline = q.limit.deadline_ms.map(std::time::Duration::from_millis);
     let (follow, poll) = (q.follow.follow, q.follow.poll);
     let Output {
         no_filename,
@@ -678,12 +704,22 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             null_sep,
             records,
             max,
+            deadline,
         );
     }
     if files.len() == 1 {
-        return query_single(&files[0], from_ms, to_ms, has, any, max_chunks);
+        return query_single(&files[0], from_ms, to_ms, has, any, max_chunks, deadline);
     }
-    query_multi(files, from_ms, to_ms, has, any, no_filename, max_chunks)
+    query_multi(
+        files,
+        from_ms,
+        to_ms,
+        has,
+        any,
+        no_filename,
+        max_chunks,
+        deadline,
+    )
 }
 
 /// The default read path: select chunks by the write-time rings (widened
@@ -707,7 +743,12 @@ fn query_entries(
     null_sep: bool,
     records: bool,
     max: Option<u64>,
+    deadline: Option<std::time::Duration>,
 ) -> anyhow::Result<()> {
+    // Started before the first store is opened: SELECTION is work too, and
+    // on a fleet it is the part that runs before any byte can come back.
+    let began = std::time::Instant::now();
+    let expired = |d: Option<std::time::Duration>| d.is_some_and(|d| began.elapsed() >= d);
     struct Src {
         path: std::path::PathBuf,
         guard: Option<(PathBuf, String)>,
@@ -729,8 +770,17 @@ fn query_entries(
     let multi = files.len() > 1 && !no_filename;
     // --max: a total entry cap shared by every source's sink.
     let limit = max.map(|m| (Rc::new(Cell::new(0u64)), m));
+    // WHICH bound stopped the read. A consumer needs the name, not just
+    // the fact: "your entry cap" and "your chunk cap" are different
+    // things to raise, and the answer used to say `max.entries` whatever
+    // had actually fired.
+    let mut stopped_by: Option<&'static str> = None;
     let mut srcs: Vec<Src> = Vec::new();
     for f in files {
+        if expired(deadline) {
+            stopped_by = Some("deadline");
+            break;
+        }
         let mut source = open_source(f)?;
         let guard = seq_guard(f);
         let tf = crate::bark::time_format(source.bark.as_ref());
@@ -908,12 +958,11 @@ fn query_entries(
     // older entries. `query_multi` interleaves for the human fleet view,
     // which has no next page.
     let mut chunks_out = 0u64;
-    // WHICH bound stopped the read. A consumer needs the name, not just
-    // the fact: "your entry cap" and "your chunk cap" are different
-    // things to raise, and the answer used to say `max.entries` whatever
-    // had actually fired.
-    let mut stopped_by: Option<&'static str> = None;
     while let Some(i) = (0..srcs.len()).find(|&i| srcs[i].pos < srcs[i].chunks.len()) {
+        if expired(deadline) {
+            stopped_by = Some("deadline");
+            break;
+        }
         let s = &mut srcs[i];
         let c = s.chunks[s.pos].1;
         s.pos += 1;
@@ -1603,6 +1652,7 @@ fn query_follow(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_single(
     file: &Path,
     from_ms: u64,
@@ -1610,7 +1660,9 @@ fn query_single(
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
+    deadline: Option<std::time::Duration>,
 ) -> anyhow::Result<()> {
+    let began = std::time::Instant::now();
     let mut source = open_source(file)?;
     let (selected, in_window) = select_chunks(
         file,
@@ -1634,6 +1686,13 @@ fn query_single(
         None => selected.clone(),
     };
     for (_, c) in &selected {
+        // No stream-end here to carry a status, so the note IS the marker:
+        // a dump that stops early with nothing saying so reads as one that
+        // ended.
+        if deadline.is_some_and(|d| began.elapsed() >= d) {
+            crate::note!("timberfs: the deadline stopped this read; the answer is partial");
+            break;
+        }
         if let Some(data) = read_chunk(file, &guard, &mut source, *c)? {
             out.write_all(&data)?;
             uncomp_total += c.uncomp_len;
@@ -1661,6 +1720,7 @@ fn query_single(
 /// boundaries carried per file so every output line gets exactly one
 /// prefix. Attribution lives in the filename — this is the fleet view
 /// over per-stream logs.
+#[allow(clippy::too_many_arguments)]
 fn query_multi(
     files: &[std::path::PathBuf],
     from_ms: u64,
@@ -1669,7 +1729,9 @@ fn query_multi(
     any: &[String],
     no_filename: bool,
     max_chunks: Option<u64>,
+    deadline: Option<std::time::Duration>,
 ) -> anyhow::Result<()> {
+    let began = std::time::Instant::now();
     struct Src {
         path: PathBuf,
         guard: Option<(PathBuf, String)>,
@@ -1719,6 +1781,13 @@ fn query_multi(
     let mut chunks_out = 0u64;
     loop {
         if max_chunks.is_some_and(|m| chunks_out >= m) {
+            break;
+        }
+        // A raw dump has no stream-end to carry a status, so the note IS
+        // the marker: a log that stops early with nothing saying so reads
+        // as a log that ended.
+        if deadline.is_some_and(|d| began.elapsed() >= d) {
+            crate::note!("timberfs: the deadline stopped this read; the answer is partial");
             break;
         }
         let next = srcs
