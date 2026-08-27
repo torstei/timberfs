@@ -2055,7 +2055,210 @@ JSON
     doc '"max":{"entries":3,"chunks":2},' logline loglines
     timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
 
+    # The predicate set is what a CALLER wants to ask, not what the index
+    # can do cheaply: substring, regex, caseless and exclusion all work at
+    # entry granularity, and each is judged on the whole entry.
+    doc '"match":{"granularity":"entries","none":[{"has":"vmgranneedle"}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 200 ] || { echo "none gave $n lines, want 200" >&2; return 1; }
+    doc '"match":{"granularity":"entries","all":[{"substring":"granneedl"}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 1 ] || { echo "substring gave $n lines, want 1" >&2; return 1; }
+    doc '"match":{"granularity":"entries","all":[{"regex":"vmgran[a-z]+ here$"}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 1 ] || { echo "regex gave $n lines, want 1" >&2; return 1; }
+    doc '"match":{"granularity":"entries","all":[{"has":"VMGRANNEEDLE","caseless":true}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 1 ] || { echo "caseless gave $n lines, want 1" >&2; return 1; }
+
+    # A chunk sweep narrows with the index and nothing else, so what it
+    # cannot prove is REFUSED rather than accepted and ignored.
+    for m in '"none":[{"has":"x"}]' '"all":[{"regex":"x"}]' \
+             '"all":[{"has":"x","caseless":true}]'; do
+        doc "\"match\":{\"granularity\":\"chunks\",$m}," logline loglines
+        timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && {
+            echo "chunk sweep accepted $m" >&2; return 1; }
+    done
+    # ...and a substring IS allowed there: it rides the index on its
+    # interior whole words.
+    doc '"match":{"granularity":"chunks","all":[{"substring":"a vmgranneedle b"}]},' logline loglines
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 || return 1
+
+    # Exactly one matcher per predicate.
+    doc '"match":{"granularity":"entries","all":[{}]},' logline loglines
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
+    doc '"match":{"granularity":"entries","all":[{"has":"a","regex":"b"}]},' logline loglines
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
+
+    # timber-filter and the document are ONE implementation, so the same
+    # predicate must give the same count through either surface.
+    doc '"match":{"granularity":"entries","all":[{"substring":"granneedl"}],"none":[{"has":"INFO"}]},' logline loglines
+    local viadoc viafilter
+    viadoc=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    viafilter=$(timber-filter --substring granneedl --not-has INFO -c "$d/vmgran.log" 2>/dev/null)
+    [ "$viadoc" = "$viafilter" ] \
+        || { echo "document says $viadoc, timber-filter says $viafilter" >&2; return 1; }
+
     rm -rf "$d" /tmp/vmgran.*
+}
+
+a_bounded_read_says_what_stopped_it_and_invents_nothing() {
+    # Three things a client cannot work without, and all three were wrong:
+    # which bound fired, how much was actually read, and whether the last
+    # entry is whole.
+    local d=/var/log/timberfs/vmbound
+    rm -rf "$d"
+    timberfs create "$d/vmbound.log" >/dev/null 2>&1 || return 1
+    # Each append seals a chunk at EOF, so splitting the writes puts the
+    # 41-line entry across a chunk boundary DETERMINISTICALLY — no
+    # dependence on where a size threshold happens to land.
+    {
+        for i in $(seq 1 20); do printf '2026-08-27T10:00:%02dZ INFO filler %d\n' "$i" "$i"; done
+        printf '2026-08-27T10:00:30Z ERROR vmboundboom\n'
+        for i in $(seq 1 20); do printf '\tat frame.number.%d(F.java:1)\n' "$i"; done
+    } | timberfs append --into "$d/vmbound.log" --quiet 2>/dev/null || return 1
+    {
+        for i in $(seq 21 40); do printf '\tat frame.number.%d(F.java:1)\n' "$i"; done
+        printf '2026-08-27T10:01:00Z INFO after\n'
+    } | timberfs append --into "$d/vmbound.log" --quiet 2>/dev/null || return 1
+    local chunks
+    chunks=$(timberfs index "$d/vmbound.log" 2>/dev/null | grep -c '^ ')
+    [ "$chunks" = 2 ] || { echo "want 2 chunks, got $chunks" >&2; timberfs index "$d/vmbound.log"; return 1; }
+    # The entry is 41 lines when read whole.
+    [ "$(timber-filter --has vmboundboom "$d/vmbound.log" 2>/dev/null | wc -l)" = 41 ] || return 1
+
+    bdoc() { cat > /tmp/vmbound.json <<JSON
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"name","op":"=","value":"vmbound"}]},
+  "window":{"axis":"logline"}, $1 "response_format":{"kind":"records"} }
+JSON
+    }
+    local end frames
+    # A chunk cap stops MID-ENTRY by construction. The half-read stack
+    # trace must not be emitted: half a stack trace presented as whole is
+    # not missing data, it is data that never existed.
+    bdoc '"max":{"chunks":1},'
+    frames=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\0' '\n' | grep -c 'at frame.number')
+    [ "$frames" = 0 ] || { echo "emitted $frames frames of a cut-off entry" >&2; return 1; }
+
+    # ...and it names the bound that fired, and counts what it READ.
+    end=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-end')
+    echo "$end" | grep -q 'limit=max.chunks' || { echo "$end" >&2; return 1; }
+    echo "$end" | grep -q 'chunks_read=1' || { echo "$end" >&2; return 1; }
+    echo "$end" | grep -q 'status=limited' || { echo "$end" >&2; return 1; }
+
+    # An entry cap names ITSELF, not the chunk cap.
+    bdoc '"max":{"entries":5},'
+    end=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-end')
+    echo "$end" | grep -q 'limit=max.entries' || { echo "$end" >&2; return 1; }
+
+    # Unbounded: nothing was cut, so the entry comes back WHOLE — the
+    # discard must not fire at genuine end-of-data, where a pending entry
+    # is merely unterminated.
+    bdoc ''
+    end=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-end')
+    echo "$end" | grep -q 'status=exhausted' || { echo "$end" >&2; return 1; }
+    echo "$end" | grep -q 'limit=' && { echo "named a bound with none set: $end" >&2; return 1; }
+    frames=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\0' '\n' | grep -c 'at frame.number')
+    [ "$frames" = 40 ] || { echo "unbounded gave $frames frames, want 40" >&2; return 1; }
+
+    rm -rf "$d" /tmp/vmbound.json
+}
+
+the_query_examples_ship_and_run() {
+    # A format nobody can see worked examples of is one nobody uses. The
+    # schema says what is legal; these say what is useful — so they are
+    # installed, indexed, and every one of them actually runs.
+    local dir=/usr/share/doc/timberfs/query-examples
+    [ -f "$dir/README.md" ] || { echo "no README in $dir" >&2; ls -la "$dir" >&2; return 1; }
+    local n
+    n=$(ls "$dir"/*.json 2>/dev/null | wc -l)
+    [ "$n" -ge 7 ] || { echo "only $n examples shipped" >&2; return 1; }
+
+    # The README must name every one of them, or a new example is
+    # invisible in exactly the place it was added to be visible.
+    local f base
+    for f in "$dir"/*.json; do
+        base=$(basename "$f")
+        grep -q "$base" "$dir/README.md" \
+            || { echo "$base is not in the README" >&2; return 1; }
+    done
+
+    # Every example is a document this build accepts. They name stores
+    # that need not exist here, so a "no store matched" answer is a pass;
+    # a PARSE or coherence refusal is not.
+    local d=/var/log/timberfs/vmex
+    rm -rf "$d"
+    timberfs create --set type=app --set host=web01 "$d/vmex.log" >/dev/null 2>&1 || return 1
+    printf '2026-08-26T12:00:00Z ERROR vmex req-8f3a\n' \
+        | timberfs append --into "$d/vmex.log" --quiet 2>/dev/null || return 1
+    for f in "$dir"/*.json; do
+        timberfs query --query "$f" >/dev/null 2>/tmp/vmex.err || {
+            echo "$(basename "$f") does not run:" >&2; cat /tmp/vmex.err >&2; return 1; }
+    done
+
+    # Enumerating is the store predicate with nothing in it, and it must
+    # find the store we just made — that is the request a client opens with.
+    timberfs query --query "$dir/query-enumerate-stores.json" 2>/dev/null \
+        | jq -e '[.[] | select(.name == "vmex")] | length == 1' >/dev/null \
+        || { echo "enumerate did not find vmex" >&2; return 1; }
+
+    # A response names its stores by IDENTITY, not only by path: that is
+    # the join key between what a request asked for and what came back.
+    cat > /tmp/vmex.json <<'JSON'
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"name","op":"=","value":"vmex"}]},
+  "window":{"axis":"logline"},"match":{"granularity":"entries","all":[{"has":"vmex"}]},
+  "response_format":{"kind":"records"} }
+JSON
+    local id
+    id=$(timberfs info --json "$d/vmex.log" 2>/dev/null | jq -r .id)
+    timberfs query --query /tmp/vmex.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^source' | grep -q "id=$id" \
+        || { timberfs query --query /tmp/vmex.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+                | grep '^source' >&2; return 1; }
+
+    # An ENTRY says where it came from durably too, not only by path: the
+    # records stream is a pipeline format, so a stage that rewrites the
+    # source records must not strand entries with an unstable key.
+    local d2=/var/log/timberfs/vmex2
+    rm -rf "$d2"
+    timberfs create --set service=vmex2 "$d2/vmex2.log" >/dev/null 2>&1 || return 1
+    printf '2026-08-26T12:00:00Z ERROR vmex req-8f3a\n' \
+        | timberfs append --into "$d2/vmex2.log" --quiet 2>/dev/null || return 1
+    local id2
+    id2=$(timberfs info --json "$d2/vmex2.log" 2>/dev/null | jq -r .id)
+    cat > /tmp/vmex2.json <<'JSON'
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"name","op":"=~","value":"vmex2?"}]},
+  "window":{"axis":"logline"},"match":{"granularity":"entries","all":[{"has":"vmex"}]},
+  "response_format":{"kind":"records"} }
+JSON
+    timberfs query --query /tmp/vmex2.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^entry' | grep -q "id=$id2" || {
+            echo "an attributed entry carries no identity:" >&2
+            timberfs query --query /tmp/vmex2.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+                | grep '^entry' >&2
+            return 1; }
+    # A single-store read attributes nothing — there is nothing to tell
+    # apart, so neither src nor id is added.
+    timberfs query --query /tmp/vmex.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^entry' | grep -qE 'src=|id=' && {
+            echo "single-store read attributed an entry it need not" >&2; return 1; }
+    rm -rf "$d2" /tmp/vmex2.json
+
+    # A following read is a process holding a stream open, not a search.
+    # REFUSED rather than silently dropped, which is how a caller ends up
+    # running a different query than the one it printed.
+    timberfs query vmex --follow --dump-json >/dev/null 2>/tmp/vmex.err && return 1
+    grep -q 'following read' /tmp/vmex.err || { cat /tmp/vmex.err >&2; return 1; }
+    # ...while a non-following dump still round-trips.
+    timberfs query vmex --has vmex --dump-json 2>/dev/null > /tmp/vmex-rt.json || return 1
+    timberfs query --query /tmp/vmex-rt.json >/dev/null 2>&1 || return 1
+
+    rm -rf "$d" /tmp/vmex.json /tmp/vmex-rt.json /tmp/vmex.err
 }
 
 identity_reports_and_repairs_the_three_broken_states() {
@@ -2401,6 +2604,8 @@ run_test "records: stream-end says whether a cap stopped it, exactly" stream_end
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
 run_test "query document: match and bounds name their granularity" a_match_selects_what_it_says_it_selects
+run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
+run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
 run_test "forest: an intake writes into a forest by name; --into-dir warns" an_intake_writes_into_a_forest_by_name
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares

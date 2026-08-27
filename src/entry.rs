@@ -41,6 +41,12 @@ pub struct Framing {
     /// Multi-file "path:" prefix — per line in text mode, once per record
     /// in -0 mode.
     pub label: Option<Vec<u8>>,
+    /// The store's IDENTITY, emitted beside `src` in a record stream.
+    /// `src` is the path, which is also the text-mode prefix a human
+    /// reads; this is what survives a move and what a position is
+    /// recorded against. Present under the same condition as `label`:
+    /// wherever an entry is attributed at all, it is attributed durably.
+    pub store_id: Option<Vec<u8>>,
 }
 
 /// One file's entry stream. The output writer is passed per call so
@@ -52,7 +58,7 @@ pub struct EntrySink {
     /// Predicates every emitted entry must satisfy. None = the search is
     /// chunk-granular, so whatever the index let through is emitted
     /// whole.
-    preds: Option<crate::grep::EntryPreds>,
+    preds: Option<crate::grep::Preds>,
     framing: Framing,
     /// Optional total-entries cap (--max), shared across sibling sinks.
     limit: Option<EntryLimit>,
@@ -115,7 +121,7 @@ impl EntrySink {
 
     /// Judge every emitted entry against these predicates, on top of the
     /// window. Absent, the search stays chunk-granular.
-    pub fn with_preds(mut self, preds: Option<crate::grep::EntryPreds>) -> EntrySink {
+    pub fn with_preds(mut self, preds: Option<crate::grep::Preds>) -> EntrySink {
         self.preds = preds;
         self
     }
@@ -265,6 +271,10 @@ impl EntrySink {
                 out.write_all(b"\x1fsrc=")?;
                 out.write_all(label)?;
             }
+            if let Some(id) = &self.framing.store_id {
+                out.write_all(b"\x1fid=")?;
+                out.write_all(id)?;
+            }
             out.write_all(b"\0")?;
             out.write_all(&entry)?;
             out.write_all(b"\0")?;
@@ -306,6 +316,21 @@ impl EntrySink {
     /// the last newline) stays buffered; it is genuinely incomplete.
     pub fn flush_pending(&mut self, out: &mut dyn Write) -> io::Result<()> {
         self.close_entry(out)
+    }
+
+    /// Throw away the entry still being assembled, because a BOUND
+    /// stopped the read before its remaining lines were read.
+    ///
+    /// Only correct where more data exists for this source. A pending
+    /// entry at genuine end-of-data is merely unterminated — the log's
+    /// last line need not end in a newline — and must still be emitted;
+    /// one cut short by a chunk cap is a fragment, and emitting it
+    /// invents an entry that never existed. The sink cannot tell those
+    /// apart, so the caller, which knows whether chunks remain, decides.
+    pub fn discard_pending(&mut self) {
+        self.line.clear();
+        self.entry.clear();
+        self.entry_ts = None;
     }
 
     /// Flush pending state; call once after the last push.
@@ -371,6 +396,7 @@ mod tests {
                 records: true,
                 show_write: false,
                 label: None,
+                store_id: None,
             },
             None,
             "test",

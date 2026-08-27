@@ -1136,9 +1136,19 @@ timberfs query /var/log/timberfs/app/app.log     --from 2026-08-26 --has ERROR -
 timberfs query --query search.json
 ```
 
-That round trip is the intended way to learn the format. The document is meant to be
-*generated* — by a tool, a client library, or eventually a query server — and the
-flags are the human sugar over the common shapes.
+That round trip is the intended way to learn the format, and worked examples ship
+alongside it at `/usr/share/doc/timberfs/query-examples/` — one per capability that
+is easy to miss, with a README naming what each demonstrates. The document is meant
+to be *generated* — by a tool, a client library, or eventually a query server — and
+the flags are the human sugar over the common shapes.
+
+⚠ Not everything the flags do can be written as a document, and not everything a
+document does has a flag. `--follow` is **refused** by `--dump-json` rather than
+dropped: a following read holds a stream open, where a document describes one
+search. Going the other way, the document chooses whether its predicates select
+entries or whole chunks, and carries `substring`, `regex`, caseless and `none`
+predicates that `timberfs query` has no flags for — `timber-filter` is the command
+line for those, and shares the implementation, so the two cannot disagree.
 
 Two rules a generator has to know, both documented in `timberfs-query-document(5)`:
 an **omitted member widens** the search rather than emptying it, and an **unknown

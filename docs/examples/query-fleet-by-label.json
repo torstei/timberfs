@@ -1,0 +1,33 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "stores": {
+    "select": [
+      {
+        "key": "type",
+        "op": "=",
+        "value": "console"
+      },
+      {
+        "key": "host",
+        "op": "=~",
+        "value": "web[0-9]+"
+      }
+    ]
+  },
+  "window": {
+    "axis": "logline",
+    "from": 1787727600000,
+    "to": 1787731200000
+  },
+  "match": {
+    "granularity": "entries",
+    "all": [
+      {
+        "has": "req-8f3a"
+      }
+    ]
+  },
+  "response_format": {
+    "kind": "records"
+  }
+}

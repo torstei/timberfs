@@ -86,7 +86,7 @@
       ]
     },
     "Bound": {
-      "description": "A bound, which must say WHAT it counts: `entries` needs a full read\nand decompression where chunks and bytes are nearly free from the\nindex, so a bare number would hide the cost. `entries` is the only\nunit this build counts, and is therefore required rather than\noptional-and-then-refused; when another arrives it becomes one of\nseveral, which relaxes the contract rather than breaking it.\n\nA `scope` (total versus per-store) belongs here and is absent until\nthere is more than one to choose between — the difference matters, but\na field with a single legal value is noise, and adding it later is\nadditive.",
+      "description": "A bound, which must say WHAT it counts, because \"stop after 10\" of\nwhat decides both the answer and its cost. Exactly one of `entries`\nand `chunks`; neither, or both, is refused rather than guessed at.\n\n⚠ That is checked at conversion, not by the shape: both members must\nbe optional for either to be given, so a JSON Schema validator cannot\ncatch those two on its own.\n\nA `scope` (total versus per-store) belongs here and is absent until\nthere is more than one to choose between — the difference matters, but\na field with a single legal value is noise, and adding it later is\nadditive.",
       "type": "object",
       "properties": {
         "chunks": {
@@ -126,7 +126,7 @@
       ]
     },
     "DocMatch": {
-      "description": "Entry predicates. Flat, mirroring the flags: `all` must all match and\nat least one of `any` must. A `none` list belongs here too and is\nabsent for the same reason as `select`: `query` has no flag that\nproduces one, and a member the contract names but the code drops is\nworse than one it does not name yet. Arbitrary boolean\ntrees would be expressible in JSON but not in flags, and then the CLI\ncould not reproduce a server's query — that waits for a version 2.",
+      "description": "The predicates, flat: every `all` must match, at least one `any` must,\nand no `none` may.\n\nFlat rather than a boolean tree. An arbitrary tree is expressible in\nJSON but not in flags, and then `--dump-json` could not reproduce a\nserver's query — that waits for a version 2. Three lists cover what a\nlog search actually asks.",
       "type": "object",
       "properties": {
         "all": {
@@ -144,6 +144,13 @@
         "granularity": {
           "description": "What these predicates SELECT, and it is REQUIRED for the same\nreason `window.axis` is: the two answers differ by orders of\nmagnitude, and a default is an assumption the next reader makes\nwrongly. This member exists because the format shipped without it\nand called itself an entry predicate while selecting chunks.",
           "$ref": "#/$defs/DocGranularity"
+        },
+        "none": {
+          "description": "None of these may match. Only meaningful at ENTRY granularity: a\nBloom filter can say a term may be present, never that it is\nabsent, so a chunk sweep cannot narrow on one and asking for it\nthere is refused rather than silently ignored.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Predicate"
+          }
         }
       },
       "additionalProperties": false,
@@ -229,18 +236,36 @@
       ]
     },
     "Predicate": {
-      "description": "One predicate. Exactly one matcher is set; the shape leaves room for\n`substring` and `regex` without changing it.",
+      "description": "One predicate. Exactly one matcher is set.\n\nThe contract says what the caller wants to ASK, not what timberfs can\nanswer cheaply. `has` rides the token index; `substring` rides it on\nits interior whole words; `regex` cannot ride it at all — and none of\nthat changes what any of them MEAN. The index decides how much gets\nread, never what matches.",
       "type": "object",
       "properties": {
+        "caseless": {
+          "description": "Compare caselessly. Refused on `regex`, which says `(?i)` itself.",
+          "type": "boolean"
+        },
         "has": {
-          "description": "A word-anchored phrase, which is the form that can ride the token\nindex and so skip chunks.",
-          "type": "string"
+          "description": "A word-anchored phrase.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "regex": {
+          "description": "A regular expression, as given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "substring": {
+          "description": "A literal anywhere, even inside a longer word.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "has"
-      ]
+      "additionalProperties": false
     },
     "ResponseFormat": {
       "description": "What comes back. A kind plus options rather than a bare name, because\nthe flags it stands for are orthogonal to it: `no_filename`,\n`show_write_time` and NUL separation shape any of the kinds.",

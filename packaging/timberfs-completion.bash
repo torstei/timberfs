@@ -84,11 +84,18 @@ _timberfs() {
     fi
 
     # A flag that takes a value: the word after it is never a handle.
+    # Every long flag that takes a VALUE. The word after one is never a
+    # store handle, so offering handles there is wrong — file completion
+    # is the useful fallback whatever the value is. Kept complete by
+    # `every_value_flag_is_known_to_the_completion`, because this list
+    # had silently fallen sixteen flags behind.
     case "$prev" in
     --into | --into-dir | --from | --to | --has | --any | --cutoff | --set | --unset | \
         --tail | --max | --poll | --chunk-size | --level | --flush-age | --retain | \
         --retain-size | --timestamp-regex | --timestamp-format | --listen | \
-        --payload-key | --route | --max-body)
+        --payload-key | --route | --max-body | --query | --select | --cursor | \
+        --rotated | --socket | --project | --key | --prefix | --only | --endpoint | \
+        --keep | --drain-every | --idle | --timeout | --from-chunk | --wait-for-writer)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;

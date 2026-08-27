@@ -457,8 +457,14 @@ pub struct Window {
 /// vocabulary is `timber-filter`'s.
 #[derive(Debug, Default, Clone)]
 pub struct Match {
-    pub has: Vec<String>,
-    pub any: Vec<String>,
+    /// Every predicate here must match. The CLI's `--has` lands here.
+    pub all: Vec<crate::grep::Pred>,
+    /// At least one of these must, when any are given. The CLI's `--any`.
+    pub any: Vec<crate::grep::Pred>,
+    /// None of these may match. No flag produces one — it is the query
+    /// document's, because a chunk sweep cannot express it (see
+    /// `Granularity`) and the flags are a chunk sweep.
+    pub none: Vec<crate::grep::Pred>,
     /// What the predicate SELECTS. The token index can only ever skip
     /// whole chunks, so these are two different answers to the same
     /// terms and the difference is not small: on a 1.2 GiB store, a term
@@ -482,16 +488,31 @@ pub enum Granularity {
 
 impl Match {
     pub fn is_empty(&self) -> bool {
-        self.has.is_empty() && self.any.is_empty()
+        self.spec().is_empty()
+    }
+
+    pub fn spec(&self) -> crate::grep::PredSpec {
+        crate::grep::PredSpec {
+            all: self.all.clone(),
+            any: self.any.clone(),
+            none: self.none.clone(),
+        }
+    }
+
+    /// What the token index can prove, as (`--has`, `--any`) terms. An
+    /// execution detail: the predicate means what it says whatever this
+    /// returns, and this only decides how much gets read.
+    pub fn index_terms(&self) -> (Vec<String>, Vec<String>) {
+        self.spec().pushdown()
     }
 
     /// The entry-level predicates, when the caller asked for entries.
     /// `None` leaves the read chunk-granular.
-    pub fn entry_preds(&self) -> anyhow::Result<Option<crate::grep::EntryPreds>> {
+    pub fn entry_preds(&self) -> anyhow::Result<Option<crate::grep::Preds>> {
         if self.granularity != Granularity::Entries || self.is_empty() {
             return Ok(None);
         }
-        Ok(Some(crate::grep::EntryPreds::new(&self.has, &self.any)?))
+        Ok(Some(crate::grep::Preds::compile(self.spec())?))
     }
 }
 
@@ -575,7 +596,10 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     q.validate()?;
     let files = &q.sources[..];
     let (from, to, from_chunk) = (q.window.from, q.window.to, q.window.from_chunk);
-    let (has, any) = (&q.matching.has[..], &q.matching.any[..]);
+    // What the INDEX can prove, which is a subset of what was asked: a
+    // caseless or regex predicate reads more rather than matching less.
+    let (has_terms, any_terms) = q.matching.index_terms();
+    let (has, any) = (&has_terms[..], &any_terms[..]);
     // The index selects chunks; these judge the entries inside them.
     // Absent, the read stays chunk-granular — every entry of every chunk
     // the index let through comes out.
@@ -668,7 +692,7 @@ fn query_entries(
     windowed: bool,
     has: &[String],
     any: &[String],
-    entry_preds: Option<crate::grep::EntryPreds>,
+    entry_preds: Option<crate::grep::Preds>,
     max_chunks: Option<u64>,
     no_filename: bool,
     show_write_time: bool,
@@ -754,6 +778,10 @@ fn query_entries(
             } else {
                 None
             },
+            // Only where an entry is attributed at all, and only in a
+            // record stream: the path is the human-readable half and this
+            // is the durable one.
+            store_id: (multi && records).then(|| store_id_of(&source)).flatten(),
         };
         srcs.push(Src {
             path: f.clone(),
@@ -812,10 +840,23 @@ fn query_entries(
         write!(out, "\x1fsources={}", files.len())?;
         out.write_all(b"\0")?;
         for (f, s) in files.iter().zip(&srcs) {
+            write!(out, "\x1esource\x1fpath={}", f.display())?;
+            // The store's IDENTITY, which is what the request selected on
+            // and what a position is recorded against. A path names a
+            // store only within one response; everything durable — a
+            // follower's declaration, a cursor, `list --json` — uses this.
+            if let Some(id) = s
+                .handle
+                .bark
+                .as_ref()
+                .and_then(|b| b.get("id"))
+                .and_then(|v| v.as_str())
+            {
+                write!(out, "\x1fid={id}")?;
+            }
             write!(
                 out,
-                "\x1esource\x1fpath={}\x1fkept={}\x1ftotal={}",
-                f.display(),
+                "\x1fkept={}\x1ftotal={}",
                 s.chunks.len(),
                 s.total_chunks
             )?;
@@ -825,6 +866,11 @@ fn query_entries(
     // K-way interleave by chunk write windows across files (within-file
     // order preserved), same as the raw fleet view.
     let mut chunks_out = 0u64;
+    // WHICH bound stopped the read. A consumer needs the name, not just
+    // the fact: "your entry cap" and "your chunk cap" are different
+    // things to raise, and the answer used to say `max.entries` whatever
+    // had actually fired.
+    let mut stopped_by: Option<&'static str> = None;
     loop {
         let mut best: Option<usize> = None;
         for (i, s) in srcs.iter().enumerate() {
@@ -851,6 +897,7 @@ fn query_entries(
         // --max reached: stop decompressing further chunks.
         if let Some((count, m)) = &limit {
             if count.get() >= *m {
+                stopped_by = Some("max.entries");
                 break;
             }
         }
@@ -859,6 +906,7 @@ fn query_entries(
         // fifteen.
         chunks_out += 1;
         if max_chunks.is_some_and(|m| chunks_out >= m) {
+            stopped_by = Some("max.chunks");
             break;
         }
     }
@@ -871,13 +919,35 @@ fn query_entries(
     // running out. A count alone cannot tell "that was all" from "your
     // limit stopped me", and a consumer that cannot tell will present a
     // truncated answer as a complete one.
-    let mut limited = srcs.iter().any(|s| s.pos < s.chunks.len());
+    let mut limited = stopped_by.is_some() || srcs.iter().any(|s| s.pos < s.chunks.len());
     for s in &mut srcs {
+        // A source with chunks left had its open entry CUT OFF rather
+        // than ended: the rest of it is in a chunk the bound stopped us
+        // reading. Emitting it would invent an entry — a stack trace with
+        // half its frames, presented as whole — so it is dropped, and a
+        // caller resumes from its first byte.
+        //
+        // Only where chunks remain: a pending entry at genuine
+        // end-of-data is merely unterminated, and must still be emitted.
+        if s.pos < s.chunks.len() {
+            s.sink.discard_pending();
+        }
         s.sink.finish(&mut out)?;
         emitted += s.sink.emitted;
         dropped += s.sink.filtered_out;
-        limited |= s.sink.suppressed > 0;
-        read += s.chunks.len();
+        // An entry the sink DROPPED because the count was already there.
+        // The loop stops feeding chunks on the cap, but a chunk already
+        // in flight can still hold entries past it — so this fires where
+        // the loop's own check does not.
+        if s.sink.suppressed > 0 {
+            limited = true;
+            stopped_by = stopped_by.or(Some("max.entries"));
+        }
+        // What was actually READ, which is how far each source advanced —
+        // not how many chunks were selected for it. They differ exactly
+        // when a cap stopped the loop, which is when a consumer is most
+        // likely to be counting.
+        read += s.pos;
         total += s.total_chunks;
     }
     if records {
@@ -888,8 +958,11 @@ fn query_entries(
             out,
             "\x1estream-end\x1fentries={emitted}\x1fdropped={dropped}\x1fchunks_read={read}\x1fchunks_total={total}\x1fstatus={status}"
         )?;
-        if limited {
-            write!(out, "\x1flimit=max.entries")?;
+        // Named, not assumed. `limited` can also be true with nothing to
+        // name — chunks left unread for a reason the loop did not record
+        // — and then saying nothing beats naming the wrong bound.
+        if let Some(which) = stopped_by {
+            write!(out, "\x1flimit={which}")?;
         }
         out.write_all(b"\0")?;
     }
@@ -1039,7 +1112,7 @@ fn query_follow(
     follow: bool,
     max: Option<u64>,
     poll: Option<f64>,
-    entry_preds: Option<crate::grep::EntryPreds>,
+    entry_preds: Option<crate::grep::Preds>,
 ) -> anyhow::Result<()> {
     let multi = files.len() > 1 && !no_filename;
     // Framing needs entries; plain text streams raw bytes (no one-entry lag).
@@ -1247,6 +1320,9 @@ fn query_follow(
                         show_write: show_write_time,
                         records,
                         label: label.clone(),
+                        store_id: (label.is_some() && records)
+                            .then(|| store_id_of(&source))
+                            .flatten(),
                     },
                     limit.clone(),
                     &f.display().to_string(),
@@ -2775,4 +2851,14 @@ fn store_value(
         bundle_bytes,
     };
     serde_json::to_value(crate::store_json::Store::new(s, &loc)).unwrap_or(serde_json::Value::Null)
+}
+
+/// The store's declared id, as bytes for a record field. Absent for a
+/// store with no manifest, which a plain `append` writes.
+fn store_id_of(h: &SourceHandle) -> Option<Vec<u8>> {
+    h.bark
+        .as_ref()
+        .and_then(|b| b.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.as_bytes().to_vec())
 }

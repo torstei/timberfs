@@ -70,6 +70,10 @@ full lineage of what it consumed.
 One per input, in argument order, before any entries. Fields:
 .B path
 (the source as given),
+.B id
+(the store's IDENTITY \(em what a request selects on and what a position
+is recorded against; absent for a store with no manifest, and for a
+stream that did not come from a store),
 .B kept
 /
 .B total
@@ -77,6 +81,24 @@ One per input, in argument order, before any entries. Fields:
 a consumer can warn \(lqthis will be slow\(rq before reading further).
 Fields are present when known; a stream that did not originate in a
 store has no chunk statistics.
+.PP
+An
+.B entry
+carries
+.B src
+(the path, which is also the prefix text output puts on each line) and
+.B id
+(the store's identity), under the same condition: both appear only where
+an entry needs attributing \(em a read of one store attributes nothing,
+because there is nothing to tell apart.
+.PP
+Both, rather than the path alone, because this is a PIPELINE format: a
+stage that drops or rewrites
+.B source
+records would otherwise leave entries keyed by a path, which is neither
+stable nor unique outside the response that produced it. An entry record
+should say where it came from without depending on another record
+surviving.
 .TP
 .B entry
 Announces the next record: its verbatim payload. Fields:
@@ -116,7 +138,9 @@ Last record of every complete stream. Fields:
 .B chunks_read
 /
 .B chunks_total
-(work done vs store size; present when known),
+(chunks actually READ, against the store's total \(em the two differ
+exactly when a bound stopped the read, which is when a consumer is
+counting; present when known),
 .B status
 \(em
 .B exhausted
@@ -124,12 +148,26 @@ when everything in the selection was read, or
 .B limited
 when a bound the CALLER set stopped it short, in which case
 .B limit
-names which one (today only
-.BR max.entries ).
+names WHICH one \(em
+.B max.entries
+or
+.BR max.chunks .
+It names the bound that actually fired; it once said
+.B max.entries
+whatever had.
 The two are not distinguishable from
 .B entries
 alone: a count reads as the whole answer either way, and a consumer that
 cannot tell will present a truncated result as a complete one.
+⚠ A bounded read never emits a PARTIAL entry. A chunk bound stops
+mid-entry by construction \(em an entry may span a boundary \(em and the
+entry being assembled when that happens is DROPPED rather than flushed:
+half a stack trace presented as whole is not missing data but data that
+never existed. A resume position names that entry's first byte, so the
+next read delivers it complete. At genuine end-of-data the pending entry
+is kept, because there it is merely unterminated: a log's last line need
+not end in a newline.
+.PP
 .B limited
 is reported only when more actually remained \(em an entry the sink
 dropped because the cap was already reached, or chunks left unread because

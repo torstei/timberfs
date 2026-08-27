@@ -224,9 +224,15 @@ The full command reference — every flag, `import`/`export`/`rotate`, retention
 forests, `.timber` bundles, and the records stream — is in the man pages:
 `man timberfs`, `man timber-filter`, `man timber-otlp`, and `man timberfs-records`.
 A search can also be handed over as a JSON document rather than assembled from
-flags (`timberfs query --query FILE`, and `--dump-json` to see the document any
-set of flags describes): `man timberfs-query-document`, with a JSON Schema at
-`/usr/share/doc/timberfs/query-document.schema.json`.
+flags — what a tool, a client library or a query server hands to timberfs.
+`timberfs query --query FILE` runs one and `--dump-json` prints the document any
+set of flags describes. It says what to search (stores by *label*, never by
+path), over what window, for what — `has`, `substring`, `regex`, caseless, and
+`none` for what must NOT appear — and in what form the answer comes, down to
+"just tell me which stores match". Worked examples ship at
+`/usr/share/doc/timberfs/query-examples/`, with a README naming what each one
+demonstrates; the contract is `man timberfs-query-document` plus a JSON Schema
+at `/usr/share/doc/timberfs/query-document.schema.json`.
 
 When a term wants a definition rather than a tour — chunk, entry, follower,
 forest, the two clocks — **[Concepts](docs/concepts.md)** indexes the

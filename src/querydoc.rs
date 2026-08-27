@@ -150,13 +150,13 @@ pub struct DocWindow {
     pub from_chunk: Option<u64>,
 }
 
-/// Entry predicates. Flat, mirroring the flags: `all` must all match and
-/// at least one of `any` must. A `none` list belongs here too and is
-/// absent for the same reason as `select`: `query` has no flag that
-/// produces one, and a member the contract names but the code drops is
-/// worse than one it does not name yet. Arbitrary boolean
-/// trees would be expressible in JSON but not in flags, and then the CLI
-/// could not reproduce a server's query — that waits for a version 2.
+/// The predicates, flat: every `all` must match, at least one `any` must,
+/// and no `none` may.
+///
+/// Flat rather than a boolean tree. An arbitrary tree is expressible in
+/// JSON but not in flags, and then `--dump-json` could not reproduce a
+/// server's query — that waits for a version 2. Three lists cover what a
+/// log search actually asks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -171,6 +171,12 @@ pub struct DocMatch {
     pub all: Vec<Predicate>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub any: Vec<Predicate>,
+    /// None of these may match. Only meaningful at ENTRY granularity: a
+    /// Bloom filter can say a term may be present, never that it is
+    /// absent, so a chunk sweep cannot narrow on one and asking for it
+    /// there is refused rather than silently ignored.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub none: Vec<Predicate>,
 }
 
 /// Whether a predicate names entries or chunks.
@@ -191,23 +197,86 @@ pub enum DocGranularity {
     Chunks,
 }
 
-/// One predicate. Exactly one matcher is set; the shape leaves room for
-/// `substring` and `regex` without changing it.
+/// One predicate. Exactly one matcher is set.
+///
+/// The contract says what the caller wants to ASK, not what timberfs can
+/// answer cheaply. `has` rides the token index; `substring` rides it on
+/// its interior whole words; `regex` cannot ride it at all — and none of
+/// that changes what any of them MEAN. The index decides how much gets
+/// read, never what matches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Predicate {
-    /// A word-anchored phrase, which is the form that can ride the token
-    /// index and so skip chunks.
-    pub has: String,
+    /// A word-anchored phrase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has: Option<String>,
+    /// A literal anywhere, even inside a longer word.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub substring: Option<String>,
+    /// A regular expression, as given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    /// Compare caselessly. Refused on `regex`, which says `(?i)` itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub caseless: bool,
 }
 
-/// A bound, which must say WHAT it counts: `entries` needs a full read
-/// and decompression where chunks and bytes are nearly free from the
-/// index, so a bare number would hide the cost. `entries` is the only
-/// unit this build counts, and is therefore required rather than
-/// optional-and-then-refused; when another arrives it becomes one of
-/// several, which relaxes the contract rather than breaking it.
+impl Predicate {
+    /// Exactly one matcher, or a refusal that says so. A predicate with
+    /// none matches everything and one with two is two questions.
+    fn compile(&self) -> anyhow::Result<crate::grep::Pred> {
+        use crate::grep::PredKind;
+        let set: Vec<(PredKind, &String)> = [
+            self.has.as_ref().map(|t| (PredKind::Has, t)),
+            self.substring.as_ref().map(|t| (PredKind::Substring, t)),
+            self.regex.as_ref().map(|t| (PredKind::Regex, t)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let (kind, text) = match set.len() {
+            1 => set[0],
+            0 => bail!(
+                "a predicate needs a matcher: `has` (a word-anchored phrase), \
+                 `substring` (a literal anywhere) or `regex`"
+            ),
+            _ => bail!(
+                "a predicate sets more than one matcher, which is more than one \
+                 question — give each its own entry in the list"
+            ),
+        };
+        if self.caseless && kind == PredKind::Regex {
+            bail!(
+                "`caseless` is refused on `regex` — a pattern says `(?i)` itself, and two \
+                 ways to say it could disagree"
+            );
+        }
+        Ok(crate::grep::Pred {
+            kind,
+            text: text.clone(),
+            caseless: self.caseless,
+        })
+    }
+
+    fn of(p: &crate::grep::Pred) -> Predicate {
+        use crate::grep::PredKind;
+        Predicate {
+            has: (p.kind == PredKind::Has).then(|| p.text.clone()),
+            substring: (p.kind == PredKind::Substring).then(|| p.text.clone()),
+            regex: (p.kind == PredKind::Regex).then(|| p.text.clone()),
+            caseless: p.caseless,
+        }
+    }
+}
+
+/// A bound, which must say WHAT it counts, because "stop after 10" of
+/// what decides both the answer and its cost. Exactly one of `entries`
+/// and `chunks`; neither, or both, is refused rather than guessed at.
+///
+/// ⚠ That is checked at conversion, not by the shape: both members must
+/// be optional for either to be given, so a JSON Schema validator cannot
+/// catch those two on its own.
 ///
 /// A `scope` (total versus per-store) belongs here and is absent until
 /// there is more than one to choose between — the difference matters, but
@@ -385,6 +454,26 @@ impl Document {
     /// store says where it is. A store with no identity cannot be named
     /// this way, and that is an error rather than a path smuggled back in.
     pub fn of(q: &Query) -> anyhow::Result<Document> {
+        // A following read is a PROCESS holding a stream open, not a
+        // search. The document describes a search, and one that never
+        // ends is a subscription — which is transport-shaped, so it
+        // belongs to whatever protocol serves the document rather than
+        // to the document.
+        //
+        // The document's equivalent is to page: read to
+        // `status=exhausted`, keep the cursor, ask again later and get
+        // what arrived since. Refused rather than dropped, because
+        // `--dump-json` claims to be the search these flags describe and
+        // silently losing one is how a caller ends up running a
+        // different query than it printed.
+        if q.follow.follow {
+            bail!(
+                "a following read cannot be written as a query document: `--follow` holds a \
+                 stream open, where a document describes one search. Ask repeatedly from \
+                 where the last answer stopped instead — or keep using `--follow`, which is \
+                 what it is for"
+            );
+        }
         let windowed = q.window.from.is_some() || q.window.to.is_some();
         Ok(Document {
             v: VERSION.to_string(),
@@ -416,18 +505,9 @@ impl Document {
                     crate::query::Granularity::Entries => DocGranularity::Entries,
                     crate::query::Granularity::Chunks => DocGranularity::Chunks,
                 },
-                all: q
-                    .matching
-                    .has
-                    .iter()
-                    .map(|h| Predicate { has: h.clone() })
-                    .collect(),
-                any: q
-                    .matching
-                    .any
-                    .iter()
-                    .map(|h| Predicate { has: h.clone() })
-                    .collect(),
+                all: q.matching.all.iter().map(Predicate::of).collect(),
+                any: q.matching.any.iter().map(Predicate::of).collect(),
+                none: q.matching.none.iter().map(Predicate::of).collect(),
             }),
             max: bound_of(q.limit.max, q.limit.max_chunks),
             tail: bound_of(q.limit.tail, q.limit.tail_chunks),
@@ -535,6 +615,35 @@ impl Document {
             b.one("tail")?;
         }
         if let Some(m) = &self.matching {
+            // A chunk sweep narrows with the token index and nothing else,
+            // so a predicate the index cannot prove would parse and do
+            // nothing there — the failure this format refuses everywhere.
+            if m.granularity == DocGranularity::Chunks {
+                if !m.none.is_empty() {
+                    bail!(
+                        "`none` cannot narrow a chunk sweep: the token index says a term MAY \
+                         be in a chunk, never that it is absent, so an exclusion there would \
+                         return the chunks it was meant to remove. Ask for \
+                         `granularity: \"entries\"`"
+                    );
+                }
+                for p in m.all.iter().chain(&m.any) {
+                    let c = p.compile()?;
+                    if c.caseless || c.kind == crate::grep::PredKind::Regex {
+                        bail!(
+                            "a chunk sweep narrows with the token index, which is exact-case \
+                             and holds whole words — {} cannot ride it and would narrow \
+                             nothing. Ask for `granularity: \"entries\"`, where it is judged \
+                             on the entry itself",
+                            if c.caseless {
+                                "a caseless predicate"
+                            } else {
+                                "`regex`"
+                            }
+                        );
+                    }
+                }
+            }
             if m.granularity == DocGranularity::Entries && fmt.kind == Kind::Chunks {
                 bail!(
                     "`response_format.kind: \"chunks\"` moves compressed chunks verbatim, so \
@@ -552,16 +661,9 @@ impl Document {
                 from_chunk: self.window.as_ref().and_then(|w| w.from_chunk),
             },
             matching: Match {
-                has: self
-                    .matching
-                    .as_ref()
-                    .map(|m| m.all.iter().map(|p| p.has.clone()).collect())
-                    .unwrap_or_default(),
-                any: self
-                    .matching
-                    .as_ref()
-                    .map(|m| m.any.iter().map(|p| p.has.clone()).collect())
-                    .unwrap_or_default(),
+                all: compile_all(self.matching.as_ref().map(|m| &m.all[..]))?,
+                any: compile_all(self.matching.as_ref().map(|m| &m.any[..]))?,
+                none: compile_all(self.matching.as_ref().map(|m| &m.none[..]))?,
                 granularity: match self.matching.as_ref().map(|m| m.granularity) {
                     Some(DocGranularity::Chunks) | None => crate::query::Granularity::Chunks,
                     Some(DocGranularity::Entries) => crate::query::Granularity::Entries,
@@ -612,6 +714,11 @@ fn bound_of(entries: Option<u64>, chunks: Option<u64>) -> Option<Bound> {
     }
 }
 
+/// Compile a list of document predicates, or nothing.
+fn compile_all(ps: Option<&[Predicate]>) -> anyhow::Result<Vec<crate::grep::Pred>> {
+    ps.unwrap_or(&[]).iter().map(|p| p.compile()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,8 +736,12 @@ mod tests {
                 from_chunk: None,
             },
             matching: Match {
-                has: vec!["ERROR".into()],
-                any: vec!["timeout".into(), "refused".into()],
+                all: vec![crate::grep::Pred::has("ERROR")],
+                any: vec![
+                    crate::grep::Pred::has("timeout"),
+                    crate::grep::Pred::has("refused"),
+                ],
+                none: Vec::new(),
                 granularity: crate::query::Granularity::Entries,
             },
             limit: Limit {
@@ -832,6 +943,143 @@ mod tests {
         assert!(doc("entries").is_ok());
         let e = doc("chunks").unwrap_err().to_string();
         assert!(e.contains("token index"), "{e}");
+    }
+
+    #[test]
+    fn a_predicate_says_what_a_caller_wants_not_what_the_index_can_do() {
+        // The contract carries `timber-filter`'s whole set, because the
+        // point of a search input is to express the search. Whether the
+        // index can help is an EXECUTION detail, and it decides how much
+        // gets read rather than what matches.
+        let doc = |m: &str| -> anyhow::Result<crate::query::Query> {
+            let d: Document = serde_json::from_str(&format!(
+                r#"{{"v":"1.0-EXPERIMENTAL","stores":{{}},
+                    "window":{{"axis":"logline"}},"match":{m}}}"#
+            ))
+            .unwrap();
+            d.to_query()
+        };
+        // Every matcher, in every list, at entry granularity.
+        for m in [
+            r#"{"granularity":"entries","all":[{"has":"ERROR"}]}"#,
+            r#"{"granularity":"entries","all":[{"substring":"req-8f"}]}"#,
+            r#"{"granularity":"entries","all":[{"regex":"^\\d+ ERROR"}]}"#,
+            r#"{"granularity":"entries","all":[{"has":"error","caseless":true}]}"#,
+            r#"{"granularity":"entries","none":[{"has":"healthcheck"}]}"#,
+            r#"{"granularity":"entries","any":[{"has":"a"},{"substring":"b"}]}"#,
+        ] {
+            assert!(doc(m).is_ok(), "{m}");
+        }
+
+        // Exactly one matcher: none matches everything, two is two
+        // questions.
+        assert!(doc(r#"{"granularity":"entries","all":[{}]}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("needs a matcher"));
+        assert!(
+            doc(r#"{"granularity":"entries","all":[{"has":"a","substring":"b"}]}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("more than one")
+        );
+        // A regex says `(?i)` itself; two ways to say it could disagree.
+        assert!(
+            doc(r#"{"granularity":"entries","all":[{"regex":"x","caseless":true}]}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("caseless")
+        );
+    }
+
+    #[test]
+    fn a_chunk_sweep_refuses_what_the_index_cannot_prove() {
+        // A chunk sweep narrows with the token index and nothing else, so
+        // a predicate the index cannot ride would parse and narrow
+        // nothing — accepted, it would read as a search that ran.
+        let doc = |m: &str| -> anyhow::Result<crate::query::Query> {
+            let d: Document = serde_json::from_str(&format!(
+                r#"{{"v":"1.0-EXPERIMENTAL","stores":{{}},
+                    "window":{{"axis":"logline"}},"match":{m}}}"#
+            ))
+            .unwrap();
+            d.to_query()
+        };
+        // An exclusion is the sharpest case: a Bloom filter can say a term
+        // MAY be in a chunk, never that it is absent, so honouring `none`
+        // there would return exactly the chunks it was meant to remove.
+        let e = doc(r#"{"granularity":"chunks","none":[{"has":"x"}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("never that it is absent"), "{e}");
+
+        for m in [
+            r#"{"granularity":"chunks","all":[{"regex":"x"}]}"#,
+            r#"{"granularity":"chunks","all":[{"has":"x","caseless":true}]}"#,
+        ] {
+            assert!(doc(m).is_err(), "{m}");
+        }
+        // What the index CAN prove is fine, including a substring, which
+        // rides it on its interior whole words.
+        assert!(doc(r#"{"granularity":"chunks","all":[{"has":"x"}]}"#).is_ok());
+        assert!(doc(r#"{"granularity":"chunks","all":[{"substring":"a req b"}]}"#).is_ok());
+    }
+
+    #[test]
+    fn the_pushdown_narrows_only_where_it_can_prove_something() {
+        use crate::grep::{Pred, PredKind, PredSpec};
+        let p = |k, t: &str, c| Pred {
+            kind: k,
+            text: t.to_string(),
+            caseless: c,
+        };
+        // A conjunction may be narrowed by ANY subset of itself, so each
+        // indexable term contributes and the rest is judged on the entry.
+        let spec = PredSpec {
+            all: vec![
+                p(PredKind::Has, "ERROR", false),
+                p(PredKind::Regex, "x+", false),
+                p(PredKind::Has, "nope", true),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(spec.pushdown().0, vec!["ERROR".to_string()]);
+
+        // A DISJUNCTION may not: one branch the index cannot prove could
+        // live in a chunk the others would let it skip, and skipping it
+        // would lose a real match.
+        let mixed = PredSpec {
+            any: vec![p(PredKind::Has, "a", false), p(PredKind::Has, "b", true)],
+            ..Default::default()
+        };
+        assert!(
+            mixed.pushdown().1.is_empty(),
+            "one caseless branch disables it"
+        );
+        let exact = PredSpec {
+            any: vec![p(PredKind::Has, "a", false), p(PredKind::Has, "b", false)],
+            ..Default::default()
+        };
+        assert_eq!(exact.pushdown().1, vec!["a".to_string(), "b".to_string()]);
+
+        // An exclusion never narrows, whatever it is.
+        let excl = PredSpec {
+            none: vec![p(PredKind::Has, "ERROR", false)],
+            ..Default::default()
+        };
+        assert_eq!(excl.pushdown(), (Vec::new(), Vec::new()));
+
+        // A substring rides on its INTERIOR whole words — its edges may
+        // sit inside longer words, but `req` here cannot.
+        let sub = PredSpec {
+            all: vec![p(PredKind::Substring, "id=req done", false)],
+            ..Default::default()
+        };
+        assert!(
+            sub.pushdown().0.contains(&"req".to_string()),
+            "{:?}",
+            sub.pushdown()
+        );
     }
 
     #[test]
