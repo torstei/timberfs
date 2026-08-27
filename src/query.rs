@@ -836,10 +836,23 @@ fn query_entries(
         write!(out, "\x1fsources={}", files.len())?;
         out.write_all(b"\0")?;
         for (f, s) in files.iter().zip(&srcs) {
+            write!(out, "\x1esource\x1fpath={}", f.display())?;
+            // The store's IDENTITY, which is what the request selected on
+            // and what a position is recorded against. A path names a
+            // store only within one response; everything durable — a
+            // follower's declaration, a cursor, `list --json` — uses this.
+            if let Some(id) = s
+                .handle
+                .bark
+                .as_ref()
+                .and_then(|b| b.get("id"))
+                .and_then(|v| v.as_str())
+            {
+                write!(out, "\x1fid={id}")?;
+            }
             write!(
                 out,
-                "\x1esource\x1fpath={}\x1fkept={}\x1ftotal={}",
-                f.display(),
+                "\x1fkept={}\x1ftotal={}",
                 s.chunks.len(),
                 s.total_chunks
             )?;

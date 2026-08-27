@@ -410,6 +410,39 @@ one schema per version, and this path will name the current one \(em so
 treat it as a moving target and read
 .B v
 from it rather than assuming which version you have.
+.SH EXAMPLES OF THE FORMAT
+Worked examples ship at
+.IR /usr/share/doc/timberfs/query\-examples/ ,
+with a
+.I README.md
+naming what each one demonstrates, and in the repository as
+.IR docs/examples/ .
+The schema says what is LEGAL; those say what is USEFUL. Run one with:
+.PP
+.nf
+.RS
+timberfs query \-\-query /usr/share/doc/timberfs/query\-examples/query\-windowed\-error.json
+.RE
+.fi
+.SH NOT EXPRESSIBLE HERE
+.B A live tail.
+.B timberfs query \-\-follow
+holds a stream open, where a document describes ONE search \(em and a
+search that never ends is a subscription, which is shaped by whatever
+protocol serves the document rather than by the document.
+.B \-\-dump\-json
+therefore REFUSES
+.B \-\-follow
+rather than quietly dropping it, which is how a caller ends up running a
+different query than the one it printed.
+.PP
+Use
+.B \-\-follow
+on the machine that holds the store. A document's equivalent is to ask
+again from where the last answer stopped \(em which is paging, and paging
+is not built yet (see
+.B ⚠ There is no paging yet
+above).
 .SH SEE ALSO
 .BR timberfs (1),
 .BR timberfs\-records (5)

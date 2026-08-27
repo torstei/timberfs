@@ -2169,6 +2169,70 @@ JSON
     rm -rf "$d" /tmp/vmbound.json
 }
 
+the_query_examples_ship_and_run() {
+    # A format nobody can see worked examples of is one nobody uses. The
+    # schema says what is legal; these say what is useful — so they are
+    # installed, indexed, and every one of them actually runs.
+    local dir=/usr/share/doc/timberfs/query-examples
+    [ -f "$dir/README.md" ] || { echo "no README in $dir" >&2; ls -la "$dir" >&2; return 1; }
+    local n
+    n=$(ls "$dir"/*.json 2>/dev/null | wc -l)
+    [ "$n" -ge 7 ] || { echo "only $n examples shipped" >&2; return 1; }
+
+    # The README must name every one of them, or a new example is
+    # invisible in exactly the place it was added to be visible.
+    local f base
+    for f in "$dir"/*.json; do
+        base=$(basename "$f")
+        grep -q "$base" "$dir/README.md" \
+            || { echo "$base is not in the README" >&2; return 1; }
+    done
+
+    # Every example is a document this build accepts. They name stores
+    # that need not exist here, so a "no store matched" answer is a pass;
+    # a PARSE or coherence refusal is not.
+    local d=/var/log/timberfs/vmex
+    rm -rf "$d"
+    timberfs create --set type=app --set host=web01 "$d/vmex.log" >/dev/null 2>&1 || return 1
+    printf '2026-08-26T12:00:00Z ERROR vmex req-8f3a\n' \
+        | timberfs append --into "$d/vmex.log" --quiet 2>/dev/null || return 1
+    for f in "$dir"/*.json; do
+        timberfs query --query "$f" >/dev/null 2>/tmp/vmex.err || {
+            echo "$(basename "$f") does not run:" >&2; cat /tmp/vmex.err >&2; return 1; }
+    done
+
+    # Enumerating is the store predicate with nothing in it, and it must
+    # find the store we just made — that is the request a client opens with.
+    timberfs query --query "$dir/query-enumerate-stores.json" 2>/dev/null \
+        | jq -e '[.[] | select(.name == "vmex")] | length == 1' >/dev/null \
+        || { echo "enumerate did not find vmex" >&2; return 1; }
+
+    # A response names its stores by IDENTITY, not only by path: that is
+    # the join key between what a request asked for and what came back.
+    cat > /tmp/vmex.json <<'JSON'
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"name","op":"=","value":"vmex"}]},
+  "window":{"axis":"logline"},"match":{"granularity":"entries","all":[{"has":"vmex"}]},
+  "response_format":{"kind":"records"} }
+JSON
+    local id
+    id=$(timberfs info --json "$d/vmex.log" 2>/dev/null | jq -r .id)
+    timberfs query --query /tmp/vmex.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^source' | grep -q "id=$id" \
+        || { timberfs query --query /tmp/vmex.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+                | grep '^source' >&2; return 1; }
+
+    # A following read is a process holding a stream open, not a search.
+    # REFUSED rather than silently dropped, which is how a caller ends up
+    # running a different query than the one it printed.
+    timberfs query vmex --follow --dump-json >/dev/null 2>/tmp/vmex.err && return 1
+    grep -q 'following read' /tmp/vmex.err || { cat /tmp/vmex.err >&2; return 1; }
+    # ...while a non-following dump still round-trips.
+    timberfs query vmex --has vmex --dump-json 2>/dev/null > /tmp/vmex-rt.json || return 1
+    timberfs query --query /tmp/vmex-rt.json >/dev/null 2>&1 || return 1
+
+    rm -rf "$d" /tmp/vmex.json /tmp/vmex-rt.json /tmp/vmex.err
+}
+
 identity_reports_and_repairs_the_three_broken_states() {
     # An id is a fact, not a setting, so `set` will not touch it. But it
     # can be broken in three ways, each with an obvious intended fix, and
@@ -2513,6 +2577,7 @@ run_test "selection: list --select matches on labels, not on the name" selection
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
 run_test "query document: match and bounds name their granularity" a_match_selects_what_it_says_it_selects
 run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
+run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
 run_test "forest: an intake writes into a forest by name; --into-dir warns" an_intake_writes_into_a_forest_by_name
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares

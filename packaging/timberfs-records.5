@@ -70,6 +70,10 @@ full lineage of what it consumed.
 One per input, in argument order, before any entries. Fields:
 .B path
 (the source as given),
+.B id
+(the store's IDENTITY \(em what a request selects on and what a position
+is recorded against; absent for a store with no manifest, and for a
+stream that did not come from a store),
 .B kept
 /
 .B total
@@ -77,6 +81,16 @@ One per input, in argument order, before any entries. Fields:
 a consumer can warn \(lqthis will be slow\(rq before reading further).
 Fields are present when known; a stream that did not originate in a
 store has no chunk statistics.
+.PP
+An
+.B entry
+carries
+.B src
+(a path) rather than an id, because a path is unique WITHIN one response
+and a uuid on every entry is not worth its bytes. Join an entry to its
+store through the
+.B source
+records, which carry both.
 .TP
 .B entry
 Announces the next record: its verbatim payload. Fields:

@@ -454,6 +454,26 @@ impl Document {
     /// store says where it is. A store with no identity cannot be named
     /// this way, and that is an error rather than a path smuggled back in.
     pub fn of(q: &Query) -> anyhow::Result<Document> {
+        // A following read is a PROCESS holding a stream open, not a
+        // search. The document describes a search, and one that never
+        // ends is a subscription — which is transport-shaped, so it
+        // belongs to whatever protocol serves the document rather than
+        // to the document.
+        //
+        // The document's equivalent is to page: read to
+        // `status=exhausted`, keep the cursor, ask again later and get
+        // what arrived since. Refused rather than dropped, because
+        // `--dump-json` claims to be the search these flags describe and
+        // silently losing one is how a caller ends up running a
+        // different query than it printed.
+        if q.follow.follow {
+            bail!(
+                "a following read cannot be written as a query document: `--follow` holds a \
+                 stream open, where a document describes one search. Ask repeatedly from \
+                 where the last answer stopped instead — or keep using `--follow`, which is \
+                 what it is for"
+            );
+        }
         let windowed = q.window.from.is_some() || q.window.to.is_some();
         Ok(Document {
             v: VERSION.to_string(),
