@@ -246,8 +246,13 @@ Neither unit nor both is refused rather than guessed at. A
 unit belongs here and is absent until something produces one; a
 .B scope
 (total versus per\-store) likewise. Counts are totals across stores, so a
-fleet view capped at 5 chunks reads five in time order, not five per
-store.
+fleet view capped at 5 chunks reads five, not five per store \(em and
+because stores are read one after another, those five come from the
+first store(s) reached. The
+.B position
+records say which, and the
+.B cursor
+resumes there.
 .RE
 .TP
 .B cursor

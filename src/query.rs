@@ -723,6 +723,8 @@ fn query_entries(
         /// move — `remove_head` rebases the one and grows the other by
         /// exactly as much.
         dropped_bytes: u64,
+        /// Its sink was already closed, on reaching the end of its chunks.
+        finished: bool,
     }
     let multi = files.len() > 1 && !no_filename;
     // --max: a total entry cap shared by every source's sink.
@@ -829,6 +831,7 @@ fn query_entries(
             // the file as it stands.
             dropped_bytes: dropped,
             resume_at,
+            finished: false,
         });
     }
 
@@ -868,6 +871,10 @@ fn query_entries(
                 }
             )?;
         }
+        // Entries of one store come in that store's order; between stores
+        // there is none. Said rather than implied: a consumer that reads a
+        // multi-store answer as a timeline gets a wrong one in silence.
+        write!(out, "\x1forder=sequential")?;
         write!(out, "\x1fsources={}", files.len())?;
         out.write_all(b"\0")?;
         for (f, s) in files.iter().zip(&srcs) {
@@ -894,25 +901,19 @@ fn query_entries(
             out.write_all(b"\0")?;
         }
     }
-    // K-way interleave by chunk write windows across files (within-file
-    // order preserved), same as the raw fleet view.
+    // Sources in turn, each drained before the next. Order is claimed
+    // WITHIN a store, never between: an interleave could only key on
+    // arrival time, and that order does not survive the next page, which
+    // resolves the store predicate again and may add a store carrying
+    // older entries. `query_multi` interleaves for the human fleet view,
+    // which has no next page.
     let mut chunks_out = 0u64;
     // WHICH bound stopped the read. A consumer needs the name, not just
     // the fact: "your entry cap" and "your chunk cap" are different
     // things to raise, and the answer used to say `max.entries` whatever
     // had actually fired.
     let mut stopped_by: Option<&'static str> = None;
-    loop {
-        let mut best: Option<usize> = None;
-        for (i, s) in srcs.iter().enumerate() {
-            if s.pos < s.chunks.len() {
-                let key = s.chunks[s.pos].1.first_write_ms;
-                if best.is_none_or(|b: usize| key < srcs[b].chunks[srcs[b].pos].1.first_write_ms) {
-                    best = Some(i);
-                }
-            }
-        }
-        let Some(i) = best else { break };
+    while let Some(i) = (0..srcs.len()).find(|&i| srcs[i].pos < srcs[i].chunks.len()) {
         let s = &mut srcs[i];
         let c = s.chunks[s.pos].1;
         s.pos += 1;
@@ -955,6 +956,16 @@ fn query_entries(
             stopped_by = Some("max.chunks");
             break;
         }
+        // Read to its end: release the entry this store was holding open
+        // NOW, before the next store's first. A sink keeps the last entry
+        // pending until a following stamped line closes it, so leaving it
+        // to the accounting pass puts every store's last entry after every
+        // other store's body — the answer interleaved after all.
+        let s = &mut srcs[i];
+        if s.pos == s.chunks.len() {
+            s.sink.finish(&mut out)?;
+            s.finished = true;
+        }
     }
     let (mut emitted, mut dropped) = (0u64, 0u64);
     let (mut read, mut total) = (0usize, 0usize);
@@ -975,10 +986,12 @@ fn query_entries(
         //
         // Only where chunks remain: a pending entry at genuine
         // end-of-data is merely unterminated, and must still be emitted.
-        if s.pos < s.chunks.len() {
-            s.sink.discard_pending();
+        if !s.finished {
+            if s.pos < s.chunks.len() {
+                s.sink.discard_pending();
+            }
+            s.sink.finish(&mut out)?;
         }
-        s.sink.finish(&mut out)?;
         emitted += s.sink.emitted;
         dropped += s.sink.filtered_out;
         // An entry the sink DROPPED because the count was already there.
@@ -1302,8 +1315,13 @@ fn query_follow(
         }
         write!(
             out,
-            "\x1ffollow={}\x1fsources={}",
+            // A follow polls each source in turn and emits what it has, so
+            // entries come in the order they reached the reader. A bounded
+            // --tail has no such loop: each source's tail goes out whole,
+            // before the next.
+            "\x1ffollow={}\x1forder={}\x1fsources={}",
             u8::from(follow),
+            if follow { "arrival" } else { "sequential" },
             files.len()
         )?;
         out.write_all(b"\0")?;

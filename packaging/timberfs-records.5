@@ -60,6 +60,10 @@ unbounded),
 (repeated; chunk-level OR alternatives of the selection),
 .B sources
 (number of inputs),
+.B order
+(how entries from different stores are arranged \(em see
+.B ORDERING
+below),
 .B stage
 (repeated; each pipeline stage that transformed the stream appends its
 own command line \(em provenance accumulates across the pipe). The
@@ -209,6 +213,44 @@ a consumer that reaches end-of-input without seeing
 .B stream-end
 must treat the stream as truncated (the producer died, or the pipe
 broke) and must not present the result as complete.
+.SH ORDERING
+Entries of ONE store always arrive in that store's own order. Between
+stores, what is claimed depends on the read, and
+.B stream-start
+names it in
+.BR order .
+.TP
+.B order=sequential
+A bounded read: each store is drained before the next begins. There is
+no order between stores, and none is implied \(em a store's entries are
+contiguous, and the store boundaries fall where they fall.
+.TP
+.B order=arrival
+A followed read
+.RB ( \-\-follow ):
+each store is polled in turn and whatever it has is emitted, so entries
+appear in the order they reached the reader.
+.PP
+Neither is a timeline. A timeline needs entries sorted by the stamp they
+CARRY, and no store is stored in that order \(em a buffered producer, a
+late arrival or an imported file puts an entry on disk long after the
+moment it describes. Sorting a stream by a key it is not already sorted
+on means holding all of it first, so a producer that streams cannot also
+sort: order by
+.B ts
+in the consumer, over a page it has whole.
+.PP
+Which is why a bounded read does not interleave. It could only key on
+arrival, and over stores spanning years the two clocks have had that long
+to diverge \(em a precise-looking sequence that is not the timeline it
+resembles. A followed read has the opposite luck: everything is arriving
+now, so
+.B order=arrival
+lands within a poll interval of the timeline without claiming to.
+.PP
+The ordering a bounded read gives holds for THAT answer only. A later
+page resolves the store predicate again, and a store that has appeared
+since carries entries older than the ones already delivered.
 .SH VERSIONING
 The stream is versioned by the
 .B v

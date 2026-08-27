@@ -797,6 +797,18 @@ prefix
 to suppress). Attribution lives in the filename \(em store one log per
 host/app and merge at read time.
 .PP
+That interleave is the TEXT view's, where it makes many logs readable as
+one. The framed modes
+.RB ( \-\-records ,
+.BR \-0 ,
+.BR \-\-show\-write\-time )
+read each store in turn and claim no order between stores, because an
+interleave could only key on arrival and a caller paging through the
+answer cannot rely on that;
+.B stream\-start
+says which applies. See
+.BR timberfs\-records (5).
+.PP
 Selection is
 .B chunk-granular
 by design: every chunk whose write-time window overlaps the requested

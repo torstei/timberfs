@@ -2187,6 +2187,52 @@ JSON
     rm -rf "$d" /tmp/vmbound.json
 }
 
+a_framed_answer_reads_stores_one_after_another() {
+    # A bounded framed answer claims order WITHIN a store and none between,
+    # so each store's entries must come back contiguous. Built so the two
+    # rules disagree: the appends alternate, so the stores' chunks alternate
+    # in write time and a read that interleaved them would emit a b a b.
+    local a=/var/log/timberfs/vmseq-a b=/var/log/timberfs/vmseq-b
+    rm -rf "$a" "$b"
+    timberfs create --set service=vmseq "$a/vmseq-a.log" >/dev/null 2>&1 || return 1
+    timberfs create --set service=vmseq "$b/vmseq-b.log" >/dev/null 2>&1 || return 1
+    # Each append seals a chunk at EOF, so alternating the appends puts the
+    # two stores' write windows in a-b-a-b order deterministically.
+    printf '2026-08-28T10:00:00Z vmseq a1\n' \
+        | timberfs append --into "$a/vmseq-a.log" --quiet 2>/dev/null || return 1
+    printf '2026-08-28T10:00:01Z vmseq b1\n' \
+        | timberfs append --into "$b/vmseq-b.log" --quiet 2>/dev/null || return 1
+    printf '2026-08-28T10:00:02Z vmseq a2\n' \
+        | timberfs append --into "$a/vmseq-a.log" --quiet 2>/dev/null || return 1
+    printf '2026-08-28T10:00:03Z vmseq b2\n' \
+        | timberfs append --into "$b/vmseq-b.log" --quiet 2>/dev/null || return 1
+
+    cat > /tmp/vmseq.json <<'JSON'
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"service","op":"=","value":"vmseq"}]},
+  "window":{"axis":"logline"},"response_format":{"kind":"records"} }
+JSON
+    local out runs n
+    out=$(timberfs query --query /tmp/vmseq.json 2>/dev/null | tr '\0' '\n')
+    n=$(echo "$out" | grep -c 'vmseq [ab][12]')
+    [ "$n" = 4 ] || { echo "want 4 entries, got $n" >&2; return 1; }
+    # Collapsing adjacent duplicates leaves one run per store when the
+    # stores are contiguous, and four when they are interleaved.
+    runs=$(echo "$out" | grep -o 'vmseq [ab]' | awk '{print $2}' | uniq | tr -d '\n')
+    [ "${#runs}" = 2 ] || { echo "stores interleaved: $runs" >&2; return 1; }
+    # ...and the answer SAYS so, rather than leaving a consumer to infer it.
+    timberfs query --query /tmp/vmseq.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-start' \
+        | grep -q 'order=sequential' || { echo "stream-start omitted order" >&2; return 1; }
+
+    # The TEXT fleet view still interleaves: it makes many logs readable as
+    # one, and has no next page to contradict.
+    runs=$(timberfs query "$a/vmseq-a.log" "$b/vmseq-b.log" 2>/dev/null \
+        | grep -o 'vmseq [ab]' | awk '{print $2}' | uniq | tr -d '\n')
+    [ "${#runs}" = 4 ] || { echo "text view stopped interleaving: $runs" >&2; return 1; }
+
+    rm -rf "$a" "$b" /tmp/vmseq.json
+}
+
 paging_walks_a_result_set_a_page_at_a_time() {
     # Every entry once, in order, on a store whose entries ALL share a
     # timestamp — the case that makes paging by clock lose everything
@@ -2683,6 +2729,7 @@ run_test "selection: list --select matches on labels, not on the name" selection
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
 run_test "query document: match and bounds name their granularity" a_match_selects_what_it_says_it_selects
 run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
+run_test "framed answers read stores one after another; text still interleaves" a_framed_answer_reads_stores_one_after_another
 run_test "paging: a cursor walks every entry once, even at one timestamp" paging_walks_a_result_set_a_page_at_a_time
 run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing

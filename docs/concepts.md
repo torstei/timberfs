@@ -62,9 +62,12 @@ trace in the index and only a recording binary can have counted them.
 stack trace included, not one line.
 → `timber-filter(1)`, `timberfs-records(5)`
 
-**fleet view** — one query across many stores, interleaved by timestamp at
-*read* time, each line prefixed with the store it came from. A read-time merge
-of files this machine can reach, deliberately not a cluster.
+**fleet view** — one query across many stores, each line prefixed with the
+store it came from. A read-time view of files this machine can reach,
+deliberately not a cluster. Plain text interleaves the stores by their chunks'
+write windows, for a readable single stream; the framed answer reads them one
+after another and claims no order between them (`timberfs-records(5)`,
+ORDERING).
 → [README](../README.md#beyond-the-getting-started-path)
 
 **`--flush-age`** — how long buffered data waits before it becomes a chunk
