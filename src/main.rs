@@ -1282,9 +1282,14 @@ fn main() -> anyhow::Result<()> {
                 // `--has` selects chunks via the token index. Entry
                 // granularity is the document's, and `timber-filter` is
                 // its command-line equivalent.
+                // The flags are the chunk sweep, and have always been:
+                // `--has` selects chunks via the token index. The richer
+                // predicates (substring, regex, caseless, negated) are the
+                // document's, and `timber-filter` is their command line.
                 matching: query::Match {
-                    has,
-                    any,
+                    all: has.iter().map(|t| timberfs::grep::Pred::has(t)).collect(),
+                    any: any.iter().map(|t| timberfs::grep::Pred::has(t)).collect(),
+                    none: Vec::new(),
                     granularity: query::Granularity::Chunks,
                 },
                 // --max/--tail count entries; the flags have no chunk

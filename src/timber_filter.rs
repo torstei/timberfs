@@ -26,10 +26,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
 use clap::Parser;
-use regex::bytes::{Regex, RegexBuilder};
 
 use timberfs::forest;
-use timberfs::grep::{interior_tokens, names_timberfs_source, word_pattern, Entries};
+use timberfs::grep::{names_timberfs_source, Entries, Preds};
 use timberfs::import::Extractor;
 use timberfs::note;
 
@@ -187,59 +186,52 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     // not an error — a filter with an empty program is cat (grep '',
     // sed '', awk 1), here entry-aware, which also makes predicate-less
     // timber-filter the records-to-text converter.
-    let mut select: Vec<Regex> = Vec::new();
+    use timberfs::grep::{Pred, PredKind, PredSpec};
+    let p = |kind, t: &String, caseless| Pred {
+        kind,
+        text: t.clone(),
+        caseless,
+    };
+    let mut spec = PredSpec::default();
     for t in &has {
-        select.push(word_rx(t, false)?);
+        spec.all.push(p(PredKind::Has, t, false));
     }
     for t in &cli.has_caseless {
-        select.push(word_rx(t, true)?);
+        spec.all.push(p(PredKind::Has, t, true));
     }
     for t in &cli.substring {
-        select.push(sub_rx(t, false)?);
+        spec.all.push(p(PredKind::Substring, t, false));
     }
     for t in &cli.substring_caseless {
-        select.push(sub_rx(t, true)?);
+        spec.all.push(p(PredKind::Substring, t, true));
     }
-    for p in &cli.regex {
-        select.push(user_rx(p, "--regex")?);
+    for t in &cli.regex {
+        spec.all.push(p(PredKind::Regex, t, false));
     }
-    let any: Option<Regex> = if cli.any.is_empty() && cli.any_caseless.is_empty() {
-        None
-    } else {
-        let mut branches: Vec<String> = cli.any.iter().map(|w| word_pattern(w)).collect();
-        branches.extend(
-            cli.any_caseless
-                .iter()
-                .map(|w| format!("(?i:{})", word_pattern(w))),
-        );
-        Some(
-            RegexBuilder::new(&branches.join("|"))
-                .multi_line(true)
-                .build()
-                .with_context(|| "bad --any".to_string())?,
-        )
-    };
-    let mut exclude: Vec<Regex> = Vec::new();
+    for t in &cli.any {
+        spec.any.push(p(PredKind::Has, t, false));
+    }
+    for t in &cli.any_caseless {
+        spec.any.push(p(PredKind::Has, t, true));
+    }
     for t in &cli.not_has {
-        exclude.push(word_rx(t, false)?);
+        spec.none.push(p(PredKind::Has, t, false));
     }
     for t in &cli.not_has_caseless {
-        exclude.push(word_rx(t, true)?);
+        spec.none.push(p(PredKind::Has, t, true));
     }
     for t in &cli.not_substring {
-        exclude.push(sub_rx(t, false)?);
+        spec.none.push(p(PredKind::Substring, t, false));
     }
     for t in &cli.not_substring_caseless {
-        exclude.push(sub_rx(t, true)?);
+        spec.none.push(p(PredKind::Substring, t, true));
     }
-    for p in &cli.not_regex {
-        exclude.push(user_rx(p, "--not-regex")?);
+    for t in &cli.not_regex {
+        spec.none.push(p(PredKind::Regex, t, false));
     }
-    let preds = Preds {
-        select,
-        any,
-        exclude,
-    };
+    // ONE implementation, shared with the query document — two would
+    // answer differently the first time either was changed.
+    let preds = Preds::compile(spec.clone())?;
 
     // Classify inputs: stores go through the selection layer, raw
     // files are read as they are. Mixing the two in one invocation
@@ -262,36 +254,33 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    // The exact pushdown — uniform by SHAPE, not by rule: exact-case
-    // positives ride the index (--has whole, every --substring on its
-    // interior words, a single --any whole); caseless can't (the index
-    // is exact-case) and excludes can't (a Bloom cannot prove absence).
-    let mut pushdown: Vec<String> = Vec::new();
-    if !stores.is_empty() {
-        for t in &cli.substring {
-            let toks = interior_tokens(t);
-            if !toks.is_empty() {
-                note!(
-                    "timber-filter: --substring {t:?} rides the token index on its \
-                     interior words ({})",
-                    toks.join(", ")
-                );
-                pushdown.extend(toks);
-            }
-        }
+    // What the index can prove, from the SAME rules the query document
+    // uses — exact-case positives ride it (`--has` whole, a `--substring`
+    // on its interior words, `--any` only when every branch is exact),
+    // caseless cannot (the index is exact-case) and exclusions cannot (a
+    // Bloom filter cannot prove absence).
+    let (mut pushdown, mut any_pushdown) = if stores.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        spec.pushdown()
+    };
+    // `has` is already passed to the selection layer on its own, so the
+    // pushdown here carries only what the flags did not spell out.
+    pushdown.retain(|t| !has.contains(t));
+    if !pushdown.is_empty() {
+        note!(
+            "timber-filter: a --substring rides the token index on its interior words ({})",
+            pushdown.join(", ")
+        );
     }
-    // --any alternatives push down as query --any (the union of exact
-    // branches is exact) — but only when ALL alternatives are exact:
-    // one caseless branch could live in a chunk the index would skip.
-    let mut any_pushdown: Vec<String> = Vec::new();
-    if !stores.is_empty() && !cli.any.is_empty() && cli.any_caseless.is_empty() {
+    if !any_pushdown.is_empty() {
         note!(
             "timber-filter: --any alternative{} ride{} the token index (union of exact branches)",
-            if cli.any.len() == 1 { "" } else { "s" },
-            if cli.any.len() == 1 { "s" } else { "" }
+            if any_pushdown.len() == 1 { "" } else { "s" },
+            if any_pushdown.len() == 1 { "s" } else { "" }
         );
-        any_pushdown = cli.any.clone();
     }
+    any_pushdown.dedup();
 
     let mut sink = Sink {
         count: cli.count,
@@ -551,46 +540,6 @@ impl<W: Write> Sink<W> {
     }
 }
 
-/// The predicate sets an entry is judged against. All Selects must
-/// hold, at least one alternative (when any were given), no Exclude.
-struct Preds {
-    select: Vec<Regex>,
-    any: Option<Regex>,
-    exclude: Vec<Regex>,
-}
-
-fn keep(preds: &Preds, entry: &[u8]) -> bool {
-    preds.select.iter().all(|r| r.is_match(entry))
-        && preds.any.as_ref().is_none_or(|r| r.is_match(entry))
-        && !preds.exclude.iter().any(|r| r.is_match(entry))
-}
-
-/// Word-anchored literal (the token index's own semantics).
-fn word_rx(t: &str, caseless: bool) -> anyhow::Result<Regex> {
-    RegexBuilder::new(&word_pattern(t))
-        .case_insensitive(caseless)
-        .multi_line(true)
-        .build()
-        .with_context(|| format!("bad phrase {t:?}"))
-}
-
-/// Literal anywhere, even inside longer words.
-fn sub_rx(t: &str, caseless: bool) -> anyhow::Result<Regex> {
-    RegexBuilder::new(&regex::escape(t))
-        .case_insensitive(caseless)
-        .multi_line(true)
-        .build()
-        .with_context(|| format!("bad literal {t:?}"))
-}
-
-/// A user regex, as given.
-fn user_rx(p: &str, flag: &str) -> anyhow::Result<Regex> {
-    RegexBuilder::new(p)
-        .multi_line(true)
-        .build()
-        .with_context(|| format!("bad {flag} pattern {p:?}"))
-}
-
 fn grep_raw<R: BufRead, W: Write>(
     reader: R,
     extractor: Extractor,
@@ -605,7 +554,7 @@ fn grep_raw<R: BufRead, W: Write>(
         warned_cap: false,
     };
     while let Some(entry) = entries.next_entry()? {
-        if keep(preds, &entry) {
+        if preds.keep(&entry) {
             let ts = if sink.records {
                 let head = String::from_utf8_lossy(&entry[..entry.len().min(256)]);
                 entries.extractor.extract(&head)
@@ -696,7 +645,7 @@ fn grep_records<R: BufRead, W: Write>(
                 if nul[0] != 0 {
                     bail!("record stream framing error: payload not NUL-terminated");
                 }
-                if keep(preds, &payload) {
+                if preds.keep(&payload) {
                     let src = kv(b"src");
                     sink.emit_meta(
                         &payload,

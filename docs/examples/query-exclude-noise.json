@@ -1,0 +1,38 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "stores": {
+    "select": [
+      {
+        "key": "type",
+        "op": "=",
+        "value": "app"
+      }
+    ]
+  },
+  "window": {
+    "axis": "logline",
+    "from": 1787727600000
+  },
+  "match": {
+    "granularity": "entries",
+    "all": [
+      {
+        "has": "ERROR"
+      }
+    ],
+    "none": [
+      {
+        "substring": "healthcheck"
+      },
+      {
+        "regex": "connection reset by peer\\s*$"
+      }
+    ]
+  },
+  "max": {
+    "entries": 100
+  },
+  "response_format": {
+    "kind": "records"
+  }
+}

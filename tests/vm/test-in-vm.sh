@@ -2055,6 +2055,50 @@ JSON
     doc '"max":{"entries":3,"chunks":2},' logline loglines
     timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
 
+    # The predicate set is what a CALLER wants to ask, not what the index
+    # can do cheaply: substring, regex, caseless and exclusion all work at
+    # entry granularity, and each is judged on the whole entry.
+    doc '"match":{"granularity":"entries","none":[{"has":"vmgranneedle"}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 200 ] || { echo "none gave $n lines, want 200" >&2; return 1; }
+    doc '"match":{"granularity":"entries","all":[{"substring":"granneedl"}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 1 ] || { echo "substring gave $n lines, want 1" >&2; return 1; }
+    doc '"match":{"granularity":"entries","all":[{"regex":"vmgran[a-z]+ here$"}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 1 ] || { echo "regex gave $n lines, want 1" >&2; return 1; }
+    doc '"match":{"granularity":"entries","all":[{"has":"VMGRANNEEDLE","caseless":true}]},' logline loglines
+    n=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    [ "$n" = 1 ] || { echo "caseless gave $n lines, want 1" >&2; return 1; }
+
+    # A chunk sweep narrows with the index and nothing else, so what it
+    # cannot prove is REFUSED rather than accepted and ignored.
+    for m in '"none":[{"has":"x"}]' '"all":[{"regex":"x"}]' \
+             '"all":[{"has":"x","caseless":true}]'; do
+        doc "\"match\":{\"granularity\":\"chunks\",$m}," logline loglines
+        timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && {
+            echo "chunk sweep accepted $m" >&2; return 1; }
+    done
+    # ...and a substring IS allowed there: it rides the index on its
+    # interior whole words.
+    doc '"match":{"granularity":"chunks","all":[{"substring":"a vmgranneedle b"}]},' logline loglines
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 || return 1
+
+    # Exactly one matcher per predicate.
+    doc '"match":{"granularity":"entries","all":[{}]},' logline loglines
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
+    doc '"match":{"granularity":"entries","all":[{"has":"a","regex":"b"}]},' logline loglines
+    timberfs query --query /tmp/vmgran.json >/dev/null 2>&1 && return 1
+
+    # timber-filter and the document are ONE implementation, so the same
+    # predicate must give the same count through either surface.
+    doc '"match":{"granularity":"entries","all":[{"substring":"granneedl"}],"none":[{"has":"INFO"}]},' logline loglines
+    local viadoc viafilter
+    viadoc=$(timberfs query --query /tmp/vmgran.json 2>/dev/null | wc -l)
+    viafilter=$(timber-filter --substring granneedl --not-has INFO -c "$d/vmgran.log" 2>/dev/null)
+    [ "$viadoc" = "$viafilter" ] \
+        || { echo "document says $viadoc, timber-filter says $viafilter" >&2; return 1; }
+
     rm -rf "$d" /tmp/vmgran.*
 }
 

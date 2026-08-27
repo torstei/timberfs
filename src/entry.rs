@@ -52,7 +52,7 @@ pub struct EntrySink {
     /// Predicates every emitted entry must satisfy. None = the search is
     /// chunk-granular, so whatever the index let through is emitted
     /// whole.
-    preds: Option<crate::grep::EntryPreds>,
+    preds: Option<crate::grep::Preds>,
     framing: Framing,
     /// Optional total-entries cap (--max), shared across sibling sinks.
     limit: Option<EntryLimit>,
@@ -115,7 +115,7 @@ impl EntrySink {
 
     /// Judge every emitted entry against these predicates, on top of the
     /// window. Absent, the search stays chunk-granular.
-    pub fn with_preds(mut self, preds: Option<crate::grep::EntryPreds>) -> EntrySink {
+    pub fn with_preds(mut self, preds: Option<crate::grep::Preds>) -> EntrySink {
         self.preds = preds;
         self
     }

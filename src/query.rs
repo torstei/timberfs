@@ -457,8 +457,14 @@ pub struct Window {
 /// vocabulary is `timber-filter`'s.
 #[derive(Debug, Default, Clone)]
 pub struct Match {
-    pub has: Vec<String>,
-    pub any: Vec<String>,
+    /// Every predicate here must match. The CLI's `--has` lands here.
+    pub all: Vec<crate::grep::Pred>,
+    /// At least one of these must, when any are given. The CLI's `--any`.
+    pub any: Vec<crate::grep::Pred>,
+    /// None of these may match. No flag produces one — it is the query
+    /// document's, because a chunk sweep cannot express it (see
+    /// `Granularity`) and the flags are a chunk sweep.
+    pub none: Vec<crate::grep::Pred>,
     /// What the predicate SELECTS. The token index can only ever skip
     /// whole chunks, so these are two different answers to the same
     /// terms and the difference is not small: on a 1.2 GiB store, a term
@@ -482,16 +488,31 @@ pub enum Granularity {
 
 impl Match {
     pub fn is_empty(&self) -> bool {
-        self.has.is_empty() && self.any.is_empty()
+        self.spec().is_empty()
+    }
+
+    pub fn spec(&self) -> crate::grep::PredSpec {
+        crate::grep::PredSpec {
+            all: self.all.clone(),
+            any: self.any.clone(),
+            none: self.none.clone(),
+        }
+    }
+
+    /// What the token index can prove, as (`--has`, `--any`) terms. An
+    /// execution detail: the predicate means what it says whatever this
+    /// returns, and this only decides how much gets read.
+    pub fn index_terms(&self) -> (Vec<String>, Vec<String>) {
+        self.spec().pushdown()
     }
 
     /// The entry-level predicates, when the caller asked for entries.
     /// `None` leaves the read chunk-granular.
-    pub fn entry_preds(&self) -> anyhow::Result<Option<crate::grep::EntryPreds>> {
+    pub fn entry_preds(&self) -> anyhow::Result<Option<crate::grep::Preds>> {
         if self.granularity != Granularity::Entries || self.is_empty() {
             return Ok(None);
         }
-        Ok(Some(crate::grep::EntryPreds::new(&self.has, &self.any)?))
+        Ok(Some(crate::grep::Preds::compile(self.spec())?))
     }
 }
 
@@ -575,7 +596,10 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     q.validate()?;
     let files = &q.sources[..];
     let (from, to, from_chunk) = (q.window.from, q.window.to, q.window.from_chunk);
-    let (has, any) = (&q.matching.has[..], &q.matching.any[..]);
+    // What the INDEX can prove, which is a subset of what was asked: a
+    // caseless or regex predicate reads more rather than matching less.
+    let (has_terms, any_terms) = q.matching.index_terms();
+    let (has, any) = (&has_terms[..], &any_terms[..]);
     // The index selects chunks; these judge the entries inside them.
     // Absent, the read stays chunk-granular — every entry of every chunk
     // the index let through comes out.
@@ -668,7 +692,7 @@ fn query_entries(
     windowed: bool,
     has: &[String],
     any: &[String],
-    entry_preds: Option<crate::grep::EntryPreds>,
+    entry_preds: Option<crate::grep::Preds>,
     max_chunks: Option<u64>,
     no_filename: bool,
     show_write_time: bool,
@@ -1039,7 +1063,7 @@ fn query_follow(
     follow: bool,
     max: Option<u64>,
     poll: Option<f64>,
-    entry_preds: Option<crate::grep::EntryPreds>,
+    entry_preds: Option<crate::grep::Preds>,
 ) -> anyhow::Result<()> {
     let multi = files.len() > 1 && !no_filename;
     // Framing needs entries; plain text streams raw bytes (no one-entry lag).

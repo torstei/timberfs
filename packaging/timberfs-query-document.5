@@ -117,17 +117,46 @@ is a resume position by chunk number: exact, where a timestamp can match
 two chunks that share a boundary millisecond.
 .TP
 .B match
-Predicates, flat.
+Predicates, flat: every
 .B all
-must all match and at least one of
+must match, at least one
 .B any
-must. A
+must, and no
 .B none
-list belongs here and is absent for the same reason: no flag produces one
-yet. A
+may. Flat rather than a boolean tree \(em an arbitrary tree is expressible
+in JSON but not in flags, and then
+.B \-\-dump\-json
+could not reproduce a server's query. That waits for a version 2.
+.RS
+.PP
+A predicate sets EXACTLY ONE matcher. The contract says what a caller
+wants to ASK, not what timberfs can answer cheaply:
+.PP
+.TP 12
 .B has
-predicate is a word\-anchored phrase, which is the form that can ride the
-token index and so skip chunks unread.
+A word\-anchored phrase. The form the token index holds, and the only one
+that can skip a chunk whole.
+.TP
+.B substring
+A literal anywhere, even inside a longer word. Rides the index on its
+INTERIOR whole words when it has any.
+.TP
+.B regex
+A regular expression, as given. Never rides the index.
+.PP
+.B caseless
+compares without case, and can never ride the index, which is exact\-case.
+It is refused on
+.B regex
+\(em a pattern says
+.B (?i)
+itself, and two ways to say it could disagree.
+.PP
+⚠ None of that changes what a predicate MEANS. The index decides how much
+gets read, never what matches \(em so a
+.B regex
+over a whole store is slow, not wrong.
+.RE
 .RS
 .PP
 .B granularity
@@ -157,11 +186,26 @@ next stage does its own matching.
 The difference is not small. On a 1.2 GiB store a term appearing in five
 entries selects 398 chunks and 325,767 lines.
 .PP
+A chunk sweep can only be narrowed by what the index can PROVE, so
+.BR none ,
+.B regex
+and
+.B caseless
+are all
+.B refused
+with
+.BR "granularity: chunks" ,
+rather than parsing and narrowing nothing. The exclusion is the sharpest
+of the three: a Bloom filter says a term MAY be in a chunk, never that it
+is absent, so honouring
+.B none
+there would return exactly the chunks it was asked to remove.
+.PP
 .B entries
 with
 .B "response_format.kind: chunks"
-is refused: compressed chunks move verbatim, so nothing decompresses them
-to judge an entry. The response echoes the granularity it applied, so a
+is refused for the mirror reason: compressed chunks move verbatim, so
+nothing decompresses them to judge an entry. The response echoes the granularity it applied, so a
 consumer can tell a superset from an answer.
 .RE
 .TP
