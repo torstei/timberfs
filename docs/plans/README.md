@@ -33,3 +33,6 @@ messages and pull requests are for.
   archive that many senders ship into.
 - [paging.md](paging.md) — walking a bounded result set: a cursor beside the
   search rather than inside it, covering every store examined.
+- [logline-order.md](logline-order.md) — ordering a multi-store answer by the
+  clock an entry CARRIES: the frontier merge that makes it streamable, and the
+  per-chunk logline range it needs.
