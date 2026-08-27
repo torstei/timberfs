@@ -297,6 +297,21 @@ here.
   sidecar-extensible, and multiplexable in the protocol before it is on
   the wire. Design note:
   [docs/plans/native-replication.md](docs/plans/native-replication.md).
+- **Paging a bounded search**: `max` truncates and `stream-end` says so, but
+  a client cannot ask for the next N — nothing in the answer is a resume
+  position. The cursor is a separate object beside the search rather than
+  part of it, keyed by store id, and it has to cover every store the search
+  EXAMINED rather than every store that produced a hit: otherwise the next
+  page re-scans the barren ones from the start of the window, which on a
+  fleet is most of the cost. Separating it also makes a live multi-store
+  search fall out — a cursor plus follow is `tail -f | grep` over a forest
+  as one request. Every cursor entry carries a position, including the
+  stores that matched nothing — never a "done" flag, since something can
+  append to a barren store between two pages and a consumer that trusted
+  the flag would skip it for the rest of the walk. Three decisions open:
+  whether the bound is per-store or total, what an absent store means, and
+  whether a walk is a snapshot. Design note:
+  [docs/plans/paging.md](docs/plans/paging.md).
 - **Chunks by address (a manifest now, bytes on demand)**: a store is a
   TAPE of which a node holds zero or more runs — a contiguous piece
   (today's store) or an ordered list of fragments with holes. With the

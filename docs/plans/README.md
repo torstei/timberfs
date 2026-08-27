@@ -31,3 +31,5 @@ messages and pull requests are for.
   and fetching bytes from whichever holder has them.
 - [receiving-end.md](receiving-end.md) — identity, names and selection on an
   archive that many senders ship into.
+- [paging.md](paging.md) — walking a bounded result set: a cursor beside the
+  search rather than inside it, covering every store examined.

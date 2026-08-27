@@ -339,134 +339,23 @@ fn print_table(rows: &[Row], full_id: bool) {
     println!("{}", format_table(&cols, &data));
 }
 
+/// The one store shape, one row per store. `info --json` writes the same
+/// object for a single store — see `store_json` for why there is no
+/// per-surface projection.
 fn rows_to_json(rows: &[Row]) -> serde_json::Value {
     serde_json::Value::Array(
         rows.iter()
             .map(|r| {
-                let s = &r.summary;
-                let mut o = serde_json::Map::new();
-                // What the store is CALLED, resolved the same way the
-                // table resolves it. `handle` is the path's own word for
-                // it, which an opaque path makes a uuid — so a consumer
-                // that wants to show a name needs this one.
-                o.insert(
-                    "name".to_string(),
-                    serde_json::Value::String(display_name(r)),
-                );
-                o.insert("handle".to_string(), r.handle.clone().into());
-                o.insert("forest".to_string(), r.forest.clone().into());
-                // Identity first: a catalogue's rows have to be joinable to
-                // whatever recorded a position against them, and a follower
-                // records its store by this and never by a path. `null` for
-                // a store with no manifest — a plain `append` mints none.
-                o.insert(
-                    "id".to_string(),
-                    s.id.clone()
-                        .map(Into::into)
-                        .unwrap_or(serde_json::Value::Null),
-                );
-                o.insert(
-                    "created".to_string(),
-                    s.created
-                        .clone()
-                        .map(Into::into)
-                        .unwrap_or(serde_json::Value::Null),
-                );
-                // Lineage across a hop: the store these entries came FROM.
-                // A field of its own rather than a label, because selecting
-                // on it would be selecting on one hop's bookkeeping.
-                o.insert(
-                    "origin_id".to_string(),
-                    s.origin_id
-                        .clone()
-                        .map(Into::into)
-                        .unwrap_or(serde_json::Value::Null),
-                );
-                // The manifest's provenance, verbatim — what a fleet view
-                // selects on. Nested so a free-form key can never collide
-                // with a field of this row.
-                o.insert(
-                    "labels".to_string(),
-                    serde_json::Value::Object(s.labels.clone()),
-                );
-                o.insert("dir".to_string(), r.dir.display().to_string().into());
-                o.insert("path".to_string(), r.path.display().to_string().into());
-                o.insert("size_bytes".to_string(), s.compressed_bytes.into());
-                o.insert(
-                    "from_ms".to_string(),
-                    s.first_write_ms
-                        .map(Into::into)
-                        .unwrap_or(serde_json::Value::Null),
-                );
-                o.insert(
-                    "to_ms".to_string(),
-                    s.last_write_ms
-                        .map(Into::into)
-                        .unwrap_or(serde_json::Value::Null),
-                );
-                o.insert("writer_live".to_string(), s.writer.is_live().into());
-                o.insert("indexed".to_string(), s.indexed().into());
-                o.insert(
-                    "retain".to_string(),
-                    s.retain
-                        .clone()
-                        .map(Into::into)
-                        .unwrap_or(serde_json::Value::Null),
-                );
-                o.insert(
-                    "retain_size".to_string(),
-                    s.retain_size
-                        .clone()
-                        .map(Into::into)
-                        .unwrap_or(serde_json::Value::Null),
-                );
-                // The same key names `info --json` uses, deliberately: a
-                // consumer reading both must not have to remember which
-                // shape each one chose.
-                match s.chunk_seq {
-                    Some((first, last)) => {
-                        o.insert("first_seq".to_string(), first.into());
-                        o.insert("last_seq".to_string(), last.into());
-                    }
-                    None => {
-                        o.insert("first_seq".to_string(), serde_json::Value::Null);
-                        o.insert("last_seq".to_string(), serde_json::Value::Null);
-                    }
-                }
-                o.insert("next_seq".to_string(), s.next_seq.into());
-                o.insert("dropped_chunks".to_string(), s.dropped_chunks().into());
-                o.insert("dropped_bytes".to_string(), s.dropped.comp_bytes.into());
-                o.insert(
-                    "dropped_uncompressed_bytes".to_string(),
-                    s.dropped.uncomp_bytes.into(),
-                );
-                // Always an array, never null: the registry knows every
-                // follower of every store, so empty means empty.
-                o.insert(
-                    "followers".to_string(),
-                    serde_json::Value::Array(
-                        s.followers.iter().map(crate::follower::to_json).collect(),
-                    ),
-                );
-                match &s.consumers {
-                    // Null distinguishes "no cursor directory declared"
-                    // from an empty array: "declared, nobody reading".
-                    // Superseded by `followers`, still reported while the
-                    // key is honoured.
-                    None => {
-                        o.insert("cursors_dir".to_string(), serde_json::Value::Null);
-                        o.insert("consumers".to_string(), serde_json::Value::Null);
-                    }
-                    Some(sv) => {
-                        o.insert(
-                            "cursors_dir".to_string(),
-                            sv.dir.display().to_string().into(),
-                        );
-                        o.insert("consumers".to_string(), crate::query::consumers_json(sv));
-                        o.insert("held_bytes".to_string(), sv.held_bytes().into());
-                    }
-                }
-                serde_json::Value::Object(o)
+                let loc = crate::store_json::Location {
+                    forest: Some(r.forest.clone()),
+                    handle: r.handle.clone(),
+                    dir: r.dir.display().to_string(),
+                    path: r.path.display().to_string(),
+                    kind: crate::store_json::Kind::Pair,
+                    bundle_bytes: None,
+                };
+                serde_json::to_value(crate::store_json::Store::new(&r.summary, &loc))
+                    .unwrap_or(serde_json::Value::Null)
             })
             .collect(),
     )
@@ -507,6 +396,12 @@ mod tests {
             retain: retain.map(str::to_string),
             retain_size: retain_size.map(str::to_string),
             retain_unconsumed: false,
+            derived_from: None,
+            derived_op: None,
+            window_from: None,
+            window_to: None,
+            command: None,
+            pattern: None,
             followers: Vec::new(),
             consumers: None,
             writer,
@@ -812,25 +707,75 @@ mod tests {
         let obj = &v[0];
         assert_eq!(obj["handle"], "nginx");
         assert_eq!(obj["forest"], "default");
-        assert_eq!(obj["size_bytes"], 2048);
-        assert_eq!(obj["from_ms"], 5);
-        assert_eq!(obj["to_ms"], 10);
-        assert_eq!(obj["writer_live"], true);
-        assert_eq!(obj["indexed"], true);
+        assert_eq!(obj["compressed_bytes"], 2048);
+        assert_eq!(obj["first_write_ms"], 5);
+        assert_eq!(obj["last_write_ms"], 10);
+        // The split the old single `indexed` boolean could not express:
+        // this store HOLDS a token index covering one chunk while having
+        // DECLARED none. A consumer that has to tell "has an index" from
+        // "promised one" now can.
+        assert_eq!(obj["index_declared"], false);
+        assert_eq!(obj["grain_chunks"], 1);
+        assert_eq!(obj["grain_bytes"], 10);
         assert_eq!(obj["retain"], "30d");
         assert_eq!(obj["retain_size"], "50G");
+        // A writer is NAMED, and its presence is liveness — there is no
+        // separate boolean that could come to disagree with it.
+        assert_eq!(obj["writer"], "active");
+
+        // The names this shape replaced. They were `info`'s or `list`'s but
+        // never both, and the same data under two names is what made the
+        // two surfaces unjoinable.
+        for gone in [
+            "size_bytes",
+            "from_ms",
+            "to_ms",
+            "writer_live",
+            "indexed",
+            "provenance",
+        ] {
+            assert!(obj.get(gone).is_none(), "`{gone}` came back");
+        }
     }
 
     #[test]
-    fn json_span_is_null_for_an_empty_store() {
+    fn an_absent_value_is_an_absent_key_not_a_null() {
+        // One rule for the whole shape: a consumer tests for the key, and
+        // the schema marks it not-required. `list` used to write nulls
+        // where `info` omitted, which is the same disagreement in a
+        // different costume.
         let rows = [row(
             "empty",
             "default",
             summary(0, None, WriterState::Idle, false, None, None),
         )];
         let v = rows_to_json(&rows);
-        assert!(v[0]["from_ms"].is_null());
-        assert!(v[0]["to_ms"].is_null());
-        assert!(v[0]["retain"].is_null());
+        let obj = v[0].as_object().unwrap();
+        for absent in [
+            "first_write_ms",
+            "last_write_ms",
+            "retain",
+            "retain_size",
+            "writer",
+        ] {
+            assert!(
+                !obj.contains_key(absent),
+                "`{absent}` should be absent, not null"
+            );
+        }
+        // ...and what is always true of a store is always present, so a
+        // consumer never has to tell "zero" from "not reported".
+        for present in [
+            "chunks",
+            "next_seq",
+            "index_declared",
+            "wal_declared",
+            "followers",
+        ] {
+            assert!(
+                obj.contains_key(present),
+                "`{present}` should always be there"
+            );
+        }
     }
 }

@@ -64,6 +64,14 @@ fn handle_of(rings_file_name: &str) -> Option<&str> {
     Some(stem.strip_suffix(".log").unwrap_or(stem))
 }
 
+/// The handle of a store known by its LOGICAL name (`nginx.log`), as
+/// opposed to its `.rings` file. The same single-`.log` strip `handle_of`
+/// applies, exposed so `info` and `list` cannot disagree about what a
+/// store is called.
+pub fn handle_of_logical(name: &str) -> &str {
+    name.strip_suffix(".log").unwrap_or(name)
+}
+
 /// Resolve a user-supplied source argument to a store path. A full path,
 /// relative path or `.timber` bundle is returned unchanged; only a bare token
 /// that names no existing store is looked up as a handle across the forests.
