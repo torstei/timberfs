@@ -606,8 +606,8 @@ mod tests {
         // column repeating the id.
         assert_eq!(row_cells(&rich[0], o)[1], "rich", "falls back to the path");
         let mut declared = rich[0].clone_for_name_test();
-        declared.summary.declared_name = Some("gateway01-console".to_string());
-        assert_eq!(row_cells(&declared, o)[1], "gateway01-console");
+        declared.summary.declared_name = Some("web01-console".to_string());
+        assert_eq!(row_cells(&declared, o)[1], "web01-console");
         // Header and cells must stay in step, which is the bug a bool
         // per optional column invites.
         assert_eq!(row_cells(&rich[0], o).len(), cols.len());

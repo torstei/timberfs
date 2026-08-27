@@ -328,9 +328,9 @@ mod tests {
         // The gesture this exists for: "the store with apache in its
         // name". As an anchored regex that is `name=~.*apache.*`, which
         // turns whatever the user typed into a pattern.
-        let l = labels(&[("name", "apache-error@http01")]);
+        let l = labels(&[("name", "apache-error@web01")]);
         assert!(Selector::parse("name=*apache").unwrap().matches(&l));
-        assert!(Selector::parse("name=*error@http").unwrap().matches(&l));
+        assert!(Selector::parse("name=*error@web").unwrap().matches(&l));
         assert!(!Selector::parse("name=*nginx").unwrap().matches(&l));
         assert!(Selector::parse("name!*nginx").unwrap().matches(&l));
         assert!(!Selector::parse("name!*apache").unwrap().matches(&l));

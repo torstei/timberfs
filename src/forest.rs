@@ -154,7 +154,7 @@ fn lookup_handle(handle: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Resolve by the name a store declares in its manifest. Declared names
-/// are NOT unique — two hosts' `gateway01-console` in one archive is the
+/// are NOT unique — two hosts' `web01-console` in one archive is the
 /// case this exists for — so several matches are reported rather than
 /// picked between, exactly as an ambiguous directory handle is.
 fn lookup_declared_name(token: &str, forests: &[Forest]) -> anyhow::Result<PathBuf> {
