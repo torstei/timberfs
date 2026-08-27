@@ -111,7 +111,12 @@ pub struct Stores {
 #[serde(deny_unknown_fields)]
 pub struct Term {
     pub key: String,
-    /// `=`, `!=`, `=~` or `!~`; regexes anchored at both ends.
+    /// `=`, `!=`, `=~`, `!~`, `=*` or `!*`.
+    ///
+    /// Regexes are anchored at both ends, so `=~` is a whole-value match.
+    /// `=*` is a LITERAL substring — what a person means by "the store
+    /// with apache in its name", and not the same as `=~.*apache.*`,
+    /// which would read a `.` in the text as a pattern.
     pub op: String,
     pub value: String,
 }

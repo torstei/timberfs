@@ -241,6 +241,22 @@ stable and goes stale. It follows decision 1: per-store scope makes "start at
 the beginning" harmless, because a new store's budget is its own and its
 entries are not claimed to be ordered against another store's.
 
+**Both, and the caller's shape decides which.** A selection is a PREDICATE, not
+a resolved list — which is what lets a store that appears mid-walk be found at
+all. So:
+
+- **A tail** re-resolves the predicate each poll, and an absent store is NEW:
+  start from the beginning of what it holds. For a genuinely new store that IS
+  "from now", since everything it holds arrived after the tail began. This is
+  the case that matters operationally — containers come and go, and a tail that
+  cannot pick up one started five minutes ago is a tail you have to keep
+  restarting.
+- **A bounded walk** wants the store set pinned, because pages that stop
+  concatenating have stopped being a result set.
+
+The difference is not a per-request flag to invent: it is `follow` versus a
+bound, which the request already distinguishes.
+
 ### 3. Do later pages stay in logline order?
 
 No — and this is a property to state rather than a decision to make. It is what
