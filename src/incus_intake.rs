@@ -1079,7 +1079,8 @@ mod tests {
     /// this intake exists to keep.
     #[test]
     fn a_refusal_is_incus_talking_not_the_container() {
-        // What incus actually sent, verbatim from rc-app01.
+        // What incus actually sent, verbatim, on a host where a console
+        // had become unattachable.
         assert_eq!(
             refusal(b"Error: Failed running forkconsole: \"attaching to the container failed\"\n")
                 .as_deref(),
@@ -1114,7 +1115,7 @@ mod tests {
             ("host", "sourcream"),
             ("incus.project", "default"),
             ("incus.instance", "gateway01"),
-            ("image", "visena-gateway:0.0.2-LOCAL"),
+            ("image", "acme-gateway:0.0.2-LOCAL"),
         ])
     }
 
@@ -1234,7 +1235,7 @@ mod tests {
                 ),
                 (b"java.lang.IllegalStateException: no route\n", 2_301),
                 (
-                    b"\tat com.visena.gateway.Router.route(Router.java:88)\n",
+                    b"\tat com.example.gateway.Router.route(Router.java:88)\n",
                     2_302,
                 ),
                 (b"OpenJDK 64-Bit Server VM warning: something\n", 8_000),
@@ -1281,7 +1282,7 @@ mod tests {
         facts.insert("entrypoint".into(), "java -jar /app.jar".into());
         let m = attach_marker(&facts, 2048);
         assert!(m.contains("incus.instance=gateway01"));
-        assert!(m.contains("image=visena-gateway:0.0.2-LOCAL"));
+        assert!(m.contains("image=acme-gateway:0.0.2-LOCAL"));
         // A value with spaces is quoted, so the marker stays parseable.
         assert!(m.contains(r#"entrypoint="java -jar /app.jar""#), "{m}");
         // The seam: how much ring backlog was stitched in behind it.
@@ -1296,16 +1297,16 @@ mod tests {
             kind: "container".into(),
             status: "Running".into(),
             location: String::new(),
-            image: "visena-gateway:0.0.2-LOCAL".into(),
+            image: "acme-gateway:0.0.2-LOCAL".into(),
             base_image: String::new(),
             entrypoint: String::new(),
             user_keys: vec![
-                ("user.service".into(), "visena-gateway".into()),
+                ("user.service".into(), "acme-gateway".into()),
                 ("user.team".into(), "platform".into()),
             ],
         };
         let f = facts(&inst, "sourcream");
-        assert_eq!(f.get("service").map(String::as_str), Some("visena-gateway"));
+        assert_eq!(f.get("service").map(String::as_str), Some("acme-gateway"));
         assert_eq!(f.get("user.team").map(String::as_str), Some("platform"));
 
         // Without the operator saying so, there is no service: the image
