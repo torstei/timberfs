@@ -620,7 +620,7 @@ pub fn tap_instance(
     opts: &IncusOpts,
     intake: &Arc<Mutex<crate::intake::Intake>>,
     stop: &Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let facts = facts(inst, server_name);
     let console = incus.console_attach(&inst.name)?;
     // From here every exit path must release the console, or a human
@@ -640,7 +640,7 @@ fn tap_attached(
     intake: &Arc<Mutex<crate::intake::Intake>>,
     stop: &Arc<AtomicBool>,
     console: &crate::incus::Console,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let mut ws = incus.console_stream(console)?;
     // Only a container has the ring; a VM's console is a file, and reading
     // it is not a drain.
@@ -698,9 +698,15 @@ fn tap_attached(
     // cannot remove anything from the websocket's queue.
     let consume_ring = inst.is_container() && !opts.keep_ring;
     let mut last_drain = now_ms();
-    while !stop.load(Ordering::Relaxed) {
-        match ws.read() {
-            Ok(Some(bytes)) => {
+    let mut delivered = 0usize;
+    while !stopping(stop) {
+        match ws.read_frame()? {
+            // Nothing within the read timeout. The loop's own `stop`
+            // check is the point: a silent console must not pin its
+            // thread against a shutdown.
+            crate::incus::Frame::Idle => {}
+            crate::incus::Frame::Data(bytes) => {
+                delivered += bytes.len();
                 let now = now_ms();
                 let out = stamper.push(&bytes, now);
                 if !out.is_empty() {
@@ -717,15 +723,14 @@ fn tap_attached(
             }
             // The console closed: the instance stopped or restarted. Not
             // an error — the supervisor decides whether to come back.
-            Ok(None) => break,
-            Err(e) => return Err(e),
+            crate::incus::Frame::Closed => break,
         }
     }
     let tail = stamper.flush(now_ms());
     if !tail.is_empty() {
         append(intake, &store, &tail)?;
     }
-    Ok(())
+    Ok(delivered)
 }
 
 fn append(
@@ -749,6 +754,30 @@ fn append(
 /// that is restarting is not ready the instant its old console closes, and
 /// a tight retry loop against a container that will not start is just a
 /// busy wait on a daemon socket.
+/// Is a shutdown under way? BOTH the signal and the flag the main thread
+/// sets, so a tap notices SIGTERM itself rather than waiting to be told.
+fn stopping(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Relaxed) || crate::append::stopping()
+}
+
+/// Sleep, but wake for a shutdown. The granularity only has to be short
+/// against a person watching `systemctl stop`.
+fn sleep_until_stopped(stop: &AtomicBool, ms: u64) {
+    let step = 100;
+    let mut left = ms;
+    while left > 0 && !stopping(stop) {
+        let n = left.min(step);
+        std::thread::sleep(std::time::Duration::from_millis(n));
+        left -= n;
+    }
+}
+
+/// Shorter than this and the console was handed straight back rather
+/// than ended: not an episode, so it backs off instead of reattaching at
+/// once. Comfortably longer than an attach costs, comfortably shorter
+/// than any real episode.
+const MIN_EPISODE: std::time::Duration = std::time::Duration::from_secs(2);
+
 const REATTACH_MS: u64 = 1_000;
 const REATTACH_MAX_MS: u64 = 30_000;
 
@@ -792,17 +821,39 @@ pub fn run(opts: IncusOpts) -> anyhow::Result<()> {
     let opts = Arc::new(opts);
     let running: Arc<Mutex<std::collections::BTreeSet<String>>> =
         Arc::new(Mutex::new(Default::default()));
+    // Held so shutdown can wait for them; see the join below.
+    let taps: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // The instances that are already up, then whatever the event stream
     // says about them from here on.
     for inst in incus.instances()? {
         if opts.wants(&inst) {
-            spawn_tap(&incus, inst, &server_name, &opts, &intake, &stop, &running);
+            spawn_tap(
+                &incus,
+                inst,
+                &server_name,
+                &opts,
+                &intake,
+                &stop,
+                &running,
+                &taps,
+            );
         }
     }
 
-    watch_lifecycle(&incus, &server_name, &opts, &intake, &stop, &running);
+    watch_lifecycle(&incus, &server_name, &opts, &intake, &stop, &running, &taps);
     stop.store(true, Ordering::Relaxed);
+    // WAIT for the taps. Each releases its console on the way out, and
+    // returning from here would exit the process and kill them where they
+    // stand — which is how every console came to be left reserved in
+    // incus after a restart, refusing the next attach AND a human running
+    // `incus console` until an operator deleted the operations by hand.
+    //
+    // Safe to wait on now that a read times out rather than blocking
+    // forever: a tap notices `stop` within that timeout wherever it is.
+    for h in taps.lock().unwrap().drain(..) {
+        let _ = h.join();
+    }
     let _ = maintenance.join();
     Ok(())
 }
@@ -816,6 +867,7 @@ fn spawn_tap(
     intake: &Arc<Mutex<crate::intake::Intake>>,
     stop: &Arc<AtomicBool>,
     running: &Arc<Mutex<std::collections::BTreeSet<String>>>,
+    taps: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) {
     {
         let mut g = running.lock().unwrap();
@@ -833,10 +885,10 @@ fn spawn_tap(
     let stop = Arc::clone(stop);
     let running = Arc::clone(running);
     let _ = incus;
-    std::thread::spawn(move || {
+    let h = std::thread::spawn(move || {
         let incus = crate::incus::Incus::new(&socket, &project);
         let mut backoff = REATTACH_MS;
-        while !stop.load(Ordering::Relaxed) {
+        while !stopping(&stop) {
             // Re-read the instance each time: an image or an entrypoint
             // may have changed under a restart, and those go in the next
             // attach marker.
@@ -847,23 +899,50 @@ fn spawn_tap(
             if !opts.wants(&inst) {
                 break;
             }
+            let began = std::time::Instant::now();
             match tap_instance(&incus, &inst, &server_name, &opts, &intake, &stop) {
-                // A clean end is a restart or a shutdown: come back
-                // promptly, because the console of the new instance is
-                // already filling its ring.
-                Ok(()) => backoff = REATTACH_MS,
+                // An episode that LASTED and then ended is a restart or a
+                // shutdown: come back promptly, because the console of
+                // the new instance is already filling its ring.
+                Ok(_) if began.elapsed() >= MIN_EPISODE => backoff = REATTACH_MS,
+                // One that ended almost at once is not an episode: the
+                // console was taken and handed straight back. Judged by
+                // DURATION rather than by bytes, because such a console
+                // often does deliver a little — a greeting, a ring
+                // replay — and counting bytes would reset the backoff
+                // every time and hammer on.
+                //
+                // Reattaching at REATTACH_MS here means an incus
+                // operation per container per SECOND for as long as the
+                // condition lasts, which is a load problem stacked on top
+                // of whatever caused it.
+                Ok(_) => {
+                    if backoff == REATTACH_MS {
+                        crate::note!(
+                            "timberfs: {}: the console closed immediately; backing off. \
+                             Something else may hold it, or the instance may have no \
+                             process on it",
+                            inst.name
+                        );
+                    }
+                    backoff = (backoff * 2).min(REATTACH_MAX_MS);
+                }
                 Err(e) => {
                     crate::note!("timberfs: {}: {e}", inst.name);
                     backoff = (backoff * 2).min(REATTACH_MAX_MS);
                 }
             }
-            if stop.load(Ordering::Relaxed) {
+            if stopping(&stop) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(backoff));
+            // Interruptible: a tap asleep in its reattach backoff would
+            // otherwise hold the shutdown for up to REATTACH_MAX_MS, and
+            // a stop that takes half a minute per host reads as a hang.
+            sleep_until_stopped(&stop, backoff);
         }
         running.lock().unwrap().remove(&inst.name);
     });
+    taps.lock().unwrap().push(h);
 }
 
 /// Follow incus's lifecycle events. A tap that only enumerated instances
@@ -877,6 +956,7 @@ fn watch_lifecycle(
     intake: &Arc<Mutex<crate::intake::Intake>>,
     stop: &Arc<AtomicBool>,
     running: &Arc<Mutex<std::collections::BTreeSet<String>>>,
+    taps: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) {
     while !stop.load(Ordering::Relaxed) && !crate::append::stopping() {
         let mut ws = match incus.events() {
@@ -891,8 +971,9 @@ fn watch_lifecycle(
             if crate::append::stopping() {
                 return;
             }
-            match ws.read() {
-                Ok(Some(bytes)) => {
+            match ws.read_frame() {
+                Ok(crate::incus::Frame::Idle) => {}
+                Ok(crate::incus::Frame::Data(bytes)) => {
                     for line in bytes.split(|b| *b == b'\n') {
                         let Some(name) = started_instance(line) else {
                             continue;
@@ -901,11 +982,11 @@ fn watch_lifecycle(
                             continue;
                         };
                         if opts.wants(&inst) {
-                            spawn_tap(incus, inst, server_name, opts, intake, stop, running);
+                            spawn_tap(incus, inst, server_name, opts, intake, stop, running, taps);
                         }
                     }
                 }
-                Ok(None) => break,
+                Ok(crate::incus::Frame::Closed) => break,
                 Err(_) => break,
             }
         }

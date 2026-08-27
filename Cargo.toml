@@ -1,6 +1,6 @@
 [package]
 name = "timberfs"
-version = "0.23.0"
+version = "0.23.1"
 edition = "2021"
 description = "Append-only, transparently compressed, write-time-indexed filesystem for log files"
 license = "MIT OR Apache-2.0"

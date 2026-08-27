@@ -67,6 +67,29 @@ fn fill_to(s: &mut UnixStream, buf: &mut Vec<u8>, want: usize, cap: usize) -> an
     Ok(true)
 }
 
+/// What a websocket read found. `Idle` is the one that matters: it means
+/// the peer is still there and said nothing within the read timeout, so
+/// the caller gets control back and can notice a shutdown. Without it a
+/// silent console blocks its thread forever.
+#[derive(Debug)]
+pub enum Frame {
+    Data(Vec<u8>),
+    Idle,
+    Closed,
+}
+
+/// Is this the read timeout expiring rather than a real failure? A socket
+/// with SO_RCVTIMEO reports one or the other depending on platform, and
+/// neither means the connection is gone.
+fn is_timeout(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    })
+}
+
 /// Read until `needle` appears, returning the offset just past it.
 fn fill_until(
     s: &mut UnixStream,
@@ -435,8 +458,13 @@ impl WebSocket {
             Some(got) => bail!("websocket accept mismatch: {got} is not {want}"),
             None => bail!("websocket upgrade had no Sec-WebSocket-Accept"),
         }
-        // A console can be legitimately silent for hours.
-        s.set_read_timeout(None)?;
+        // A console can be legitimately silent for hours, so a read must
+        // not treat silence as an error — but it must not block on it
+        // forever either. Blocking forever meant a tap could never notice
+        // a shutdown: SIGTERM reaches ONE thread, and the rest sat in
+        // read() until systemd's stop timeout killed the process, which
+        // left every console reserved in incus against everyone.
+        s.set_read_timeout(Some(Duration::from_secs(1)))?;
         Ok(WebSocket {
             stream: s,
             buf: buf[head_end..].to_vec(),
@@ -458,6 +486,18 @@ impl WebSocket {
     /// The next payload, or None when the peer closed. Control frames are
     /// handled here: a ping is ponged (a console left unanswered is a
     /// console incus eventually drops), a close ends the stream.
+    /// One frame, or why there was not one. A timeout anywhere inside is
+    /// `Idle`: the buffer keeps whatever arrived, so the next call
+    /// resumes mid-frame rather than losing it.
+    pub fn read_frame(&mut self) -> anyhow::Result<Frame> {
+        match self.read() {
+            Ok(Some(b)) => Ok(Frame::Data(b)),
+            Ok(None) => Ok(Frame::Closed),
+            Err(e) if is_timeout(&e) => Ok(Frame::Idle),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn read(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
         loop {
             if !self.fill(2)? {
@@ -627,6 +667,57 @@ fn sha1(msg: &[u8]) -> [u8; 20] {
 
 #[cfg(test)]
 mod tests {
+    /// A silent peer must NOT pin the reading thread. This is the bug
+    /// that made `systemctl stop timberfs-incus` hang: the console
+    /// websocket had its read timeout cleared, so a tap sat in `read()`
+    /// forever. SIGTERM reaches ONE thread, so the rest never noticed the
+    /// shutdown, systemd's stop timeout expired, and the SIGKILL left
+    /// every console still RESERVED in incus — refusing the next attach
+    /// and a human running `incus console` alike.
+    #[test]
+    fn a_silent_peer_yields_idle_rather_than_blocking_forever() {
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().unwrap();
+        // The timeout `connect` installs after its handshake.
+        a.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut ws = WebSocket {
+            stream: a,
+            buf: Vec::new(),
+        };
+        // `_b` is open and silent — the console of a container with
+        // nothing to say, which is the normal case for hours at a time.
+        let t = std::time::Instant::now();
+        match ws.read_frame().unwrap() {
+            Frame::Idle => {}
+            other => panic!("silence gave {other:?}, want Idle"),
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "read did not return within the timeout"
+        );
+        // Idle is not closed: the caller loops and reads again, and the
+        // buffer is untouched, so a frame split across the timeout is not
+        // lost.
+        assert!(matches!(ws.read_frame().unwrap(), Frame::Idle));
+    }
+
+    /// A peer that goes away is CLOSED, which is a different answer and
+    /// makes the caller stop rather than spin.
+    #[test]
+    fn a_closed_peer_is_closed_not_idle() {
+        use std::os::unix::net::UnixStream;
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        drop(b);
+        let mut ws = WebSocket {
+            stream: a,
+            buf: Vec::new(),
+        };
+        assert!(matches!(ws.read_frame().unwrap(), Frame::Closed));
+    }
+
     use super::*;
 
     #[test]
