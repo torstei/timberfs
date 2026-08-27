@@ -116,7 +116,9 @@ Last record of every complete stream. Fields:
 .B chunks_read
 /
 .B chunks_total
-(work done vs store size; present when known),
+(chunks actually READ, against the store's total \(em the two differ
+exactly when a bound stopped the read, which is when a consumer is
+counting; present when known),
 .B status
 \(em
 .B exhausted
@@ -124,12 +126,26 @@ when everything in the selection was read, or
 .B limited
 when a bound the CALLER set stopped it short, in which case
 .B limit
-names which one (today only
-.BR max.entries ).
+names WHICH one \(em
+.B max.entries
+or
+.BR max.chunks .
+It names the bound that actually fired; it once said
+.B max.entries
+whatever had.
 The two are not distinguishable from
 .B entries
 alone: a count reads as the whole answer either way, and a consumer that
 cannot tell will present a truncated result as a complete one.
+⚠ A bounded read never emits a PARTIAL entry. A chunk bound stops
+mid-entry by construction \(em an entry may span a boundary \(em and the
+entry being assembled when that happens is DROPPED rather than flushed:
+half a stack trace presented as whole is not missing data but data that
+never existed. A resume position names that entry's first byte, so the
+next read delivers it complete. At genuine end-of-data the pending entry
+is kept, because there it is merely unterminated: a log's last line need
+not end in a newline.
+.PP
 .B limited
 is reported only when more actually remained \(em an entry the sink
 dropped because the cap was already reached, or chunks left unread because

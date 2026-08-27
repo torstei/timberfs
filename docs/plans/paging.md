@@ -116,15 +116,86 @@ expresses it, and chunk selection already skips chunks whose write window falls
 outside the range, so a flag would save nothing and could still be believed on
 the wrong axis.
 
-## `n` counts entries, positionally
+## The position is an absolute byte offset on the tape
 
-Not bytes: a chunk decompresses as a unit either way, so a byte offset saves
-only the framing pass. An entry count is what `Cursor { seq, n }` already
-means and what `resolve`/`advance` already implement against retention.
+Torstein's, and better than the two coordinates that preceded it here.
+`chunks-by-address.md` already models a store as an endless TAPE with a
+beginning; a position is then simply a point on it:
 
-Not hits: a hit count is only valid for the predicate that produced it, so
-changing the predicate between pages would resume somewhere meaningless.
-Positional `n` plus re-applying the predicate is self-correcting.
+```
+absolute_offset = dropped.uncomp_bytes + chunk.uncomp_start + bytes into the chunk
+```
+
+**One integer per store**, not a pair — comparable, orderable, and
+subtractable, so progress falls out of the position itself. With the store
+id it is globally unique: `(store_id, offset)` addresses every byte the
+store has ever held. A timberfs URL is a short step from there, and it
+would be a permanent citation for a log line — stable across moves,
+retention and replication, since a replica keeps the bytes AND the
+numbering (a COPY receiver renumbers, but it declares a new identity, so
+the address stays sound).
+
+Resolution is a binary search: subtract `dropped.uncomp_bytes` for the
+file-relative offset, then search `uncomp_start`, which is monotonic.
+
+### Why retention does not threaten it
+
+`dropped.uncomp_bytes` is a FLOOR — it covers only the drops a
+byte-recording binary performed — so on a store head-dropped before those
+counters existed, absolute offsets are understated. **By a constant,
+forever**, which is harmless:
+
+```
+legacy: an old binary drops chunks 0-2 (3000 B, unrecorded)
+        dropped=0, chunk5.uncomp_start=2000  ->  absolute = 2000
+a recording binary then drops 3-4 (2000 B)
+        dropped=2000, chunk5.uncomp_start=0  ->  absolute = 2000   (unchanged)
+```
+
+Every later drop is recorded and compensates exactly. Positions stay
+unique, monotonic and stable; all that is lost is the claim that offset 0
+is that store's first ever byte, which nothing needs.
+
+⚠ The offset must be in the STORE's space, not the file's.
+`remove_head` rebases `uncomp_start` (`c.uncomp_start -= uncomp_cut`), so
+a file-relative offset moves under retention. Adding `dropped` is what
+makes it absolute.
+
+### It dissolves the straddling entry
+
+An entry beginning in chunk 10 and ending in chunk 11 has ONE address —
+the byte its first line starts at. Resuming there reads its head from 10
+and completes it in 11, with no special case and no entry counting. Which
+is also why a bounded read must DISCARD a cut-off entry rather than emit
+it: the position names the entry's start, so the next page delivers it
+whole, and emitting a fragment now would deliver it twice, once wrong.
+
+⚠ `Cursor { seq, n }` — every follower's position — is entries-into-chunk,
+a different representation of the same idea. Whether followers move to
+this address is deliberately left open: there may be a use for more than
+one kind of cursor, and paging does not have to settle it.
+
+## What `chunk` and `entries` are still for
+
+Progress, not position. "Chunk 400 of 9000" reads to a human where a byte
+count does not, and both numbers come from the index without decompressing
+anything — which is what lets a search that has found NOTHING still report
+that it is advancing.
+
+So the two are nested apart, and a client cannot resume from the wrong
+one by mistake:
+
+```json
+{ "id": "S1",
+  "position": { "offset": 40810234 },
+  "progress": { "chunks_read": 400, "chunks_total": 9000,
+                "bytes_read": 41943040, "bytes_total": 912345678 } }
+```
+
+⚠ `progress.bytes_total` is bytes SELECTED for this search, not the
+store's size — the fraction is against the work this query will do. It
+therefore changes if the same cursor is replayed with a different
+predicate, which is fine, because progress decides nothing.
 
 ## Three decisions still open
 

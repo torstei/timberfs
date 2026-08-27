@@ -849,6 +849,11 @@ fn query_entries(
     // K-way interleave by chunk write windows across files (within-file
     // order preserved), same as the raw fleet view.
     let mut chunks_out = 0u64;
+    // WHICH bound stopped the read. A consumer needs the name, not just
+    // the fact: "your entry cap" and "your chunk cap" are different
+    // things to raise, and the answer used to say `max.entries` whatever
+    // had actually fired.
+    let mut stopped_by: Option<&'static str> = None;
     loop {
         let mut best: Option<usize> = None;
         for (i, s) in srcs.iter().enumerate() {
@@ -875,6 +880,7 @@ fn query_entries(
         // --max reached: stop decompressing further chunks.
         if let Some((count, m)) = &limit {
             if count.get() >= *m {
+                stopped_by = Some("max.entries");
                 break;
             }
         }
@@ -883,6 +889,7 @@ fn query_entries(
         // fifteen.
         chunks_out += 1;
         if max_chunks.is_some_and(|m| chunks_out >= m) {
+            stopped_by = Some("max.chunks");
             break;
         }
     }
@@ -895,13 +902,35 @@ fn query_entries(
     // running out. A count alone cannot tell "that was all" from "your
     // limit stopped me", and a consumer that cannot tell will present a
     // truncated answer as a complete one.
-    let mut limited = srcs.iter().any(|s| s.pos < s.chunks.len());
+    let mut limited = stopped_by.is_some() || srcs.iter().any(|s| s.pos < s.chunks.len());
     for s in &mut srcs {
+        // A source with chunks left had its open entry CUT OFF rather
+        // than ended: the rest of it is in a chunk the bound stopped us
+        // reading. Emitting it would invent an entry — a stack trace with
+        // half its frames, presented as whole — so it is dropped, and a
+        // caller resumes from its first byte.
+        //
+        // Only where chunks remain: a pending entry at genuine
+        // end-of-data is merely unterminated, and must still be emitted.
+        if s.pos < s.chunks.len() {
+            s.sink.discard_pending();
+        }
         s.sink.finish(&mut out)?;
         emitted += s.sink.emitted;
         dropped += s.sink.filtered_out;
-        limited |= s.sink.suppressed > 0;
-        read += s.chunks.len();
+        // An entry the sink DROPPED because the count was already there.
+        // The loop stops feeding chunks on the cap, but a chunk already
+        // in flight can still hold entries past it — so this fires where
+        // the loop's own check does not.
+        if s.sink.suppressed > 0 {
+            limited = true;
+            stopped_by = stopped_by.or(Some("max.entries"));
+        }
+        // What was actually READ, which is how far each source advanced —
+        // not how many chunks were selected for it. They differ exactly
+        // when a cap stopped the loop, which is when a consumer is most
+        // likely to be counting.
+        read += s.pos;
         total += s.total_chunks;
     }
     if records {
@@ -912,8 +941,11 @@ fn query_entries(
             out,
             "\x1estream-end\x1fentries={emitted}\x1fdropped={dropped}\x1fchunks_read={read}\x1fchunks_total={total}\x1fstatus={status}"
         )?;
-        if limited {
-            write!(out, "\x1flimit=max.entries")?;
+        // Named, not assumed. `limited` can also be true with nothing to
+        // name — chunks left unread for a reason the loop did not record
+        // — and then saying nothing beats naming the wrong bound.
+        if let Some(which) = stopped_by {
+            write!(out, "\x1flimit={which}")?;
         }
         out.write_all(b"\0")?;
     }

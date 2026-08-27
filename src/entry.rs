@@ -308,6 +308,21 @@ impl EntrySink {
         self.close_entry(out)
     }
 
+    /// Throw away the entry still being assembled, because a BOUND
+    /// stopped the read before its remaining lines were read.
+    ///
+    /// Only correct where more data exists for this source. A pending
+    /// entry at genuine end-of-data is merely unterminated — the log's
+    /// last line need not end in a newline — and must still be emitted;
+    /// one cut short by a chunk cap is a fragment, and emitting it
+    /// invents an entry that never existed. The sink cannot tell those
+    /// apart, so the caller, which knows whether chunks remain, decides.
+    pub fn discard_pending(&mut self) {
+        self.line.clear();
+        self.entry.clear();
+        self.entry_ts = None;
+    }
+
     /// Flush pending state; call once after the last push.
     pub fn finish(&mut self, out: &mut dyn Write) -> io::Result<()> {
         if !self.line.is_empty() {

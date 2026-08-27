@@ -2102,6 +2102,73 @@ JSON
     rm -rf "$d" /tmp/vmgran.*
 }
 
+a_bounded_read_says_what_stopped_it_and_invents_nothing() {
+    # Three things a client cannot work without, and all three were wrong:
+    # which bound fired, how much was actually read, and whether the last
+    # entry is whole.
+    local d=/var/log/timberfs/vmbound
+    rm -rf "$d"
+    timberfs create "$d/vmbound.log" >/dev/null 2>&1 || return 1
+    # Each append seals a chunk at EOF, so splitting the writes puts the
+    # 41-line entry across a chunk boundary DETERMINISTICALLY — no
+    # dependence on where a size threshold happens to land.
+    {
+        for i in $(seq 1 20); do printf '2026-08-27T10:00:%02dZ INFO filler %d\n' "$i" "$i"; done
+        printf '2026-08-27T10:00:30Z ERROR vmboundboom\n'
+        for i in $(seq 1 20); do printf '\tat frame.number.%d(F.java:1)\n' "$i"; done
+    } | timberfs append --into "$d/vmbound.log" --quiet 2>/dev/null || return 1
+    {
+        for i in $(seq 21 40); do printf '\tat frame.number.%d(F.java:1)\n' "$i"; done
+        printf '2026-08-27T10:01:00Z INFO after\n'
+    } | timberfs append --into "$d/vmbound.log" --quiet 2>/dev/null || return 1
+    local chunks
+    chunks=$(timberfs index "$d/vmbound.log" 2>/dev/null | grep -c '^ ')
+    [ "$chunks" = 2 ] || { echo "want 2 chunks, got $chunks" >&2; timberfs index "$d/vmbound.log"; return 1; }
+    # The entry is 41 lines when read whole.
+    [ "$(timber-filter --has vmboundboom "$d/vmbound.log" 2>/dev/null | wc -l)" = 41 ] || return 1
+
+    bdoc() { cat > /tmp/vmbound.json <<JSON
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"name","op":"=","value":"vmbound"}]},
+  "window":{"axis":"logline"}, $1 "response_format":{"kind":"records"} }
+JSON
+    }
+    local end frames
+    # A chunk cap stops MID-ENTRY by construction. The half-read stack
+    # trace must not be emitted: half a stack trace presented as whole is
+    # not missing data, it is data that never existed.
+    bdoc '"max":{"chunks":1},'
+    frames=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\0' '\n' | grep -c 'at frame.number')
+    [ "$frames" = 0 ] || { echo "emitted $frames frames of a cut-off entry" >&2; return 1; }
+
+    # ...and it names the bound that fired, and counts what it READ.
+    end=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-end')
+    echo "$end" | grep -q 'limit=max.chunks' || { echo "$end" >&2; return 1; }
+    echo "$end" | grep -q 'chunks_read=1' || { echo "$end" >&2; return 1; }
+    echo "$end" | grep -q 'status=limited' || { echo "$end" >&2; return 1; }
+
+    # An entry cap names ITSELF, not the chunk cap.
+    bdoc '"max":{"entries":5},'
+    end=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-end')
+    echo "$end" | grep -q 'limit=max.entries' || { echo "$end" >&2; return 1; }
+
+    # Unbounded: nothing was cut, so the entry comes back WHOLE — the
+    # discard must not fire at genuine end-of-data, where a pending entry
+    # is merely unterminated.
+    bdoc ''
+    end=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-end')
+    echo "$end" | grep -q 'status=exhausted' || { echo "$end" >&2; return 1; }
+    echo "$end" | grep -q 'limit=' && { echo "named a bound with none set: $end" >&2; return 1; }
+    frames=$(timberfs query --query /tmp/vmbound.json 2>/dev/null \
+        | tr '\0' '\n' | grep -c 'at frame.number')
+    [ "$frames" = 40 ] || { echo "unbounded gave $frames frames, want 40" >&2; return 1; }
+
+    rm -rf "$d" /tmp/vmbound.json
+}
+
 identity_reports_and_repairs_the_three_broken_states() {
     # An id is a fact, not a setting, so `set` will not touch it. But it
     # can be broken in three ways, each with an obvious intended fix, and
@@ -2445,6 +2512,7 @@ run_test "records: stream-end says whether a cap stopped it, exactly" stream_end
 run_test "selection: list --select matches on labels, not on the name" selection_is_by_label_not_by_name
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
 run_test "query document: match and bounds name their granularity" a_match_selects_what_it_says_it_selects
+run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
 run_test "forest: an intake writes into a forest by name; --into-dir warns" an_intake_writes_into_a_forest_by_name
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares
