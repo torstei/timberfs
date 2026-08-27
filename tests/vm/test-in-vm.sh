@@ -1696,7 +1696,7 @@ BARK
     grep -q "$u" /tmp/vmname.tab && { echo "the uuid leaked into NAME" >&2; return 1; }
 
     # --names is what completion consumes, so it must offer the same.
-    timberfs list "$d" --names 2>/dev/null | sort | tr '\n' ',' | grep -qx 'web01-console,plainstore,' \
+    timberfs list "$d" --names 2>/dev/null | sort | tr '\n' ',' | grep -qx 'plainstore,web01-console,' \
         || { timberfs list "$d" --names >&2; return 1; }
 
     # `info` answers to the declared name, and leads with it rather than
