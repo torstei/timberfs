@@ -667,18 +667,23 @@ fn tap_attached(
     }
 
     let mut stamper = Stamper::new(Prefix::render(&opts.prefix, facts), opts.idle_ms);
-    let mut first = Vec::new();
+    // The marker is held back until something is actually collected. It
+    // marks a SEAM IN CONTENT — where a gap, if any, is — so writing one
+    // for an attach that turns out to collect nothing records our own
+    // retrying instead: a store whose whole contents are "console
+    // attached" every thirty seconds, which is what an unattachable
+    // console produced for two days.
+    let mut pending_marker = Vec::new();
     if opts.mark_episodes {
-        let mut marker = Vec::new();
-        Prefix::render(&opts.prefix, facts).write(now_ms(), &mut marker);
-        marker.extend_from_slice(attach_marker(facts, backlog.len()).as_bytes());
-        marker.push(b'\n');
-        first.extend_from_slice(&marker);
+        Prefix::render(&opts.prefix, facts).write(now_ms(), &mut pending_marker);
+        pending_marker.extend_from_slice(attach_marker(facts, backlog.len()).as_bytes());
+        pending_marker.push(b'\n');
     }
     if !backlog.is_empty() {
+        // The ring HAD content, so this episode has collected something
+        // whatever the websocket goes on to do.
+        let mut first = std::mem::take(&mut pending_marker);
         first.extend(stamper.push_recovered(&backlog, now_ms()));
-    }
-    if !first.is_empty() {
         append(intake, &store, &first)?;
     }
 
@@ -699,6 +704,14 @@ fn tap_attached(
     let consume_ring = inst.is_container() && !opts.keep_ring;
     let mut last_drain = now_ms();
     let mut delivered = 0usize;
+    // What the console said, kept for the diagnostic below. An attach
+    // that incus refuses is not silent: it answers over the console
+    // stream, in its own words, and those words are the answer to "why".
+    let mut heard: Vec<u8> = Vec::new();
+    // Output from the first seconds, written once the episode proves it
+    // is one.
+    let mut held: Vec<u8> = Vec::new();
+    let began = std::time::Instant::now();
     while !stopping(stop) {
         match ws.read_frame()? {
             // Nothing within the read timeout. The loop's own `stop`
@@ -707,10 +720,25 @@ fn tap_attached(
             crate::incus::Frame::Idle => {}
             crate::incus::Frame::Data(bytes) => {
                 delivered += bytes.len();
+                heard.extend_from_slice(&bytes);
                 let now = now_ms();
                 let out = stamper.push(&bytes, now);
                 if !out.is_empty() {
-                    append(intake, &store, &out)?;
+                    if began.elapsed() < MIN_EPISODE {
+                        // Held, not dropped. An attach incus refuses
+                        // answers over this same stream in its own words,
+                        // and recording that as console output fills the
+                        // store with our retrying. Nothing is lost by
+                        // waiting: the episode's flush below writes
+                        // whatever is held, so a container that prints
+                        // its dying words and vanishes still keeps them.
+                        held.extend_from_slice(&out);
+                    } else {
+                        let mut w = std::mem::take(&mut pending_marker);
+                        w.extend_from_slice(&std::mem::take(&mut held));
+                        w.extend_from_slice(&out);
+                        append(intake, &store, &w)?;
+                    }
                 }
                 if consume_ring && now.saturating_sub(last_drain) >= opts.drain_every_ms as i64 {
                     last_drain = now;
@@ -727,8 +755,16 @@ fn tap_attached(
         }
     }
     let tail = stamper.flush(now_ms());
-    if !tail.is_empty() {
-        append(intake, &store, &tail)?;
+    held.extend_from_slice(&tail);
+    // A refusal is incus talking, not the container: report it and record
+    // nothing. Anything else held is the container's, and is written.
+    if let Some(why) = refusal(&heard) {
+        bail!("{why}");
+    }
+    if !held.is_empty() {
+        let mut w = std::mem::take(&mut pending_marker);
+        w.extend_from_slice(&held);
+        append(intake, &store, &w)?;
     }
     Ok(delivered)
 }
@@ -770,6 +806,33 @@ fn sleep_until_stopped(stop: &AtomicBool, ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(n));
         left -= n;
     }
+}
+
+/// incus answering "no" over the console stream rather than in the HTTP
+/// reply. A refused attach still opens the websocket, and what comes
+/// down it is incus's own error — which is the operator's answer, and
+/// which used to be recorded silently into the store instead of said.
+///
+/// Matched narrowly: an `Error:` line, the shape incus's CLI prints, and
+/// only for a short answer. A container's own output can contain the
+/// word, and losing a crash log to a heuristic would defeat the purpose
+/// of collecting consoles at all.
+fn refusal(heard: &[u8]) -> Option<String> {
+    if heard.len() > 512 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(heard);
+    // The WHOLE of it must be one `Error:` line. A container's output is
+    // not one line and then end-of-stream inside two seconds, and this is
+    // the direction that must not be wrong: a crash log withheld because
+    // it happened to start with the word is the failure that matters,
+    // where a refusal recorded as content is only noise.
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let line = lines.next()?.trim();
+    if lines.next().is_some() || !line.starts_with("Error: ") {
+        return None;
+    }
+    Some(line.to_string())
 }
 
 /// Shorter than this and the console was handed straight back rather
@@ -920,8 +983,8 @@ fn spawn_tap(
                     if backoff == REATTACH_MS {
                         crate::note!(
                             "timberfs: {}: the console closed immediately; backing off. \
-                             Something else may hold it, or the instance may have no \
-                             process on it",
+                             `incus console {}` will say why",
+                            inst.name,
                             inst.name
                         );
                     }
@@ -1009,6 +1072,33 @@ pub fn started_instance(line: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// incus answers a refused attach over the console stream itself.
+    /// Telling that from the container's own output matters both ways: a
+    /// refusal recorded as console content fills the store with our
+    /// retrying, and a crash log mistaken for a refusal is the one thing
+    /// this intake exists to keep.
+    #[test]
+    fn a_refusal_is_incus_talking_not_the_container() {
+        // What incus actually sent, verbatim from rc-app01.
+        assert_eq!(
+            refusal(b"Error: Failed running forkconsole: \"attaching to the container failed\"\n")
+                .as_deref(),
+            Some("Error: Failed running forkconsole: \"attaching to the container failed\"")
+        );
+
+        // A container's own output is NOT a refusal, however alarming.
+        assert!(refusal(b"2026-08-27 ERROR java.lang.OutOfMemoryError\n").is_none());
+        assert!(refusal(b"Error: connection refused\n  at Foo.bar(Foo.java:1)\n").is_none());
+        assert!(refusal(b"").is_none());
+
+        // Length is the backstop: a real console burst is not a one-line
+        // answer, so anything substantial is the container's whatever it
+        // starts with.
+        let mut big = b"Error: Failed running forkconsole\n".to_vec();
+        big.extend(std::iter::repeat_n(b'x', 600));
+        assert!(refusal(&big).is_none(), "a long stream is the container's");
+    }
+
     use super::*;
 
     fn f(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
