@@ -1,6 +1,10 @@
 # Paging: a cursor beside the search, not inside it
 
-**Status: design, nothing built.** The pieces it rests on are real: a store
+**Status: the position and the cursor are BUILT (0.24.0); the deadline and
+the service-imposed limits are not.** A `position` record per examined
+store says where each got to, and handing those back as the request's
+`cursor` resumes exactly there. What follows is the reasoning, and what
+remains. The pieces it rests on are real: a store
 carries an id, `Cursor { seq, n }` already means "chunk, and entries delivered
 from it" and already resolves against retention, the records stream already
 emits one `source` record per examined store, and `stream-end` already says
@@ -11,6 +15,19 @@ See [the query document](../../packaging/timberfs-query-document.5) for the
 request this extends, and `timberfs-records(5)` for the response.
 
 ## What a client can do today
+
+Page. A `position` record per examined store carries an absolute offset on
+that store's tape; `cursor` in the request hands them back. Six entries
+sharing one timestamp are six distinct positions, which is the case that
+made the timestamp approach useless.
+
+What is still missing is the **deadline** — a bound on how LONG a search
+may take rather than how much it returns — and the service-imposed limits
+a query server will want to declare. A fleet-wide read is slow because it
+READS a lot, not because it matches a lot, so a caller who wants an answer
+within a few seconds still cannot ask for one.
+
+## What a client could do before that (kept, because it is the argument)
 
 Nothing. `max` truncates, `stream-end` says `status=limited`, and there the
 answer stops. None of what is there is a resume position:

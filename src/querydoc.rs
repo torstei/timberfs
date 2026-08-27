@@ -69,6 +69,15 @@ pub struct Document {
     pub window: Option<DocWindow>,
     #[serde(rename = "match", skip_serializing_if = "Option::is_none", default)]
     pub matching: Option<DocMatch>,
+    /// Where a previous answer stopped, per store. One entry for every
+    /// store that answer EXAMINED, including the ones that matched
+    /// nothing — leave those out and the next page re-scans them from the
+    /// start of the window, which on a fleet is most of the cost.
+    ///
+    /// The response's `position` records are exactly this shape, so a
+    /// client hands back what it was given.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cursor: Vec<Position>,
     /// A cap counting forward from the start.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max: Option<Bound>,
@@ -102,6 +111,23 @@ pub struct Document {
 pub struct Stores {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub select: Vec<Term>,
+}
+
+/// Where one store was left off. The offset is absolute on that store's
+/// TAPE — what has ever left it, plus where the next undelivered entry
+/// sits in what remains — so retention cannot move it, and it cannot
+/// collide the way a timestamp does: on a fleet whose entries share a
+/// second, paging by clock loses everything that shared the last one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Position {
+    /// The store, by identity. Never by path.
+    pub id: String,
+    /// Resume just here. Absent means that store delivered nothing, so
+    /// the next read starts where the window does — not at zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub offset: Option<u64>,
 }
 
 /// One term of the store predicate, matched against the whole manifest —
@@ -481,6 +507,10 @@ impl Document {
         }
         let windowed = q.window.from.is_some() || q.window.to.is_some();
         Ok(Document {
+            // A cursor is a POSITION, not part of the search, so nothing
+            // the flags describe can produce one — `--dump-json` renders
+            // the query, and where you are in it is the caller's.
+            cursor: Vec::new(),
             v: VERSION.to_string(),
             stores: Stores {
                 select: sources_as_identity(&q.sources)?,
@@ -660,6 +690,11 @@ impl Document {
         }
         let q = Query {
             sources: resolve_stores(&self.stores)?,
+            cursor: self
+                .cursor
+                .iter()
+                .filter_map(|p| p.offset.map(|o| (p.id.clone(), o)))
+                .collect(),
             window: Window {
                 from: self.window.as_ref().and_then(|w| w.from),
                 to: self.window.as_ref().and_then(|w| w.to),
@@ -730,6 +765,7 @@ mod tests {
 
     fn q() -> Query {
         Query {
+            cursor: Default::default(),
             // No sources: "every store". Naming one would need a real
             // store on disk, because a document names stores by their
             // IDENTITY and only a store can supply that — which is the

@@ -420,8 +420,9 @@ class Shell:
             if toks[1][1].lower().startswith("cursor"):
                 if not self.cursors: print("  no cursors"); return
                 for n, c in sorted(self.cursors.items()):
-                    at = c["at"] or "(not started)"
-                    print(f"  {n:14} at {at}   {c['stmt']}")
+                    at = (", ".join(f"{p['id'][:8]}@{p.get('offset','-')}"
+                                    for p in c["at"]) or "(not started)")
+                    print(f"  {n:14} at {at}\n  {'':14}    {c['stmt']}")
                 return
             if not self.views: print("  no logviews"); return
             for n, t in sorted(self.views.items()):
@@ -437,7 +438,7 @@ class Shell:
             if toks[2][1].lower() != "cursor" or toks[3][1].lower() != "for":
                 raise ValueError("declare <name> cursor for <select ...>")
             inner = line[line.lower().index(" for ") + 5:]
-            self.cursors[name] = {"stmt": inner.rstrip(" ;"), "at": None}
+            self.cursors[name] = {"stmt": inner.rstrip(" ;"), "at": []}
             print(f"  cursor {name}")
             return
         if head == "close":
@@ -466,10 +467,9 @@ class Shell:
         raise ValueError(f"`{head}`? try `help`")
 
     def fetch(self, cur, n):
-        """One page. ⚠ The position is a TIMESTAMP, because the protocol
-        has no cursor yet — so a page boundary inside a chunk can repeat
-        or skip an entry. docs/plans/paging.md is the fix: a position is
-        an absolute byte offset per store, which cannot do either."""
+        """One page, from a real cursor: the positions the last answer
+        reported, handed straight back. Byte-exact on each store's tape,
+        so entries sharing a timestamp are still six distinct places."""
         toks = [t for t in lex(cur["stmt"]) if t[1] != ";"]
         kind = toks[1][1].lower()
         terms = self.source(toks[3])
@@ -477,24 +477,32 @@ class Shell:
         if i < len(toks) and toks[i][1].lower() == "where":
             conds, i = parse_where(toks, i + 1)
         doc = build(kind, terms, conds, {"entries": n})
-        if cur["at"] is not None:
-            doc.setdefault("window", {"axis": "logline"})["from"] = cur["at"]
+        if cur["at"]:
+            doc["cursor"] = cur["at"]
         out, err, rc = run(doc)
-        if rc != 0: print(f"  ! {err}"); return
-        newest = cur["at"]
+        if rc != 0:
+            print(f"  ! {err}"); return
+        # Every store EXAMINED reports one, barren ones included — drop
+        # those and the next page rescans them from the window's start.
+        at, shown = [], 0
         for k, f, payload in records(out):
             if k == "source":
                 self.names[f.get("id", "?")] = os.path.basename(f.get("path", "?"))
             elif k == "entry":
                 who = self.names.get(f.get("id", ""), "")
                 print(f"  {who:28} {(payload or '').rstrip()}")
-                newest = max(newest or 0, int(f.get("ts", 0)) + 1)
+                shown += 1
+            elif k == "position" and f.get("id"):
+                p = {"id": f["id"]}
+                if "offset" in f:
+                    p["offset"] = int(f["offset"])
+                at.append(p)
             elif k == "stream-end":
-                if f.get("status") == "exhausted":
-                    print("  -- end of the cursor (for now)")
-                else:
-                    print(f"  -- more to come; `fetch {n} from ...` again")
-        cur["at"] = newest
+                if f.get("status") == "exhausted" and not shown:
+                    print("  -- nothing more (for now)")
+                elif f.get("status") == "limited":
+                    print(f"  -- more: `fetch {n} from ...` again")
+        cur["at"] = at
 
     def once(self, doc, kind):
         out, err, rc = run(doc)

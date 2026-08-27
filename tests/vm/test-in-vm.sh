@@ -2187,6 +2187,66 @@ JSON
     rm -rf "$d" /tmp/vmbound.json
 }
 
+paging_walks_a_result_set_a_page_at_a_time() {
+    # Every entry once, in order, on a store whose entries ALL share a
+    # timestamp — the case that makes paging by clock lose everything
+    # that shared the last one. A position is an offset on the store's
+    # tape, so six entries of the same second are six positions.
+    local d=/var/log/timberfs/vmpage
+    rm -rf "$d"
+    timberfs create --set service=vmpage "$d/vmpage.log" >/dev/null 2>&1 || return 1
+    local i
+    for i in 1 2 3 4 5 6; do
+        printf '2026-08-27T10:00:00Z vmpage entry %d\n' "$i" \
+            | timberfs append --into "$d/vmpage.log" --quiet 2>/dev/null || return 1
+    done
+    local id
+    id=$(timberfs info --json "$d/vmpage.log" 2>/dev/null | jq -r .id)
+    [ -n "$id" ] && [ "$id" != null ] || { echo "no store id" >&2; return 1; }
+
+    local cur="" got="" page off all=""
+    for page in 1 2 3 4; do
+        cat > /tmp/vmpage.json <<JSON
+{ "v":"1.0-EXPERIMENTAL",
+  "stores":{"select":[{"key":"service","op":"=","value":"vmpage"}]},
+  "window":{"axis":"logline"}, "max":{"entries":2}, $cur
+  "response_format":{"kind":"records"} }
+JSON
+        got=$(timberfs query --query /tmp/vmpage.json 2>/dev/null \
+              | tr '\0' '\n' | grep -o 'vmpage entry [0-9]' | tr '\n' ' ')
+        off=$(timberfs query --query /tmp/vmpage.json 2>/dev/null \
+              | tr '\036\037\0' '\n|\n' | grep '^position' \
+              | grep -o 'offset=[0-9]*' | cut -d= -f2)
+        all="$all$got"
+        if [ "$page" = 4 ]; then
+            # Walked out: nothing left, and no position to go on with.
+            [ -z "$got" ] || { echo "page 4 gave '$got', want nothing" >&2; return 1; }
+            [ -z "$off" ] || { echo "exhausted but offered offset=$off" >&2; return 1; }
+            break
+        fi
+        [ -n "$off" ] || { echo "page $page offered no position" >&2; return 1; }
+        cur="\"cursor\":[{\"id\":\"$id\",\"offset\":$off}],"
+    done
+    # Every entry, once, in order.
+    [ "$all" = "vmpage entry 1 vmpage entry 2 vmpage entry 3 vmpage entry 4 vmpage entry 5 vmpage entry 6 " ] \
+        || { echo "walked: '$all'" >&2; return 1; }
+
+    # A store that matched NOTHING still reports where it got to, or the
+    # next page rescans it from the start of the window.
+    cat > /tmp/vmpage2.json <<'JSON'
+{ "v":"1.0-EXPERIMENTAL",
+  "stores":{"select":[{"key":"service","op":"=","value":"vmpage"}]},
+  "window":{"axis":"logline"},
+  "match":{"granularity":"entries","all":[{"has":"nosuchtermhere"}]},
+  "response_format":{"kind":"records"} }
+JSON
+    timberfs query --query /tmp/vmpage2.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^position' | grep -q "id=$id" \
+        || { echo "a barren store reported no position" >&2; return 1; }
+
+    rm -rf "$d" /tmp/vmpage.json /tmp/vmpage2.json
+}
+
 the_query_examples_ship_and_run() {
     # A format nobody can see worked examples of is one nobody uses. The
     # schema says what is legal; these say what is useful — so they are
@@ -2623,6 +2683,7 @@ run_test "selection: list --select matches on labels, not on the name" selection
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
 run_test "query document: match and bounds name their granularity" a_match_selects_what_it_says_it_selects
 run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
+run_test "paging: a cursor walks every entry once, even at one timestamp" paging_walks_a_result_set_a_page_at_a_time
 run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
 run_test "forest: an intake writes into a forest by name; --into-dir warns" an_intake_writes_into_a_forest_by_name

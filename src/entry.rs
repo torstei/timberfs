@@ -81,6 +81,17 @@ pub struct EntrySink {
     entry_chunk: Option<u64>,
     cur_chunk: Option<u64>,
 
+    /// Where the line being accumulated STARTED, as an absolute offset on
+    /// the store's tape: `dropped bytes + the chunk's offset + into it`.
+    /// Absolute, so retention cannot move it — `remove_head` rebases a
+    /// chunk's own offset and the drop counter compensates exactly.
+    line_begin: u64,
+    /// Just past the last entry this sink EMITTED. A caller resumes here:
+    /// everything after it is re-examined, so an entry the window or a
+    /// predicate rejected is simply rejected again, and nothing that was
+    /// delivered can be delivered twice.
+    pub emitted_end: Option<u64>,
+
     pub emitted: u64,
     pub filtered_out: u64,
     pub stamped: u64,
@@ -116,6 +127,8 @@ impl EntrySink {
             stamped: 0,
             offset_sum_ms: 0,
             offset_n: 0,
+            line_begin: 0,
+            emitted_end: None,
         }
     }
 
@@ -136,28 +149,38 @@ impl EntrySink {
         data: &[u8],
         chunk: Option<u64>,
         write_win: (u64, u64),
+        base: u64,
         out: &mut dyn Write,
     ) -> io::Result<()> {
         self.cur_write_win = write_win;
         self.cur_chunk = chunk;
+        // A line that began in the previous chunk keeps the offset it
+        // started at — it is absolute, so it stays right across the seam.
+        if self.line.is_empty() {
+            self.line_begin = base;
+        }
         let mut start = 0;
         for (i, &b) in data.iter().enumerate() {
             if b == b'\n' {
                 self.line.extend_from_slice(&data[start..=i]);
                 start = i + 1;
+                let began = self.line_begin;
+                self.line_begin = base + start as u64;
                 let line = std::mem::take(&mut self.line);
-                self.take_line(line, out)?;
+                self.take_line(line, began, out)?;
             }
         }
         self.line.extend_from_slice(&data[start..]);
         Ok(())
     }
 
-    fn take_line(&mut self, line: Vec<u8>, out: &mut dyn Write) -> io::Result<()> {
+    /// `began` is where this line starts on the tape — which is also
+    /// where the entry it interrupts ENDS, when it is a stamped one.
+    fn take_line(&mut self, line: Vec<u8>, began: u64, out: &mut dyn Write) -> io::Result<()> {
         let head = String::from_utf8_lossy(&line[..line.len().min(256)]);
         match self.extractor.extract(&head) {
             Some(ts) => {
-                self.close_entry(out)?;
+                self.close_at(began, out)?;
                 self.entry_ts = Some(ts);
                 self.entry_write_win = self.cur_write_win;
                 self.entry_chunk = self.cur_chunk;
@@ -188,6 +211,18 @@ impl EntrySink {
                 }
                 self.entry.extend_from_slice(&line);
             }
+        }
+        Ok(())
+    }
+
+    /// Close the open entry, recording where it ended so a caller can
+    /// resume just past it.
+    fn close_at(&mut self, end: u64, out: &mut dyn Write) -> io::Result<()> {
+        let had = !self.entry.is_empty();
+        let before = self.emitted;
+        self.close_entry(out)?;
+        if had && self.emitted > before {
+            self.emitted_end = Some(end);
         }
         Ok(())
     }
@@ -335,11 +370,15 @@ impl EntrySink {
 
     /// Flush pending state; call once after the last push.
     pub fn finish(&mut self, out: &mut dyn Write) -> io::Result<()> {
+        // A trailing line with no newline still began somewhere, and the
+        // data ends where it ends.
+        let end = self.line_begin + self.line.len() as u64;
         if !self.line.is_empty() {
+            let began = self.line_begin;
             let line = std::mem::take(&mut self.line);
-            self.take_line(line, out)?;
+            self.take_line(line, began, out)?;
         }
-        self.close_entry(out)?;
+        self.close_at(end, out)?;
 
         // The timezone tripwire: on one host the clocks cancel, so a
         // persistent offset near a whole number of hours is a parsing or
@@ -422,6 +461,7 @@ mod tests {
             b"2026-08-21T10:00:00Z first\n2026-08-21T10:00:01Z second\n",
             Some(41),
             (100, 200),
+            0,
             &mut out,
         )
         .unwrap();
@@ -439,8 +479,14 @@ mod tests {
         // zero would be a lie — chunk 0 is a real chunk.
         let mut sink = records_sink();
         let mut out = Vec::new();
-        sink.push_chunk(b"2026-08-21T10:00:00Z live\n", None, (100, 200), &mut out)
-            .unwrap();
+        sink.push_chunk(
+            b"2026-08-21T10:00:00Z live\n",
+            None,
+            (100, 200),
+            0,
+            &mut out,
+        )
+        .unwrap();
         sink.finish(&mut out).unwrap();
         let h = heads(&out);
         assert_eq!(h.len(), 1, "{h:?}");
@@ -469,10 +515,11 @@ mod tests {
             b"2026-08-21T10:00:00Z split ",
             Some(7),
             (100, 200),
+            0,
             &mut out,
         )
         .unwrap();
-        sink.push_chunk(b"continues here\n", Some(8), (200, 300), &mut out)
+        sink.push_chunk(b"continues here\n", Some(8), (200, 300), 0, &mut out)
             .unwrap();
         sink.finish(&mut out).unwrap();
         let h = heads(&out);

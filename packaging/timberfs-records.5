@@ -129,6 +129,36 @@ is neither dense nor monotone),
 streams name their source once, in
 .BR stream-start / source ).
 .TP
+.B position
+One per store EXAMINED, after the entries and before
+.BR stream-end .
+Fields:
+.B path
+and
+.B id
+(which store),
+.B offset
+(resume just here \(em ABSENT when this store delivered nothing, which is
+not the same as offset zero), and
+.BR chunks_read / chunks_selected
+as progress.
+.RS
+.PP
+The offset is absolute on the store's TAPE \(em what has ever left the
+store, plus where the next undelivered entry sits in what remains \(em so
+retention cannot move it, and unlike a timestamp it cannot COLLIDE. On a
+fleet whose entries share a second, resuming by clock loses every entry
+that shared the last one.
+.PP
+Hand these back as the query document's
+.B cursor
+and the next read continues exactly here; see
+.BR timberfs-query-document (5).
+Present for a store that matched NOTHING too \(em dropping those makes
+the next page rescan them from the start of the window, which on a fleet
+is most of the cost.
+.RE
+.TP
 .B stream-end
 Last record of every complete stream. Fields:
 .B entries

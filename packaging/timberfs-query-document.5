@@ -249,28 +249,50 @@ unit belongs here and is absent until something produces one; a
 fleet view capped at 5 chunks reads five in time order, not five per
 store.
 .RE
-.SS ⚠ There is no paging yet
+.TP
+.B cursor
+Where a previous answer stopped, per store: a list of
+.BR id / offset
+objects, which is exactly the shape of the
+.B position
+records that answer ended with. A client hands back what it was given.
+.RS
+.PP
+The offset is absolute on that store's
+.BR tape :
+what has ever left the store, plus where the next undelivered entry sits
+in what remains. Retention cannot move it \(em
+.B remove_head
+rebases a chunk's own offset and grows the drop counter by exactly as
+much \(em and, unlike a clock, it cannot COLLIDE. That is not a corner
+case: on a fleet whose entries share a second, resuming by timestamp
+loses every entry that shared the last one.
+.PP
+Include an entry for every store the previous answer EXAMINED, including
+the ones that matched nothing. Leave those out and the next page rescans
+them from the start of the window, which on a fleet is most of the cost.
+.PP
+A store ABSENT from the cursor is read from the start of the window. For
+a tail that is right \(em it is new, and everything it holds is new. A
+bounded walk that wants otherwise pins its store set instead.
+.RE
+.SS Paging, and what it still does not do
 .B stream\-end
 says whether a cap stopped the read
 .RB ( status=limited ,
-naming which one), so a client can always tell a truncated answer from a
-complete one. It cannot yet ask for the NEXT N.
+naming which one), a
+.B position
+record per store says where each one got to, and
+.B cursor
+hands those back. That is a page.
 .PP
-Do not build paging on what is there.
-.B window.from_chunk
-is a resume position for a FOLLOWING read and is refused on a windowed
-one; a timestamp cannot separate two entries inside a chunk, nor two
-chunks that share a boundary millisecond; and an entry's
-.B chunk=
-in the records stream names the chunk it sits in, not where in it \(em so
-resuming from that chunk re-delivers everything before it.
-.PP
-The position paging needs already exists in this project, as a
-follower's cursor: a chunk number plus the entries already delivered from
-that chunk, resolved against retention so a dropped anchor is REPORTED
-rather than silently clamped. Exposing it here is additive within
-.BR v=1 .
-Until then, a bound is for "show me some", not for walking a result set.
+What is NOT here yet is a
+.BR deadline :
+a bound on how long a search may take, rather than on how much it
+returns. A slow fleet-wide read is slow because it READS a lot, not
+because it matches a lot, so a caller who wants an answer within a few
+seconds cannot ask for one. That, and the service-imposed limits a query
+server will want, are the next things.
 .TP
 .B response_format
 A

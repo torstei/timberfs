@@ -431,6 +431,11 @@ pub struct Query {
     /// The stores to read. Paths today; a label selection resolves to
     /// these.
     pub sources: Vec<std::path::PathBuf>,
+    /// Where a previous read left each store, by identity. A store absent
+    /// from this is read from the start of the window: for a TAIL that is
+    /// right — it is new, and everything it holds is new — and a bounded
+    /// walk that wants otherwise pins its store set instead.
+    pub cursor: std::collections::BTreeMap<String, u64>,
     pub window: Window,
     pub matching: Match,
     pub limit: Limit,
@@ -600,6 +605,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     // caseless or regex predicate reads more rather than matching less.
     let (has_terms, any_terms) = q.matching.index_terms();
     let (has, any) = (&has_terms[..], &any_terms[..]);
+    let cursor = &q.cursor;
     // The index selects chunks; these judge the entries inside them.
     // Absent, the read stays chunk-granular — every entry of every chunk
     // the index let through comes out.
@@ -666,6 +672,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             any,
             entry_preds,
             max_chunks,
+            cursor,
             no_filename,
             show_write_time,
             null_sep,
@@ -694,6 +701,7 @@ fn query_entries(
     any: &[String],
     entry_preds: Option<crate::grep::Preds>,
     max_chunks: Option<u64>,
+    cursor: &std::collections::BTreeMap<String, u64>,
     no_filename: bool,
     show_write_time: bool,
     null_sep: bool,
@@ -708,6 +716,13 @@ fn query_entries(
         total_chunks: usize,
         pos: usize,
         sink: crate::entry::EntrySink,
+        /// Resume just past here, when the caller handed back a position.
+        resume_at: Option<u64>,
+        /// What has left this store over its life. Added to a chunk's own
+        /// offset it gives a position on the tape that retention cannot
+        /// move — `remove_head` rebases the one and grows the other by
+        /// exactly as much.
+        dropped_bytes: u64,
     }
     let multi = files.len() > 1 && !no_filename;
     // --max: a total entry cap shared by every source's sink.
@@ -769,6 +784,17 @@ fn query_entries(
         } else {
             selected
         };
+        // Where a previous answer left this store, if the caller handed
+        // one back. Keyed by IDENTITY: a path would not survive a move,
+        // and the answer that produced it named the store that way.
+        let dropped = dropped_bytes_of(f);
+        let resume_at = source
+            .bark
+            .as_ref()
+            .and_then(|b| b.get("id"))
+            .and_then(|v| v.as_str())
+            .and_then(|id| cursor.get(id))
+            .copied();
         let framing = crate::entry::Framing {
             null_sep,
             show_write: show_write_time,
@@ -798,6 +824,11 @@ fn query_entries(
                 &f.display().to_string(),
             )
             .with_preds(entry_preds.clone()),
+            // Read once per source: what has left this store over its
+            // life, which anchors every offset to the tape rather than to
+            // the file as it stands.
+            dropped_bytes: dropped,
+            resume_at,
         });
     }
 
@@ -888,10 +919,25 @@ fn query_entries(
         let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
             continue; // retained away by a race between selection and read
         };
+        // Resume: a chunk wholly before the position holds nothing new,
+        // and the one the position lands in is entered part-way. Byte
+        // exact, where a timestamp cannot tell two entries of the same
+        // second apart — which is why a position is an offset at all.
+        let chunk_base = s.dropped_bytes + c.uncomp_start;
+        let (data, base) = match s.resume_at {
+            Some(at) if at >= chunk_base + data.len() as u64 => continue,
+            Some(at) if at > chunk_base => (&data[(at - chunk_base) as usize..], at),
+            _ => (&data[..], chunk_base),
+        };
         s.sink.push_chunk(
-            &data,
+            data,
             Some(c.seq),
             (c.first_write_ms, c.last_write_ms),
+            // The chunk's place on the store's endless tape: what has
+            // already left the store, plus where this chunk sits in what
+            // remains. Retention rebases the second and the first
+            // compensates it exactly, so the sum never moves.
+            base,
             &mut out,
         )?;
         // --max reached: stop decompressing further chunks.
@@ -951,6 +997,38 @@ fn query_entries(
         total += s.total_chunks;
     }
     if records {
+        // WHERE EACH STORE GOT TO, one record per source, before the
+        // stream ends. An absolute offset on that store's tape: with its
+        // id it addresses a byte of a log that has ever existed, and it
+        // is the position a caller resumes from.
+        //
+        // Emitted for every store EXAMINED, including ones that matched
+        // nothing — otherwise the next page re-scans them from the start
+        // of the window, which on a fleet is most of the cost.
+        for (f, s) in files.iter().zip(&srcs) {
+            write!(out, "\x1eposition\x1fpath={}", f.display())?;
+            if let Some(id) = s
+                .handle
+                .bark
+                .as_ref()
+                .and_then(|b| b.get("id"))
+                .and_then(|v| v.as_str())
+            {
+                write!(out, "\x1fid={id}")?;
+            }
+            // Just past the last entry DELIVERED. Absent when this store
+            // delivered none, which is not the same as position zero.
+            if let Some(at) = s.sink.emitted_end {
+                write!(out, "\x1foffset={at}")?;
+            }
+            write!(
+                out,
+                "\x1fchunks_read={}\x1fchunks_selected={}",
+                s.pos,
+                s.chunks.len()
+            )?;
+            out.write_all(b"\0")?;
+        }
         // `status` and `limit` are new fields in v=1, which that format
         // permits: consumers ignore keys they do not know.
         let status = if limited { "limited" } else { "exhausted" };
@@ -1169,7 +1247,10 @@ fn query_follow(
     ) -> anyhow::Result<()> {
         for e in entries {
             match sink {
-                Some(s) => s.push_chunk(&e.payload, None, (e.wf, e.wl), out)?,
+                // The live edge is in no chunk yet, so it has no position
+                // on the tape — which is exactly why an entry from it
+                // carries no `chunk` either.
+                Some(s) => s.push_chunk(&e.payload, None, (e.wf, e.wl), 0, out)?,
                 None => emit_raw(out, &e.payload, label)?,
             }
         }
@@ -1192,6 +1273,9 @@ fn query_follow(
         // pending entry has already been closed for this quiet streak.
         last_data: std::time::Instant,
         flushed_idle: bool,
+        /// What has left this store, so an offset is on the tape rather
+        /// than in the file as it stands.
+        dropped_bytes: u64,
     }
 
     // An entry is only closed by the NEXT stamped line, so the newest
@@ -1339,6 +1423,7 @@ fn query_follow(
                         &data,
                         Some(c.seq),
                         (c.first_write_ms, c.last_write_ms),
+                        dropped_bytes_of(f) + c.uncomp_start,
                         &mut out,
                     )?,
                     None => emit_raw(&mut out, &data, label.as_deref())?,
@@ -1372,6 +1457,7 @@ fn query_follow(
             noted_overtaken: false,
             last_data: std::time::Instant::now(),
             flushed_idle: false,
+            dropped_bytes: dropped_bytes_of(f),
         });
     }
     out.flush()?;
@@ -1437,6 +1523,9 @@ fn query_follow(
                                     fresh,
                                     Some(c.seq),
                                     (c.first_write_ms, c.last_write_ms),
+                                    // `skip` bytes of this chunk were
+                                    // already delivered on an earlier poll.
+                                    s.dropped_bytes + c.uncomp_start + skip as u64,
                                     &mut out,
                                 )?,
                                 None => emit_raw(&mut out, fresh, s.label.as_deref())?,
@@ -2861,4 +2950,24 @@ fn store_id_of(h: &SourceHandle) -> Option<Vec<u8>> {
         .and_then(|b| b.get("id"))
         .and_then(|v| v.as_str())
         .map(|s| s.as_bytes().to_vec())
+}
+
+/// What has left this store over its life, uncompressed. Added to a
+/// chunk's own offset it gives a position on the store's endless TAPE,
+/// which retention cannot move: `remove_head` rebases the chunk offsets
+/// down by exactly what it grows this by.
+///
+/// ⚠ A FLOOR on a store head-dropped before these counters existed, so
+/// its offsets start from an origin that is not its first ever byte.
+/// Harmless: the understatement is a constant, every later drop is
+/// counted, and a position only ever has to be comparable with others
+/// from the same store.
+fn dropped_bytes_of(input: &Path) -> u64 {
+    let Ok((dir, name)) = resolve_backing(input) else {
+        return 0;
+    };
+    std::fs::File::open(format::rings_path(&dir, &name))
+        .and_then(|f| format::read_header_dropped(&f))
+        .map(|d| d.uncomp_bytes)
+        .unwrap_or(0)
 }

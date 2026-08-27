@@ -1275,6 +1275,10 @@ fn main() -> anyhow::Result<()> {
             }
             let q = query::Query {
                 sources: files,
+                // No flag carries a position: resuming is the document's,
+                // because a cursor is what a PREVIOUS ANSWER said, and the
+                // flags describe a search rather than a place in one.
+                cursor: Default::default(),
                 window: query::Window {
                     from,
                     to,
