@@ -1050,9 +1050,17 @@ List only the stores whose manifest satisfies
 .IR EXPR ,
 the same predicate the query document takes. Comma-separated terms are
 ANDed;
-.BR key=value ", " key!=value ", " key=~regex " and " key!~regex
-(regexes anchored at both ends). An absent label reads as the empty
-string, so
+.BR key=value ", " key!=value ", " key=~regex ", " key!~regex ", "
+.BR key=*text " and " key!*text
+(regexes anchored at both ends;
+.B =*
+is a LITERAL substring anywhere in the value \(em what a person means by
+"the store with apache in its name", and not the same as
+.BR name=~.*apache.* ,
+where a
+.B .
+in the text would be read as a pattern). An absent label reads as the
+empty string, so
 .B key=
 selects the stores that do NOT declare it and
 .B key!=

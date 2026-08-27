@@ -1748,6 +1748,24 @@ selection_is_by_label_not_by_name() {
     got=$(timberfs list --names --select 'service=~vms' 2>/dev/null)
     [ -z "$got" ] || { echo "unanchored regex matched $got" >&2; return 1; }
 
+    # `=*` is the substring the anchoring makes awkward: "the store with
+    # `sel` in its name" is the commonest thing anyone asks, and saying it
+    # as `=~.*sel.*` would read the typed text as a pattern.
+    got=$(timberfs list --names --select 'name=*sel-' 2>/dev/null | sort | tr '\n' ',')
+    [ "$got" = "vmsel-a,vmsel-b," ] || { echo "name=*sel- gave $got" >&2; return 1; }
+    # Scoped by service, because the forest holds every other test's
+    # stores too and `not containing -a` is true of most of them.
+    got=$(timberfs list --names --select 'service=vmsel,name!*-a' 2>/dev/null)
+    [ "$got" = "vmsel-b" ] || { echo "name!*-a gave $got" >&2; return 1; }
+    # LITERAL: a dot is a dot. `vmsel.a` matches nothing, where the
+    # equivalent regex would have matched `vmsel-a`.
+    got=$(timberfs list --names --select 'name=*vmsel.a' 2>/dev/null)
+    [ -z "$got" ] || { echo "a substring was read as a pattern: $got" >&2; return 1; }
+    got=$(timberfs list --names --select 'name=~.*vmsel.a.*' 2>/dev/null)
+    [ "$got" = "vmsel-a" ] || { echo "the regex form should match: $got" >&2; return 1; }
+    # An empty substring is in every value, so it says nothing.
+    timberfs list --select 'name=*' >/dev/null 2>&1 && return 1
+
     # Matched nothing is a successful answer WITH coverage, not an error
     # and not silence — "no results" must not read as "nothing searched".
     got=$(timberfs list --names --select 'service=vmsel,type=nope' 2>/tmp/vmsel.err) || return 1

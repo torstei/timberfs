@@ -11,7 +11,17 @@
 //! key!=value     it does not
 //! key=~regex     it matches regex, anchored at both ends
 //! key!~regex     it does not
+//! key=*text      it CONTAINS text, anywhere in the value
+//! key!*text      it does not
 //! ```
+//!
+//! `=*` exists because "the store whose name has `apache` in it" is the
+//! commonest thing anyone asks, and an anchored regex is a poor way to
+//! say it: `name=~.*apache.*` turns a user's literal text into a pattern,
+//! so a name with a `.` or a `+` in it matches things nobody asked for.
+//! It is the store-side counterpart of `timber-filter`'s `--substring`
+//! and the query document's `substring` predicate, which have always had
+//! this and which store selection did not.
 //!
 //! An absent label reads as the empty string, so `key!=` selects the
 //! stores that declare `key` and `key=` the ones that do not — the same
@@ -29,6 +39,8 @@ enum Op {
     Ne,
     Match,
     NotMatch,
+    Contains,
+    NotContains,
 }
 
 #[derive(Debug)]
@@ -47,6 +59,9 @@ impl Term {
             // Parsing built the regex, so `re` is Some for both regex ops.
             Op::Match => self.re.as_ref().is_some_and(|r| r.is_match(have)),
             Op::NotMatch => self.re.as_ref().is_some_and(|r| !r.is_match(have)),
+            // Literal, and case-sensitive like every other operator here.
+            Op::Contains => have.contains(&self.value),
+            Op::NotContains => !have.contains(&self.value),
         }
     }
 }
@@ -148,18 +163,26 @@ fn parse_term(part: &str) -> anyhow::Result<Term> {
     }
     // Longest operator first: `!=` and `!~` before `=`, else `key!=v`
     // would parse as key `key!` — a term that matches nothing, silently.
+    // Longest operator first: `!=` and `!~` before `=`, else `key!=v`
+    // would parse as key `key!` — a term that matches nothing, silently.
+    // `=*` before `=` for the same reason, or `name=*x` would be an
+    // equality against the literal `*x`.
     let (key, op, value) = if let Some((k, v)) = part.split_once("!=") {
         (k, Op::Ne, v)
     } else if let Some((k, v)) = part.split_once("!~") {
         (k, Op::NotMatch, v)
+    } else if let Some((k, v)) = part.split_once("!*") {
+        (k, Op::NotContains, v)
     } else if let Some((k, v)) = part.split_once("=~") {
         (k, Op::Match, v)
+    } else if let Some((k, v)) = part.split_once("=*") {
+        (k, Op::Contains, v)
     } else if let Some((k, v)) = part.split_once('=') {
         (k, Op::Eq, v)
     } else {
         bail!(
             "selector term {part:?} has no operator — expected key=value, \
-             key!=value, key=~regex or key!~regex"
+             key!=value, key=~regex, key!~regex, key=*text or key!*text"
         );
     };
     let key = key.trim();
@@ -167,6 +190,16 @@ fn parse_term(part: &str) -> anyhow::Result<Term> {
         bail!("selector term {part:?} has no label name");
     }
     let value = unquote(value.trim());
+    // An empty substring is contained in everything, so it says nothing —
+    // and `key!=` already spells "declares this key". Two ways to say one
+    // thing, one of which reads like a typo, is worse than a refusal.
+    if matches!(op, Op::Contains | Op::NotContains) && value.is_empty() {
+        bail!(
+            "selector term {part:?} has an empty substring, which every value contains — \
+             use `{}!=` for \"declares this label\"",
+            key.trim()
+        );
+    }
     let re = match op {
         Op::Match | Op::NotMatch => Some(
             // Anchored, as in Prometheus and Loki: an unanchored `=~`
@@ -288,6 +321,39 @@ mod tests {
         assert!(Selector::parse("service=").unwrap().matches(&l));
         assert!(!Selector::parse("service!=").unwrap().matches(&l));
         assert!(Selector::parse("type!=").unwrap().matches(&l));
+    }
+
+    #[test]
+    fn a_substring_is_a_literal_not_a_pattern() {
+        // The gesture this exists for: "the store with apache in its
+        // name". As an anchored regex that is `name=~.*apache.*`, which
+        // turns whatever the user typed into a pattern.
+        let l = labels(&[("name", "apache-error@http01")]);
+        assert!(Selector::parse("name=*apache").unwrap().matches(&l));
+        assert!(Selector::parse("name=*error@http").unwrap().matches(&l));
+        assert!(!Selector::parse("name=*nginx").unwrap().matches(&l));
+        assert!(Selector::parse("name!*nginx").unwrap().matches(&l));
+        assert!(!Selector::parse("name!*apache").unwrap().matches(&l));
+
+        // A LITERAL: metacharacters are themselves, which is the whole
+        // point. `.` matches a dot, not any character.
+        let dotted = labels(&[("name", "a.b")]);
+        assert!(Selector::parse("name=*a.b").unwrap().matches(&dotted));
+        assert!(!Selector::parse("name=*axb").unwrap().matches(&dotted));
+        let axb = labels(&[("name", "axb")]);
+        assert!(
+            !Selector::parse("name=*a.b").unwrap().matches(&axb),
+            "a dot is a dot, where a regex would have matched"
+        );
+
+        // `=*` is tried before `=`, or this is an equality against `*x`.
+        assert!(Selector::parse("name=*apache").unwrap().matches(&l));
+        assert!(!Selector::parse("name=apache").unwrap().matches(&l));
+
+        // Empty contains everything, so it says nothing — and `key!=`
+        // already means "declares this label".
+        assert!(Selector::parse("name=*").is_err());
+        assert!(Selector::parse("name!*").is_err());
     }
 
     #[test]

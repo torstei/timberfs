@@ -68,7 +68,15 @@ takes, in structured form: a list of
 objects, ANDed, where
 .B op
 is
-.BR = ", " != ", " =~ " or " !~ .
+.BR = ", " != ", " =~ ", " !~ ", " =* " or " !* .
+Regexes are anchored at both ends;
+.B =*
+is a LITERAL substring, which is what a person means by "the store with
+apache in its name" and is not the same as
+.BR =~.*apache.* ,
+where a
+.B .
+in the text would be read as a pattern.
 An absent label reads as the empty string, so
 .B "service="
 selects the stores that do not declare one.
