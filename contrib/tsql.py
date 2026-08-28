@@ -32,6 +32,8 @@ KINDS = ("records", "loglines", "stores", "chunks")
 OPS = ("!=", "!~", "!*", "=~", "=*", "=")
 
 HELP = """
+  select stores from [];                   what is out there (start here)
+
   create logview [type=console] console;   name a predicate
   drop logview console;                    forget it
   show logviews;                           what is defined
@@ -40,7 +42,9 @@ HELP = """
   tail   <kind> from <source> [where ...];
 
     <kind>    records | loglines | stores | chunks
-    <source>  a view name, or a predicate literal like [type=console]
+    <source>  a view name, or a predicate literal like [type=console].
+              [] is the EMPTY predicate, and an empty predicate is every
+              store -- enumerating is not a separate verb
 
   where, joined by `and` -- the SUBJECT says what is being asked:
 
