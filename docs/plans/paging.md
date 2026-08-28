@@ -1,15 +1,13 @@
 # Paging: a cursor beside the search, not inside it
 
-**Status: the position and the cursor are BUILT (0.24.0); the deadline and
-the service-imposed limits are not.** A `position` record per examined
+**Status: the position, the cursor and the deadline are BUILT; the
+service-imposed limits are not.** A `position` record per examined
 store says where each got to, and handing those back as the request's
 `cursor` resumes exactly there. What follows is the reasoning, and what
-remains. The pieces it rests on are real: a store
-carries an id, `Cursor { seq, n }` already means "chunk, and entries delivered
-from it" and already resolves against retention, the records stream already
-emits one `source` record per examined store, and `stream-end` already says
-whether a cap stopped the read. What is missing is a position in the response
-and a way to hand one back.
+remains. The pieces it rested on were already there: a store carries an id,
+`Cursor { seq, n }` means "chunk, and entries delivered from it" and resolves
+against retention, the records stream emits one `source` record per examined
+store, and `stream-end` says whether a bound stopped the read.
 
 See [the query document](../../packaging/timberfs-query-document.5) for the
 request this extends, and `timberfs-records(5)` for the response.
@@ -21,11 +19,17 @@ that store's tape; `cursor` in the request hands them back. Six entries
 sharing one timestamp are six distinct positions, which is the case that
 made the timestamp approach useless.
 
-What is still missing is the **deadline** — a bound on how LONG a search
-may take rather than how much it returns — and the service-imposed limits
-a query server will want to declare. A fleet-wide read is slow because it
-READS a lot, not because it matches a lot, so a caller who wants an answer
-within a few seconds still cannot ask for one.
+Bound the wait, with `deadline: {"ms": 5000}`. A fleet read is slow because
+it READS a lot, not because it matches a lot, so no count bounds it; and
+unlike a timeout in the caller — which drops the connection and everything
+already on it — a deadline is answered. Stores read to the end are complete,
+the one it stopped inside carries a position, a store selected but never
+opened has `chunks_read=0`, and one it never reached at all has no `source`
+record while `stream-start` still counts it.
+
+What is still missing are the **service-imposed limits** a query server
+will want to declare — its own ceilings on what a request may ask for,
+announced rather than discovered by having a request refused.
 
 ## What a client could do before that (kept, because it is the argument)
 
@@ -88,13 +92,16 @@ COVERED those chunks, it just did not have to read them. Recording that costs
 nothing and saves the whole scan next time.
 
 Consequence to decide deliberately: **the cursor is O(stores examined)**. Five
-is nothing; five thousand is five thousand entries on every page. Worth
-exploring: the merge is time-ordered, so when it stops, every store's next
-chunk begins at or after one frontier time — which suggests a watermark plus
-explicit positions only for the stores straddling it. Not safe alone (chunk
-boundaries sharing a millisecond is the hazard `from_chunk` exists to avoid),
-but as watermark-with-exceptions it could collapse the common case to nearly
-constant size.
+is nothing; five thousand is five thousand entries on every page. A watermark
+was sketched here on the grounds that the merge was time-ordered, so a stop
+left every store's next chunk at or after one frontier time. A bounded read
+no longer interleaves — it drains each store before the next — so there is no
+such frontier and the sketch does not apply. What sequential gives instead is
+that the positions COMPRESS by shape: every store before the one it stopped in
+is at its end, every store after it is untouched, and only one is part-way.
+Whether that is worth encoding is open; see
+[logline-order.md](logline-order.md) for the mode that would restore a real
+frontier, and what it needs first.
 
 ## Two gaps in the response
 

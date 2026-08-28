@@ -2233,6 +2233,68 @@ JSON
     rm -rf "$a" "$b" /tmp/vmseq.json
 }
 
+a_deadline_bounds_the_wait_and_the_answer_says_where_it_stopped() {
+    # A deadline is the one bound whose effect is not reproducible, so the
+    # assertions are the INVARIANTS rather than a particular split.
+    # A forest is scanned ONE level deep, so each store is its own
+    # directory directly under it.
+    local i n
+    rm -rf /var/log/timberfs/vmdl-1 /var/log/timberfs/vmdl-2 /var/log/timberfs/vmdl-3
+    for i in 1 2 3; do
+        local st=/var/log/timberfs/vmdl-$i/vmdl-$i.log
+        timberfs create --set svc=vmdl "$st" >/dev/null 2>&1 || return 1
+        seq 1 8000 | awk -v n=$i \
+            '{printf "2026-08-28T10:00:%02dZ INFO vmdl store %s line %d filler filler\n", $1%60, n, $1}' \
+            | timberfs append --into "$st" --chunk-size 4096 --quiet 2>/dev/null \
+            || return 1
+    done
+
+    ddoc() { cat > /tmp/vmdl.json <<JSON
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"svc","op":"=","value":"vmdl"}]},
+  "window":{"axis":"logline"}, $1 "response_format":{"kind":"records"} }
+JSON
+    }
+    local end
+    # Generous: it must not fire on its own, or every other assertion here
+    # would pass for the wrong reason.
+    ddoc '"deadline":{"ms":600000},'
+    end=$(timberfs query --query /tmp/vmdl.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-end')
+    echo "$end" | grep -q 'status=exhausted' || { echo "600s deadline fired: $end" >&2; return 1; }
+    n=$(echo "$end" | sed 's/.*|entries=\([0-9]*\)|.*/\1/')
+    [ "$n" = 24000 ] || { echo "unbounded gave $n entries, want 24000" >&2; return 1; }
+
+    # 1 ms against ~300 chunks: it fires, and NAMES itself rather than
+    # borrowing an entry cap's name.
+    ddoc '"deadline":{"ms":1},'
+    end=$(timberfs query --query /tmp/vmdl.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep '^stream-end')
+    echo "$end" | grep -q 'status=limited' || { echo "$end" >&2; return 1; }
+    echo "$end" | grep -q 'limit=deadline' || { echo "$end" >&2; return 1; }
+
+    # The STAIRCASE, which holds wherever the deadline lands and is the
+    # sequential read made visible: stores complete until the one it
+    # stopped inside, and nothing after that was opened at all.
+    timberfs query --query /tmp/vmdl.json 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^position' | sed 's/.*|chunks_read=\([0-9]*\)|chunks_selected=\([0-9]*\).*/\1 \2/' \
+        | awk 'BEGIN{done=0}
+               {if (done && $1 != 0) {print "store read after the deadline stopped one"; exit 1}
+                if ($1 < $2) done=1}
+               END{exit 0}' || return 1
+
+    # Zero is refused rather than obeyed, and a follow has no end to bound.
+    ddoc '"deadline":{"ms":0},'
+    timberfs query --query /tmp/vmdl.json >/dev/null 2>/tmp/vmdl.err && {
+        echo "a zero deadline was accepted" >&2; return 1; }
+    grep -q 'zero' /tmp/vmdl.err || { cat /tmp/vmdl.err >&2; return 1; }
+    timberfs query --deadline 5 --follow /var/log/timberfs/vmdl-1/vmdl-1.log \
+        >/dev/null 2>/tmp/vmdl.err && {
+        echo "--deadline with --follow was accepted" >&2; return 1; }
+
+    rm -rf /var/log/timberfs/vmdl-1 /var/log/timberfs/vmdl-2 /var/log/timberfs/vmdl-3 \
+        /tmp/vmdl.json /tmp/vmdl.err
+}
+
 paging_walks_a_result_set_a_page_at_a_time() {
     # Every entry once, in order, on a store whose entries ALL share a
     # timestamp — the case that makes paging by clock lose everything
@@ -2730,6 +2792,7 @@ run_test "query document: selects by label, and can answer with stores" a_query_
 run_test "query document: match and bounds name their granularity" a_match_selects_what_it_says_it_selects
 run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
 run_test "framed answers read stores one after another; text still interleaves" a_framed_answer_reads_stores_one_after_another
+run_test "deadline: bounds the wait, names itself, and says where it stopped" a_deadline_bounds_the_wait_and_the_answer_says_where_it_stopped
 run_test "paging: a cursor walks every entry once, even at one timestamp" paging_walks_a_result_set_a_page_at_a_time
 run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing

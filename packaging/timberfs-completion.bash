@@ -95,7 +95,8 @@ _timberfs() {
         --retain-size | --timestamp-regex | --timestamp-format | --listen | \
         --payload-key | --route | --max-body | --query | --select | --cursor | \
         --rotated | --socket | --project | --key | --prefix | --only | --endpoint | \
-        --keep | --drain-every | --idle | --timeout | --from-chunk | --wait-for-writer)
+        --keep | --drain-every | --idle | --timeout | --from-chunk | --wait-for-writer | \
+        --deadline)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;

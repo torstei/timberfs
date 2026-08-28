@@ -1,0 +1,30 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "stores": {
+    "select": [
+      {
+        "key": "type",
+        "op": "=",
+        "value": "console"
+      }
+    ]
+  },
+  "window": {
+    "axis": "logline",
+    "from": 1787727600000
+  },
+  "match": {
+    "granularity": "entries",
+    "all": [
+      {
+        "has": "req-8f3a"
+      }
+    ]
+  },
+  "deadline": {
+    "ms": 5000
+  },
+  "response_format": {
+    "kind": "records"
+  }
+}

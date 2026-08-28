@@ -10,6 +10,17 @@
         "$ref": "#/$defs/Position"
       }
     },
+    "deadline": {
+      "description": "How long the search may take. Composes with `max` rather than\nconflicting: they bound different things, and a fleet read is slow\nbecause it READS a lot, not because it matches a lot.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Deadline"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "match": {
       "anyOf": [
         {
@@ -116,6 +127,22 @@
         }
       },
       "additionalProperties": false
+    },
+    "Deadline": {
+      "description": "A bound on TIME rather than on volume.\n\nWhy the service and not the client: a client-side timeout drops the\nconnection and everything that had already arrived with it. A deadline\nis answered — the stores read completely are complete, the one it\nstopped in has a position to resume from, and the ones never reached\nsay so.",
+      "type": "object",
+      "properties": {
+        "ms": {
+          "description": "Milliseconds, as every other time in this document is.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ms"
+      ]
     },
     "DocGranularity": {
       "description": "Whether a predicate names entries or chunks.",
