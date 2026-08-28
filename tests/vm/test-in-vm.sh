@@ -2331,6 +2331,85 @@ an_unknown_selector_operator_is_refused_not_quietly_truncated() {
     rm -rf "$d" /tmp/vmop.json /tmp/vmop.err
 }
 
+a_quiet_store_keeps_its_place_across_pages() {
+    # The defect: a store that delivers nothing on a page reported a
+    # `position` with NO offset, and an offsetless cursor entry IS the
+    # start of the window — so handing the answer back, exactly as the
+    # format says to, re-read every store that had gone quiet.
+    #
+    # Two stores of different lengths is what shows it. Stores are read one
+    # after another, so the short one is exhausted while the long one is
+    # still going, and the page after that used to re-deliver it.
+    local a=/var/log/timberfs/vmquiet-a b=/var/log/timberfs/vmquiet-b i
+    rm -rf "$a" "$b"
+    timberfs create --set svc=vmquiet "$a/vmquiet-a.log" >/dev/null 2>&1 || return 1
+    timberfs create --set svc=vmquiet "$b/vmquiet-b.log" >/dev/null 2>&1 || return 1
+    for i in 1 2; do
+        printf '2026-08-28T11:00:00Z vmquiet A entry %d\n' "$i" \
+            | timberfs append --into "$a/vmquiet-a.log" --quiet 2>/dev/null || return 1
+    done
+    for i in 1 2 3 4; do
+        printf '2026-08-28T11:00:00Z vmquiet B entry %d\n' "$i" \
+            | timberfs append --into "$b/vmquiet-b.log" --quiet 2>/dev/null || return 1
+    done
+
+    # Walk two at a time, feeding each answer's positions straight back.
+    python3 - <<'PY'
+import json, subprocess, sys, collections
+
+def page(cursor):
+    doc = {"v": "1.0-EXPERIMENTAL",
+           "stores": {"select": [{"key": "svc", "op": "=", "value": "vmquiet"}]},
+           "window": {"axis": "logline"},
+           "max": {"entries": 2},
+           "response_format": {"kind": "records"}}
+    if cursor:
+        doc["cursor"] = cursor
+    p = subprocess.run(["timberfs", "query", "--query", "-"],
+                       input=json.dumps(doc), capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    entries, positions, limited = [], [], False
+    for rec in p.stdout.split("\x1e"):
+        if not rec:
+            continue
+        head, _, rest = rec.partition("\0")
+        parts = head.split("\x1f")
+        f = dict(x.split("=", 1) for x in parts[1:] if "=" in x)
+        if parts[0] == "entry":
+            entries.append(rest.split("\0", 1)[0].strip())
+        elif parts[0] == "position" and f.get("id"):
+            # VERBATIM: whatever the answer said, unedited. That is the
+            # contract, and it is what used to lose a quiet store.
+            q = {"id": f["id"]}
+            if "offset" in f:
+                q["offset"] = int(f["offset"])
+            positions.append(q)
+        elif parts[0] == "stream-end":
+            limited = f.get("status") == "limited"
+    return entries, positions, limited
+
+seen, cursor = [], []
+for _ in range(8):
+    got, cursor, more = page(cursor)
+    seen += got
+    if not more:
+        break
+
+want = 6
+counts = collections.Counter(seen)
+dupes = {k: v for k, v in counts.items() if v > 1}
+if len(seen) != want or dupes:
+    print(f"walked {len(seen)} entries, {len(counts)} distinct (want {want})",
+          file=sys.stderr)
+    for k, v in sorted(dupes.items()):
+        print(f"  DELIVERED {v}x: {k}", file=sys.stderr)
+    sys.exit(1)
+PY
+    local rc=$?
+    rm -rf "$a" "$b"
+    return $rc
+}
+
 paging_walks_a_result_set_a_page_at_a_time() {
     # Every entry once, in order, on a store whose entries ALL share a
     # timestamp — the case that makes paging by clock lose everything
@@ -2348,7 +2427,7 @@ paging_walks_a_result_set_a_page_at_a_time() {
     id=$(timberfs info --json "$d/vmpage.log" 2>/dev/null | jq -r .id)
     [ -n "$id" ] && [ "$id" != null ] || { echo "no store id" >&2; return 1; }
 
-    local cur="" got="" page off all=""
+    local cur="" got="" page off all="" prev=""
     for page in 1 2 3 4; do
         cat > /tmp/vmpage.json <<JSON
 { "v":"1.0-EXPERIMENTAL",
@@ -2363,12 +2442,18 @@ JSON
               | grep -o 'offset=[0-9]*' | cut -d= -f2)
         all="$all$got"
         if [ "$page" = 4 ]; then
-            # Walked out: nothing left, and no position to go on with.
+            # Walked out: nothing left, and the position UNCHANGED rather
+            # than gone. Nothing moved, so it did not move either — and an
+            # absent offset would mean the start of the window, so a client
+            # handing this answer back would re-read the store whole.
             [ -z "$got" ] || { echo "page 4 gave '$got', want nothing" >&2; return 1; }
-            [ -z "$off" ] || { echo "exhausted but offered offset=$off" >&2; return 1; }
+            [ "$off" = "$prev" ] \
+                || { echo "exhausted page moved the position: $prev -> ${off:-none}" >&2
+                     return 1; }
             break
         fi
         [ -n "$off" ] || { echo "page $page offered no position" >&2; return 1; }
+        prev=$off
         cur="\"cursor\":[{\"id\":\"$id\",\"offset\":$off}],"
     done
     # Every entry, once, in order.
@@ -2830,6 +2915,7 @@ run_test "bounded read: names the bound, counts what it read, invents no entry" 
 run_test "framed answers read stores one after another; text still interleaves" a_framed_answer_reads_stores_one_after_another
 run_test "deadline: bounds the wait, names itself, and says where it stopped" a_deadline_bounds_the_wait_and_the_answer_says_where_it_stopped
 run_test "selector: an unknown operator is refused, not truncated" an_unknown_selector_operator_is_refused_not_quietly_truncated
+run_test "paging: a store that goes quiet keeps its place" a_quiet_store_keeps_its_place_across_pages
 run_test "paging: a cursor walks every entry once, even at one timestamp" paging_walks_a_result_set_a_page_at_a_time
 run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
