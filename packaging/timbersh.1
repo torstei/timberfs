@@ -75,6 +75,30 @@ It is RUN, not read \(em a script of statements, the way
 is.
 .RB ( $TIMBERSH_RC )
 .TP
+.BI \-\-histfile " FILE"
+Where the line history is kept, default
+.IR ~/.timbersh\-history .
+.RB ( $TIMBERSH_HISTFILE )
+.RS
+.PP
+⚠ Created mode 0600, and created that way rather than widened and then
+narrowed \(em between those two calls the file is readable, which is the
+window the mode exists to close. A history of queries is a list of the
+identifiers somebody went looking for: request ids, customer names,
+hostnames. That is production data in a dotfile, and
+.BR psql (1)
+has the same exposure and the same answer.
+.PP
+Failing to read or write it never stops a session. A read\-only home, a
+missing directory, a file owned by somebody else \(em none of that is a
+reason to refuse to open a shell, so it is reported once and the session
+runs without history.
+.RE
+.TP
+.BI \-\-histsize " N"
+How many lines to keep, default 2000.
+.RB ( $TIMBERSH_HISTSIZE )
+.TP
 .BI \-\-ttl " SECS"
 Expire the cached store list after SECS. Default 0, which never expires
 it \(em

@@ -57,6 +57,8 @@ export for one session and nothing else:
 | `--cmd` | `TIMBERFS_CMD` | how to reach a timberfs; it gets the document on stdin |
 | `--hosts` | `TIMBERFS_HOSTS` | fan out, substituting each host for `_TIMBERHOST_` in `--cmd` |
 | `--rc` | `TIMBERSH_RC` | statements run at startup |
+| `--histfile` | `TIMBERSH_HISTFILE` | line history, `~/.timbersh-history`, mode 0600 |
+| `--histsize` | `TIMBERSH_HISTSIZE` | how many lines to keep (2000) |
 | `--ttl` | `TIMBERSH_STORE_TTL` | expire the cached store list after N seconds; 0 (default) never expires it |
 
 `--cmd` is only ever handed a document on stdin, so anything that reaches a

@@ -50,6 +50,10 @@ something else again at the far end.
                  remembers where it lives. Unset, there is one unnamed host
                  and nothing is substituted.
   TIMBERSH_RC    statements run at startup, default ~/.timbershrc
+  TIMBERSH_HISTFILE
+                 line history, default ~/.timbersh-history, mode 0600
+  TIMBERSH_HISTSIZE
+                 how many lines to keep, default 2000
 """
 import argparse, datetime, json, os, re, readline, shlex, subprocess, sys, threading, time
 
@@ -66,6 +70,9 @@ TARGETS = HOSTS or [None]
 # it happens when you know something changed, and it says what did.
 STORE_TTL = float(os.environ.get("TIMBERSH_STORE_TTL", "0"))
 RC = os.environ.get("TIMBERSH_RC", os.path.expanduser("~/.timbershrc"))
+HISTFILE = os.environ.get("TIMBERSH_HISTFILE",
+                          os.path.expanduser("~/.timbersh-history"))
+HISTSIZE = int(os.environ.get("TIMBERSH_HISTSIZE", "2000"))
 KINDS = ("records", "loglines", "stores", "chunks")
 OPS = ("!=", "!~", "!*", "=~", "=*", "=")
 
@@ -1316,6 +1323,54 @@ class Shell:
             print("\n  stopped.")
 
 
+def load_history(path, size):
+    """Read the history, and arrange for it to be written back.
+
+    ⚠ Mode 0600, and created that way rather than fixed afterwards. A
+    history of queries is a list of the identifiers someone went looking
+    for — request ids, customer names, hostnames — which is production
+    data sitting in a dotfile. `psql` has the same exposure and the same
+    answer.
+
+    Failure here never stops a session. A read-only home, a directory that
+    does not exist, a file someone else owns: none of that is a reason to
+    refuse to open a shell, so it is reported once and the session runs
+    without history."""
+    readline.set_history_length(size)
+    try:
+        readline.read_history_file(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"  ! history not read from {path}: {e}")
+
+    def save():
+        try:
+            # Create it 0600 rather than widening then narrowing: between
+            # those two calls the file is readable, and that window is the
+            # whole point of the mode.
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+            readline.write_history_file(path)
+        except OSError as e:
+            print(f"  ! history not saved to {path}: {e}")
+
+    return save
+
+
+def remember(line):
+    """Record a line, whether or not readline saw it.
+
+    In a terminal readline adds it as `input()` returns; through a pipe it
+    does not, because `input()` only uses readline on a tty. Adding it here
+    makes the history the same either way — and comparing against the last
+    entry is what stops a terminal getting two copies of every line."""
+    n = readline.get_current_history_length()
+    if n and readline.get_history_item(n) == line:
+        return
+    readline.add_history(line)
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(
         prog="timbersh", add_help=True,
@@ -1340,6 +1395,11 @@ def parse_args(argv):
                     help="expire the cached store list after SECS. Default 0, "
                          "which never expires it — `refresh` re-reads it. "
                          "$TIMBERSH_STORE_TTL")
+    ap.add_argument("--histfile", metavar="FILE", default=HISTFILE,
+                    help="where the line history is kept, mode 0600. "
+                         "$TIMBERSH_HISTFILE")
+    ap.add_argument("--histsize", metavar="N", type=int, default=HISTSIZE,
+                    help="how many lines to keep. $TIMBERSH_HISTSIZE")
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="start without printing the help")
     return ap.parse_args(argv)
@@ -1366,24 +1426,34 @@ def main(argv=None):
     readline.set_completer(Complete(sh))
     readline.set_completer_delims(" ")
     readline.parse_and_bind("tab: complete")
+    save_history = load_history(a.histfile, a.histsize)
     if not a.quiet:
         print(HELP)
         if len(TARGETS) > 1:
             print(f"  {len(TARGETS)} hosts: {', '.join(TARGETS)}\n")
     if sh.views:
         print(f"  {len(sh.views)} logview(s) from {RC}: {', '.join(sorted(sh.views))}")
-    while True:
-        try:
-            line = input("\ntimberfs=# ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print(); return
-        if not line: continue
-        try:
-            sh.do(line)
-        except SystemExit:
-            return
-        except Exception as e:
-            print(f"  ! {e}")
+    # Whatever ends the session — `\\q`, EOF, an interrupt, a statement
+    # that raised — the history is written. An exit path that skipped it
+    # would lose exactly the session someone wants back.
+    try:
+        while True:
+            try:
+                line = input("\ntimberfs=# ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if not line:
+                continue
+            remember(line)
+            try:
+                sh.do(line)
+            except SystemExit:
+                return
+            except Exception as e:
+                print(f"  ! {e}")
+    finally:
+        save_history()
 
 
 if __name__ == "__main__":
