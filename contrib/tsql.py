@@ -24,9 +24,12 @@ already has them and a second copy would drift:
   TIMBERFS_CMD   argv prefix, default `timberfs query --query -`
   TIMBERFS_RC    views loaded at startup, default ~/.timberfsrc
 """
-import json, os, re, readline, shlex, subprocess, sys, time
+import json, os, re, readline, shlex, subprocess, sys, threading, time
 
 CMD = shlex.split(os.environ.get("TIMBERFS_CMD", "timberfs query --query -"))
+# How long the store list is reused for completion and `\d`. Short, because
+# a store that appears mid-session is exactly what a predicate is for.
+STORE_TTL = float(os.environ.get("TSQL_STORE_TTL", "30"))
 RC = os.environ.get("TIMBERFS_RC", os.path.expanduser("~/.timberfsrc"))
 KINDS = ("records", "loglines", "stores", "chunks")
 OPS = ("!=", "!~", "!*", "=~", "=*", "=")
@@ -466,18 +469,34 @@ class Shell:
         self.cursors = {}
         self.names = {}
         self._universe = None
+        self._universe_at = 0.0
+        self._universe_lock = threading.Lock()
+        # Filled in the background: against a remote forest the round trip
+        # is seconds, and paying it on the first TAB is what makes
+        # completion feel broken rather than slow.
+        threading.Thread(target=self.universe, daemon=True).start()
         if os.path.exists(RC):
             self.load(RC, quiet=True)
 
     def universe(self, fresh=False):
-        """Every store. Cached, because completion must not cost a
-        subprocess per keystroke; `fresh` re-reads it for the cases where
-        being right matters more than being quick."""
-        if self._universe is None or fresh:
-            out, err, rc = run({"v": "1.0-EXPERIMENTAL", "stores": {"select": []},
-                                "response_format": {"kind": "stores"}})
-            self._universe = json.loads(out or "[]") if rc == 0 else []
-        return self._universe
+        """Every store, cached for STORE_TTL seconds.
+
+        Completion must not cost a round trip per keystroke, and against a
+        remote forest that trip is seconds. But it cannot be cached forever
+        either: a logview is a PREDICATE precisely so a store that appears
+        later is in it, and a completer offering a set that can no longer
+        change would contradict that. So it expires rather than being
+        pinned, and `fresh` forces a read where being right beats being
+        quick."""
+        with self._universe_lock:
+            stale = (self._universe is None
+                     or time.monotonic() - self._universe_at > STORE_TTL)
+            if fresh or stale:
+                out, err, rc = run({"v": "1.0-EXPERIMENTAL", "stores": {"select": []},
+                                    "response_format": {"kind": "stores"}})
+                self._universe = json.loads(out or "[]") if rc == 0 else []
+                self._universe_at = time.monotonic()
+            return self._universe
 
     def expand_ids(self, terms):
         """A short id is INPUT here and never leaves: it is resolved to the
@@ -564,12 +583,6 @@ class Shell:
         for n, t in sorted(self.views.items()):
             print(f"  {n:14} [{','.join(x['key']+x['op']+x['value'] for x in t)}]")
 
-    def stores_matching(self, terms):
-        out, err, rc = run({"v": "1.0-EXPERIMENTAL", "stores": {"select": terms},
-                            "response_format": {"kind": "stores"}})
-        if rc != 0: raise ValueError(err or f"exit {rc}")
-        return json.loads(out or "[]")
-
     def backslash(self, line):
         """psql's muscle memory. Terminated by the newline, not by `;` —
         typing `\\d;` is not what fingers do."""
@@ -584,7 +597,9 @@ class Shell:
         # predicate. The selector is a CONJUNCTION, and this has to match a
         # name OR an id prefix; a prefix is not an operator it has anyway.
         # It also cannot go wrong across versions, which `=*` did.
-        stores = self.stores_matching([])
+        # The cached list: `\\d` is the QUICK look, and the query path
+        # below is the one that is always current.
+        stores = self.universe()
         if arg:
             a = arg.lower()
             stores = [x for x in stores
