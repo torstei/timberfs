@@ -145,6 +145,20 @@ it can be recorded. It is a POSITION, not a fact about the entry, so unlike
 it is not carried into a destination store \(em an ingesting writer numbers
 its own chunks, or two fan-in sources would interleave into a sequence that
 is neither dense nor monotone),
+.B offset
+(where this run of bytes BEGINS on the store's tape: what has ever left
+the store plus where it sits in what remains, so retention cannot move it.
+With
+.B len
+above, the record states BOTH ends of what it served \(em and the runs
+CHAIN, so a consumer can check that what arrived is contiguous rather than
+trust that it is: the end of one entry is the start of the next, and the
+end of the last is the
+.B position
+that store reports. Same name and same quantity as that record's, because
+there is one kind of position here. Absent under the same condition as
+.BR chunk ,
+and for the same reason),
 .B src
 (source path; present only in multi-source streams \(em single-source
 streams name their source once, in

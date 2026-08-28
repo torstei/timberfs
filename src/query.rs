@@ -701,7 +701,10 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             || max.is_some()
             || entry_preds.is_some())
     {
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::new(stdout.lock());
         return query_entries(
+            &mut out,
             files,
             from_ms,
             to_ms,
@@ -743,7 +746,8 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
 /// parseable line timestamps) fall back to the unwidened raw window with
 /// a note — never both looser AND unexplained.
 #[allow(clippy::too_many_arguments)]
-fn query_entries(
+fn query_entries<W: Write>(
+    mut out: &mut W,
     files: &[std::path::PathBuf],
     from_ms: u64,
     to_ms: u64,
@@ -900,8 +904,6 @@ fn query_entries(
         });
     }
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
     // --records brackets the stream with typed metadata: stream-start
     // carries the format version and an echo of the selection (canonical
     // ms values — downstream tools can record lineage), one source record
@@ -3239,7 +3241,7 @@ mod chunk_stream_tests {
     use crate::store::{Config, Store};
 
     /// A store with several chunks, and the lines that went into it.
-    fn store_with_chunks(tag: &str, lines: usize) -> (std::path::PathBuf, Vec<u8>) {
+    pub(super) fn store_with_chunks(tag: &str, lines: usize) -> (std::path::PathBuf, Vec<u8>) {
         let dir = std::env::temp_dir().join(format!("timberfs-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = Config {
@@ -3404,6 +3406,79 @@ mod chunk_stream_tests {
         assert!(
             end["chunks_total"].parse::<usize>().unwrap() > 2,
             "the total must say how much was NOT sent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod served_bytes_tests {
+    use super::chunk_stream_tests::store_with_chunks;
+    use super::*;
+
+    /// Every record that serves bytes says where they sit: `offset` is
+    /// where the run begins and `len` how long it is, so the record
+    /// states BOTH ends of what it handed over. The runs then chain —
+    /// the end of one entry is the start of the next, and the end of the
+    /// last is the `position` the store reports — so a consumer can
+    /// CHECK that what arrived is contiguous instead of trusting it.
+    #[test]
+    fn every_served_run_of_bytes_says_where_it_sits_and_they_chain() {
+        let (dir, content) = store_with_chunks("servedbytes", 400);
+        let mut buf = Vec::new();
+        query_entries(
+            &mut buf,
+            &[dir.join("app.log")],
+            0,
+            u64::MAX,
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            &Default::default(),
+            true,  // no_filename
+            false, // show_write_time
+            false, // null_sep
+            true,  // records
+            None,
+            None,
+        )
+        .unwrap();
+
+        let (mut at, mut entries, mut position, mut i) = (0u64, 0, None, 0);
+        while i < buf.len() {
+            assert_eq!(buf[i], 0x1e);
+            let end = i + buf[i..].iter().position(|&b| b == 0).unwrap();
+            let header = String::from_utf8(buf[i + 1..end].to_vec()).unwrap();
+            let mut parts = header.split('\x1f');
+            let kind = parts.next().unwrap();
+            let f: std::collections::HashMap<&str, &str> =
+                parts.filter_map(|p| p.split_once('=')).collect();
+            i = end + 1;
+            if kind == "position" {
+                position = f.get("offset").map(|v| v.parse::<u64>().unwrap());
+            }
+            if let Some(n) = f.get("len") {
+                let n: usize = n.parse().unwrap();
+                if kind == "entry" {
+                    let off: u64 = f["offset"].parse().unwrap();
+                    assert_eq!(off, at, "entry {entries} does not follow the one before");
+                    // What the record CLAIMS about its bytes, checked
+                    // against the bytes it served.
+                    assert_eq!(&buf[i..i + n], &content[off as usize..off as usize + n]);
+                    at = off + n as u64;
+                    entries += 1;
+                }
+                i += n + 1;
+            }
+        }
+        assert_eq!(entries, 400);
+        assert_eq!(at, content.len() as u64, "the runs must cover the store");
+        assert_eq!(
+            position,
+            Some(at),
+            "the position must be where the served bytes ended"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

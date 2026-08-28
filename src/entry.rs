@@ -80,6 +80,10 @@ pub struct EntrySink {
     /// them as delivered but cannot durably stand inside them.
     entry_chunk: Option<u64>,
     cur_chunk: Option<u64>,
+    /// Where the open entry BEGINS on the tape. Meaningful only while
+    /// `entry_chunk` is set: a live-edge entry is in no chunk and has no
+    /// position at all.
+    entry_begin: u64,
 
     /// Where the line being accumulated STARTED, as an absolute offset on
     /// the store's tape: `dropped bytes + the chunk's offset + into it`.
@@ -122,6 +126,7 @@ impl EntrySink {
             cur_write_win: (0, 0),
             entry_chunk: None,
             cur_chunk: None,
+            entry_begin: 0,
             emitted: 0,
             filtered_out: 0,
             stamped: 0,
@@ -184,6 +189,7 @@ impl EntrySink {
                 self.entry_ts = Some(ts);
                 self.entry_write_win = self.cur_write_win;
                 self.entry_chunk = self.cur_chunk;
+                self.entry_begin = began;
                 self.entry = line;
                 self.stamped += 1;
                 // Divergence = distance OUTSIDE the chunk's write window;
@@ -203,11 +209,13 @@ impl EntrySink {
                 if self.entry.is_empty() {
                     self.entry_write_win = self.cur_write_win;
                     self.entry_chunk = self.cur_chunk;
+                    self.entry_begin = began;
                 }
                 if self.entry.len() + line.len() > ENTRY_CAP {
                     self.close_entry(out)?;
                     self.entry_write_win = self.cur_write_win;
                     self.entry_chunk = self.cur_chunk;
+                    self.entry_begin = began;
                 }
                 self.entry.extend_from_slice(&line);
             }
@@ -299,8 +307,13 @@ impl EntrySink {
             // Present only for an entry that is already in a chunk: its
             // ABSENCE is how a consumer knows this one came from the live
             // edge and cannot be resumed from yet.
+            //
+            // `offset` is where this run of bytes BEGINS on the tape, and
+            // `len` above is how long it is, so the record states both
+            // ends of what it served. Same name the `position` record
+            // uses: there is one kind of position in this protocol.
             if let Some(seq) = self.entry_chunk {
-                write!(out, "\x1fchunk={seq}")?;
+                write!(out, "\x1fchunk={seq}\x1foffset={}", self.entry_begin)?;
             }
             if let Some(label) = &self.framing.label {
                 out.write_all(b"\x1fsrc=")?;
