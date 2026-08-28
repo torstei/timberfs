@@ -742,7 +742,15 @@ class Shell:
                 return
             return self.show_views()
         if head == "drop":
-            self.views.pop(toks[2][1], None); return
+            if len(toks) < 3 or toks[1][1].lower() != "logview":
+                raise ValueError("drop logview <name>")
+            name = toks[2][1]
+            # Succeeding on a name that is not there hides the typo AND
+            # leaves the view you meant to drop in place, so the next
+            # query still runs against it.
+            if self.views.pop(name, None) is None:
+                raise ValueError(f"no logview `{name}` — `show logviews;` lists them")
+            return
         if head == "create":
             self.views[toks[-1][1]] = self.source(toks[2]); return
         if head == "declare":
@@ -755,7 +763,12 @@ class Shell:
             print(f"  cursor {name}")
             return
         if head == "close":
-            self.cursors.pop(toks[1][1], None); return
+            if len(toks) < 2:
+                raise ValueError("close <cursor>")
+            name = toks[1][1]
+            if self.cursors.pop(name, None) is None:
+                raise ValueError(f"no cursor `{name}` — `show cursors;` lists them")
+            return
         if head == "fetch":
             n = int(toks[1][1])
             if toks[2][1].lower() != "from": raise ValueError("fetch N from <cursor>")
