@@ -207,8 +207,8 @@ a container started later is tapped too. One store per instance by default,
 found by its labels rather than by a name built from them:
 
 ```sh
-timberfs list --select 'type=console,incus.instance=gateway01'
-timberfs query gateway01-console --follow
+timberfs list --select 'type=console,incus.instance=web01'
+timberfs query web01-console --follow
 ```
 
 *Why not the ring on a timer:* it loses everything between polls whenever more

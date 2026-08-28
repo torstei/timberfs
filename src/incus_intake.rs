@@ -1114,7 +1114,7 @@ mod tests {
             ("type", "console"),
             ("host", "sourcream"),
             ("incus.project", "default"),
-            ("incus.instance", "gateway01"),
+            ("incus.instance", "web01"),
             ("image", "acme-gateway:0.0.2-LOCAL"),
         ])
     }
@@ -1124,7 +1124,7 @@ mod tests {
         let key = parse_key(DEFAULT_KEY).unwrap();
         assert_eq!(
             key_selector(&key, &base()),
-            "type=console,incus.project=default,incus.instance=gateway01"
+            "type=console,incus.project=default,incus.instance=web01"
         );
         // Every key fact is a label, or the store could not be found
         // again by the key that made it.
@@ -1149,7 +1149,7 @@ mod tests {
         assert_eq!(store_name(&base(), &key), "sourcream-console");
         assert_eq!(
             store_name(&base(), &parse_key(DEFAULT_KEY).unwrap()),
-            "gateway01-console"
+            "web01-console"
         );
         // An empty key is the one refusal: it selects everything.
         assert!(parse_key("").is_err());
@@ -1202,8 +1202,8 @@ mod tests {
         // Derived from the SHAPE, so it reads a store several instances
         // share — the instance is a different word on every line.
         for line in [
-            "gateway01 2026-08-25T10:00:00.123+02:00 hello",
-            "auth01 2026-08-25T10:00:00.124+02:00 hello",
+            "web01 2026-08-25T10:00:00.123+02:00 hello",
+            "db01 2026-08-25T10:00:00.124+02:00 hello",
         ] {
             let got = compiled.captures(line).unwrap().get(1).unwrap().as_str();
             assert!(got.starts_with("2026-08-25T10:00:00.12"), "{got}");
@@ -1273,7 +1273,7 @@ mod tests {
     #[test]
     fn a_prefix_may_carry_the_instance_for_a_merged_store() {
         let out = stamped(&[(b"hello\n", 0)], "{time} {incus.instance} ", 100);
-        assert!(out.contains(" gateway01 hello"), "{out}");
+        assert!(out.contains(" web01 hello"), "{out}");
     }
 
     #[test]
@@ -1281,7 +1281,7 @@ mod tests {
         let mut facts = base();
         facts.insert("entrypoint".into(), "java -jar /app.jar".into());
         let m = attach_marker(&facts, 2048);
-        assert!(m.contains("incus.instance=gateway01"));
+        assert!(m.contains("incus.instance=web01"));
         assert!(m.contains("image=acme-gateway:0.0.2-LOCAL"));
         // A value with spaces is quoted, so the marker stays parseable.
         assert!(m.contains(r#"entrypoint="java -jar /app.jar""#), "{m}");
@@ -1292,7 +1292,7 @@ mod tests {
     #[test]
     fn user_service_is_lifted_but_nothing_is_guessed_from_the_image() {
         let inst = Instance {
-            name: "gateway01".into(),
+            name: "web01".into(),
             project: "default".into(),
             kind: "container".into(),
             status: "Running".into(),

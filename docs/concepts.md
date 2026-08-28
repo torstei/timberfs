@@ -263,7 +263,7 @@ exactly one store or none. An empty result reports what it searched, because
 
 **name** — what a store is *called*: a human-facing string it declares in its
 manifest, falling back to what its path calls it. Non-unique by design — two
-hosts' `gateway01-console` in one archive coexist, told apart by **identity** —
+hosts' `web01-console` in one archive coexist, told apart by **identity** —
 so looking one up can be ambiguous, and that is reported rather than guessed.
 Shown by `list` in its own column and offered by `--names`; not a **label**,
 because it is not where the entries came from, but fully matchable like

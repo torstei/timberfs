@@ -1680,8 +1680,8 @@ a_store_is_called_what_it_declares() {
     # store's two sides must agree from the first byte, and patching the
     # id afterwards is refused (as it should be).
     cat > "$d/$u/$u.log.bark" <<BARK
-{"id": "$u", "name": "gateway01-console", "type": "console",
- "host": "vmhost", "incus.instance": "gateway01", "incus.project": "default"}
+{"id": "$u", "name": "web01-console", "type": "console",
+ "host": "vmhost", "incus.instance": "web01", "incus.project": "default"}
 BARK
     printf 'console line\n' | timberfs append --into "$d/$u/$u.log" --quiet 2>/dev/null || return 1
     # ...and a store beside it that declares no name at all.
@@ -1691,18 +1691,18 @@ BARK
     # what its path gives it.
     timberfs list "$d" > /tmp/vmname.tab 2>/dev/null || return 1
     head -1 /tmp/vmname.tab | grep -qE '^ID[[:space:]]+NAME' || { head -1 /tmp/vmname.tab >&2; return 1; }
-    grep -q 'gateway01-console' /tmp/vmname.tab || { cat /tmp/vmname.tab >&2; return 1; }
+    grep -q 'web01-console' /tmp/vmname.tab || { cat /tmp/vmname.tab >&2; return 1; }
     grep -q 'plainstore' /tmp/vmname.tab || { cat /tmp/vmname.tab >&2; return 1; }
     grep -q "$u" /tmp/vmname.tab && { echo "the uuid leaked into NAME" >&2; return 1; }
 
     # --names is what completion consumes, so it must offer the same.
-    timberfs list "$d" --names 2>/dev/null | sort | tr '\n' ',' | grep -qx 'gateway01-console,plainstore,' \
+    timberfs list "$d" --names 2>/dev/null | sort | tr '\n' ',' | grep -qx 'plainstore,web01-console,' \
         || { timberfs list "$d" --names >&2; return 1; }
 
     # `info` answers to the declared name, and leads with it rather than
     # with the uuid the path happens to use.
     timberfs info "$d/$u/$u.log" > /tmp/vmname.info 2>&1 || return 1
-    head -1 /tmp/vmname.info | grep -q '^gateway01-console' || { head -1 /tmp/vmname.info >&2; return 1; }
+    head -1 /tmp/vmname.info | grep -q '^web01-console' || { head -1 /tmp/vmname.info >&2; return 1; }
     # The name is NOT among the labels: it has its own column and its own
     # line, and it is not where the entries came from.
     grep -E '^  manifest' /tmp/vmname.info | grep -q 'name=' && { grep manifest /tmp/vmname.info >&2; return 1; }
@@ -1713,9 +1713,9 @@ BARK
     # and the settings alike. Nothing is withheld for being the wrong KIND
     # of fact.
     local got
-    for q in 'type=console' 'name=gateway01-console' 'name=~.*-console' "id=$u" 'incus.instance=gateway01'; do
+    for q in 'type=console' 'name=web01-console' 'name=~.*-console' "id=$u" 'incus.instance=web01'; do
         got=$(timberfs list "$d" --names --select "$q" 2>/dev/null)
-        [ "$got" = "gateway01-console" ] || { echo "select $q gave '$got'" >&2; return 1; }
+        [ "$got" = "web01-console" ] || { echo "select $q gave '$got'" >&2; return 1; }
     done
     # ...including a store whose name only its path supplies.
     got=$(timberfs list "$d" --names --select 'name=plainstore' 2>/dev/null)

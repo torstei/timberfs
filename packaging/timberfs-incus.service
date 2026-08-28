@@ -9,7 +9,7 @@
 # a name built from them:
 #
 #   timberfs list --select 'type=console'
-#   timberfs query gateway01-console --follow
+#   timberfs query web01-console --follow
 #
 # Change the key, add a prefix, or narrow to some instances with a
 # drop-in:
