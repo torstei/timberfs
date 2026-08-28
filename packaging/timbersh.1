@@ -1,0 +1,102 @@
+.TH TIMBERSH 1 "2026-08-28" "timberfs" "User Commands"
+.SH NAME
+timbersh \- an interactive shell for timberfs
+.SH SYNOPSIS
+.B timbersh
+.RI [ --cmd " ARGV" ]
+.RI [ --hosts " H,H" ]
+.RI [ --rc " FILE" ]
+.RI [ --ttl " SECS" ]
+.RB [ \-q ]
+.SH DESCRIPTION
+A console for reading timberfs stores, in a grammar borrowed from SQL. It
+selects the stores to read with a predicate, searches them, and pages
+through the answer.
+.PP
+⚠
+.B EXPERIMENTAL.
+The statements it accepts are NOT promised and change without notice. It
+exists to be USED \(em a protocol nobody writes a client against is one
+whose awkward parts stay theoretical, and every awkward part this has
+found became a fix in timberfs. Do not build anything on its grammar.
+.PP
+It speaks
+.BR timberfs\-query\-document (5)
+and nothing else: every statement becomes a document handed to a timberfs
+on standard input, and every answer is read back the same way. It
+implements no part of the store SELECTOR \(em each host resolves its own,
+so a predicate means here exactly what it means there.
+.SH OPTIONS
+.TP
+.BI \-\-cmd " ARGV"
+How to reach a timberfs; it is handed the document on stdin. Default
+.BR "timberfs query --query -" .
+Anything that reaches one works \(em a wrapper,
+.BR ssh (1),
+a container exec.
+.RB ( $TIMBERFS_CMD )
+.TP
+.BI \-\-hosts " H,H"
+Fan out to these hosts, substituting each for
+.B _TIMBERHOST_
+in
+.BR \-\-cmd .
+Their stores present as one set with a
+.B HOST
+column, each remembering where it lives.
+.RB ( $TIMBERFS_HOSTS )
+.RS
+.PP
+A read goes to every host at once and is rendered in the order they were
+given. There is no order claimed BETWEEN hosts, for the reason a bounded
+timberfs answer is
+.B order=sequential
+(see
+.BR timberfs\-records (5)).
+A
+.B limit
+is a total, so a host whose output falls past it did work that is never
+shown \(em the price of not paying the latency serially.
+.PP
+Several hosts with no
+.B _TIMBERHOST_
+in
+.B \-\-cmd
+is refused: every host would get the same command, so one forest would be
+read N times and every entry returned N times under a different host's
+name.
+.RE
+.TP
+.BI \-\-rc " FILE"
+Statements run at startup, default
+.IR ~/.timbershrc .
+It is RUN, not read \(em a script of statements, the way
+.I .psqlrc
+is.
+.RB ( $TIMBERSH_RC )
+.TP
+.BI \-\-ttl " SECS"
+Expire the cached store list after SECS. Default 0, which never expires
+it \(em
+.B refresh
+re-reads it and says what changed.
+.RB ( $TIMBERSH_STORE_TTL )
+.TP
+.B \-q
+Start without printing the help.
+.SH STATEMENTS
+.B \(rsd
+lists the stores;
+.B \(rsd NAME
+or
+.B \(rsd ID
+describes one.
+.B show hosts;
+says what each host is and whether anything it said went wrong.
+.B \(rs?
+prints the grammar, which is the authority \(em this page deliberately
+does not copy it, because it moves.
+.SH SEE ALSO
+.BR timberfs (1),
+.BR timberfs\-query\-document (5),
+.BR timberfs\-records (5)

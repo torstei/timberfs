@@ -85,6 +85,9 @@ jobs:
         run: |
           cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
           cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
+          # The console, packaged apart so `timberfs` keeps a dependency
+          # list of fuse3 and libc6 and installs on a bare host.
+          cargo deb --variant sh --no-build --target x86_64-unknown-linux-gnu
 
       - name: Test the exact release artifact in a VM
         run: tests/vm/run-vm-test.sh target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb
@@ -96,6 +99,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dist"
           cp target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/"
           cp target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/timberfs_amd64.deb"
+          cp target/x86_64-unknown-linux-gnu/debian/timberfs-sh_*_amd64.deb "$RUNNER_TEMP/dist/"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2

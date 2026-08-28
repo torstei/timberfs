@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""timberfs SQL-ish console — prototype.
+"""timbersh — an interactive shell for timberfs.
+
+⚠ EXPERIMENTAL, and the grammar is not promised. It exists to be USED
+against a real fleet, because a protocol nobody writes a client against
+is a protocol whose awkward parts stay theoretical — and every awkward
+part it has found so far became a fix in timberfs. Expect statements to
+change under you; nothing here is a compatibility surface yet.
+
 
     create logview [type=console] console;
     select stores  from console;
@@ -42,7 +49,7 @@ something else again at the far end.
                  Stores from every host are presented as one set, and each
                  remembers where it lives. Unset, there is one unnamed host
                  and nothing is substituted.
-  TIMBERFS_RC    views loaded at startup, default ~/.timberfsrc
+  TIMBERSH_RC    statements run at startup, default ~/.timbershrc
 """
 import argparse, datetime, json, os, re, readline, shlex, subprocess, sys, threading, time
 
@@ -57,12 +64,16 @@ TARGETS = HOSTS or [None]
 # mid-session is rare and paying a round trip for it on a schedule is not.
 # `refresh` is the way to ask, which is better than a timer either way —
 # it happens when you know something changed, and it says what did.
-STORE_TTL = float(os.environ.get("TSQL_STORE_TTL", "0"))
-RC = os.environ.get("TIMBERFS_RC", os.path.expanduser("~/.timberfsrc"))
+STORE_TTL = float(os.environ.get("TIMBERSH_STORE_TTL", "0"))
+RC = os.environ.get("TIMBERSH_RC", os.path.expanduser("~/.timbershrc"))
 KINDS = ("records", "loglines", "stores", "chunks")
 OPS = ("!=", "!~", "!*", "=~", "=*", "=")
 
 HELP = """
+  timbersh — EXPERIMENTAL. The statements below are not promised: this is
+  a testbed for the timberfs query protocol, and it changes when using it
+  shows something wrong with the protocol or with itself.
+
   \\d                     the stores, their short ids, and what still
                          splits them by label
   \\d NAME | \\d ID        that one in full -- a substring of the name, or a
@@ -116,7 +127,7 @@ HELP = """
                                session otherwise) and say what changed
 
   save 'file';                 write the logviews out as statements
-  load 'file';                 run a file of statements (as ~/.timberfsrc
+  load 'file';                 run a file of statements (as ~/.timbershrc
                                is run at startup — it is a SCRIPT, so it
                                can hold anything you could type)
   help;  quit
@@ -1307,9 +1318,10 @@ class Shell:
 
 def parse_args(argv):
     ap = argparse.ArgumentParser(
-        prog="tsql", add_help=True,
+        prog="timbersh", add_help=True,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="A SQL-ish console for timberfs.",
+        description="timbersh — an interactive shell for timberfs. "
+                    "EXPERIMENTAL: the grammar is not promised.",
         epilog="Every option defaults to the environment variable beside it, so\n"
                "a flag overrides an export for one session and nothing else.\n"
                "Inside the shell, `\\?` prints the statement syntax.")
@@ -1321,15 +1333,13 @@ def parse_args(argv):
                     default=os.environ.get("TIMBERFS_HOSTS", ""),
                     help="fan out to these hosts, substituting each for "
                          f"{HOST_TOKEN} in --cmd. $TIMBERFS_HOSTS")
-    ap.add_argument("--rc", metavar="FILE",
-                    default=os.environ.get("TIMBERFS_RC",
-                                           os.path.expanduser("~/.timberfsrc")),
-                    help="statements run at startup. $TIMBERFS_RC")
+    ap.add_argument("--rc", metavar="FILE", default=RC,
+                    help="statements run at startup. $TIMBERSH_RC")
     ap.add_argument("--ttl", metavar="SECS", type=float,
-                    default=float(os.environ.get("TSQL_STORE_TTL", "0")),
+                    default=float(os.environ.get("TIMBERSH_STORE_TTL", "0")),
                     help="expire the cached store list after SECS. Default 0, "
                          "which never expires it — `refresh` re-reads it. "
-                         "$TSQL_STORE_TTL")
+                         "$TIMBERSH_STORE_TTL")
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="start without printing the help")
     return ap.parse_args(argv)
@@ -1347,7 +1357,7 @@ def main(argv=None):
     # come back N times, labelled with a different host each time. A wrong
     # answer that looks like a busy fleet.
     if len(TARGETS) > 1 and not any(HOST_TOKEN in x for x in CMD):
-        sys.exit(f"tsql: --hosts names {len(TARGETS)} hosts, but --cmd has no "
+        sys.exit(f"timbersh: --hosts names {len(TARGETS)} hosts, but --cmd has no "
                  f"{HOST_TOKEN} to put them in:\n      {a.cmd}")
     sh = Shell()
     # A space is the only delimiter: `[type=console` is ONE word to the

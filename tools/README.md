@@ -1,19 +1,24 @@
-# contrib
+# tools
 
-Things that use timberfs rather than being part of it. Not installed by
-the package, not covered by the VM suite, and not held to the same
-compatibility promises — they are here because they exercise the
-interfaces, and a client that lives outside the repo stops being run.
+Programs that USE timberfs rather than being part of it. They live in this
+repository on purpose: a client kept somewhere else stops being run, and
+stops being edited in the same commit as the protocol change it needed.
 
-## `tsql.py` — a SQL-ish console
+## `timbersh` — an interactive shell for timberfs
 
-**A prototype.** The grammar is still moving; do not build anything on it.
+⚠ **EXPERIMENTAL.** The statements it accepts are not promised and change
+without notice. Do not build anything on the grammar.
+
+Shipped as its own package, `timberfs-sh`, so that `timberfs` keeps a
+dependency list of `fuse3, libc6` and installs on a bare host — and so
+this can version on its own, which it needs to, because its grammar moves
+while the format does not.
 
 ```sh
-./contrib/tsql.py --help          # options
-./contrib/tsql.py                 # the local forest
-./contrib/tsql.py --hosts web01,web02,db01 \
-                  --cmd "ssh _TIMBERHOST_ timberfs query --query -"
+timbersh --help                   # options
+timbersh                          # the local forest
+timbersh --hosts web01,web02,db01 \
+         --cmd "ssh _TIMBERHOST_ timberfs query --query -"
 ```
 
 ```sql
@@ -32,8 +37,8 @@ export for one session and nothing else:
 |---|---|---|
 | `--cmd` | `TIMBERFS_CMD` | how to reach a timberfs; it gets the document on stdin |
 | `--hosts` | `TIMBERFS_HOSTS` | fan out, substituting each host for `_TIMBERHOST_` in `--cmd` |
-| `--rc` | `TIMBERFS_RC` | statements run at startup |
-| `--ttl` | `TSQL_STORE_TTL` | expire the cached store list after N seconds; 0 (default) never expires it |
+| `--rc` | `TIMBERSH_RC` | statements run at startup |
+| `--ttl` | `TIMBERSH_STORE_TTL` | expire the cached store list after N seconds; 0 (default) never expires it |
 
 `--cmd` is only ever handed a document on stdin, so anything that reaches a
 timberfs works — a wrapper, `ssh`, a container exec.
@@ -127,6 +132,6 @@ search the server reads as a different question.
   seconds, and paying it there is what makes completion feel broken rather
   than slow. `refresh` re-reads it and says what changed, which beats a
   timer: it happens when you know something did.
-* `~/.timberfsrc` is RUN, not read: a script of statements, the way
+* `~/.timbershrc` is RUN, not read: a script of statements, the way
   `.psqlrc` is. `save` therefore refuses to default to it — writing the
   logviews back would delete whatever else it does.

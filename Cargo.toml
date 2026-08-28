@@ -151,3 +151,16 @@ assets = [
 [package.metadata.deb.variants.compat]
 name = "timberfs"
 depends = "fuse3, libc6 (>= 2.31)"
+
+# The console, packaged apart from the filesystem it reads. Two reasons:
+# `timberfs` keeps a dependency list of `fuse3, libc6` and installs on a
+# bare host, and this versions on its own — which it needs to, because its
+# grammar is EXPERIMENTAL and moves while the format does not.
+[package.metadata.deb.variants.sh]
+name = "timberfs-sh"
+depends = "timberfs, python3"
+assets = [
+    ["tools/timbersh", "usr/bin/timbersh", "755"],
+    ["packaging/timbersh.1", "usr/share/man/man1/", "644"],
+    ["tools/README.md", "usr/share/doc/timberfs-sh/README.md", "644"],
+]
