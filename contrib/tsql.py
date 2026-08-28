@@ -22,11 +22,28 @@ already has them and a second copy would drift:
   * time parsing — `--from X --dump-json` is asked what X means
 
   TIMBERFS_CMD   argv prefix, default `timberfs query --query -`
+  TIMBERFS_HOSTS comma-separated hosts to fan out to. Every occurrence of
+                 _TIMBERHOST_ in TIMBERFS_CMD is replaced with the host:
+
+                   TIMBERFS_HOSTS=web01,web02,db01
+                   TIMBERFS_CMD="ssh _TIMBERHOST_ timberfs query --query -"
+
+                 Any command that reaches a timberfs works, so a wrapper
+                 that takes the host as an argument does too.
+
+                 Stores from every host are presented as one set, and each
+                 remembers where it lives. Unset, there is one unnamed host
+                 and nothing is substituted.
   TIMBERFS_RC    views loaded at startup, default ~/.timberfsrc
 """
 import json, os, re, readline, shlex, subprocess, sys, threading, time
 
 CMD = shlex.split(os.environ.get("TIMBERFS_CMD", "timberfs query --query -"))
+HOST_TOKEN = "_TIMBERHOST_"
+HOSTS = [h.strip() for h in os.environ.get("TIMBERFS_HOSTS", "").split(",") if h.strip()]
+# `None` is the one unnamed host: no fan-out, no substitution, and every
+# host-aware path below collapses to what it did before.
+TARGETS = HOSTS or [None]
 # How long the store list is reused for completion and `\d`. Short, because
 # a store that appears mid-session is exactly what a predicate is for.
 STORE_TTL = float(os.environ.get("TSQL_STORE_TTL", "30"))
@@ -43,6 +60,12 @@ HELP = """
   A short id works as INPUT anywhere -- `[id=79d7f23a]` -- and is resolved
   to the whole one before the query is sent, the way a short SHA is. An
   ambiguous prefix is refused, never picked from.
+
+  With TIMBERFS_HOSTS set, every host is asked and the stores show as one
+  set with a HOST column. Listings go out in parallel; reads go host by
+  host (no order is claimed between them) and `limit N` is N in total, so
+  a later host may go unread -- it says so when that happens. A host that
+  cannot be reached is named, never quietly missing.
   \\d+                    ...the listing with chunk counts and write spans
   \\dv                    the logviews      \\?  this      \\q  quit
 
@@ -145,8 +168,19 @@ def parse_pred(text):
 
 
 # ------------------------------------------------------------- timberfs
-def run(doc, stream=False):
-    p = subprocess.run(CMD, input=json.dumps(doc), capture_output=True, text=True)
+def argv_for(host):
+    return CMD if host is None else [a.replace(HOST_TOKEN, host) for a in CMD]
+
+
+def run(doc, host=None):
+    """One document to one host. A transport that never started — ssh
+    refusing, a wrapper missing — comes back as a non-zero rc with its own
+    words, and is reported rather than counted as an empty answer."""
+    try:
+        p = subprocess.run(argv_for(host), input=json.dumps(doc),
+                           capture_output=True, text=True)
+    except OSError as e:
+        return "", str(e), 127
     return p.stdout, p.stderr.strip(), p.returncode
 
 
@@ -201,9 +235,9 @@ def describe_store(s):
     field the answer carries, because the point of asking about ONE is
     that you want what the table view had to leave out."""
     lab = s.get("labels") or {}
-    rows = [
-        ("name", s.get("name")),
-        ("id", s.get("id", "(none)")),
+    rows = ([("name", s.get("name")), ("id", s.get("id", "(none)"))]
+            + ([("host", s["_host"])] if s.get("_host") else [])
+            + [
         ("forest", s.get("forest") or "-"),
         ("kind", s.get("kind")),
         ("labels", " ".join(f"{k}={v}" for k, v in sorted(lab.items())) or "(none)"),
@@ -211,7 +245,7 @@ def describe_store(s):
         ("size", f"{human(s.get('compressed_bytes',0))} compressed"
                  f"  /  {human(s.get('logical_bytes',0))} logical"),
         ("write span", f"{when_ms(s.get('first_write_ms'))}  ..  {when_ms(s.get('last_write_ms'))}"),
-    ]
+    ])
     if s.get("dropped_chunks"):
         rows.append(("dropped", f"{s['dropped_chunks']} chunks, "
                                 f"{human(s.get('dropped_uncompressed_bytes',0))} off the tape"))
@@ -224,12 +258,18 @@ def describe_store(s):
     if s.get("followers"):
         rows.append(("followers", ", ".join(f.get("name", "?") for f in s["followers"])))
     rows.append(("path", s.get("path")))
-    print(f"\nStore \"{s.get('name')}\"")
+    on = f"  on {s['_host']}" if s.get("_host") else ""
+    print(f"\nStore \"{s.get('name')}\"{on}")
     for k, v in rows:
         print(f"  {k:12} {v}")
 
 
-def show_stores(stores, verbose=False):
+def show_stores(stores, verbose=False, unreachable=None):
+    # Named FIRST, not as a footnote: a short list and a broken one look
+    # the same, and the point of merging hosts is that you stop counting
+    # them yourself.
+    for host, why in sorted((unreachable or {}).items(), key=lambda x: x[0] or ""):
+        print(f"  ⚠ {host or '(local)'}: UNREACHABLE — {why.splitlines()[0][:90]}")
     n = len(stores)
     c = common(stores)
     hdr = f"{n} store" + ("" if n == 1 else "s")
@@ -240,16 +280,22 @@ def show_stores(stores, verbose=False):
         # The ID column is a PREFIX and is labelled as one, because it is
         # hex either way and `id=` is an exact match: pasting what is shown
         # here selects nothing.
-        hdr = f"  {'NAME':30} {'ID(8)':{SHORT_ID}}  {'SIZE':>9}"
+        # The host column appears only when there is more than one, so a
+        # single-host session looks exactly as it did.
+        multi = len(TARGETS) > 1
+        hw = max([len(s.get("_host") or "") for s in stores] + [4]) if multi else 0
+        hdr = f"  {'HOST':{hw}}  " if multi else "  "
+        hdr += f"{'NAME':30} {'ID(8)':{SHORT_ID}}  {'SIZE':>9}"
         print(hdr + ("      CHUNKS  WRITE SPAN" if verbose else "   LABELS"))
         # No row numbers. A store is named, and its NAME is what every
         # other command takes; an ordinal changes the moment another store
         # appears, which is the same trap as naming one by its path.
-        for s in sorted(stores, key=lambda s: s["name"]):
+        for s in sorted(stores, key=lambda s: (s.get("_host") or "", s["name"])):
             lab = " ".join(f"{k}={v}" for k, v in sorted((s.get("labels") or {}).items())
                            if k not in c)
-            row = (f"  {s['name']:30} {short_id(s):{SHORT_ID}}  "
-                   f"{human(s.get('compressed_bytes',0)):>9}")
+            row = f"  {s.get('_host') or '':{hw}}  " if multi else "  "
+            row += (f"{s['name']:30} {short_id(s):{SHORT_ID}}  "
+                    f"{human(s.get('compressed_bytes',0)):>9}")
             if verbose:
                 row += (f" {s.get('chunks',0):>7} ch  "
                         f"{when_ms(s.get('first_write_ms'))} .. {when_ms(s.get('last_write_ms'))} ")
@@ -301,6 +347,10 @@ def show_records(out, names):
                 note += f", STOPPED by {f.get('limit','a bound')}"
             print(note)
     return shown
+
+
+def label(host):
+    return host or "(local)"
 
 
 # ---------------------------------------------------------------- build
@@ -470,6 +520,7 @@ class Shell:
         self.names = {}
         self._universe = None
         self._universe_at = 0.0
+        self.unreachable = {}
         self._universe_lock = threading.Lock()
         # Filled in the background: against a remote forest the round trip
         # is seconds, and paying it on the first TAB is what makes
@@ -479,7 +530,7 @@ class Shell:
             self.load(RC, quiet=True)
 
     def universe(self, fresh=False):
-        """Every store, cached for STORE_TTL seconds.
+        """Every store on every host, cached for STORE_TTL seconds.
 
         Completion must not cost a round trip per keystroke, and against a
         remote forest that trip is seconds. But it cannot be cached forever
@@ -487,15 +538,44 @@ class Shell:
         later is in it, and a completer offering a set that can no longer
         change would contradict that. So it expires rather than being
         pinned, and `fresh` forces a read where being right beats being
-        quick."""
+        quick.
+
+        Hosts are read in PARALLEL, so N of them cost the slowest one
+        rather than the sum. Each store is tagged with where it lives; a
+        host that could not be reached is remembered separately and named
+        in every listing, because a short list and a broken one look
+        identical."""
         with self._universe_lock:
             stale = (self._universe is None
                      or time.monotonic() - self._universe_at > STORE_TTL)
-            if fresh or stale:
-                out, err, rc = run({"v": "1.0-EXPERIMENTAL", "stores": {"select": []},
-                                    "response_format": {"kind": "stores"}})
-                self._universe = json.loads(out or "[]") if rc == 0 else []
-                self._universe_at = time.monotonic()
+            if not (fresh or stale):
+                return self._universe
+            doc = {"v": "1.0-EXPERIMENTAL", "stores": {"select": []},
+                   "response_format": {"kind": "stores"}}
+            got, bad, lock = [], {}, threading.Lock()
+
+            def one(host):
+                out, err, rc = run(doc, host)
+                with lock:
+                    if rc != 0:
+                        bad[host] = err or f"exit {rc}"
+                        return
+                    try:
+                        stores = json.loads(out or "[]")
+                    except json.JSONDecodeError as e:
+                        bad[host] = f"not JSON: {e}"
+                        return
+                    for st in stores:
+                        st["_host"] = host
+                    got.extend(stores)
+
+            ts = [threading.Thread(target=one, args=(h,)) for h in TARGETS]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self._universe, self.unreachable = got, bad
+            self._universe_at = time.monotonic()
             return self._universe
 
     def expand_ids(self, terms):
@@ -612,7 +692,8 @@ class Shell:
         # several: list them, so the name can be narrowed.
         if arg and len(stores) == 1:
             return describe_store(stores[0])
-        return show_stores(stores, verbose=cmd.endswith("+"))
+        return show_stores(stores, verbose=cmd.endswith("+"),
+                           unreachable=self.unreachable)
 
     def do(self, line):
         if line.lstrip().startswith("\\"):
@@ -682,32 +763,57 @@ class Shell:
         if i < len(toks) and toks[i][1].lower() == "where":
             conds, i = parse_where(toks, i + 1)
         doc = build(kind, terms, conds, {"entries": n})
+        # The WHOLE cursor goes to every host. A position names a store by
+        # id, ids are uuids, and a host simply never looks up one it does
+        # not have — so nothing has to be routed and a page can straddle
+        # machines. (Verified against timberfs: an unknown id in `cursor` is
+        # ignored, and the known one still resumes.)
         if cur["at"]:
             doc["cursor"] = cur["at"]
-        out, err, rc = run(doc)
-        if rc != 0:
-            print(f"  ! {err}"); return
-        # Every store EXAMINED reports one, barren ones included — drop
-        # those and the next page rescans them from the window's start.
-        at, shown = [], 0
-        for k, f, payload in records(out):
-            if k == "source":
-                self.names[f.get("id", "?")] = os.path.basename(f.get("path", "?"))
-            elif k == "entry":
-                who = self.names.get(f.get("id", ""), "")
-                print(f"  {who:28} {(payload or '').rstrip()}")
-                shown += 1
-            elif k == "position" and f.get("id"):
-                p = {"id": f["id"]}
-                if "offset" in f:
-                    p["offset"] = int(f["offset"])
-                at.append(p)
-            elif k == "stream-end":
-                if f.get("status") == "exhausted" and not shown:
-                    print("  -- nothing more (for now)")
-                elif f.get("status") == "limited":
-                    print(f"  -- more: `fetch {n} from ...` again")
-        cur["at"] = at
+        # Positions MERGE onto the ones already held rather than replacing
+        # them. A store that delivered nothing this page reports a position
+        # with NO offset — and an offsetless entry means "start of the
+        # window", so taking the answer at face value would re-read every
+        # store that happened to go quiet. Keep what we had for those.
+        at = {p["id"]: p for p in cur["at"]}
+        shown, more, bad = 0, False, {}
+        for host in TARGETS:
+            if shown >= n:
+                break
+            d = dict(doc, max=dict(doc["max"], entries=n - shown))
+            out, err, rc = run(d, host)
+            if rc != 0:
+                bad[host] = err or f"exit {rc}"
+                continue
+            for k, f, payload in records(out):
+                if k == "source":
+                    self.names[f.get("id", "?")] = os.path.basename(f.get("path", "?"))
+                elif k == "entry":
+                    who = self.names.get(f.get("id", ""), "")
+                    where = f"{label(host)} " if len(TARGETS) > 1 else ""
+                    print(f"  {where}{who:28} {(payload or '').rstrip()}")
+                    shown += 1
+                # Every store EXAMINED reports one, barren ones included —
+                # drop those and the next page rescans them from the
+                # window's start. Across hosts they simply accumulate.
+                elif k == "position" and f.get("id"):
+                    if "offset" in f:
+                        at[f["id"]] = {"id": f["id"], "offset": int(f["offset"])}
+                    else:
+                        at.setdefault(f["id"], {"id": f["id"]})
+                elif k == "stream-end" and f.get("status") == "limited":
+                    more = True
+        for host, why in bad.items():
+            print(f"  ⚠ {label(host)}: {why.splitlines()[0][:100]}")
+        # A host left unread has more by definition, whatever the ones that
+        # did run said.
+        if shown >= n and len(TARGETS) > 1:
+            more = True
+        if more:
+            print(f"  -- more: `fetch {n} from ...` again")
+        elif not shown:
+            print("  -- nothing more (for now)")
+        cur["at"] = list(at.values())
 
     def why_empty(self, doc):
         """Nothing came back — was anything even SEARCHED?
@@ -718,24 +824,78 @@ class Shell:
         is paid on the confusing case and nowhere else."""
         probe = {k: v for k, v in doc.items() if k in ("v", "stores")}
         probe["response_format"] = {"kind": "stores"}
-        out, err, rc = run(probe)
-        if rc != 0:
-            return None
-        n = len(json.loads(out or "[]"))
+        n = 0
+        for host in TARGETS:
+            out, err, rc = run(probe, host)
+            if rc == 0:
+                n += len(json.loads(out or "[]"))
         if n:
             return f"  -- nothing matched, in {n} store(s)"
-        return "  -- that predicate selects NO STORE, so nothing was searched"
+        return ("  -- that predicate selects NO STORE"
+                + (f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1 else "")
+                + ", so nothing was searched")
 
     def once(self, doc, kind):
-        out, err, rc = run(doc)
-        if rc != 0: print(f"  ! {err}"); return
+        # A `stores` answer is a SET, so the hosts merge into one listing.
         if kind == "stores":
-            return show_stores(json.loads(out or "[]"))
-        shown = show_records(out, self.names) if kind == "records" \
-            else (sys.stdout.write(out) or len(out.strip()))
-        if not shown:
+            return self.list_stores(doc)
+        # Everything else is a READ, and reads go host by host. Interleaving
+        # them could only key on arrival, and would claim a timeline across
+        # machines that nothing here can honour -- the same reason a bounded
+        # timberfs answer is `order=sequential`.
+        want = doc.get("max", {}).get("entries")
+        total, bad = 0, {}
+        for host in TARGETS:
+            if want is not None and total >= want:
+                # A cap is what fits on YOUR screen, not per host. Stopping
+                # here is what makes that true, and is why hosts are read in
+                # turn rather than all at once.
+                print(f"  -- stopped at {want}; {label(host)} and any after "
+                      f"it were not read")
+                break
+            d = dict(doc)
+            if want is not None:
+                d["max"] = dict(doc["max"], entries=want - total)
+            out, err, rc = run(d, host)
+            if rc != 0:
+                bad[host] = err or f"exit {rc}"
+                continue
+            if len(TARGETS) > 1:
+                print(f"  == {label(host)}")
+            total += show_records(out, self.names) if kind == "records" \
+                else (sys.stdout.write(out) or len(out.strip().splitlines()))
+        for host, why in bad.items():
+            print(f"  ⚠ {label(host)}: {why.splitlines()[0][:100]}")
+        if not total and not bad:
             note = self.why_empty(doc)
             if note: print(note)
+
+    def list_stores(self, doc):
+        """One listing from every host, in parallel: a set has no order to
+        preserve, so nothing is gained by waiting for them in turn."""
+        got, bad, lock = [], {}, threading.Lock()
+
+        def one(host):
+            out, err, rc = run(doc, host)
+            with lock:
+                if rc != 0:
+                    bad[host] = err or f"exit {rc}"
+                    return
+                try:
+                    stores = json.loads(out or "[]")
+                except json.JSONDecodeError as e:
+                    bad[host] = f"not JSON: {e}"
+                    return
+                for st in stores:
+                    st["_host"] = host
+                got.extend(stores)
+
+        ts = [threading.Thread(target=one, args=(h,)) for h in TARGETS]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        show_stores(got, unreachable=bad)
 
     def tail(self, doc):
         """The ONE statement with no document behind it: a poll loop. By
@@ -745,19 +905,28 @@ class Shell:
               "\n  boundary this can duplicate or miss. The cursor fixes that.")
         doc = dict(doc, response_format={"kind": "records"})
         seen = doc.get("window", {}).get("from", when(time.strftime("%H:%M")))
+        # Said once per host per outage, not once per poll.
+        complained = {}
         try:
             while True:
                 d = dict(doc, window=dict(doc.get("window", {"axis": "logline"}),
                                           **{"from": seen}))
-                out, err, rc = run(d)
-                if rc == 0:
+                for host in TARGETS:
+                    out, err, rc = run(d, host)
+                    if rc != 0:
+                        if complained.get(host) != err:
+                            print(f"  ⚠ {label(host)}: {err.splitlines()[0][:100]}")
+                            complained[host] = err
+                        continue
+                    complained.pop(host, None)
                     for kind, f, payload in records(out):
                         if kind == "source":
                             self.names[f.get("id", "?")] = os.path.basename(
                                 f.get("path", "?"))
                         elif kind == "entry" and int(f.get("ts", 0)) >= seen:
                             who = self.names.get(f.get("id", ""), "")
-                            print(f"  {who:28} {(payload or '').rstrip()}")
+                            where = f"{label(host)} " if len(TARGETS) > 1 else ""
+                            print(f"  {where}{who:28} {(payload or '').rstrip()}")
                             seen = max(seen, int(f.get("ts", 0)) + 1)
                 time.sleep(2)
         except KeyboardInterrupt:
