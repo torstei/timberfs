@@ -540,6 +540,12 @@ class Shell:
 
 def main():
     sh = Shell()
+    # A space is the only delimiter: `[type=console` is ONE word to the
+    # completer, which is what lets a predicate literal complete its own
+    # keys and values.
+    readline.set_completer(Complete(sh))
+    readline.set_completer_delims(" ")
+    readline.parse_and_bind("tab: complete")
     print(HELP if "-q" not in sys.argv else "")
     if sh.views:
         print(f"  {len(sh.views)} logview(s) from {RC}: {', '.join(sorted(sh.views))}")
