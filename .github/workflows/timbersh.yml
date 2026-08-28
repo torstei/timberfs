@@ -107,4 +107,12 @@ jobs:
   apt:
     needs: release
     uses: ./.github/workflows/apt-repo.yml
+    # On the JOB, not inherited from the top of this file. A caller CAPS
+    # what the workflow it calls may have, and the set above has no
+    # `pages: write` — so without this the run fails at startup, before a
+    # single step, with only "a workflow file issue" to go on.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     secrets: inherit
