@@ -200,10 +200,13 @@ def show_stores(stores, verbose=False):
     print(hdr)
     f = facets(stores)
     if n <= 25 or not f:
-        for i, s in enumerate(sorted(stores, key=lambda s: s["name"]), 1):
+        # No row numbers. A store is named, and its NAME is what every
+        # other command takes; an ordinal changes the moment another store
+        # appears, which is the same trap as naming one by its path.
+        for s in sorted(stores, key=lambda s: s["name"]):
             lab = " ".join(f"{k}={v}" for k, v in sorted((s.get("labels") or {}).items())
                            if k not in c)
-            row = f"  {i:3}  {s['name']:34} {human(s.get('compressed_bytes',0)):>9}"
+            row = f"  {s['name']:36} {human(s.get('compressed_bytes',0)):>9}"
             if verbose:
                 row += (f" {s.get('chunks',0):>7} ch  "
                         f"{when_ms(s.get('first_write_ms'))} .. {when_ms(s.get('last_write_ms'))} ")
