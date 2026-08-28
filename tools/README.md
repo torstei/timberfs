@@ -102,6 +102,26 @@ found within an hour of it existing:
   That is the argument for a position being an absolute byte offset
   rather than a clock: see [docs/plans/paging.md](../docs/plans/paging.md).
 
+### Tests
+
+```sh
+tests/timbersh/test-timbersh            # all
+tests/timbersh/test-timbersh short_id   # one, by substring
+```
+
+No VM, no timberfs, no network: `--cmd` points at a fake that answers from
+a script. `scripts/check.sh` runs them, so they gate a push like everything
+else.
+
+The fake **records every document it is asked**, which is the useful half —
+almost every bug here has been in what was *sent* rather than what was
+printed, and a test that reads only the output cannot see a window on the
+wrong axis or a cursor that lost a store's place.
+
+⚠ Each case was checked by reintroducing its bug and watching it fail. The
+paging test passed with the fix deleted, twice, for two different reasons
+before it meant anything.
+
 ### What it does not implement, and what it must
 
 **The selector** is never reimplemented — every `from` is a real
