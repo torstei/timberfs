@@ -15,12 +15,23 @@ script in the main package would put an interpreter there for one
 optional tool. `apt install timberfs` pulls no Python; `apt install
 timberfs-sh` pulls both it and timberfs.
 
-Both packages carry the SAME version — they are built from one
-`Cargo.toml`, and a cargo-deb variant cannot override it. That is the
-right behaviour here rather than a limitation: `timbersh 0.24.0` is the
-console built alongside `timberfs 0.24.0`, and therefore the one that
-knows that protocol. For a client whose whole job is exercising the
-format, sharing the version is the useful fact.
+It releases on its own tag, and its version is `tools/VERSION`:
+
+```sh
+timbersh-v0.1.0     ->  builds timberfs-sh, and rebuilds the apt pool
+v0.25.0             ->  builds timberfs, VM-tests it, publishes the crate
+```
+
+Because the CYCLES differ, not the source. A timberfs release is an
+on-disk format re-tested in a VM and published to crates.io; this is a
+script that changes while a session is open. Sharing a release event
+would mean either the console ships stale or timberfs is released for
+reasons that are not timberfs's.
+
+⚠ Same repository, deliberately. The client and the protocol change in
+one commit series — that is where this tool's value comes from, and every
+protocol fix it has found was verified against both the old server and
+the new in a single branch. Only the release is separate.
 
 ```sh
 timbersh --help                   # options
