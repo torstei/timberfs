@@ -467,6 +467,17 @@ class Complete:
             return BACKSLASH
         if n <= 1:
             return VERBS
+        # `declare NAME cursor for <statement>`. Past `for` it IS an
+        # ordinary statement, so complete it as one rather than teaching
+        # this branch the whole grammar a second time — and `toks[0]` is
+        # `declare` there, which every rule below keys on.
+        if toks[0] == "declare":
+            low = line.lower()
+            if " for " in low:
+                rest = line[low.index(" for ") + 5:]
+                return ["select", "tail"] if not rest.strip() \
+                    else self.options(rest, word)
+            return {3: ["cursor"], 4: ["for"]}.get(n, [])
         # inside a predicate literal: a key, then that key's values
         if word.startswith("["):
             body = word[1:]
@@ -499,12 +510,14 @@ class Complete:
             return AFTER_TIME
         if prev in ("create", "drop"):
             return ["logview"]
+        # What follows `logview` depends on the verb: `drop` names one that
+        # exists, `create` starts the predicate the new one will be.
+        if prev == "logview":
+            return sorted(self.sh.views) if toks[0] == "drop" else ["["]
         if prev == "show":
             return ["logviews", "cursors"]
         if prev == "close":
             return sorted(self.sh.cursors)
-        if prev == "declare":
-            return []
         if toks[0] in ("select", "tail") and prev not in ("where",):
             return ["where", "limit"]
         return []
