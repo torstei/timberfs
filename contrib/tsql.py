@@ -36,6 +36,10 @@ HELP = """
                          splits them by label
   \\d NAME | \\d ID        that one in full -- a substring of the name, or a
                          prefix of the id (the 8 chars \\d prints)
+
+  A short id works as INPUT anywhere -- `[id=79d7f23a]` -- and is resolved
+  to the whole one before the query is sent, the way a short SHA is. An
+  ambiguous prefix is refused, never picked from.
   \\d+                    ...the listing with chunk counts and write spans
   \\dv                    the logviews      \\?  this      \\q  quit
 
@@ -296,19 +300,6 @@ def show_records(out, names):
     return shown
 
 
-def id_prefix_hint(doc):
-    """`\\d` prints a short id and `id=` is EXACT, so pasting one selects
-    nothing. Say so where it happens rather than leaving an empty answer."""
-    for t in doc.get("stores", {}).get("select", []):
-        v = t.get("value", "")
-        if (t.get("key") == "id" and t.get("op") == "="
-                and len(v) < 36 and v and all(c in "0123456789abcdef-" for c in v.lower())):
-            return (f"\n     `id=` is exact, and {v!r} is {len(v)} of 36 characters — "
-                    f"the listing prints a prefix.\n"
-                    f"     Try `id=~{v}.*`, or `\\d {v}` for the whole id.")
-    return ""
-
-
 # ---------------------------------------------------------------- build
 def build(kind, terms, conds, limit):
     doc = {"v": "1.0-EXPERIMENTAL", "stores": {"select": terms}}
@@ -478,14 +469,49 @@ class Shell:
         if os.path.exists(RC):
             self.load(RC, quiet=True)
 
-    def universe(self):
-        """Every store, for completion only. Cached: completion must not
-        cost a subprocess per keystroke."""
-        if self._universe is None:
+    def universe(self, fresh=False):
+        """Every store. Cached, because completion must not cost a
+        subprocess per keystroke; `fresh` re-reads it for the cases where
+        being right matters more than being quick."""
+        if self._universe is None or fresh:
             out, err, rc = run({"v": "1.0-EXPERIMENTAL", "stores": {"select": []},
                                 "response_format": {"kind": "stores"}})
             self._universe = json.loads(out or "[]") if rc == 0 else []
         return self._universe
+
+    def expand_ids(self, terms):
+        """A short id is INPUT here and never leaves: it is resolved to the
+        whole one before the document is built, the way a short SHA works.
+
+        Nothing is guessed — the store list says which id it is, or that it
+        is ambiguous, and an ambiguous one is refused rather than picked
+        from. That is the difference between this and rewriting a query on
+        a hunch: an exact `id=` on the wire still means exactly itself."""
+        for t in terms:
+            v = t.get("value", "")
+            if t.get("key") != "id" or t.get("op") not in ("=", "!="):
+                continue
+            if len(v) >= 36 or not v:
+                continue
+            hits = self.ids_starting(v)
+            if not hits:
+                # A store created since the cache was filled is the one
+                # reason to pay for a re-read here.
+                hits = self.ids_starting(v, fresh=True)
+            if len(hits) == 1:
+                t["value"] = hits[0]
+            elif not hits:
+                raise ValueError(f"no store has an id starting {v!r}")
+            else:
+                raise ValueError(
+                    f"{v!r} is ambiguous — {len(hits)} stores start with it: "
+                    + ", ".join(h[:12] for h in sorted(hits)))
+        return terms
+
+    def ids_starting(self, prefix, fresh=False):
+        p = prefix.lower()
+        return [s["id"] for s in self.universe(fresh)
+                if (s.get("id") or "").lower().startswith(p)]
 
     def keys_of(self):
         # `name` and `id` are not labels, but the selector matches the whole
@@ -504,7 +530,10 @@ class Shell:
                 for k, v in (s.get("labels") or {}).items() if k == key}
 
     def source(self, tok):
-        if tok[0] == "pred": return parse_pred(tok[1])
+        # Every path that turns text into terms comes through here, so this
+        # is the one place a short id has to be expanded — including the
+        # terms a `create logview` stores, which keeps a saved view exact.
+        if tok[0] == "pred": return self.expand_ids(parse_pred(tok[1]))
         if tok[1] in self.views: return self.views[tok[1]]
         raise ValueError(f"no logview `{tok[1]}` — `show logviews;` lists them")
 
@@ -680,8 +709,7 @@ class Shell:
         n = len(json.loads(out or "[]"))
         if n:
             return f"  -- nothing matched, in {n} store(s)"
-        return "  -- that predicate selects NO STORE, so nothing was searched" \
-               + id_prefix_hint(doc)
+        return "  -- that predicate selects NO STORE, so nothing was searched"
 
     def once(self, doc, kind):
         out, err, rc = run(doc)
