@@ -86,8 +86,38 @@ jobs:
           cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
           cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
 
-      - name: Test the exact release artifact in a VM
-        run: tests/vm/run-vm-test.sh target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb
+      # CI already ran the VM suite on this exact commit, on BOTH images,
+      # after building the compat .deb with the identical commands above.
+      # Re-running it here repeated a SUBSET of that — one image — for nine
+      # minutes; and "the exact artifact" was never literally the bytes CI
+      # tested either, since a Rust build is not bit-reproducible.
+      #
+      # ⚠ A commit CI never ran on FAILS here. That is the whole gate, and
+      # why it requires a `success` rather than the absence of a failure: a
+      # tag pushed before CI finished has no runs at all.
+      - name: Require CI to have passed on this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "gating on $sha"
+          for ctx in checks vm-tests; do
+            # join(" ") and not @tsv: the match below is space-delimited, so a
+            # tab would hide a SECOND run's conclusion, and a check that failed
+            # and was re-run green would read as failed.
+            got=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$sha/check-runs" \
+                    --paginate \
+                    --jq "[.check_runs[] | select(.name == \"$ctx\") | .conclusion] | join(\" \")")
+            echo "  $ctx: ${got:-<no run>}"
+            case " $got " in
+              *" success "*) ;;
+              *)
+                echo "::error::$ctx has no successful run for $sha. Push the" \
+                     "commit, let CI finish, then tag it."
+                exit 1
+                ;;
+            esac
+          done
 
       # Assets are staged OUTSIDE the checkout: cargo publish refuses to
       # run from a dirty working tree, and rightly so.
