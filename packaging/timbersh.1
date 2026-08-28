@@ -108,6 +108,26 @@ re-reads it and says what changed.
 .TP
 .B \-q
 Start without printing the help.
+.SH HOSTS AT RUNTIME
+.B "add host NAME"
+asks it from now on;
+.B "drop host NAME"
+stops. Both take several names, and both re-read the store list at once,
+because the cached one is tagged with the host each store came from and
+would otherwise answer for a fleet that is no longer the one being asked.
+.PP
+A host set and a command must agree, and the disagreement is refused in
+BOTH directions because each is wrong in the same silent way. Several
+hosts with no
+.B _TIMBERHOST_
+to put them in sends the same command to each, so one forest is read N
+times and every entry comes back N times under a different host's name. A
+placeholder with no host to fill it runs the command with
+.B _TIMBERHOST_
+still in it \(em which reaches something, or nothing, and reports
+whatever that was.
+.PP
+Dropping the last host is refused: a shell with none has nothing to ask.
 .SH STATEMENTS
 .B \(rsd
 lists the stores;

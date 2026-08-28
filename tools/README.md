@@ -41,6 +41,8 @@ timbersh --hosts web01,web02,db01 \
 ```
 
 ```sql
+add host web03;                    -- ask it too, from now on
+drop host web03;                   -- stop asking it
 create logview [type=console] console;
 select stores  from console;
 select records from console where entry has 'ERROR' limit 100;
