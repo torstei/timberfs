@@ -1309,16 +1309,21 @@ class Shell:
         if stopped is not None:
             print(f"  -- stopped at {want}; {label(stopped)} and any after it "
                   f"were read but not shown")
-        # A host with nothing is counted, not given a header of its own:
-        # six empty headers is noise standing where an answer should be.
-        if empty and len(TARGETS) > 1:
-            print(f"  -- nothing on {len(empty)}: "
-                  + ", ".join(label(h) for h in TARGETS if h in empty))
-        report_errors(bad)
-        if not total and not bad and not empty:
+        # NOTHING came back, and nothing failed. Which host had nothing is
+        # then the one thing that does not matter: every host has nothing,
+        # and the tally reads identically whether the stores held no
+        # matching entry or the predicate selected no store at all. Say
+        # which — it costs one round trip, on the case that needs it.
+        if not total and not bad:
             note = self.why_empty(doc)
             if note:
                 print(note)
+        # A host with nothing is counted, not given a header of its own:
+        # six empty headers is noise standing where an answer should be.
+        elif empty and len(TARGETS) > 1:
+            print(f"  -- nothing on {len(empty)}: "
+                  + ", ".join(label(h) for h in TARGETS if h in empty))
+        report_errors(bad)
 
     def list_stores(self, doc):
         """One listing from every host, in parallel: a set has no order to

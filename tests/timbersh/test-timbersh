@@ -243,6 +243,35 @@ def the_history_survives_the_session():
     s.cleanup()
 
 
+@test
+def a_predicate_that_selects_no_store_says_so():
+    """`[host=imap01]` where the label holds the FQDN matches nothing, on
+    every host including the one with the data — and the answer was
+    `nothing on 10`, the same words as "the stores held no matching
+    entry". Opposite problems: one means the data is not there, the other
+    means the question never ran."""
+    s = Session({h: {"stores": [], "records": []} for h in ("a", "b")},
+                hosts=["a", "b"]).run(
+        "select records from [host=imap01] where entry has 'X';")
+    assert "NO STORE" in s.out, s.out
+    assert "nothing was searched" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def stores_that_matched_but_held_nothing_are_not_the_same_answer():
+    """The other side of it: the predicate was right and the entries are
+    not there. Saying `NO STORE` here would send someone to fix a
+    selector that is already correct."""
+    s = Session({h: {"stores": [store(f"{h}1", ID_A if h == "a" else ID_B)],
+                     "records": []} for h in ("a", "b")},
+                hosts=["a", "b"]).run(
+        "select records from [] where entry has 'X';")
+    assert "nothing matched, in 2 store(s)" in s.out, s.out
+    assert "NO STORE" not in s.out, s.out
+    s.cleanup()
+
+
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else ""
     chosen = [t for t in TESTS if want in t.__name__]
