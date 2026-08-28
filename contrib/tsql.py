@@ -534,10 +534,38 @@ def build(kind, terms, conds, limit):
                     "`entry has` and `chunk may have` in one where")
             (match["none"] if c["neg"] else match["all"]).append(
                 {c["kind"]: c["text"]})
-    if kind in ("records", "loglines") and "axis" not in win:
+    # What was ASKED for, before any default overwrites it. Checking after
+    # the defaults meant `select chunks ... where logline since` had its
+    # axis rewritten to `write` and then passed — the timestamp typed
+    # against one clock, silently applied to the other.
+    asked = win.get("axis")
+    if kind in ("records", "loglines") and asked is None:
         win["axis"] = "logline"
     if kind == "chunks":
         win["axis"] = "write"
+    # Refused HERE, not by every host in turn. This shell chose both halves
+    # — the kind from `select loglines`, the axis from `written since` — so
+    # sending a pair it could have known was incoherent is a builder
+    # defect, and nine hosts relaying one verdict is not a better error.
+    #
+    # It is safe to know this where the SELECTOR would not be: getting it
+    # wrong can only refuse something the server would have accepted, which
+    # is loud. A drifted selector returns different ENTRIES, silently.
+    #
+    # And it can be said in the words that were typed, which timberfs
+    # cannot — it only ever saw `window.axis` and `response_format.kind`.
+    if asked == "write" and kind in ("records", "loglines"):
+        raise ValueError(
+            f"`written since`/`until` selects whole CHUNKS, so it cannot answer "
+            f"with {kind} — a chunk has one write window covering everything in "
+            f"it.\n     For entries, ask on the clock the lines carry: `logline "
+            f"since ...`.\n     For the raw chunks the write axis does give: "
+            f"`select chunks from ...`.")
+    if asked == "logline" and kind == "chunks":
+        raise ValueError(
+            "`select chunks` is the write axis — chunks carry no entry parsing, "
+            "so a logline window has nothing to apply to.\n     Use `written "
+            "since ...`, or ask for `records`/`loglines` instead.")
     if win: doc["window"] = win
     if gran is not None:
         match = {k: v for k, v in match.items() if v}
