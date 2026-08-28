@@ -38,8 +38,11 @@ declared once in the manifest instead of enforced by a schedule.
 ## Answer "what happened at 13:42" across a fleet
 
 Keep one store per host/app and merge them at **read** time. There is no
-cluster and no ingest tier to run: chunks interleave by timestamp across files,
-and each line carries a `path:` prefix naming who logged it.
+cluster and no ingest tier to run: chunks interleave by the window they were
+WRITTEN in, and each line carries a `path:` prefix naming who logged it. That
+interleave is the text view's — a framed answer reads the stores one after
+another and claims no order between them (`timberfs-records(5)`, ORDERING),
+because across stores only arrival is a key anything is sorted by.
 
 ```sh
 timberfs query --from 13:42 --to 13:43 collector/host*-app.log
