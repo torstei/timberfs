@@ -2295,6 +2295,31 @@ JSON
         /tmp/vmdl.json /tmp/vmdl.err
 }
 
+dump_json_needs_no_store_so_it_can_answer_what_a_time_means() {
+    # `--dump-json` reads nothing, so requiring a store made the one job it
+    # is uniquely good for impossible: telling a client what a typed time
+    # means, without that client writing a second date parser.
+    local out
+    out=$(timberfs query --from '2026-08-28 11:10' --dump-json 2>&1) || {
+        echo "$out" >&2; return 1; }
+    echo "$out" | grep -q '"from": 17' || { echo "$out" >&2; return 1; }
+    # No store named means EVERY store, which is what an empty predicate is.
+    echo "$out" | grep -q '"stores": {}' || { echo "$out" >&2; return 1; }
+
+    # A bad time still fails, and says so rather than reporting a missing
+    # argument for one that was given.
+    timberfs query --from 'not a time' --dump-json >/dev/null 2>/tmp/vmdj.err && {
+        echo "a nonsense time was accepted" >&2; return 1; }
+    grep -q 'unrecognized time' /tmp/vmdj.err || { cat /tmp/vmdj.err >&2; return 1; }
+
+    # And a read that actually reads still requires one.
+    timberfs query --from '11:00' >/dev/null 2>/tmp/vmdj.err && {
+        echo "a real read ran with no store" >&2; return 1; }
+    grep -q 'FILES' /tmp/vmdj.err || { cat /tmp/vmdj.err >&2; return 1; }
+
+    rm -f /tmp/vmdj.err
+}
+
 an_unknown_selector_operator_is_refused_not_quietly_truncated() {
     # A near miss cannot be guessed at safely: the parser tries operators
     # longest-first, so an unknown one is not rejected there — a shorter
@@ -2914,6 +2939,7 @@ run_test "query document: match and bounds name their granularity" a_match_selec
 run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
 run_test "framed answers read stores one after another; text still interleaves" a_framed_answer_reads_stores_one_after_another
 run_test "deadline: bounds the wait, names itself, and says where it stopped" a_deadline_bounds_the_wait_and_the_answer_says_where_it_stopped
+run_test "dump-json: no store needed, so it can say what a time means" dump_json_needs_no_store_so_it_can_answer_what_a_time_means
 run_test "selector: an unknown operator is refused, not truncated" an_unknown_selector_operator_is_refused_not_quietly_truncated
 run_test "paging: a store that goes quiet keeps its place" a_quiet_store_keeps_its_place_across_pages
 run_test "paging: a cursor walks every entry once, even at one timestamp" paging_walks_a_result_set_a_page_at_a_time
