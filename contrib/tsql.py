@@ -325,22 +325,55 @@ def describe_store(s):
 
 
 def fmt_err(why):
-    """A fleet's worth of failures has to stay readable, so several hosts
-    get one truncated line each. With ONE, that line is the whole answer —
-    and timberfs puts the reason in the `Caused by:` that truncating cut
-    off."""
-    why = (why or "").strip()
-    if len(TARGETS) > 1:
-        return why.splitlines()[0][:100] if why else "no reason given"
-    return "\n     ".join(x for x in why.splitlines() if x.strip()) or "no reason given"
+    """The WHOLE reason, however many hosts said it.
+
+    This used to keep only the first line when there were several hosts, on
+    the theory that a fleet's worth of failures has to stay readable. It
+    does — but the first line is not the reason. `visena-timberfs` opens
+    with "The query document was refused:" and puts the sentence that
+    matters underneath; timberfs puts it in a `Caused by:`. Nine hosts each
+    reporting a colon and nothing after it is not readable, it is empty.
+    What keeps a fleet readable is saying an identical failure ONCE, which
+    is `report_errors`."""
+    lines = [x.rstrip() for x in (why or "").strip().splitlines() if x.strip()]
+    return "\n     ".join(lines) or "no reason given"
+
+
+def report_errors(bad):
+    """One line per DISTINCT failure, naming who had it.
+
+    A fleet fails the same way at the same time — a document every host
+    refuses, a credential that expired — and printing it once per host
+    buries the sentence under the list of who said it."""
+    if not bad:
+        return
+    by_msg = {}
+    for host, why in bad.items():
+        by_msg.setdefault(fmt_err(why), []).append(host)
+    for msg, hosts in by_msg.items():
+        if len(TARGETS) == 1:
+            who = label(hosts[0])
+        elif len(hosts) == len(TARGETS):
+            who = f"all {len(hosts)} hosts"
+        else:
+            who = ", ".join(label(h) for h in TARGETS if h in hosts)
+        print(f"  ⚠ {who}: {msg}")
 
 
 def show_unreachable(bad):
     """Named FIRST, not as a footnote: a short list and a broken one look
     the same, and the point of merging hosts is that you stop counting
-    them yourself."""
-    for host, why in sorted((bad or {}).items(), key=lambda x: x[0] or ""):
-        print(f"  ⚠ {label(host)}: UNREACHABLE — {fmt_err(why)}")
+    them yourself. Grouped like every other failure, so a fleet that went
+    down for one reason says it once."""
+    if not bad:
+        return
+    by_msg = {}
+    for host, why in bad.items():
+        by_msg.setdefault(fmt_err(why), []).append(host)
+    for msg, hosts in by_msg.items():
+        who = ", ".join(label(h) for h in TARGETS if h in hosts) or ", ".join(
+            label(h) for h in hosts)
+        print(f"  ⚠ {who}: UNREACHABLE — {msg}")
 
 
 def show_stores(stores, verbose=False, unreachable=None):
@@ -1078,8 +1111,7 @@ class Shell:
                         at.setdefault(f["id"], {"id": f["id"]})
                 elif k == "stream-end" and f.get("status") == "limited":
                     more = True
-        for host, why in bad.items():
-            print(f"  ⚠ {label(host)}: {fmt_err(why)}")
+        report_errors(bad)
         # A host left unread has more by definition, whatever the ones that
         # did run said.
         if shown >= n and len(TARGETS) > 1:
@@ -1175,8 +1207,7 @@ class Shell:
         if empty and len(TARGETS) > 1:
             print(f"  -- nothing on {len(empty)}: "
                   + ", ".join(label(h) for h in TARGETS if h in empty))
-        for host, why in bad.items():
-            print(f"  ⚠ {label(host)}: {fmt_err(why)}")
+        report_errors(bad)
         if not total and not bad and not empty:
             note = self.why_empty(doc)
             if note:
