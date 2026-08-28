@@ -32,7 +32,16 @@ KINDS = ("records", "loglines", "stores", "chunks")
 OPS = ("!=", "!~", "!*", "=~", "=*", "=")
 
 HELP = """
-  select stores from [];                   what is out there (start here)
+  \\d                     the stores, and the labels that still split them
+  \\d NAME                that one in full (NAME is a substring)
+  \\d+                    ...the listing with chunk counts and write spans
+  \\dv                    the logviews      \\?  this      \\q  quit
+
+  \\d is the quick look. Once there are more stores than fit a screen, the
+  QUERY is the tool -- it can select on any label, not just the name:
+
+  select stores from [];                   every store, as a query
+  select stores from [type=console,host=*rc];
 
   create logview [type=console] console;   name a predicate
   drop logview console;                    forget it
@@ -146,7 +155,44 @@ def human(n):
         n /= 1024
 
 
-def show_stores(stores):
+def when_ms(ms):
+    return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(ms / 1000)) if ms else "-"
+
+
+def describe_store(s):
+    """One store in full, the way `\\d name` describes a relation. Every
+    field the answer carries, because the point of asking about ONE is
+    that you want what the table view had to leave out."""
+    lab = s.get("labels") or {}
+    rows = [
+        ("name", s.get("name")),
+        ("id", s.get("id", "(none)")),
+        ("forest", s.get("forest") or "-"),
+        ("kind", s.get("kind")),
+        ("labels", " ".join(f"{k}={v}" for k, v in sorted(lab.items())) or "(none)"),
+        ("chunks", f"{s.get('chunks', 0)}  (seq {s.get('first_seq','-')}..{s.get('last_seq','-')})"),
+        ("size", f"{human(s.get('compressed_bytes',0))} compressed"
+                 f"  /  {human(s.get('logical_bytes',0))} logical"),
+        ("write span", f"{when_ms(s.get('first_write_ms'))}  ..  {when_ms(s.get('last_write_ms'))}"),
+    ]
+    if s.get("dropped_chunks"):
+        rows.append(("dropped", f"{s['dropped_chunks']} chunks, "
+                                f"{human(s.get('dropped_uncompressed_bytes',0))} off the tape"))
+    rows.append(("index", f"grain over {s['grain_chunks']} chunks" if s.get("grain_chunks")
+                 else ("declared, not built yet" if s.get("index_declared") else "none")))
+    # A writer is reported only while it LIVES, so its presence is the
+    # liveness — there is no separate "is it running" field to disagree.
+    rows.append(("writer", s.get("writer") or "none (nothing appending)"))
+    rows.append(("wal", "yes (live edge is tailable)" if s.get("wal_declared") else "no"))
+    if s.get("followers"):
+        rows.append(("followers", ", ".join(f.get("name", "?") for f in s["followers"])))
+    rows.append(("path", s.get("path")))
+    print(f"\nStore \"{s.get('name')}\"")
+    for k, v in rows:
+        print(f"  {k:12} {v}")
+
+
+def show_stores(stores, verbose=False):
     n = len(stores)
     c = common(stores)
     hdr = f"{n} store" + ("" if n == 1 else "s")
@@ -157,7 +203,11 @@ def show_stores(stores):
         for i, s in enumerate(sorted(stores, key=lambda s: s["name"]), 1):
             lab = " ".join(f"{k}={v}" for k, v in sorted((s.get("labels") or {}).items())
                            if k not in c)
-            print(f"  {i:3}  {s['name']:34} {human(s.get('compressed_bytes',0)):>9}  {lab}")
+            row = f"  {i:3}  {s['name']:34} {human(s.get('compressed_bytes',0)):>9}"
+            if verbose:
+                row += (f" {s.get('chunks',0):>7} ch  "
+                        f"{when_ms(s.get('first_write_ms'))} .. {when_ms(s.get('last_write_ms'))} ")
+            print(f"{row}  {lab}")
     else:
         print("  (too many to list)")
     if f:
@@ -283,6 +333,7 @@ def parse_where(toks, i):
 
 
 # ----------------------------------------------------------- completion
+BACKSLASH = ["\\d", "\\d+", "\\dv", "\\?", "\\q"]
 VERBS = ["select", "tail", "declare", "fetch", "close", "create", "drop",
          "show", "save", "load", "help", "quit"]
 AFTER_ENTRY = ["has", "not", "substring", "regex"]
@@ -306,6 +357,12 @@ class Complete:
             toks[-1] if toks and line.endswith(" ") else None)
         n = len(toks) + (1 if line.endswith(" ") else 0)
 
+        # A backslash command takes a store NAME, so once past the command
+        # itself the names are the only thing that can follow.
+        if line.lstrip().startswith("\\"):
+            if n > 1:
+                return sorted(x["name"] for x in self.sh.universe())
+            return BACKSLASH
         if n <= 1:
             return VERBS
         # inside a predicate literal: a key, then that key's values
@@ -412,7 +469,44 @@ class Shell:
                 f.write(f"create logview [{pred}] {name};\n")
         print(f"  {len(self.views)} logview(s) -> {path}")
 
+    def show_views(self):
+        if not self.views: print("  no logviews"); return
+        for n, t in sorted(self.views.items()):
+            print(f"  {n:14} [{','.join(x['key']+x['op']+x['value'] for x in t)}]")
+
+    def stores_matching(self, terms):
+        out, err, rc = run({"v": "1.0-EXPERIMENTAL", "stores": {"select": terms},
+                            "response_format": {"kind": "stores"}})
+        if rc != 0: raise ValueError(err or f"exit {rc}")
+        return json.loads(out or "[]")
+
+    def backslash(self, line):
+        """psql's muscle memory. Terminated by the newline, not by `;` —
+        typing `\\d;` is not what fingers do."""
+        cmd, _, arg = line[1:].strip().partition(" ")
+        arg = arg.strip().rstrip(";")
+        if cmd in ("q", "quit"): raise SystemExit
+        if cmd in ("?", "h", "help"): print(HELP); return
+        if cmd == "dv": return self.show_views()
+        if cmd.rstrip("+") != "d":
+            raise ValueError(f"`\\{cmd}`? this shell knows \\d \\d+ \\dv \\? \\q")
+        # A bare word is a NAME SUBSTRING, not a pattern: it is what a
+        # person means by "the apache one", and `=*` is literal so a dot
+        # in a store name cannot behave like a wildcard.
+        terms = [{"key": "name", "op": "=*", "value": arg}] if arg else []
+        stores = self.stores_matching(terms)
+        if not stores:
+            print(f"  no store matches {arg!r}" if arg else "  no stores")
+            return
+        # Named one thing: describe it, as `\\d relation` does. Named
+        # several: list them, so the name can be narrowed.
+        if arg and len(stores) == 1:
+            return describe_store(stores[0])
+        return show_stores(stores, verbose=cmd.endswith("+"))
+
     def do(self, line):
+        if line.lstrip().startswith("\\"):
+            return self.backslash(line.lstrip())
         toks = [t for t in lex(line) if t[1] != ";"]
         if not toks: return
         head = toks[0][1].lower()
@@ -428,10 +522,7 @@ class Shell:
                                     for p in c["at"]) or "(not started)")
                     print(f"  {n:14} at {at}\n  {'':14}    {c['stmt']}")
                 return
-            if not self.views: print("  no logviews"); return
-            for n, t in sorted(self.views.items()):
-                print(f"  {n:14} [{','.join(x['key']+x['op']+x['value'] for x in t)}]")
-            return
+            return self.show_views()
         if head == "drop":
             self.views.pop(toks[2][1], None); return
         if head == "create":
