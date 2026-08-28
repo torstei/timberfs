@@ -156,13 +156,22 @@ fn split_terms(expr: &str) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Every operator a term may use, longest first — the order the parser
+/// tries them in.
+///
+/// Public because a caller that BUILDS a term (the query document) has to
+/// refuse an operator this build does not know. Formatting an unknown one
+/// into a selector string does not fail: the parser finds a shorter
+/// operator inside it and reads the remainder as part of the value, so
+/// `=?` becomes `=` against `?value` and `!=X` becomes `!=` against
+/// `Xvalue` — the second matching nearly everything.
+pub const OPS: [&str; 6] = ["!=", "!~", "!*", "=~", "=*", "="];
+
 fn parse_term(part: &str) -> anyhow::Result<Term> {
     let part = part.trim();
     if part.is_empty() {
         bail!("empty term in selector (a stray comma?)");
     }
-    // Longest operator first: `!=` and `!~` before `=`, else `key!=v`
-    // would parse as key `key!` — a term that matches nothing, silently.
     // Longest operator first: `!=` and `!~` before `=`, else `key!=v`
     // would parse as key `key!` — a term that matches nothing, silently.
     // `=*` before `=` for the same reason, or `name=*x` would be an

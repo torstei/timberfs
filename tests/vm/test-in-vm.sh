@@ -2295,6 +2295,42 @@ JSON
         /tmp/vmdl.json /tmp/vmdl.err
 }
 
+an_unknown_selector_operator_is_refused_not_quietly_truncated() {
+    # A near miss cannot be guessed at safely: the parser tries operators
+    # longest-first, so an unknown one is not rejected there — a shorter
+    # one is found inside it and the rest joins the VALUE. `=?` matched
+    # nothing and `!=X` matched nearly everything, both answered as though
+    # understood.
+    local d=/var/log/timberfs/vmop
+    rm -rf "$d"
+    timberfs create --set svc=vmop "$d/vmop.log" >/dev/null 2>&1 || return 1
+    printf '2026-08-28T10:00:00Z INFO vmop line\n' \
+        | timberfs append --into "$d/vmop.log" --quiet 2>/dev/null || return 1
+
+    opdoc() { printf '{"v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"svc","op":"%s","value":"vmop"}]},"response_format":{"kind":"stores"}}' "$1" > /tmp/vmop.json; }
+    local op out
+    for op in '=?' '!=Y' 'LIKE'; do
+        opdoc "$op"
+        if timberfs query --query /tmp/vmop.json >/dev/null 2>/tmp/vmop.err; then
+            echo "operator $op was accepted" >&2; return 1
+        fi
+        # It names the operator it was given AND the ones that exist, so a
+        # generator is told rather than left to diff two answers.
+        grep -q -- "$op" /tmp/vmop.err || { cat /tmp/vmop.err >&2; return 1; }
+        grep -q -- '=\*' /tmp/vmop.err || { cat /tmp/vmop.err >&2; return 1; }
+    done
+
+    # Every real operator still works, including the one whose absence
+    # started this. `=~` is anchored, so the bare value is a whole match.
+    for op in '=' '=~' '=*'; do
+        opdoc "$op"
+        out=$(timberfs query --query /tmp/vmop.json 2>/dev/null | grep -c '"svc"') || true
+        [ "$out" -ge 1 ] || { echo "operator $op matched nothing" >&2; return 1; }
+    done
+
+    rm -rf "$d" /tmp/vmop.json /tmp/vmop.err
+}
+
 paging_walks_a_result_set_a_page_at_a_time() {
     # Every entry once, in order, on a store whose entries ALL share a
     # timestamp — the case that makes paging by clock lose everything
@@ -2793,6 +2829,7 @@ run_test "query document: match and bounds name their granularity" a_match_selec
 run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
 run_test "framed answers read stores one after another; text still interleaves" a_framed_answer_reads_stores_one_after_another
 run_test "deadline: bounds the wait, names itself, and says where it stopped" a_deadline_bounds_the_wait_and_the_answer_says_where_it_stopped
+run_test "selector: an unknown operator is refused, not truncated" an_unknown_selector_operator_is_refused_not_quietly_truncated
 run_test "paging: a cursor walks every entry once, even at one timestamp" paging_walks_a_result_set_a_page_at_a_time
 run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing

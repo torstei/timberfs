@@ -148,6 +148,11 @@ pub struct Term {
     /// `=*` is a LITERAL substring — what a person means by "the store
     /// with apache in its name", and not the same as `=~.*apache.*`,
     /// which would read a `.` in the text as a pattern.
+    ///
+    /// Enumerated in the schema rather than described as a string, so a
+    /// generator can be told which operators exist by the contract instead
+    /// of discovering it from an answer that came back wrong.
+    #[cfg_attr(test, schemars(extend("enum" = crate::select::OPS)))]
     pub op: String,
     pub value: String,
 }
@@ -616,6 +621,33 @@ impl Document {
                 self.v
             );
         }
+        // An operator this build does not know must be REFUSED, never
+        // formatted into a selector string. The parser tries operators
+        // longest-first, so an unknown one is not rejected there — a
+        // shorter operator is found inside it and the rest becomes part of
+        // the value. `=?` reads as `=` against `?value` and matches
+        // nothing; `!=X` reads as `!=` against `Xvalue` and matches nearly
+        // everything. Both answer 200 with a confident wrong result.
+        //
+        // Which is how a newer generator meets an older timberfs: `=*`
+        // shipped after v0.23.1, and against a build without it
+        // `name=*auth01` silently became `name` equals `*auth01`.
+        for t in &self.stores.select {
+            if !crate::select::OPS.contains(&t.op.as_str()) {
+                bail!(
+                    "`stores.select` uses the operator {:?}, which this timberfs does not \
+                     know — it has {}. An operator is not guessed at: a near miss would be \
+                     read as a shorter one with the rest of it stuck to the value, and \
+                     answered as though it had been understood",
+                    t.op,
+                    crate::select::OPS
+                        .iter()
+                        .map(|o| format!("`{o}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         if self.max.is_some() && self.tail.is_some() {
             bail!("`max` and `tail` are different operations: give one, not both");
         }
@@ -907,6 +939,35 @@ mod tests {
         // A member at the top level, too.
         let bad = r#"{"v":"1.0-EXPERIMENTAL","stores":{},"limits":{"entries":1}}"#;
         assert!(serde_json::from_str::<Document>(bad).is_err());
+    }
+
+    #[test]
+    fn an_operator_this_build_does_not_know_is_refused_not_truncated() {
+        // The failure this exists to stop, measured against v0.23.1: `=*`
+        // shipped after it, and a build without that operator answered
+        // `name=*auth01` with an empty list and exit 0 — the parser found
+        // `=` inside `=*` and compared against the value `*auth01`.
+        //
+        // The direction that hurts is the other one. `!=` found inside a
+        // mistyped negation matches nearly every store, so a typo WIDENS
+        // the answer and nothing in it says so.
+        let doc = |op: &str| {
+            format!(
+                r#"{{"v":"1.0-EXPERIMENTAL","stores":{{"select":[
+                     {{"key":"name","op":"{op}","value":"s1"}}]}}}}"#
+            )
+        };
+        for op in ["=?", "=X", "!=Y", "LIKE", "~~", ""] {
+            let d: Document = serde_json::from_str(&doc(op)).unwrap();
+            let e = d.to_query().unwrap_err().to_string();
+            assert!(e.contains(op) || op.is_empty(), "{op:?} was not named: {e}");
+            assert!(e.contains("`=*`"), "{op:?} did not list the real ones: {e}");
+        }
+        // ...and every operator that does exist still parses.
+        for op in crate::select::OPS {
+            let d: Document = serde_json::from_str(&doc(op)).unwrap();
+            assert!(d.to_query().is_ok(), "{op:?} was refused");
+        }
     }
 
     #[test]

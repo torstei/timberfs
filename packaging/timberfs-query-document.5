@@ -82,6 +82,39 @@ An absent label reads as the empty string, so
 selects the stores that do not declare one.
 .RS
 .PP
+⚠ An operator this timberfs does not know is REFUSED, naming the ones it
+has. It is never guessed at, because a near miss cannot be guessed at
+safely: the selector parser tries operators longest\-first, so an unknown
+one is not rejected there \(em a shorter operator is found inside it and
+the remainder becomes part of the VALUE. A mistyped
+.B =?
+reads as
+.B =
+against
+.BR ?value ,
+matching nothing; a mistyped
+.B !=X
+reads as
+.B !=
+against
+.BR Xvalue ,
+matching nearly every store. Both would be answered as though understood.
+.PP
+This is also what a NEWER generator meets on an OLDER timberfs, and the
+reason to check the version rather than the answer:
+.B =*
+shipped after
+.BR v0.23.1 ,
+and a build without it read
+.B name=*apache
+as
+.B name
+equal to
+.BR *apache .
+The refusal is in this build; it cannot reach one already deployed. The
+schema enumerates the operators so a generator can be told rather than
+find out.
+.PP
 There is deliberately NO way to name a store by file path. A path is the
 worst key a query can use: it is not stable across a move, it is not
 unique across forests, and it says nothing about what the store holds. A
