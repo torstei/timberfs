@@ -77,7 +77,7 @@ HELP = """
   select stores from [];                   every store, as a query
   select stores from [type=console,host=*rc];
 
-  create logview [type=console] console;   name a predicate
+  create logview console [type=console];   name a predicate (either order)
   drop logview console;                    forget it
   show logviews;                           what is defined
 
@@ -514,6 +514,9 @@ class Complete:
         # exists, `create` starts the predicate the new one will be.
         if prev == "logview":
             return sorted(self.sh.views) if toks[0] == "drop" else ["["]
+        # Still owed a predicate, whichever side the name went.
+        if toks[0] == "create" and not any(t.startswith("[") for t in toks[2:]):
+            return ["["]
         if prev == "show":
             return ["logviews", "cursors"]
         if prev == "close":
@@ -752,7 +755,21 @@ class Shell:
                 raise ValueError(f"no logview `{name}` — `show logviews;` lists them")
             return
         if head == "create":
-            self.views[toks[-1][1]] = self.source(toks[2]); return
+            if len(toks) < 4 or toks[1][1].lower() != "logview":
+                raise ValueError("create logview <name> [predicate]")
+            # EITHER ORDER, and `as` optional. A predicate literal is
+            # `[...]` and a name is not, so the tokens say which is which —
+            # that is what the literal is FOR, and it costs nothing to let
+            # SQL's habit (`create view name as ...`) work too.
+            rest = [t for t in toks[2:] if t[1].lower() != "as"]
+            pred = [t for t in rest if t[0] == "pred"]
+            name = [t for t in rest if t[0] != "pred"]
+            if len(pred) != 1 or len(name) != 1:
+                raise ValueError(
+                    "create logview <name> [predicate] — one name and one "
+                    "[predicate], in either order")
+            self.views[name[0][1]] = self.source(pred[0])
+            return
         if head == "declare":
             # `declare errs cursor for select records from console where ...`
             name = toks[1][1]
