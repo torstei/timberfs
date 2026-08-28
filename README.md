@@ -207,8 +207,10 @@ See [Two clocks](docs/deployment.md#two-clocks-and-when-they-diverge).
 
 The tour above is the whole core loop. The main thing it leaves out is the
 **fleet view**: keep one log per host/app and merge them at *read* time, so a
-single query spans the fleet — chunks interleave by timestamp across files, and
-each line carries a `path:` prefix showing who logged it.
+single query spans the fleet — chunks interleave by the window they were
+WRITTEN in, and each line carries a `path:` prefix showing who logged it. (The
+framed answer reads the stores one after another instead and claims no order
+between them; see `timberfs-records(5)`, ORDERING.)
 
 ```sh
 timberfs query --from 13:42 --to 13:43 collector/host*-app.log
