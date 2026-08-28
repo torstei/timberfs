@@ -406,7 +406,7 @@ def records(out):
         yield kind, fields, payload
 
 
-def show_loglines(out, by_path):
+def show_loglines(out, by_path, header=None):
     """timberfs prefixes each line with the store's PATH, which on a fleet
     is most of the terminal and none of the information. Rewrite it to the
     store's name, in the column `records` uses, so the two kinds read the
@@ -418,6 +418,8 @@ def show_loglines(out, by_path):
     truncated one."""
     n = 0
     for line in out.splitlines():
+        if header and n == 0:
+            print(header)
         head, sep, rest = line.partition(":")
         if sep and head in by_path:
             print(f"  {by_path[head]:28} {rest}")
@@ -427,21 +429,27 @@ def show_loglines(out, by_path):
     return n
 
 
-def show_records(out, names):
+def show_records(out, names, header=None):
     last, shown = None, 0
     for kind, f, payload in records(out):
         if kind == "source":
             names[f.get("id", "?")] = os.path.basename(f.get("path", "?"))
         elif kind == "entry":
+            if header and shown == 0:
+                print(header)
             who = names.get(f.get("id", ""), "")
             for i, line in enumerate((payload or "").rstrip("\n").split("\n")):
                 print(f"  {who:28} {line}" if i == 0 else f"  {'':28} {line}")
             shown += 1
         elif kind == "stream-end":
-            note = f"  -- {f.get('entries','?')} entries"
-            if f.get("status") == "limited":
-                note += f", STOPPED by {f.get('limit','a bound')}"
-            print(note)
+            # Only where something was shown: a per-host "0 entries" from
+            # every host that had nothing is the noise the header fix is
+            # about, said a second way.
+            if shown or header is None:
+                note = f"  -- {f.get('entries','?')} entries"
+                if f.get("status") == "limited":
+                    note += f", STOPPED by {f.get('limit','a bound')}"
+                print(note)
     return shown
 
 
@@ -1096,6 +1104,44 @@ class Shell:
                 + (f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1 else "")
                 + ", so nothing was searched")
 
+    def hosts_holding(self, doc):
+        """Which hosts have a store this predicate selects, asked in
+        PARALLEL — and asked of THEM, so the selector is still timberfs's.
+
+        Without it a read walks every host in turn and most of them have
+        nothing: `[name=apache-error]` over eight hosts was eight
+        sequential round trips through a wrapper for two lines, six of
+        them returning nothing. This is one round trip of wall clock,
+        after which only the hosts that said yes are read.
+
+        Returns (hosts, empty, bad). A host that could not be asked is
+        KEPT in the read set — refusing to read it because a probe failed
+        would turn one failure into silence."""
+        probe = {k: v for k, v in doc.items() if k in ("v", "stores")}
+        probe["response_format"] = {"kind": "stores"}
+        holding, empty, bad, lock = [], [], {}, threading.Lock()
+
+        def one(host):
+            out, err, rc = self.ask(probe, host)
+            with lock:
+                if rc != 0:
+                    bad[host] = err or f"exit {rc}"
+                    return
+                try:
+                    stores, _ = unwrap(out)
+                except (json.JSONDecodeError, ValueError) as e:
+                    bad[host] = str(e)
+                    return
+                (holding if stores else empty).append(host)
+
+        ts = [threading.Thread(target=one, args=(h,)) for h in TARGETS]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        keep = [h for h in TARGETS if h in holding or h in bad]
+        return keep, empty, bad
+
     def once(self, doc, kind):
         # A `stores` answer is a SET, so the hosts merge into one listing.
         if kind == "stores":
@@ -1104,15 +1150,17 @@ class Shell:
         # them could only key on arrival, and would claim a timeline across
         # machines that nothing here can honour -- the same reason a bounded
         # timberfs answer is `order=sequential`.
+        targets, empty, bad = (TARGETS, [], {})
+        if len(TARGETS) > 1:
+            targets, empty, bad = self.hosts_holding(doc)
         want = doc.get("max", {}).get("entries")
-        total, bad = 0, {}
-        for host in TARGETS:
+        total, stopped = 0, None
+        for host in targets:
             if want is not None and total >= want:
                 # A cap is what fits on YOUR screen, not per host. Stopping
                 # here is what makes that true, and is why hosts are read in
                 # turn rather than all at once.
-                print(f"  -- stopped at {want}; {label(host)} and any after "
-                      f"it were not read")
+                stopped = host
                 break
             d = dict(doc)
             if want is not None:
@@ -1121,19 +1169,34 @@ class Shell:
             if rc != 0:
                 bad[host] = err or f"exit {rc}"
                 continue
-            if len(TARGETS) > 1:
-                print(f"  == {label(host)}")
+            # The header goes above the OUTPUT, so a host with nothing to
+            # show does not announce itself. Six empty headers is not a
+            # report, it is noise standing where an answer should be.
+            n = 0
             if kind == "records":
-                total += show_records(out, self.names)
+                n = show_records(out, self.names, header=(
+                    f"  == {label(host)}" if len(TARGETS) > 1 else None))
             elif kind == "loglines":
-                total += show_loglines(out, self.paths_on(host))
+                n = show_loglines(out, self.paths_on(host), header=(
+                    f"  == {label(host)}" if len(TARGETS) > 1 else None))
             else:
-                total += sys.stdout.write(out) and 0 or len(out.strip().splitlines())
+                n = sys.stdout.write(out) and 0 or len(out.strip().splitlines())
+            total += n
+        if stopped is not None:
+            print(f"  -- stopped at {want}; {label(stopped)} and any after "
+                  f"it were not read")
+        # Skipping is REPORTED. A host that was never read is a hole in the
+        # answer, and one that is silent reads as a host with nothing.
+        if empty:
+            # In the order they were given, not the order threads finished.
+            print(f"  -- no matching store on {len(empty)}: "
+                  + ", ".join(label(h) for h in TARGETS if h in empty))
         for host, why in bad.items():
             print(f"  ⚠ {label(host)}: {fmt_err(why)}")
-        if not total and not bad:
+        if not total and not bad and not empty:
             note = self.why_empty(doc)
-            if note: print(note)
+            if note:
+                print(note)
 
     def list_stores(self, doc):
         """One listing from every host, in parallel: a set has no order to

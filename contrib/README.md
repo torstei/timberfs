@@ -45,6 +45,14 @@ answer is `order=sequential`. `limit N` is N in total, so a later host may go
 unread — it says so when that happens, and a host it cannot reach is named
 rather than quietly missing.
 
+A read first asks every host, **in parallel**, which of them hold a store the
+predicate selects, and reads only those. It does not evaluate the predicate
+itself — each host resolves its own, so the selector stays timberfs's.
+Measured on seven hosts at a second of latency each, where one holds the
+store: **7.0 s → 2.1 s**. Hosts with nothing are reported as a count rather
+than as a row of empty headers, and one that could not be probed is read
+anyway: skipping it would turn a failure into silence.
+
 ### What it is for
 
 Dogfooding `timberfs-query-document(5)`. A protocol nobody writes a
