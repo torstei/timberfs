@@ -1277,6 +1277,16 @@ fn main() -> anyhow::Result<()> {
                 // Listing stores and reading entries are the same
                 // document asking for different answers, so the kind
                 // decides which one runs.
+                // The handshake: who is answering, before anything is
+                // asked of them.
+                if doc.asks_server() {
+                    doc.to_query()?; // its refusals still apply
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&querydoc::server_info())?
+                    );
+                    return Ok(());
+                }
                 if doc.lists_stores() {
                     doc.to_query()?; // its refusals still apply
                     list::cmd_list(&[], false, true, Some(&doc.store_selector()), false)?;

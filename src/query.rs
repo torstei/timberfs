@@ -894,7 +894,11 @@ fn query_entries(
     // carries totals — its PRESENCE is the completeness marker: a
     // consumer hitting EOF without it knows the stream was truncated.
     if records {
-        write!(out, "\x1estream-start\x1fv=1")?;
+        write!(
+            out,
+            "\x1estream-start\x1fv=1\x1ftimberfs={}",
+            env!("CARGO_PKG_VERSION")
+        )?;
         if from_ms > 0 {
             write!(out, "\x1ffrom={from_ms}")?;
         }
@@ -1367,7 +1371,15 @@ fn query_follow(
         // A followed stream is unbounded: stream-start, then entries, and
         // deliberately no stream-end — its absence is the honest "still live
         // (or truncated)" marker. A bounded --tail (no --follow) does close.
-        write!(out, "\x1estream-start\x1fv=1")?;
+        // WHICH BUILD produced this. An answer outlives the connection
+        // that fetched it — relayed, piped, kept — and a consumer that
+        // finds one behaving oddly should not have to infer the version
+        // from the behaviour.
+        write!(
+            out,
+            "\x1estream-start\x1fv=1\x1ftimberfs={}",
+            env!("CARGO_PKG_VERSION")
+        )?;
         if let Some(fr) = from {
             write!(out, "\x1ffrom={fr}")?;
         }

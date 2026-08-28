@@ -350,6 +350,56 @@ applies \(em it bounds work, not framing \(em but the marker is a note on
 standard error, and a relay is unlikely to carry that.
 .RE
 .TP
+.B response_format.kind: \(dqserver\(dq
+WHO is answering, and nothing else: this build of timberfs, the query
+document version it speaks, and every operator
+.B stores.select
+accepts here. It reads no store.
+.RS
+.PP
+.nf
+{ \(dqtimberfs\(dq: \(dq0.24.0\(dq,
+  \(dqquery_document\(dq: \(dq1.0\-EXPERIMENTAL\(dq,
+  \(dqselector_operators\(dq: [\(dq!=\(dq, \(dq!~\(dq, \(dq!*\(dq, \(dq=~\(dq, \(dq=*\(dq, \(dq=\(dq] }
+.fi
+.PP
+The handshake, and the reason it exists is a defect it would have caught.
+.B =*
+shipped after
+.BR v0.23.1 ,
+and a build without it does not refuse the operator \(em it truncates it
+to
+.B =
+and reads the
+.B *
+as part of the value, so
+.B name=*apache
+silently became
+.B name
+equal to
+.BR *apache :
+an empty answer, exit 0, for a store the same session had just listed.
+.PP
+The OPERATORS are listed rather than left to be worked out from the
+version, because that is the question a client actually has. Knowing the
+build is \(lq0.24.0\(rq only helps someone who also keeps a table of
+which release added what; knowing the operator is there is the answer.
+They come from the selector's own list, so this cannot advertise one the
+parser does not have.
+.PP
+Everything that describes a SEARCH is refused rather than ignored \(em
+.BR stores.select ,
+.BR window ,
+.BR match ,
+.BR max ,
+.BR tail ,
+.B deadline
+and
+.BR cursor .
+The store predicate too, which is what separates this from a store
+listing: that answers with stores, this answers with the server.
+.RE
+.TP
 .B cursor
 Where a previous answer stopped, per store: a list of
 .BR id / offset

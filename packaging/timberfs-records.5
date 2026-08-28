@@ -49,6 +49,10 @@ First record of every stream. Fields:
 .B v
 (format version, this document describes
 .BR v=1 ),
+.B timberfs
+(the BUILD that produced this answer \(em an answer outlives the
+connection that fetched it, and a consumer finding one that behaves oddly
+should not have to infer the version from the behaviour),
 .B from
 /
 .B to

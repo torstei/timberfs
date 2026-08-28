@@ -19,6 +19,12 @@ with the timberfs it talks to. The **store objects** a search answers with
 are not covered by that — those are the same objects `info --json` and
 `list --json` emit.
 
+## Asking who is answering
+
+| | |
+|---|---|
+| [query-server.json](query-server.json) | **The handshake.** Which build, which document version, and which selector operators it has. Reads no store. Ask this first: `=*` shipped after v0.23.1 and an older build does not *refuse* it — it truncates the operator and answers with something else. The operators are listed so a client asks whether one EXISTS rather than keeping a table of which release added it. |
+
 ## Finding stores
 
 | | |

@@ -266,6 +266,11 @@
           "description": "Compressed chunks, verbatim — nothing decompressed at either end.\n⚠ Chunks do not align to a window, so the answer is a SUPERSET of\nwhat was asked for and the response must say what window it\nactually widened to.",
           "type": "string",
           "const": "chunks"
+        },
+        {
+          "description": "WHO is answering: this build, the document version it speaks, and\nthe selector operators it has. Reads no store.\n\nThe handshake. Without it a client discovers a difference by being\nanswered wrongly: `=*` shipped after v0.23.1 and an older build\ndoes not refuse it, so `name=*apache` silently became `name` equal\nto `*apache`. Asking beats guessing, and asking beats version\narithmetic too — a client wants to know whether an OPERATOR exists,\nnot to keep a table of which release added which.",
+          "type": "string",
+          "const": "server"
         }
       ]
     },
