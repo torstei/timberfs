@@ -98,6 +98,15 @@ def lex(s):
     return out
 
 
+# Rust's regex metacharacters. Escaping them is what turns a typed name
+# into a LITERAL inside the anchored `=~` match below.
+RX_META = "\\.+*?()|[]{}^$"
+
+
+def rx_literal(text):
+    return "".join("\\" + c if c in RX_META else c for c in text)
+
+
 def parse_pred(text):
     """`type=console,host=web01` -> document terms. The SYNTAX is parsed
     here; what it MEANS is timberfs's business, and asking it is the only
@@ -110,7 +119,19 @@ def parse_pred(text):
                 terms.append({"key": k.strip(), "op": op, "value": v.strip()})
                 break
         else:
-            terms.append({"key": "name", "op": "=*", "value": part.strip()})
+            # Something that LOOKS like an operator but is not one is a
+            # typo, not a store called that. Reading it as a name would
+            # answer "0 stores" for a search that was never run.
+            if any(c in part for c in "=~!*"):
+                raise ValueError(
+                    f"`{part.strip()}` has no operator I know — one of "
+                    + ", ".join(OPS))
+            # A bare word is the NAME, matched anywhere in it. Spelled as
+            # an escaped anchored regex rather than `=*` for the reason in
+            # `backslash`: a timberfs before 0.24.0 truncates `=*` to `=`
+            # and reads the `*` as part of the value, silently.
+            terms.append({"key": "name", "op": "=~",
+                          "value": f".*{rx_literal(part.strip())}.*"})
     return terms
 
 
@@ -153,15 +174,6 @@ def human(n):
         if n < 1024 or u == "GiB":
             return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
         n /= 1024
-
-
-# Rust's regex metacharacters. Escaping them is what turns a typed name
-# into a LITERAL inside the anchored `=~` match below.
-RX_META = "\\.+*?()|[]{}^$"
-
-
-def rx_literal(text):
-    return "".join("\\" + c if c in RX_META else c for c in text)
 
 
 def when_ms(ms):
