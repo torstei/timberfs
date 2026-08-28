@@ -32,8 +32,10 @@ KINDS = ("records", "loglines", "stores", "chunks")
 OPS = ("!=", "!~", "!*", "=~", "=*", "=")
 
 HELP = """
-  \\d                     the stores, and the labels that still split them
-  \\d NAME                that one in full (NAME is a substring)
+  \\d                     the stores, their short ids, and what still
+                         splits them by label
+  \\d NAME | \\d ID        that one in full -- a substring of the name, or a
+                         prefix of the id (the 8 chars \\d prints)
   \\d+                    ...the listing with chunk counts and write spans
   \\dv                    the logviews      \\?  this      \\q  quit
 
@@ -176,6 +178,13 @@ def human(n):
         n /= 1024
 
 
+SHORT_ID = 8
+
+
+def short_id(s):
+    return (s.get("id") or "-")[:SHORT_ID]
+
+
 def when_ms(ms):
     return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(ms / 1000)) if ms else "-"
 
@@ -227,7 +236,8 @@ def show_stores(stores, verbose=False):
         for s in sorted(stores, key=lambda s: s["name"]):
             lab = " ".join(f"{k}={v}" for k, v in sorted((s.get("labels") or {}).items())
                            if k not in c)
-            row = f"  {s['name']:36} {human(s.get('compressed_bytes',0)):>9}"
+            row = (f"  {s['name']:30} {short_id(s):{SHORT_ID}}  "
+                   f"{human(s.get('compressed_bytes',0)):>9}")
             if verbose:
                 row += (f" {s.get('chunks',0):>7} ch  "
                         f"{when_ms(s.get('first_write_ms'))} .. {when_ms(s.get('last_write_ms'))} ")
@@ -514,18 +524,16 @@ class Shell:
         if cmd == "dv": return self.show_views()
         if cmd.rstrip("+") != "d":
             raise ValueError(f"`\\{cmd}`? this shell knows \\d \\d+ \\dv \\? \\q")
-        # A bare word is a NAME SUBSTRING, not a pattern -- what a person
-        # means by "the apache one".
-        #
-        # Spelled as an ESCAPED anchored regex rather than with `=*`, which
-        # says exactly this and is the better tool: `=*` landed after
-        # v0.23.1 and a timberfs without it does not refuse the operator.
-        # It truncates it to `=` and reads the `*` as part of the VALUE, so
-        # `\\d web01` came back "no store matches" against a store plainly
-        # in `\\d`. Escaping keeps the text literal either way.
-        terms = ([{"key": "name", "op": "=~", "value": f".*{rx_literal(arg)}.*"}]
-                 if arg else [])
-        stores = self.stores_matching(terms)
+        # Fetched whole and filtered here, rather than asked for by
+        # predicate. The selector is a CONJUNCTION, and this has to match a
+        # name OR an id prefix; a prefix is not an operator it has anyway.
+        # It also cannot go wrong across versions, which `=*` did.
+        stores = self.stores_matching([])
+        if arg:
+            a = arg.lower()
+            stores = [x for x in stores
+                      if a in (x.get("name") or "").lower()
+                      or (x.get("id") or "").lower().startswith(a)]
         if not stores:
             print(f"  no store matches {arg!r}" if arg else "  no stores")
             return
