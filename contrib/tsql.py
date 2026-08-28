@@ -155,6 +155,15 @@ def human(n):
         n /= 1024
 
 
+# Rust's regex metacharacters. Escaping them is what turns a typed name
+# into a LITERAL inside the anchored `=~` match below.
+RX_META = "\\.+*?()|[]{}^$"
+
+
+def rx_literal(text):
+    return "".join("\\" + c if c in RX_META else c for c in text)
+
+
 def when_ms(ms):
     return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(ms / 1000)) if ms else "-"
 
@@ -493,10 +502,17 @@ class Shell:
         if cmd == "dv": return self.show_views()
         if cmd.rstrip("+") != "d":
             raise ValueError(f"`\\{cmd}`? this shell knows \\d \\d+ \\dv \\? \\q")
-        # A bare word is a NAME SUBSTRING, not a pattern: it is what a
-        # person means by "the apache one", and `=*` is literal so a dot
-        # in a store name cannot behave like a wildcard.
-        terms = [{"key": "name", "op": "=*", "value": arg}] if arg else []
+        # A bare word is a NAME SUBSTRING, not a pattern -- what a person
+        # means by "the apache one".
+        #
+        # Spelled as an ESCAPED anchored regex rather than with `=*`, which
+        # says exactly this and is the better tool: `=*` landed after
+        # v0.23.1 and a timberfs without it does not refuse the operator.
+        # It truncates it to `=` and reads the `*` as part of the VALUE, so
+        # `\\d web01` came back "no store matches" against a store plainly
+        # in `\\d`. Escaping keeps the text literal either way.
+        terms = ([{"key": "name", "op": "=~", "value": f".*{rx_literal(arg)}.*"}]
+                 if arg else [])
         stores = self.stores_matching(terms)
         if not stores:
             print(f"  no store matches {arg!r}" if arg else "  no stores")
