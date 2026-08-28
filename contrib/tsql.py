@@ -398,6 +398,27 @@ def records(out):
         yield kind, fields, payload
 
 
+def show_loglines(out, by_path):
+    """timberfs prefixes each line with the store's PATH, which on a fleet
+    is most of the terminal and none of the information. Rewrite it to the
+    store's name, in the column `records` uses, so the two kinds read the
+    same way.
+
+    Split on the FIRST colon and look the prefix up: a path that is not a
+    store we know about is left exactly as it came, because guessing at
+    the shape of a line is how a log line containing a colon becomes a
+    truncated one."""
+    n = 0
+    for line in out.splitlines():
+        head, sep, rest = line.partition(":")
+        if sep and head in by_path:
+            print(f"  {by_path[head]:28} {rest}")
+        else:
+            print(f"  {line}" if line else "")
+        n += 1
+    return n
+
+
 def show_records(out, names):
     last, shown = None, 0
     for kind, f, payload in records(out):
@@ -690,6 +711,13 @@ class Shell:
                     + ", ".join(h[:12] for h in sorted(hits)))
         return terms
 
+    def paths_on(self, host):
+        """path -> store name, for the stores on ONE host. Per host because
+        two machines can hold the same path, and the answer being rendered
+        came from exactly one of them."""
+        return {st["path"]: st["name"] for st in self.universe()
+                if st.get("path") and st.get("_host") == host}
+
     def ids_starting(self, prefix, fresh=False):
         p = prefix.lower()
         return [s["id"] for s in self.universe(fresh)
@@ -980,8 +1008,12 @@ class Shell:
                 continue
             if len(TARGETS) > 1:
                 print(f"  == {label(host)}")
-            total += show_records(out, self.names) if kind == "records" \
-                else (sys.stdout.write(out) or len(out.strip().splitlines()))
+            if kind == "records":
+                total += show_records(out, self.names)
+            elif kind == "loglines":
+                total += show_loglines(out, self.paths_on(host))
+            else:
+                total += sys.stdout.write(out) and 0 or len(out.strip().splitlines())
         for host, why in bad.items():
             print(f"  ⚠ {label(host)}: {fmt_err(why)}")
         if not total and not bad:
