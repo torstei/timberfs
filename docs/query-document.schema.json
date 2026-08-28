@@ -361,8 +361,16 @@
           "type": "string"
         },
         "op": {
-          "description": "`=`, `!=`, `=~`, `!~`, `=*` or `!*`.\n\nRegexes are anchored at both ends, so `=~` is a whole-value match.\n`=*` is a LITERAL substring — what a person means by \"the store\nwith apache in its name\", and not the same as `=~.*apache.*`,\nwhich would read a `.` in the text as a pattern.",
-          "type": "string"
+          "description": "`=`, `!=`, `=~`, `!~`, `=*` or `!*`.\n\nRegexes are anchored at both ends, so `=~` is a whole-value match.\n`=*` is a LITERAL substring — what a person means by \"the store\nwith apache in its name\", and not the same as `=~.*apache.*`,\nwhich would read a `.` in the text as a pattern.\n\nEnumerated in the schema rather than described as a string, so a\ngenerator can be told which operators exist by the contract instead\nof discovering it from an answer that came back wrong.",
+          "type": "string",
+          "enum": [
+            "!=",
+            "!~",
+            "!*",
+            "=~",
+            "=*",
+            "="
+          ]
         },
         "value": {
           "type": "string"
