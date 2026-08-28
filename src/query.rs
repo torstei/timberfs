@@ -553,8 +553,19 @@ pub struct Output {
     pub null_sep: bool,
     pub records: bool,
     /// The raw escape hatch: chunks selected by write time, no entry
-    /// parsing and no logline filtering.
+    /// parsing and no logline filtering. Emits the chunks' CONTENT as
+    /// text — `--by-write-time`, which is a pipe's input and a person's
+    /// read.
     pub by_write_time: bool,
+    /// The same selection, framed: each chunk as its ring record plus the
+    /// COMPRESSED frame, verbatim.
+    ///
+    /// Separate from `by_write_time` because they are different answers to
+    /// different readers. A text dump cannot say where one chunk ended,
+    /// which number it was, or what window it covered — and it costs the
+    /// decompression its reader did not ask for: 502,893 bytes shipped for
+    /// 23,834 stored, measured on one store.
+    pub chunk_records: bool,
 }
 
 /// Reading forward as data arrives.
@@ -645,6 +656,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
         null_sep,
         records,
         by_write_time,
+        chunk_records,
     } = q.output;
     let from_ms = from.unwrap_or(0);
     let to_ms = to.unwrap_or(u64::MAX);
@@ -706,6 +718,9 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             max,
             deadline,
         );
+    }
+    if chunk_records {
+        return query_chunks_framed(files, from_ms, to_ms, has, any, max_chunks, deadline);
     }
     if files.len() == 1 {
         return query_single(&files[0], from_ms, to_ms, has, any, max_chunks, deadline);
@@ -1674,6 +1689,140 @@ fn query_follow(
         out.write_all(b"\0")?;
     }
     out.flush()?;
+    Ok(())
+}
+
+/// Chunks as `timberfs-records(5)`: the ring, then the zstd frame.
+///
+/// The text path beside this decompresses and concatenates, which loses
+/// every boundary a consumer needs — where one chunk ended, which number
+/// it was, what window it covered — and pays for a decompression nobody
+/// asked for. This ships what is stored and says what each piece is.
+#[allow(clippy::too_many_arguments)]
+fn query_chunks_framed(
+    files: &[std::path::PathBuf],
+    from_ms: u64,
+    to_ms: u64,
+    has: &[String],
+    any: &[String],
+    max_chunks: Option<u64>,
+    deadline: Option<std::time::Duration>,
+) -> anyhow::Result<()> {
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    write_chunks_framed(
+        &mut out, files, from_ms, to_ms, has, any, max_chunks, deadline,
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+/// The stream itself, over any writer, so a test can read what a consumer
+/// would receive rather than a paraphrase of it.
+#[allow(clippy::too_many_arguments)]
+fn write_chunks_framed<W: Write>(
+    out: &mut W,
+    files: &[std::path::PathBuf],
+    from_ms: u64,
+    to_ms: u64,
+    has: &[String],
+    any: &[String],
+    max_chunks: Option<u64>,
+    deadline: Option<std::time::Duration>,
+) -> anyhow::Result<()> {
+    let began = std::time::Instant::now();
+    write!(
+        out,
+        "\x1estream-start\x1fv=1\x1fserver_version={}\x1forder=sequential\x1fsources={}",
+        crate::querydoc::server_version(),
+        files.len()
+    )?;
+    out.write_all(b"\0")?;
+
+    let (mut sent, mut total_chunks) = (0u64, 0usize);
+    let mut stopped: Option<&'static str> = None;
+    for f in files {
+        let mut source = open_source(f)?;
+        let guard = seq_guard(f);
+        let (selected, _) = select_chunks(
+            f,
+            &source.records,
+            source.seq_at_open,
+            from_ms,
+            to_ms,
+            has,
+            any,
+        )?;
+        // The manifest's id as text; `store_id_of` hands back bytes for the
+        // entry sink, which writes them straight out.
+        let id: Option<String> = source
+            .bark
+            .as_ref()
+            .and_then(|b| b.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        total_chunks += source.records.len();
+        write!(out, "\x1esource\x1fpath={}", f.display())?;
+        if let Some(id) = &id {
+            write!(out, "\x1fid={id}")?;
+        }
+        write!(
+            out,
+            "\x1fkept={}\x1ftotal={}",
+            selected.len(),
+            source.records.len()
+        )?;
+        out.write_all(b"\0")?;
+
+        for (_, c) in &selected {
+            if max_chunks.is_some_and(|m| sent >= m) {
+                stopped = Some("max.chunks");
+                break;
+            }
+            if deadline.is_some_and(|d| began.elapsed() >= d) {
+                stopped = Some("deadline");
+                break;
+            }
+            // The COMPRESSED frame. `read_chunk` decompresses; this is the
+            // whole reason the raw reader exists.
+            let Some(frame) = read_chunk_raw(f, &guard, &mut source, *c)? else {
+                continue; // retained away between selection and read
+            };
+            write!(out, "\x1echunk\x1flen={}", frame.len())?;
+            if let Some(id) = &id {
+                write!(out, "\x1fid={id}")?;
+            }
+            if files.len() > 1 {
+                write!(out, "\x1fsrc={}", f.display())?;
+            }
+            write!(
+                out,
+                "\x1fchunk={}\x1funcomp_start={}\x1funcomp_len={}\x1fwf={}\x1fwl={}",
+                c.seq, c.uncomp_start, c.uncomp_len, c.first_write_ms, c.last_write_ms
+            )?;
+            out.write_all(b"\0")?;
+            out.write_all(&frame)?;
+            out.write_all(b"\0")?;
+            sent += 1;
+        }
+        if stopped.is_some() {
+            break;
+        }
+    }
+
+    write!(
+        out,
+        "\x1estream-end\x1fchunks={sent}\x1fchunks_total={total_chunks}\x1fstatus={}",
+        if stopped.is_some() {
+            "limited"
+        } else {
+            "exhausted"
+        }
+    )?;
+    if let Some(b) = stopped {
+        write!(out, "\x1flimit={b}")?;
+    }
+    out.write_all(b"\0")?;
     Ok(())
 }
 
@@ -3082,4 +3231,180 @@ fn dropped_bytes_of(input: &Path) -> u64 {
         .and_then(|f| format::read_header_dropped(&f))
         .map(|d| d.uncomp_bytes)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod chunk_stream_tests {
+    use super::*;
+    use crate::store::{Config, Store};
+
+    /// A store with several chunks, and the lines that went into it.
+    fn store_with_chunks(tag: &str, lines: usize) -> (std::path::PathBuf, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("timberfs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            chunk_size: 4096,
+            level: 3,
+            flush_age_ms: 60_000,
+        };
+        let mut st = Store::open(&dir, cfg).unwrap();
+        st.create("app.log").unwrap();
+        crate::bark::ensure_identified(&dir, "app.log").unwrap();
+        let f = st.files.get_mut("app.log").unwrap();
+        let mut content = Vec::new();
+        for i in 0..lines {
+            let line = format!("2026-08-28T10:00:00Z INFO worker {i} handled a request\n");
+            f.append_stamped(line.as_bytes(), 1_000_000 + i as u64, &cfg)
+                .unwrap();
+            content.extend_from_slice(line.as_bytes());
+        }
+        f.flush_chunk(&cfg).unwrap();
+        (dir, content)
+    }
+
+    /// Read the stream the way `timberfs-records(5)` says it must be read:
+    /// header to the first NUL, then exactly `len` bytes. Splitting on the
+    /// delimiters instead lands INSIDE a zstd frame, which contains 0x1e
+    /// and 0x00 like any other bytes — the reason `len` is authoritative
+    /// and not merely convenient.
+    fn records(buf: &[u8]) -> Vec<(String, std::collections::HashMap<String, String>, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < buf.len() {
+            assert_eq!(buf[i], 0x1e, "record does not start with RS at {i}");
+            let end = i + buf[i..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("unterminated header");
+            let header = String::from_utf8(buf[i + 1..end].to_vec()).unwrap();
+            let mut parts = header.split('\x1f');
+            let kind = parts.next().unwrap().to_string();
+            let fields: std::collections::HashMap<String, String> = parts
+                .filter_map(|p| {
+                    p.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect();
+            i = end + 1;
+            let payload = match fields.get("len") {
+                Some(n) => {
+                    let n: usize = n.parse().unwrap();
+                    let p = buf[i..i + n].to_vec();
+                    assert_eq!(buf[i + n], 0, "payload not closed by NUL");
+                    i += n + 1;
+                    p
+                }
+                None => Vec::new(),
+            };
+            out.push((kind, fields, payload));
+        }
+        out
+    }
+
+    #[test]
+    fn chunks_are_shipped_as_stored_and_each_carries_its_ring() {
+        // `kind: "chunks"` promised "compressed, verbatim — nothing
+        // decompressed at either end" and shipped the DECOMPRESSED
+        // contents, with no chunk boundaries: 502,893 bytes for 23,834
+        // stored, and a consumer that could not tell where one chunk
+        // ended, which number it was, or what window it covered.
+        let (dir, content) = store_with_chunks("chunkstream", 3000);
+        let mut buf = Vec::new();
+        write_chunks_framed(
+            &mut buf,
+            &[dir.join("app.log")],
+            0,
+            u64::MAX,
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let recs = records(&buf);
+
+        assert_eq!(recs.first().map(|r| r.0.as_str()), Some("stream-start"));
+        assert_eq!(recs.last().map(|r| r.0.as_str()), Some("stream-end"));
+        assert_eq!(recs.last().unwrap().1["status"], "exhausted");
+
+        let chunks: Vec<_> = recs.iter().filter(|r| r.0 == "chunk").collect();
+        assert!(
+            chunks.len() > 1,
+            "expected several chunks, got {}",
+            chunks.len()
+        );
+        assert_eq!(
+            recs.last().unwrap().1["chunks"],
+            chunks.len().to_string(),
+            "stream-end must count what it actually sent"
+        );
+
+        let mut shipped = 0usize;
+        let mut rebuilt = Vec::new();
+        let mut expect_at = 0u64;
+        for (n, (_, f, payload)) in chunks.iter().enumerate() {
+            // Compressed, and compressed as a STANDARD zstd frame: the
+            // magic is what makes the answer decodable by a consumer that
+            // does not link our zstd.
+            assert_eq!(
+                &payload[..4],
+                &[0x28, 0xb5, 0x2f, 0xfd],
+                "chunk {n} is not a zstd frame — it is being decompressed on the way out"
+            );
+            let plain = zstd::stream::decode_all(&payload[..]).unwrap();
+            // The ring, which is what makes the bytes usable at all.
+            assert_eq!(plain.len().to_string(), f["uncomp_len"]);
+            assert_eq!(f["chunk"], n.to_string());
+            assert_eq!(
+                f["uncomp_start"],
+                expect_at.to_string(),
+                "offsets not dense"
+            );
+            assert!(
+                f.contains_key("id") && f.contains_key("wf") && f.contains_key("wl"),
+                "{f:?}"
+            );
+            assert!(f["wf"].parse::<u64>().unwrap() <= f["wl"].parse::<u64>().unwrap());
+            expect_at += plain.len() as u64;
+            shipped += payload.len();
+            rebuilt.extend_from_slice(&plain);
+        }
+        // Reassembled by uncomp_start, the chunks ARE the log.
+        assert_eq!(rebuilt, content);
+        assert!(
+            shipped * 4 < content.len(),
+            "shipped {shipped} for {} of content — not the stored bytes",
+            content.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_capped_chunk_read_says_which_bound_stopped_it() {
+        // A short answer that cannot be told from a complete one is the
+        // defect this whole framing exists to remove.
+        let (dir, _) = store_with_chunks("chunkcap", 3000);
+        let mut buf = Vec::new();
+        write_chunks_framed(
+            &mut buf,
+            &[dir.join("app.log")],
+            0,
+            u64::MAX,
+            &[],
+            &[],
+            Some(2),
+            None,
+        )
+        .unwrap();
+        let recs = records(&buf);
+        let end = &recs.last().unwrap().1;
+        assert_eq!(recs.iter().filter(|r| r.0 == "chunk").count(), 2);
+        assert_eq!(end["status"], "limited");
+        assert_eq!(end["limit"], "max.chunks");
+        assert!(
+            end["chunks_total"].parse::<usize>().unwrap() > 2,
+            "the total must say how much was NOT sent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
