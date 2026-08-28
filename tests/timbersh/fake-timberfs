@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""A timberfs that answers from a script, and records what it was asked.
+
+The point is the RECORDING. Most of what has gone wrong in timbersh was in
+the document it SENT — a window on the wrong axis, a short id that never
+became a long one, a cursor handed back in a way that lost a store's
+place. None of that is visible in the output, so a test that only reads
+the printed answer cannot see it.
+
+    FAKE_DIR       where to write requests.jsonl, and where the scenario is
+    TIMBERSH_TEST_HOST   the host name (substituted into --cmd by timbersh)
+
+The scenario is FAKE_DIR/scenario.json, one entry per host (or "" for the
+unnamed one):
+
+    {"alpha": {"stores": [ ... ], "loglines": "...", "records": [...]},
+     "beta":  {"fail": "ssh: no route to host", "code": 255},
+     "old":   {"stores": [...], "bare": true}}     <- pre-envelope server
+"""
+import json, os, sys
+
+FAKE_DIR = os.environ["FAKE_DIR"]
+host = sys.argv[1] if len(sys.argv) > 1 else ""
+
+doc = json.loads(sys.stdin.read() or "{}")
+with open(os.path.join(FAKE_DIR, "requests.jsonl"), "a") as f:
+    f.write(json.dumps({"host": host, "doc": doc}) + "\n")
+
+kind = (doc.get("response_format") or {}).get("kind", "loglines")
+
+scenario = json.load(open(os.path.join(FAKE_DIR, "scenario.json")))
+me = scenario.get(host, {})
+
+# A host may answer DIFFERENTLY on successive calls, which is the only way
+# to test anything about paging: a store that had a position and then goes
+# quiet is the case a cursor loses, and it cannot happen twice in a row to
+# a server that always says the same thing.
+#
+# ⚠ Counted per KIND. timbersh reads the store list at startup and again
+# whenever the host set changes, so a counter over all calls advances the
+# sequence before the first `fetch` — and a paging test then begins at
+# page two and quietly proves nothing.
+if "sequence" in me:
+    n = os.path.join(FAKE_DIR, f"calls-{host or 'local'}-{kind}")
+    i = int(open(n).read()) if os.path.exists(n) else 0
+    open(n, "w").write(str(i + 1))
+    seq = me["sequence"]
+    me = {**me, **seq[min(i, len(seq) - 1)]}
+
+if "fail" in me:
+    print(me["fail"], file=sys.stderr)
+    sys.exit(me.get("code", 1))
+if "note" in me:                       # stderr on a SUCCESSFUL call
+    print(me["note"], file=sys.stderr)
+
+if kind == "stores":
+    stores = me.get("stores", [])
+    # A server from before the envelope answers with the bare array.
+    if me.get("bare"):
+        print(json.dumps(stores))
+    else:
+        print(json.dumps({"server_version": me.get("version", "timberfs, 0.25.0"),
+                          "stores": stores}))
+elif kind == "records":
+    out = [f"\x1estream-start\x1fv=1\x1fserver_version={me.get('version', 'timberfs, 0.25.0')}"
+           f"\x1forder=sequential\x1fsources={len(me.get('stores', []))}\0"]
+    for s in me.get("stores", []):
+        out.append(f"\x1esource\x1fpath=/l/{s['name']}.log\x1fid={s['id']}"
+                   f"\x1fkept=1\x1ftotal=1\0")
+    for e in me.get("records", []):
+        out.append(f"\x1eentry\x1flen={len(e['text'])}\x1fid={e['id']}\0{e['text']}\0")
+    for p in me.get("positions", []):
+        off = f"\x1foffset={p['offset']}" if "offset" in p else ""
+        out.append(f"\x1eposition\x1fpath=/l/x.log\x1fid={p['id']}{off}"
+                   f"\x1fchunks_read=1\x1fchunks_selected=1\0")
+    out.append(f"\x1estream-end\x1fentries={len(me.get('records', []))}"
+               f"\x1fstatus={me.get('status', 'exhausted')}\0")
+    sys.stdout.write("".join(out))
+else:
+    sys.stdout.write(me.get("loglines", ""))
