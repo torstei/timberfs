@@ -100,6 +100,15 @@ search the server reads as a different question.
   defaulted by accident, and asking for both granularities at once is
   ungrammatical rather than merely refused. (`may` because a Bloom filter
   cannot say more than that.)
+* **`show hosts;`** is what you are talking to: the version each one
+  reported, how many stores it has, and whether anything it said went
+  wrong. A host answering without a version is a timberfs from before the
+  field existed — a fact about that host, not a gap in the listing.
+* Every call goes through one place that RECORDS what came back. timberfs
+  writes its explanations to stderr and still exits 0 (`no store matches
+  ...`, `retention overtook this follower`), and those are exactly the
+  sentences that answer "why did I get nothing" — they used to be
+  discarded on every successful call.
 * The **store list is read once and kept** for the session, and shared by
   completion and `\d`. It is fetched in a background thread at startup, so
   the first TAB does not pay a round trip — against a remote forest that is

@@ -89,6 +89,8 @@ HELP = """
   create logview console [type=console];   name a predicate (either order)
   drop logview console;                    forget it
   show logviews;                           what is defined
+  show hosts;                              what each one is, and whether
+                                           anything it said went wrong
 
   select <kind> from <source> [where ...] [limit N [chunks]];
   tail   <kind> from <source> [where ...];
@@ -457,8 +459,14 @@ def unwrap(text):
     that has to be detected some other way."""
     payload = json.loads(text or "[]")
     if isinstance(payload, dict):
-        return payload.get("stores") or [], payload.get("server_version")
-    return payload, None
+        stores = payload.get("stores")
+        if stores is None:
+            raise ValueError("an answer object with no `stores`: "
+                             + ", ".join(sorted(payload)) or "(empty)")
+        return stores, payload.get("server_version")
+    if isinstance(payload, list):
+        return payload, None
+    raise ValueError(f"expected an answer, got {type(payload).__name__}")
 
 
 # ---------------------------------------------------------------- build
@@ -621,7 +629,7 @@ class Complete:
         if toks[0] == "create" and not any(t.startswith("[") for t in toks[2:]):
             return ["["]
         if prev == "show":
-            return ["logviews", "cursors"]
+            return ["hosts", "logviews", "cursors"]
         if prev == "close":
             return sorted(self.sh.cursors)
         if toks[0] in ("select", "tail") and prev not in ("where",):
@@ -646,8 +654,10 @@ class Shell:
         self._universe = None
         self._universe_at = 0.0
         self.unreachable = {}
-        # host -> what it said it is, or None where it predates the field.
-        self.versions = {}
+        # host -> {version, error, note, seen}: what each one last said,
+        # so `show hosts;` can answer "what am I talking to, and did
+        # anything go wrong" without a second round trip.
+        self.hosts = {}
         self._universe_lock = threading.Lock()
         # Filled in the background: against a remote forest the round trip
         # is seconds, and paying it on the first TAB is what makes
@@ -655,6 +665,35 @@ class Shell:
         threading.Thread(target=self.universe, daemon=True).start()
         if os.path.exists(RC):
             self.load(RC, quiet=True)
+
+    def ask(self, doc, host=None):
+        """Every call to a host goes through here, so that what it said is
+        RECORDED rather than thrown away.
+
+        timberfs writes its explanations to stderr and still exits 0 — `no
+        store matches ...`, `retention overtook this follower`, a coverage
+        warning. Those are exactly the sentences that answer "why did I get
+        nothing", and they were being discarded on every successful call."""
+        # Stamped BEFORE the call, and a later call never loses to an
+        # earlier one that happened to finish after it. The prewarm thread
+        # runs alongside whatever is typed first, so without this the
+        # startup listing could land last and erase the note from the
+        # command the person actually ran.
+        started = time.monotonic()
+        out, err, rc = run(doc, host)
+        st = self.hosts.setdefault(host, {})
+        if started < st.get("at", 0):
+            return out, err, rc
+        st["at"] = started
+        st["seen"] = True
+        if rc != 0:
+            st["error"] = err or f"exit {rc}"
+        else:
+            st.pop("error", None)
+            # Kept, not printed: a note is context for an answer that looks
+            # wrong, and printing every one would bury the answer.
+            st["note"] = err or None
+        return out, err, rc
 
     def universe(self, fresh=False):
         """Every store on every host, cached for STORE_TTL seconds.
@@ -686,7 +725,7 @@ class Shell:
             got, bad, lock = [], {}, threading.Lock()
 
             def one(host):
-                out, err, rc = run(doc, host)
+                out, err, rc = self.ask(doc, host)
                 with lock:
                     if rc != 0:
                         bad[host] = err or f"exit {rc}"
@@ -696,7 +735,7 @@ class Shell:
                     except json.JSONDecodeError as e:
                         bad[host] = f"not JSON: {e}"
                         return
-                    self.versions[host] = ver
+                    self.hosts.setdefault(host, {})["version"] = ver
                     for st in stores:
                         st["_host"] = host
                     got.extend(stores)
@@ -869,6 +908,37 @@ class Shell:
             print("  " + "   ".join(bits))
             show_unreachable(self.unreachable)
             return
+        if head == "show" and len(toks) > 1 and toks[1][1].lower().startswith("host"):
+            self.universe()  # cheap: cached, and it is what fills this in
+            w = max([len(label(h)) for h in TARGETS] + [4])
+            print(f"  {'HOST':{w}}  {'VERSION':20}  STORES  STATUS")
+            for host in TARGETS:
+                st = self.hosts.get(host, {})
+                n = sum(1 for x in self.universe() if x.get("_host") == host)
+                # An older timberfs answers with the bare array and no
+                # version at all, which is a FACT about it rather than a
+                # gap in the listing.
+                if st.get("error"):
+                    # It did not answer, so it said nothing about itself —
+                    # which is not the same as answering without the field.
+                    ver, n = "-", "-"
+                    status = f"UNREACHABLE — {fmt_err(st['error'])}"
+                elif not st.get("seen"):
+                    ver, n, status = "-", "-", "not asked yet"
+                else:
+                    # Answered, but with no version in it: a timberfs from
+                    # before the field existed. A fact about that host.
+                    ver = st.get("version") or "(not reported)"
+                    status = "ok"
+                print(f"  {label(host):{w}}  {ver:20}  {str(n):>6}  {status}")
+                # The note timberfs printed and still exited 0 on. Kept
+                # because it is the sentence that explains an answer which
+                # looks wrong, and it used to be discarded.
+                if st.get("note"):
+                    for line in st["note"].splitlines():
+                        if line.strip():
+                            print(f"  {'':{w}}  note: {line.strip()[:100]}")
+            return
         if head == "show":
             if toks[1][1].lower().startswith("cursor"):
                 if not self.cursors: print("  no cursors"); return
@@ -972,7 +1042,7 @@ class Shell:
             if shown >= n:
                 break
             d = dict(doc, max=dict(doc["max"], entries=n - shown))
-            out, err, rc = run(d, host)
+            out, err, rc = self.ask(d, host)
             if rc != 0:
                 bad[host] = err or f"exit {rc}"
                 continue
@@ -1017,7 +1087,7 @@ class Shell:
         probe["response_format"] = {"kind": "stores"}
         n = 0
         for host in TARGETS:
-            out, err, rc = run(probe, host)
+            out, err, rc = self.ask(probe, host)
             if rc == 0:
                 n += len(unwrap(out)[0])
         if n:
@@ -1047,7 +1117,7 @@ class Shell:
             d = dict(doc)
             if want is not None:
                 d["max"] = dict(doc["max"], entries=want - total)
-            out, err, rc = run(d, host)
+            out, err, rc = self.ask(d, host)
             if rc != 0:
                 bad[host] = err or f"exit {rc}"
                 continue
@@ -1071,7 +1141,7 @@ class Shell:
         got, bad, lock = [], {}, threading.Lock()
 
         def one(host):
-            out, err, rc = run(doc, host)
+            out, err, rc = self.ask(doc, host)
             with lock:
                 if rc != 0:
                     bad[host] = err or f"exit {rc}"
@@ -1081,7 +1151,7 @@ class Shell:
                 except json.JSONDecodeError as e:
                     bad[host] = f"not JSON: {e}"
                     return
-                self.versions[host] = ver
+                self.hosts.setdefault(host, {})["version"] = ver
                 for st in stores:
                     st["_host"] = host
                 got.extend(stores)
@@ -1108,7 +1178,7 @@ class Shell:
                 d = dict(doc, window=dict(doc.get("window", {"axis": "logline"}),
                                           **{"from": seen}))
                 for host in TARGETS:
-                    out, err, rc = run(d, host)
+                    out, err, rc = self.ask(d, host)
                     if rc != 0:
                         if complained.get(host) != err:
                             print(f"  ⚠ {label(host)}: {fmt_err(err)}")
