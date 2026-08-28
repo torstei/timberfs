@@ -313,8 +313,10 @@ enum Command {
     Query {
         /// Backing file(s) or .timber bundle(s); several are interleaved
         /// by chunk time-windows with grep-style "path:" line prefixes.
-        /// A `--query` document names its own stores instead
-        #[arg(required_unless_present = "query", num_args = 0..)]
+        /// A `--query` document names its own stores instead, and
+        /// `--dump-json` reads no store at all — omitted there, the
+        /// document selects every one
+        #[arg(required_unless_present_any = ["query", "dump_json"], num_args = 0..)]
         files: Vec<PathBuf>,
         /// Start of the time window (RFC3339, 'YYYY-MM-DD [HH:MM[:SS]]'
         /// — a bare date is midnight, dotted dates work too,

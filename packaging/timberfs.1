@@ -879,8 +879,21 @@ description of it that cannot drift:
 .RS
 timberfs query app.log \-\-from 13:42 \-\-has ERROR \-\-max 10 \-\-dump\-json
 timberfs query ... \-\-dump\-json | timberfs query \-\-query \-
+timberfs query \-\-from '2026\-08\-28 11:10' \-\-dump\-json
 .RE
 .fi
+.PP
+A store is OPTIONAL here, unlike every other read: this reads none. With
+no
+.I FILE
+the document selects every store \(em an empty predicate, which is what
+an empty
+.B stores
+member means \(em so the flags can be rendered without naming one. That
+is also how a generator asks what a time means: hand
+.B \-\-from
+whatever a person typed and read the milliseconds back out, rather than
+writing a second date parser that will drift from this one.
 .PP
 Note what the round trip does to the store: the flags name it by
 .BR path ,
