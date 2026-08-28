@@ -1078,9 +1078,21 @@ fn query_entries(
             {
                 write!(out, "\x1fid={id}")?;
             }
-            // Just past the last entry DELIVERED. Absent when this store
-            // delivered none, which is not the same as position zero.
-            if let Some(at) = s.sink.emitted_end {
+            // Just past the last entry DELIVERED — or, where this store
+            // delivered none, the position it was RESUMED from.
+            //
+            // The fallback is what makes the round trip lossless. A caller
+            // hands the whole answer back as the next `cursor`, so a store
+            // that went quiet on one page would otherwise come back with
+            // no offset, and an offsetless entry means the start of the
+            // window: every quiet store re-read from the beginning, every
+            // entry in it delivered twice. Nothing moved, so the position
+            // did not either.
+            //
+            // Absent only where there is no position at all — nothing
+            // delivered and nothing resumed from — which is a store this
+            // search has not consumed any of.
+            if let Some(at) = s.sink.emitted_end.or(s.resume_at) {
                 write!(out, "\x1foffset={at}")?;
             }
             write!(

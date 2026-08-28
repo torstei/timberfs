@@ -161,6 +161,20 @@ and the next read continues exactly here; see
 Present for a store that matched NOTHING too \(em dropping those makes
 the next page rescan them from the start of the window, which on a fleet
 is most of the cost.
+.PP
+The round trip is LOSSLESS, and the case that decides it is a store which
+delivers nothing on some page. Its offset is then the one it was RESUMED
+from, not absent: nothing moved, so the position did not either. Absent
+means there is no position at all \(em nothing delivered and nothing
+resumed from \(em a store this search has consumed none of, which reads
+from the start of the window.
+.PP
+⚠ The difference is not cosmetic. An offsetless entry in a
+.B cursor
+IS the start of the window, so a producer that omitted the offset for a
+quiet store would have every consumer re-read it whole on the next page
+and deliver every entry in it twice \(em while following this format's
+own instruction to hand the positions back.
 .RE
 .TP
 .B stream-end

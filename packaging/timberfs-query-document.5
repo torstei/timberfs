@@ -372,6 +372,15 @@ Include an entry for every store the previous answer EXAMINED, including
 the ones that matched nothing. Leave those out and the next page rescans
 them from the start of the window, which on a fleet is most of the cost.
 .PP
+Hand back what you were given, unaltered. An entry with NO
+.B offset
+means the start of the window, and a
+.B position
+carries none only where a store has been consumed nothing of \(em one
+that merely went quiet on a page reports the offset it was RESUMED from,
+so a walk cannot lose its place by paging past a store that had nothing
+to say.
+.PP
 A store ABSENT from the cursor is read from the start of the window. For
 a tail that is right \(em it is new, and everything it holds is new. A
 bounded walk that wants otherwise pins its store set instead.
