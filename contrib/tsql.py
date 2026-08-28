@@ -230,6 +230,11 @@ def show_stores(stores, verbose=False):
     print(hdr)
     f = facets(stores)
     if n <= 25 or not f:
+        # The ID column is a PREFIX and is labelled as one, because it is
+        # hex either way and `id=` is an exact match: pasting what is shown
+        # here selects nothing.
+        hdr = f"  {'NAME':30} {'ID(8)':{SHORT_ID}}  {'SIZE':>9}"
+        print(hdr + ("      CHUNKS  WRITE SPAN" if verbose else "   LABELS"))
         # No row numbers. A store is named, and its NAME is what every
         # other command takes; an ordinal changes the moment another store
         # appears, which is the same trap as naming one by its path.
@@ -289,6 +294,19 @@ def show_records(out, names):
                 note += f", STOPPED by {f.get('limit','a bound')}"
             print(note)
     return shown
+
+
+def id_prefix_hint(doc):
+    """`\\d` prints a short id and `id=` is EXACT, so pasting one selects
+    nothing. Say so where it happens rather than leaving an empty answer."""
+    for t in doc.get("stores", {}).get("select", []):
+        v = t.get("value", "")
+        if (t.get("key") == "id" and t.get("op") == "="
+                and len(v) < 36 and v and all(c in "0123456789abcdef-" for c in v.lower())):
+            return (f"\n     `id=` is exact, and {v!r} is {len(v)} of 36 characters — "
+                    f"the listing prints a prefix.\n"
+                    f"     Try `id=~{v}.*`, or `\\d {v}` for the whole id.")
+    return ""
 
 
 # ---------------------------------------------------------------- build
@@ -470,9 +488,18 @@ class Shell:
         return self._universe
 
     def keys_of(self):
-        return {k for s in self.universe() for k in (s.get("labels") or {})}
+        # `name` and `id` are not labels, but the selector matches the whole
+        # manifest, so they are selectable and belong in completion.
+        return {"name", "id"} | {k for s in self.universe()
+                                 for k in (s.get("labels") or {})}
 
     def values_of(self, key):
+        if key == "name":
+            return {s["name"] for s in self.universe() if s.get("name")}
+        # The WHOLE id: `id=` is an exact match, and the 8 characters the
+        # listing prints are a prefix that would select nothing.
+        if key == "id":
+            return {s["id"] for s in self.universe() if s.get("id")}
         return {str(v) for s in self.universe()
                 for k, v in (s.get("labels") or {}).items() if k == key}
 
@@ -638,12 +665,34 @@ class Shell:
                     print(f"  -- more: `fetch {n} from ...` again")
         cur["at"] = at
 
+    def why_empty(self, doc):
+        """Nothing came back — was anything even SEARCHED?
+
+        "no store matched the predicate" and "the stores held no matching
+        entry" are opposite problems and look identical from an empty
+        answer. Only asked when the answer IS empty, so the extra request
+        is paid on the confusing case and nowhere else."""
+        probe = {k: v for k, v in doc.items() if k in ("v", "stores")}
+        probe["response_format"] = {"kind": "stores"}
+        out, err, rc = run(probe)
+        if rc != 0:
+            return None
+        n = len(json.loads(out or "[]"))
+        if n:
+            return f"  -- nothing matched, in {n} store(s)"
+        return "  -- that predicate selects NO STORE, so nothing was searched" \
+               + id_prefix_hint(doc)
+
     def once(self, doc, kind):
         out, err, rc = run(doc)
         if rc != 0: print(f"  ! {err}"); return
-        if kind == "stores": show_stores(json.loads(out or "[]"))
-        elif kind == "records": show_records(out, self.names)
-        else: sys.stdout.write(out)
+        if kind == "stores":
+            return show_stores(json.loads(out or "[]"))
+        shown = show_records(out, self.names) if kind == "records" \
+            else (sys.stdout.write(out) or len(out.strip()))
+        if not shown:
+            note = self.why_empty(doc)
+            if note: print(note)
 
     def tail(self, doc):
         """The ONE statement with no document behind it: a poll loop. By
