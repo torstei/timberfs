@@ -1279,7 +1279,11 @@ fn main() -> anyhow::Result<()> {
                 // decides which one runs.
                 if doc.lists_stores() {
                     doc.to_query()?; // its refusals still apply
-                    list::cmd_list(&[], false, true, Some(&doc.store_selector()), false)?;
+                    let stores = list::stores_json(&[], Some(&doc.store_selector()))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&querydoc::Answer::with_stores(stores))?
+                    );
                     return Ok(());
                 }
                 query::cmd_query(&doc.to_query()?)?;

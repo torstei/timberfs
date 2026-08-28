@@ -350,6 +350,65 @@ applies \(em it bounds work, not framing \(em but the marker is a note on
 standard error, and a relay is unlikely to carry that.
 .RE
 .TP
+.B Every answer says what produced it
+A JSON answer is an object carrying
+.B server_version
+beside what was asked for:
+.RS
+.PP
+.nf
+{ \(dqserver_version\(dq: \(dqtimberfs, 0.24.0\(dq,
+  \(dqstores\(dq: [ ... ] }
+.fi
+.PP
+The records stream carries the same field in
+.BR stream\-start .
+.B loglines
+and
+.B chunks
+have nowhere to put it, which is what makes them the raw kinds.
+.PP
+It rides on the ANSWER rather than on a request of its own. A client that
+must ask separately is a client that can forget to, and the version is
+wanted exactly when something looks wrong \(em which is while reading an
+answer, not before it.
+.PP
+Product AND version, because the thing answering need not be a timberfs:
+a relay, a wrapper or another implementation says what it is in the same
+field, the way an HTTP
+.B Server:
+header does.
+.PP
+The reason it exists is a defect it would have caught.
+.B =*
+shipped after
+.BR v0.23.1 ,
+and a build without it does not refuse the operator \(em it truncates it
+to
+.B =
+and reads the
+.B *
+as part of the value, so
+.B name=*apache
+silently became
+.B name
+equal to
+.BR *apache :
+an empty answer, exit 0, for a store the same session had just listed.
+.PP
+The answer's contract is published too, at
+.IR /usr/share/doc/timberfs/query\-answer.schema.json ,
+generated from the same types and checked against them by a test \(em so
+a client can validate what came back, not only be refused for what it
+sent.
+.PP
+⚠ A VERSION, not a list of what this build can do. A capability list
+would be a second source of truth that can disagree with it \(em two
+builds both calling themselves 0.24.0 could advertise different lists,
+and then neither says which build it is. The version is the identity;
+what follows from it is the client's to know.
+.RE
+.TP
 .B cursor
 Where a previous answer stopped, per store: a list of
 .BR id / offset

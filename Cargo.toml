@@ -95,6 +95,9 @@ assets = [
     ["packaging/timberfs-records.5", "usr/share/man/man5/", "644"],
     ["packaging/timberfs-query-document.5", "usr/share/man/man5/", "644"],
     ["docs/query-document.schema.json", "usr/share/doc/timberfs/", "644"],
+    # The ANSWER's contract, beside the request's. A client that can be
+    # refused for an unknown member deserves a way to check what came back.
+    ["docs/query-answer.schema.json", "usr/share/doc/timberfs/", "644"],
     # The query-document examples. Shipped because a format nobody can
     # see worked examples of is one nobody uses: the schema says what is
     # legal, these say what is USEFUL.
@@ -148,3 +151,4 @@ assets = [
 [package.metadata.deb.variants.compat]
 name = "timberfs"
 depends = "fuse3, libc6 (>= 2.31)"
+

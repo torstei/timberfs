@@ -1,0 +1,110 @@
+name: timbersh
+
+# The console releases on its OWN tag, `timbersh-vX.Y.Z`, because its cycle
+# is not timberfs's: it is a script that changes while a session is open,
+# where a timberfs release is an on-disk format re-tested in a VM and
+# published to crates.io. Coupling them would mean either the console ships
+# stale or timberfs is released for reasons that are not timberfs's.
+#
+# Same repository on purpose. A protocol change and the client change it
+# needs belong in one commit series — that is where this tool's value comes
+# from — and only the RELEASE is separate.
+#
+# The version comes from tools/VERSION and must match the tag.
+# apt-repo.yml rebuilds the pool from every release, so it picks this up
+# with no change of its own.
+
+on:
+  push:
+    tags: ["timbersh-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # A tag that disagrees with the file would publish a package whose
+      # version is not the one anybody tagged, and nothing downstream could
+      # tell.
+      - name: The tag must be the version
+        run: |
+          file=$(tr -d '[:space:]' < tools/VERSION)
+          tag="${GITHUB_REF_NAME#timbersh-v}"
+          echo "tools/VERSION=$file  tag=$tag"
+          [ "$file" = "$tag" ] || {
+            echo "::error::tools/VERSION says $file, tag says $tag"; exit 1; }
+
+      - name: It has to run
+        run: |
+          python3 -m py_compile tools/timbersh
+          python3 tools/timbersh --help > /dev/null
+
+      # Architecture: all — it is a script, and cargo-deb would have called
+      # it amd64.
+      - name: Build the .deb
+        run: |
+          V=$(tr -d '[:space:]' < tools/VERSION)
+          root="$RUNNER_TEMP/pkg"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" \
+                   "$root/usr/share/man/man1" "$root/usr/share/doc/timberfs-sh"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: timberfs-sh
+          Version: $V
+          Section: utils
+          Priority: optional
+          Architecture: all
+          Depends: timberfs, python3
+          Maintainer: Torstein Tauno Svendsen <torstei@gmail.com>
+          Homepage: https://github.com/torstei/timberfs
+          Description: timbersh, an interactive shell for timberfs
+           A console for reading timberfs stores, in a grammar borrowed from
+           SQL. EXPERIMENTAL: the statements it accepts are not promised.
+          EOF
+          install -m 755 tools/timbersh "$root/usr/bin/timbersh"
+          gzip -9c packaging/timbersh.1 > "$root/usr/share/man/man1/timbersh.1.gz"
+          install -m 644 tools/README.md "$root/usr/share/doc/timberfs-sh/README.md"
+          # Dual-licensed, like the crate. Both, not one silently chosen —
+          # and NOT `|| true`, which would let a missing licence file ship
+          # a package with no copyright at all.
+          { echo "timberfs-sh is MIT OR Apache-2.0, at your option."; echo
+            echo "=== MIT ==="; cat LICENSE-MIT; echo
+            echo "=== Apache-2.0 ==="; cat LICENSE-APACHE
+          } > "$root/usr/share/doc/timberfs-sh/copyright"
+          mkdir -p "$RUNNER_TEMP/dist"
+          dpkg-deb --build --root-owner-group "$root" \
+            "$RUNNER_TEMP/dist/timberfs-sh_${V}_all.deb"
+          dpkg-deb -I "$RUNNER_TEMP/dist/timberfs-sh_${V}_all.deb"
+          dpkg-deb -c "$RUNNER_TEMP/dist/timberfs-sh_${V}_all.deb"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/dist/*
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/dist/* \
+            --title "timbersh $GITHUB_REF_NAME" \
+            --notes "The timberfs console. ⚠ EXPERIMENTAL — the statements it accepts are not promised.
+
+          \`\`\`sh
+          apt install timberfs-sh
+          \`\`\`" \
+            --verify-tag
+
+  # The pool is a function of the releases, so it is rebuilt after this one
+  # exactly as it is after a timberfs release.
+  apt:
+    needs: release
+    uses: ./.github/workflows/apt-repo.yml
+    secrets: inherit

@@ -1847,18 +1847,23 @@ JSON
   "response_format": { "kind": "stores" } }
 JSON
     timberfs query --query /tmp/vmqd-stores.json > /tmp/vmqd.stores 2>/dev/null || return 1
-    got=$(jq -r '[.[] | select(.labels.service == "vmqd") | .name] | sort | join(",")' \
+    got=$(jq -r '[.stores[] | select(.labels.service == "vmqd") | .name] | sort | join(",")' \
         /tmp/vmqd.stores)
     [ "$got" = "vmqd-a,vmqd-b" ] || { echo "kind:stores gave '$got'" >&2; return 1; }
     # It carries the identity a follower would key on, not just a name.
-    jq -e '.[] | select(.name == "vmqd-a") | .id | test("^[0-9a-f-]{36}$")' \
-        /tmp/vmqd.stores >/dev/null || { jq -c '.[0]' /tmp/vmqd.stores; return 1; }
+    jq -e '.stores[] | select(.name == "vmqd-a") | .id | test("^[0-9a-f-]{36}$")' \
+        /tmp/vmqd.stores >/dev/null || { jq -c '.stores[0]' /tmp/vmqd.stores; return 1; }
+    # An ANSWER says what produced it — the field a client reads when a
+    # store behaves like a different version of timberfs, which is what
+    # `=*` did before there was one.
+    jq -e '.server_version | startswith("timberfs, ")' /tmp/vmqd.stores >/dev/null \
+        || { jq -c '.server_version' /tmp/vmqd.stores; return 1; }
 
     # Enumeration is that same request with no predicate, not a second verb.
     printf '{"v":"1.0-EXPERIMENTAL","stores":{},"response_format":{"kind":"stores"}}\n' \
         > /tmp/vmqd-all.json
     timberfs query --query /tmp/vmqd-all.json 2>/dev/null \
-        | jq -e 'length >= 2' >/dev/null || return 1
+        | jq -e '.stores | length >= 2' >/dev/null || return 1
 
     # A member the answer cannot honour is REFUSED, never ignored: a
     # document that parses and quietly does something else is the failure
@@ -2536,8 +2541,20 @@ the_query_examples_ship_and_run() {
     # Enumerating is the store predicate with nothing in it, and it must
     # find the store we just made — that is the request a client opens with.
     timberfs query --query "$dir/query-enumerate-stores.json" 2>/dev/null \
-        | jq -e '[.[] | select(.name == "vmex")] | length == 1' >/dev/null \
+        | jq -e '[.stores[] | select(.name == "vmex")] | length == 1' >/dev/null \
         || { echo "enumerate did not find vmex" >&2; return 1; }
+
+    # Both contracts ship: what a request may say, and what an answer
+    # carries. The second was prose until an answer grew members of its
+    # own, and a client that can be REFUSED for an unknown member deserves
+    # a way to check what came back.
+    local sc
+    for sc in query-document.schema.json query-answer.schema.json; do
+        [ -f "/usr/share/doc/timberfs/$sc" ] \
+            || { echo "$sc is not installed" >&2; return 1; }
+        jq -e '.["$schema"]' "/usr/share/doc/timberfs/$sc" >/dev/null \
+            || { echo "$sc is not a schema" >&2; return 1; }
+    done
 
     # A response names its stores by IDENTITY, not only by path: that is
     # the join key between what a request asked for and what came back.

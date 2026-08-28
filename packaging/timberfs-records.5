@@ -49,6 +49,12 @@ First record of every stream. Fields:
 .B v
 (format version, this document describes
 .BR v=1 ),
+.B server_version
+(WHAT produced this answer, product and version: \(lqtimberfs, 0.24.0\(rq.
+An answer outlives the connection that fetched it \(em relayed, piped,
+kept \(em and a consumer finding one that behaves oddly should not have
+to infer the version from the behaviour. The product is named because the
+thing answering need not be a timberfs),
 .B from
 /
 .B to

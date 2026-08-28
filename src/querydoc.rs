@@ -468,6 +468,44 @@ fn sources_as_identity(sources: &[std::path::PathBuf]) -> anyhow::Result<Vec<Ter
     }])
 }
 
+/// The envelope a JSON answer carries.
+///
+/// `server_version` belongs to the ANSWER, not to any one kind of it. The
+/// records stream carries the same field in `stream-start`; this is where
+/// it goes when the answer is JSON. `loglines` and `chunks` have nowhere
+/// to put it, which is what makes them the raw kinds.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct Answer {
+    /// What produced this: `"timberfs, 0.24.0"`.
+    pub server_version: String,
+    /// What was asked for — `response_format.kind: "stores"` today.
+    ///
+    /// Typed as the store objects themselves rather than as opaque JSON,
+    /// because a contract a client cannot validate against is prose with
+    /// extra punctuation.
+    #[cfg_attr(test, schemars(with = "Vec<crate::store_json::Store>"))]
+    pub stores: serde_json::Value,
+}
+
+impl Answer {
+    pub fn with_stores(stores: serde_json::Value) -> Self {
+        Answer {
+            server_version: server_version(),
+            stores,
+        }
+    }
+}
+
+/// What is answering: `"timberfs, <version>"`.
+///
+/// Product AND version, because the thing answering need not be a
+/// timberfs — a relay, a wrapper or another implementation says what it
+/// is in the same field, the way an HTTP `Server:` header does.
+pub fn server_version() -> String {
+    format!("timberfs, {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// The stores a predicate names. An empty predicate is every store —
 /// enumerating is not a different question from searching, it is this one
 /// with nothing in it.
@@ -971,6 +1009,27 @@ mod tests {
     }
 
     #[test]
+    fn every_answer_says_what_produced_it() {
+        // The gap this closes: `=*` shipped after v0.23.1, and a build
+        // without it does NOT refuse the operator — `name=*apache`
+        // silently became `name` equal to `*apache`. A client could only
+        // find out by being answered wrongly.
+        //
+        // It rides on the ANSWER rather than on a request of its own,
+        // because a client that has to ask separately is a client that
+        // can forget to, and the version is wanted exactly when something
+        // looks wrong — which is while reading an answer, not before.
+        let v = server_version();
+        assert!(v.starts_with("timberfs, "), "{v}");
+        assert!(v.ends_with(env!("CARGO_PKG_VERSION")), "{v}");
+
+        let a = Answer::with_stores(serde_json::json!([]));
+        let rendered = serde_json::to_value(&a).unwrap();
+        assert_eq!(rendered["server_version"], v);
+        assert!(rendered["stores"].is_array());
+    }
+
+    #[test]
     fn the_axis_is_required() {
         // Optional, it would be omitted, and the document would inherit
         // the CLI's defect of an axis that switches with the mode.
@@ -1317,6 +1376,47 @@ mod tests {
             committed, generated,
             "the query document's contract has changed. Review the diff, then:\n  \
              UPDATE_SCHEMA=1 cargo test --lib the_committed_schema_matches_the_types"
+        );
+    }
+
+    /// The ANSWER is a contract too, and was prose while the request had
+    /// a schema. That asymmetry is the one a client feels: timberfs
+    /// refuses a request member it does not know, and offered no way to
+    /// check what came back.
+    ///
+    /// The records stream is deliberately NOT here — it is a NUL-framed
+    /// byte format, which a JSON Schema cannot describe and
+    /// `timberfs-records(5)` can.
+    #[test]
+    fn the_committed_answer_schema_matches_the_types() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/query-answer.schema.json");
+        let generated =
+            serde_json::to_string_pretty(&schemars::schema_for!(Answer)).unwrap() + "\n";
+        if std::env::var("UPDATE_SCHEMA").is_ok() {
+            std::fs::write(path, &generated).unwrap();
+            return;
+        }
+        let committed = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            committed, generated,
+            "the answer's contract has changed. Review the diff, then:\n  \
+             UPDATE_SCHEMA=1 cargo test --lib the_committed_answer_schema_matches_the_types"
+        );
+    }
+
+    /// An answer this build actually emits must satisfy the schema it
+    /// publishes — a generated contract nothing is checked against is a
+    /// contract that drifts on the first field somebody adds by hand.
+    #[test]
+    fn a_real_answer_satisfies_the_published_answer_schema() {
+        let schema = schemars::schema_for!(Answer);
+        let compiled = jsonschema::validator_for(&serde_json::to_value(&schema).unwrap())
+            .expect("the generated schema must itself be valid");
+        let a = Answer::with_stores(serde_json::json!([]));
+        let v = serde_json::to_value(&a).unwrap();
+        assert!(
+            compiled.is_valid(&v),
+            "{v} does not satisfy the answer schema"
         );
     }
 

@@ -9,7 +9,13 @@ Run any of them:
 timberfs query --query query-windowed-error.json
 ```
 
-The schema (`query-document.schema.json`) says what is *legal*. These say
+Two schemas ship beside these: `query-document.schema.json` is what a
+*request* may say, and `query-answer.schema.json` is what a JSON *answer*
+carries — the `server_version` envelope and the store objects inside it.
+(The records stream is a byte format, so its contract is
+`timberfs-records(5)` rather than a schema.)
+
+The request schema says what is *legal*. These say
 what is *useful*, and each one exists to show a capability that is easy to
 miss.
 

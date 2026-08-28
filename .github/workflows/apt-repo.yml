@@ -2,7 +2,8 @@ name: apt-repo
 
 # Rebuilds the apt repository at https://torstei.github.io/timberfs from
 # scratch and deploys it to GitHub Pages. The repo is a pure function of
-# the GitHub releases: every released versioned .deb goes into the pool,
+# the GitHub releases: every released versioned .deb goes into the pool
+# (`timberfs` and `timberfs-sh` alike),
 # apt-ftparchive generates the metadata, and the Release file is signed
 # with the key in the APT_SIGNING_KEY secret (public half:
 # packaging/apt/timberfs-archive-keyring.gpg, served as /key.gpg).
@@ -38,8 +39,16 @@ jobs:
         run: |
           mkdir -p site/pool/main
           for tag in $(gh release list --json tagName -q '.[].tagName'); do
-            gh release download "$tag" --pattern 'timberfs_*-*_amd64.deb' \
-              --dir site/pool/main
+            # Both packages, named explicitly, and their names differ in
+            # more than the suffix: `timberfs` is versioned `X.Y.Z-1` and
+            # built `_amd64`, while `timberfs-sh` is `X.Y.Z` and `_all` —
+            # it is a script, and it releases on its own tag. A glob
+            # written for one silently omits the other, and the omission
+            # looks exactly like a package that was never released.
+            gh release download "$tag" \
+              --pattern 'timberfs_*-*_amd64.deb' \
+              --pattern 'timberfs-sh_*_all.deb' \
+              --dir site/pool/main || true
           done
           ls -l site/pool/main
 
@@ -52,7 +61,11 @@ jobs:
         run: |
           cd site
           mkdir -p dists/stable/main/binary-amd64
-          apt-ftparchive --arch amd64 packages pool \
+          # No --arch filter: the pool holds only what this repository
+          # released, and `timberfs-sh` is `Architecture: all`. Whether an
+          # arch filter admits `all` is exactly the kind of thing that
+          # would drop a package silently, so there is nothing to admit.
+          apt-ftparchive packages pool \
             > dists/stable/main/binary-amd64/Packages
           gzip -k -9 dists/stable/main/binary-amd64/Packages
           apt-ftparchive \
