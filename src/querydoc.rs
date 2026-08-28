@@ -402,16 +402,6 @@ pub enum Kind {
     /// what was asked for and the response must say what window it
     /// actually widened to.
     Chunks,
-    /// WHO is answering: this build, the document version it speaks, and
-    /// the selector operators it has. Reads no store.
-    ///
-    /// The handshake. Without it a client discovers a difference by being
-    /// answered wrongly: `=*` shipped after v0.23.1 and an older build
-    /// does not refuse it, so `name=*apache` silently became `name` equal
-    /// to `*apache`. Asking beats guessing, and asking beats version
-    /// arithmetic too — a client wants to know whether an OPERATOR exists,
-    /// not to keep a table of which release added which.
-    Server,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -478,31 +468,42 @@ fn sources_as_identity(sources: &[std::path::PathBuf]) -> anyhow::Result<Vec<Ter
     }])
 }
 
-/// What this build IS, for the handshake — `response_format.kind:
-/// "server"`.
+/// The envelope a JSON answer carries.
 ///
-/// The operators are listed rather than left to be inferred from the
-/// version, because a client wants to know whether `=*` exists, not which
-/// release added it. Taken from `select::OPS`, so this cannot claim an
-/// operator the parser does not have.
+/// `server_version` belongs to the ANSWER, not to any one kind of it. The
+/// records stream carries the same field in `stream-start`; this is where
+/// it goes when the answer is JSON. `loglines` and `chunks` have nowhere
+/// to put it, which is what makes them the raw kinds.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-pub struct ServerInfo {
-    /// This build of timberfs.
-    pub timberfs: String,
-    /// The query document version it speaks — the one thing a generator
-    /// must match, and not the same as the build's version.
-    pub query_document: String,
-    /// Every operator `stores.select` accepts here.
-    pub selector_operators: Vec<String>,
+pub struct Answer {
+    /// What produced this: `"timberfs, 0.24.0"`.
+    pub server_version: String,
+    /// What was asked for — `response_format.kind: "stores"` today.
+    ///
+    /// Typed as the store objects themselves rather than as opaque JSON,
+    /// because a contract a client cannot validate against is prose with
+    /// extra punctuation.
+    #[cfg_attr(test, schemars(with = "Vec<crate::store_json::Store>"))]
+    pub stores: serde_json::Value,
 }
 
-pub fn server_info() -> ServerInfo {
-    ServerInfo {
-        timberfs: env!("CARGO_PKG_VERSION").to_string(),
-        query_document: VERSION.to_string(),
-        selector_operators: crate::select::OPS.iter().map(|o| o.to_string()).collect(),
+impl Answer {
+    pub fn with_stores(stores: serde_json::Value) -> Self {
+        Answer {
+            server_version: server_version(),
+            stores,
+        }
     }
+}
+
+/// What is answering: `"timberfs, <version>"`.
+///
+/// Product AND version, because the thing answering need not be a
+/// timberfs — a relay, a wrapper or another implementation says what it
+/// is in the same field, the way an HTTP `Server:` header does.
+pub fn server_version() -> String {
+    format!("timberfs, {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// The stores a predicate names. An empty predicate is every store —
@@ -635,13 +636,6 @@ impl Document {
             .is_some_and(|f| f.kind == Kind::Stores)
     }
 
-    /// Is this the handshake rather than a search?
-    pub fn asks_server(&self) -> bool {
-        self.response_format
-            .as_ref()
-            .is_some_and(|f| f.kind == Kind::Server)
-    }
-
     /// The store predicate as a `--select` expression.
     pub fn store_selector(&self) -> String {
         selector_expr(&self.stores)
@@ -699,29 +693,6 @@ impl Document {
             kind: Kind::Loglines,
             options: FormatOptions::default(),
         });
-        if self.asks_server() {
-            // This answer describes the SERVER, so nothing that describes
-            // a search has anything to act on — including the store
-            // predicate, which is the difference from a store listing.
-            // Accepting and ignoring them is the failure this format
-            // refuses everywhere else.
-            for (name, present) in [
-                ("stores.select", !self.stores.select.is_empty()),
-                ("window", self.window.is_some()),
-                ("match", self.matching.is_some()),
-                ("max", self.max.is_some()),
-                ("tail", self.tail.is_some()),
-                ("deadline", self.deadline.is_some()),
-                ("cursor", !self.cursor.is_empty()),
-            ] {
-                if present {
-                    bail!(
-                        "`{name}` describes a search, and `response_format.kind: \
-                         \"server\"` answers with the server — it reads no store"
-                    );
-                }
-            }
-        }
         if self.lists_stores() {
             // A store listing has no entries, so members that describe
             // entries have nothing to act on. Ignoring them would be the
@@ -1038,54 +1009,24 @@ mod tests {
     }
 
     #[test]
-    fn the_handshake_answers_with_the_server_and_reads_no_store() {
-        // The gap this closes: `=*` shipped after v0.23.1 and an older
-        // build does NOT refuse it — `name=*apache` silently became `name`
-        // equal to `*apache`. A client has to be able to ASK.
-        let doc: Document = serde_json::from_str(
-            r#"{"v":"1.0-EXPERIMENTAL","stores":{},
-                "response_format":{"kind":"server"}}"#,
-        )
-        .unwrap();
-        assert!(doc.asks_server());
-        doc.to_query().expect("the handshake is a legal document");
+    fn every_answer_says_what_produced_it() {
+        // The gap this closes: `=*` shipped after v0.23.1, and a build
+        // without it does NOT refuse the operator — `name=*apache`
+        // silently became `name` equal to `*apache`. A client could only
+        // find out by being answered wrongly.
+        //
+        // It rides on the ANSWER rather than on a request of its own,
+        // because a client that has to ask separately is a client that
+        // can forget to, and the version is wanted exactly when something
+        // looks wrong — which is while reading an answer, not before.
+        let v = server_version();
+        assert!(v.starts_with("timberfs, "), "{v}");
+        assert!(v.ends_with(env!("CARGO_PKG_VERSION")), "{v}");
 
-        let info = server_info();
-        assert_eq!(info.timberfs, env!("CARGO_PKG_VERSION"));
-        assert_eq!(info.query_document, VERSION);
-        // Taken from the parser's own list, so it cannot advertise an
-        // operator this build does not have — which is the whole point.
-        assert_eq!(info.selector_operators, crate::select::OPS);
-        assert!(info.selector_operators.iter().any(|o| o == "=*"));
-
-        // It describes the SERVER, so everything that describes a search
-        // is refused rather than ignored — the store predicate included,
-        // which is what separates it from a store listing.
-        for member in [
-            r#""stores":{"select":[{"key":"a","op":"=","value":"b"}]}"#,
-            r#""window":{"axis":"logline","from":1}"#,
-            r#""match":{"granularity":"entries","all":[{"has":"x"}]}"#,
-            r#""max":{"entries":5}"#,
-            r#""tail":{"entries":5}"#,
-            r#""deadline":{"ms":5}"#,
-            r#""cursor":[{"id":"x"}]"#,
-        ] {
-            // The stores case REPLACES the empty predicate rather than
-            // adding a second one, which is a duplicate field, not a
-            // refusal.
-            let base = if member.starts_with(r#""stores""#) {
-                String::new()
-            } else {
-                r#""stores":{},"#.to_string()
-            };
-            let body = format!(
-                r#"{{"v":"1.0-EXPERIMENTAL",{base}{member},
-                    "response_format":{{"kind":"server"}}}}"#
-            );
-            let d: Document = serde_json::from_str(&body).unwrap();
-            let e = d.to_query().unwrap_err().to_string();
-            assert!(e.contains("reads no store"), "{member} was accepted: {e}");
-        }
+        let a = Answer::with_stores(serde_json::json!([]));
+        let rendered = serde_json::to_value(&a).unwrap();
+        assert_eq!(rendered["server_version"], v);
+        assert!(rendered["stores"].is_array());
     }
 
     #[test]
@@ -1435,6 +1376,47 @@ mod tests {
             committed, generated,
             "the query document's contract has changed. Review the diff, then:\n  \
              UPDATE_SCHEMA=1 cargo test --lib the_committed_schema_matches_the_types"
+        );
+    }
+
+    /// The ANSWER is a contract too, and was prose while the request had
+    /// a schema. That asymmetry is the one a client feels: timberfs
+    /// refuses a request member it does not know, and offered no way to
+    /// check what came back.
+    ///
+    /// The records stream is deliberately NOT here — it is a NUL-framed
+    /// byte format, which a JSON Schema cannot describe and
+    /// `timberfs-records(5)` can.
+    #[test]
+    fn the_committed_answer_schema_matches_the_types() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/query-answer.schema.json");
+        let generated =
+            serde_json::to_string_pretty(&schemars::schema_for!(Answer)).unwrap() + "\n";
+        if std::env::var("UPDATE_SCHEMA").is_ok() {
+            std::fs::write(path, &generated).unwrap();
+            return;
+        }
+        let committed = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            committed, generated,
+            "the answer's contract has changed. Review the diff, then:\n  \
+             UPDATE_SCHEMA=1 cargo test --lib the_committed_answer_schema_matches_the_types"
+        );
+    }
+
+    /// An answer this build actually emits must satisfy the schema it
+    /// publishes — a generated contract nothing is checked against is a
+    /// contract that drifts on the first field somebody adds by hand.
+    #[test]
+    fn a_real_answer_satisfies_the_published_answer_schema() {
+        let schema = schemars::schema_for!(Answer);
+        let compiled = jsonschema::validator_for(&serde_json::to_value(&schema).unwrap())
+            .expect("the generated schema must itself be valid");
+        let a = Answer::with_stores(serde_json::json!([]));
+        let v = serde_json::to_value(&a).unwrap();
+        assert!(
+            compiled.is_valid(&v),
+            "{v} does not satisfy the answer schema"
         );
     }
 

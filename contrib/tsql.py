@@ -447,6 +447,20 @@ def label(host):
     return host or "(local)"
 
 
+def unwrap(text):
+    """An answer, as (stores, server_version).
+
+    A JSON answer is an object carrying `server_version` beside what was
+    asked for. Before that field existed it was the bare array, and that
+    is still what the deployed fleet sends — so the SHAPE says which, and
+    an older server is one whose version is simply unknown rather than one
+    that has to be detected some other way."""
+    payload = json.loads(text or "[]")
+    if isinstance(payload, dict):
+        return payload.get("stores") or [], payload.get("server_version")
+    return payload, None
+
+
 # ---------------------------------------------------------------- build
 def build(kind, terms, conds, limit):
     doc = {"v": "1.0-EXPERIMENTAL", "stores": {"select": terms}}
@@ -632,6 +646,8 @@ class Shell:
         self._universe = None
         self._universe_at = 0.0
         self.unreachable = {}
+        # host -> what it said it is, or None where it predates the field.
+        self.versions = {}
         self._universe_lock = threading.Lock()
         # Filled in the background: against a remote forest the round trip
         # is seconds, and paying it on the first TAB is what makes
@@ -676,10 +692,11 @@ class Shell:
                         bad[host] = err or f"exit {rc}"
                         return
                     try:
-                        stores = json.loads(out or "[]")
+                        stores, ver = unwrap(out)
                     except json.JSONDecodeError as e:
                         bad[host] = f"not JSON: {e}"
                         return
+                    self.versions[host] = ver
                     for st in stores:
                         st["_host"] = host
                     got.extend(stores)
@@ -1002,7 +1019,7 @@ class Shell:
         for host in TARGETS:
             out, err, rc = run(probe, host)
             if rc == 0:
-                n += len(json.loads(out or "[]"))
+                n += len(unwrap(out)[0])
         if n:
             return f"  -- nothing matched, in {n} store(s)"
         return ("  -- that predicate selects NO STORE"
@@ -1060,10 +1077,11 @@ class Shell:
                     bad[host] = err or f"exit {rc}"
                     return
                 try:
-                    stores = json.loads(out or "[]")
+                    stores, ver = unwrap(out)
                 except json.JSONDecodeError as e:
                     bad[host] = f"not JSON: {e}"
                     return
+                self.versions[host] = ver
                 for st in stores:
                     st["_host"] = host
                 got.extend(stores)

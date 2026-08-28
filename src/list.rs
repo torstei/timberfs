@@ -34,6 +34,36 @@ pub fn cmd_list(
     select: Option<&str>,
     full_id: bool,
 ) -> anyhow::Result<()> {
+    let Some(rows) = scan(dirs, select)? else {
+        return Ok(());
+    };
+    if names_only {
+        for r in &rows {
+            println!("{}", display_name(r));
+        }
+        return Ok(());
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows_to_json(&rows))?);
+        return Ok(());
+    }
+    print_table(&rows, full_id);
+    Ok(())
+}
+
+/// The stores a selector picks, for an ANSWER to carry.
+///
+/// The same scan and the same store objects as `list --json`. What the
+/// answer wraps them in is the answer's business, not this function's —
+/// a CLI listing is a listing, an answer says what produced it.
+pub fn stores_json(dirs: &[PathBuf], select: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    Ok(match scan(dirs, select)? {
+        Some(rows) => rows_to_json(&rows),
+        None => serde_json::Value::Array(Vec::new()),
+    })
+}
+
+fn scan(dirs: &[PathBuf], select: Option<&str>) -> anyhow::Result<Option<Vec<Row>>> {
     // Parse before scanning: a malformed predicate is a usage error, and
     // reporting it after a full forest walk would read as "matched
     // nothing".
@@ -44,7 +74,7 @@ pub fn cmd_list(
     let forests = crate::forest::forests_for_list(dirs);
     if dirs.is_empty() && forests.is_empty() {
         crate::note!("timberfs: no forests configured (see /etc/timberfs/forests.d/)");
-        return Ok(());
+        return Ok(None);
     }
 
     // Once per listing, not once per store: every scan of the registry
@@ -116,18 +146,7 @@ pub fn cmd_list(
         }
     }
 
-    if names_only {
-        for r in &rows {
-            println!("{}", display_name(r));
-        }
-        return Ok(());
-    }
-    if json {
-        println!("{}", serde_json::to_string_pretty(&rows_to_json(&rows))?);
-        return Ok(());
-    }
-    print_table(&rows, full_id);
-    Ok(())
+    Ok(Some(rows))
 }
 
 /// Read a store's index and manifest directly (no trunk file needed — list

@@ -1,0 +1,330 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Answer",
+  "description": "The envelope a JSON answer carries.\n\n`server_version` belongs to the ANSWER, not to any one kind of it. The\nrecords stream carries the same field in `stream-start`; this is where\nit goes when the answer is JSON. `loglines` and `chunks` have nowhere\nto put it, which is what makes them the raw kinds.",
+  "type": "object",
+  "properties": {
+    "server_version": {
+      "description": "What produced this: `\"timberfs, 0.24.0\"`.",
+      "type": "string"
+    },
+    "stores": {
+      "description": "What was asked for — `response_format.kind: \"stores\"` today.\n\nTyped as the store objects themselves rather than as opaque JSON,\nbecause a contract a client cannot validate against is prose with\nextra punctuation.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Store"
+      }
+    }
+  },
+  "required": [
+    "server_version",
+    "stores"
+  ],
+  "$defs": {
+    "Kind": {
+      "description": "What the thing on disk IS. A `.timber` bundle is a snapshot, so the\nquestions a live pair answers — who is writing it, who is following it\n— do not arise, and their fields are ABSENT rather than answered with\nan empty one. Absent is \"not applicable\"; empty is \"none\".",
+      "oneOf": [
+        {
+          "description": "A backing pair: `.trunk` + `.rings`, plus sidecars.",
+          "type": "string",
+          "const": "pair"
+        },
+        {
+          "description": "A `.timber` transfer bundle.",
+          "type": "string",
+          "const": "bundle"
+        }
+      ]
+    },
+    "Store": {
+      "description": "A store, as JSON.",
+      "type": "object",
+      "properties": {
+        "bundle_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "chunks": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "compressed_bytes": {
+          "description": "On disk.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "consumers": true,
+        "created": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursors_dir": {
+          "description": "The declared cursor directory, and what stands in it. Absent means no\ndirectory is declared, which is not the same as one declared with\nnobody reading — that is an empty `consumers`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursors_superseded": {
+          "description": "Marks the `cursors_*` block as superseded by `followers`. Always\n`true` when present, so it carries nothing `consumers` does not —\nkept because removing it is a separate decision from unifying the\nshape.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "cursors_unreadable": {
+          "description": "Cursor files that could not be read. Absent means none were.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "derived_from": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "derived_op": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dir": {
+          "type": "string"
+        },
+        "dropped_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "dropped_chunks": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "dropped_uncompressed_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "first_seq": {
+          "description": "The oldest chunk number still held, and the newest. Absent for a\nstore holding nothing.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "first_write_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "followers": {
+          "description": "Registered followers: empty means none are registered, because the\nregistry knows every follower of every store. ABSENT for a bundle,\nwhere the question does not arise.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": true
+        },
+        "forest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "grain_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "grain_chunks": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "handle": {
+          "description": "The path's own word for it, which an opaque path makes a uuid.",
+          "type": "string"
+        },
+        "held_bytes": {
+          "description": "Bytes the slowest consumer is holding back from retention.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "description": "The store's id. Absent only for a store that has no manifest, which\na plain `append` produces; every other surface treats that as broken.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "index_declared": {
+          "description": "Whether the manifest DECLARES a token index — which is not the same\nas holding one. `grain_chunks` says how much of the store one\nactually covers, and the two were previously flattened into a single\n`indexed` boolean that could not tell them apart.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/Kind"
+        },
+        "labels": {
+          "description": "The manifest's provenance, verbatim — what a fleet view selects on.\nNested so a free-form key can never collide with a field of this\nobject.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "last_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_write_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "logical_bytes": {
+          "description": "Uncompressed. What a reader will actually get.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "name": {
+          "description": "What the store CALLS ITSELF: its declared name, or its handle when it\ndeclares none. Never the file's name — that is in `path`, and a store\nwhose path is opaque has a readable name only here.",
+          "type": "string"
+        },
+        "next_seq": {
+          "description": "The number the next chunk will take. Never restarts, so it is the\nlifetime count of chunks this store has ever held.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "origin_id": {
+          "description": "The store these entries came FROM, one hop back. A field rather than\na label: selecting on it would be selecting on one hop's bookkeeping.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "pattern": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retain": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retain_size": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retain_unconsumed": {
+          "type": "boolean"
+        },
+        "rings_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sap_pending_bytes": {
+          "description": "Bytes in the write-ahead sidecar not yet in a sealed chunk.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "wal_declared": {
+          "type": "boolean"
+        },
+        "window_from": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_to": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "writer": {
+          "description": "The writer holding this store, ABSENT when nobody does. Presence is\nliveness — there is no separate boolean to disagree with it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "handle",
+        "dir",
+        "path",
+        "kind",
+        "labels",
+        "chunks",
+        "logical_bytes",
+        "compressed_bytes",
+        "next_seq",
+        "dropped_chunks",
+        "dropped_bytes",
+        "dropped_uncompressed_bytes",
+        "index_declared",
+        "wal_declared",
+        "retain_unconsumed"
+      ]
+    }
+  }
+}
