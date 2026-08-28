@@ -33,7 +33,7 @@ export for one session and nothing else:
 | `--cmd` | `TIMBERFS_CMD` | how to reach a timberfs; it gets the document on stdin |
 | `--hosts` | `TIMBERFS_HOSTS` | fan out, substituting each host for `_TIMBERHOST_` in `--cmd` |
 | `--rc` | `TIMBERFS_RC` | statements run at startup |
-| `--ttl` | `TSQL_STORE_TTL` | how long the store list is reused |
+| `--ttl` | `TSQL_STORE_TTL` | expire the cached store list after N seconds; 0 (default) never expires it |
 
 `--cmd` is only ever handed a document on stdin, so anything that reaches a
 timberfs works — a wrapper, `ssh`, a container exec.
@@ -100,6 +100,12 @@ search the server reads as a different question.
   defaulted by accident, and asking for both granularities at once is
   ungrammatical rather than merely refused. (`may` because a Bloom filter
   cannot say more than that.)
+* The **store list is read once and kept** for the session, and shared by
+  completion and `\d`. It is fetched in a background thread at startup, so
+  the first TAB does not pay a round trip — against a remote forest that is
+  seconds, and paying it there is what makes completion feel broken rather
+  than slow. `refresh` re-reads it and says what changed, which beats a
+  timer: it happens when you know something did.
 * `~/.timberfsrc` is RUN, not read: a script of statements, the way
   `.psqlrc` is. `save` therefore refuses to default to it — writing the
   logviews back would delete whatever else it does.

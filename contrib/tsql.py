@@ -52,9 +52,12 @@ HOSTS = [h.strip() for h in os.environ.get("TIMBERFS_HOSTS", "").split(",") if h
 # `None` is the one unnamed host: no fan-out, no substitution, and every
 # host-aware path below collapses to what it did before.
 TARGETS = HOSTS or [None]
-# How long the store list is reused for completion and `\d`. Short, because
-# a store that appears mid-session is exactly what a predicate is for.
-STORE_TTL = float(os.environ.get("TSQL_STORE_TTL", "30"))
+# How long the store list is reused for completion and `\d`. ZERO is
+# never: the list is read once and kept, because a store appearing
+# mid-session is rare and paying a round trip for it on a schedule is not.
+# `refresh` is the way to ask, which is better than a timer either way —
+# it happens when you know something changed, and it says what did.
+STORE_TTL = float(os.environ.get("TSQL_STORE_TTL", "0"))
 RC = os.environ.get("TIMBERFS_RC", os.path.expanduser("~/.timberfsrc"))
 KINDS = ("records", "loglines", "stores", "chunks")
 OPS = ("!=", "!~", "!*", "=~", "=*", "=")
@@ -106,6 +109,9 @@ HELP = """
     logline since '12:00'      the timestamps the lines carry
     logline until '13:00'
     written since '2026-08-27' when the data arrived
+
+  refresh;                     re-read the store list (kept for the
+                               session otherwise) and say what changed
 
   save 'file';                 write the logviews out as statements
   load 'file';                 run a file of statements (as ~/.timberfsrc
@@ -519,6 +525,7 @@ def parse_where(toks, i):
 # ----------------------------------------------------------- completion
 BACKSLASH = ["\\d", "\\d+", "\\dv", "\\?", "\\q"]
 VERBS = ["select", "tail", "declare", "fetch", "close", "create", "drop",
+         "refresh",
          "show", "save", "load", "help", "quit"]
 AFTER_ENTRY = ["has", "not", "substring", "regex"]
 AFTER_TIME = ["since", "until", "between"]
@@ -644,14 +651,18 @@ class Shell:
         pinned, and `fresh` forces a read where being right beats being
         quick.
 
+        Kept for the whole session by default (STORE_TTL 0) — `refresh`
+        re-reads it, and does so when you know something changed rather
+        than on a timer that mostly finds nothing.
+
         Hosts are read in PARALLEL, so N of them cost the slowest one
         rather than the sum. Each store is tagged with where it lives; a
         host that could not be reached is remembered separately and named
         in every listing, because a short list and a broken one look
         identical."""
         with self._universe_lock:
-            stale = (self._universe is None
-                     or time.monotonic() - self._universe_at > STORE_TTL)
+            stale = self._universe is None or (
+                STORE_TTL > 0 and time.monotonic() - self._universe_at > STORE_TTL)
             if not (fresh or stale):
                 return self._universe
             doc = {"v": "1.0-EXPERIMENTAL", "stores": {"select": []},
@@ -824,6 +835,23 @@ class Shell:
         if head == "help": print(HELP); return
         if head == "save": self.save(toks[1][1] if len(toks) > 1 else None); return
         if head == "load": self.load(toks[1][1] if len(toks) > 1 else RC); return
+        if head == "refresh":
+            before = {st.get("id") or st["name"]: st["name"]
+                      for st in self.universe()}
+            after = {st.get("id") or st["name"]: st["name"]
+                     for st in self.universe(fresh=True)}
+            new = [n for k, n in after.items() if k not in before]
+            gone = [n for k, n in before.items() if k not in after]
+            bits = [f"{len(after)} store(s)"]
+            if new:
+                bits.append(f"new: {', '.join(sorted(new))}")
+            if gone:
+                bits.append(f"gone: {', '.join(sorted(gone))}")
+            if not new and not gone:
+                bits.append("unchanged")
+            print("  " + "   ".join(bits))
+            show_unreachable(self.unreachable)
+            return
         if head == "show":
             if toks[1][1].lower().startswith("cursor"):
                 if not self.cursors: print("  no cursors"); return
@@ -1104,9 +1132,10 @@ def parse_args(argv):
                                            os.path.expanduser("~/.timberfsrc")),
                     help="statements run at startup. $TIMBERFS_RC")
     ap.add_argument("--ttl", metavar="SECS", type=float,
-                    default=float(os.environ.get("TSQL_STORE_TTL", "30")),
-                    help="how long the store list is reused for completion and "
-                         "`\\d`. $TSQL_STORE_TTL")
+                    default=float(os.environ.get("TSQL_STORE_TTL", "0")),
+                    help="expire the cached store list after SECS. Default 0, "
+                         "which never expires it — `refresh` re-reads it. "
+                         "$TSQL_STORE_TTL")
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="start without printing the help")
     return ap.parse_args(argv)
