@@ -10,9 +10,17 @@ stops being edited in the same commit as the protocol change it needed.
 without notice. Do not build anything on the grammar.
 
 Shipped as its own package, `timberfs-sh`, so that `timberfs` keeps a
-dependency list of `fuse3, libc6` and installs on a bare host — and so
-this can version on its own, which it needs to, because its grammar moves
-while the format does not.
+dependency list of `fuse3, libc6` and installs on a bare host: a Python
+script in the main package would put an interpreter there for one
+optional tool. `apt install timberfs` pulls no Python; `apt install
+timberfs-sh` pulls both it and timberfs.
+
+Both packages carry the SAME version — they are built from one
+`Cargo.toml`, and a cargo-deb variant cannot override it. That is the
+right behaviour here rather than a limitation: `timbersh 0.24.0` is the
+console built alongside `timberfs 0.24.0`, and therefore the one that
+knows that protocol. For a client whose whole job is exercising the
+format, sharing the version is the useful fact.
 
 ```sh
 timbersh --help                   # options
