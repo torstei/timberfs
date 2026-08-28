@@ -217,6 +217,22 @@ timberfs query --from 13:42 --to 13:43 collector/host*-app.log
 timber-filter --has req-8f3a collector/*.log        # which hosts saw it?
 ```
 
+For a fleet that is not one machine's directory, there is a console:
+`timbersh`, in the separate `timberfs-sh` package. It reads many hosts as
+one set of stores, selecting them by what they DECLARE rather than by
+where they sit:
+
+```sh
+timbersh --hosts web01,web02,db01 --cmd "ssh _TIMBERHOST_ timberfs query --query -"
+```
+```sql
+select loglines from [type=apache] where logline since '00:00' and entry has 'error' limit 20;
+```
+
+⚠ EXPERIMENTAL: its statements are not promised. It exists to be used
+against a real fleet, because a protocol nobody writes a client against is
+one whose awkward parts stay theoretical — see [tools/](tools/README.md).
+
 The deployment *shapes* all of this composes into — giving an application OTLP
 without touching it, a full-fidelity tier under an expensive backend, container
 logs, replaying an incident window into a backend — are in
@@ -515,6 +531,9 @@ Signed-By: /usr/share/keyrings/timberfs.gpg
 EOF
 
 sudo apt update && sudo apt install timberfs
+
+# The console, separately — it needs python3, which the filesystem does not.
+sudo apt install timberfs-sh
 ```
 
 Or grab a single `.deb` from the latest GitHub release (built, VM-tested
