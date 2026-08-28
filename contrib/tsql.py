@@ -266,12 +266,16 @@ def describe_store(s):
         print(f"  {k:12} {v}")
 
 
+def show_unreachable(bad):
+    """Named FIRST, not as a footnote: a short list and a broken one look
+    the same, and the point of merging hosts is that you stop counting
+    them yourself."""
+    for host, why in sorted((bad or {}).items(), key=lambda x: x[0] or ""):
+        print(f"  ⚠ {label(host)}: UNREACHABLE — {why.splitlines()[0][:90]}")
+
+
 def show_stores(stores, verbose=False, unreachable=None):
-    # Named FIRST, not as a footnote: a short list and a broken one look
-    # the same, and the point of merging hosts is that you stop counting
-    # them yourself.
-    for host, why in sorted((unreachable or {}).items(), key=lambda x: x[0] or ""):
-        print(f"  ⚠ {host or '(local)'}: UNREACHABLE — {why.splitlines()[0][:90]}")
+    show_unreachable(unreachable)
     n = len(stores)
     c = common(stores)
     hdr = f"{n} store" + ("" if n == 1 else "s")
@@ -688,7 +692,15 @@ class Shell:
                       if a in (x.get("name") or "").lower()
                       or (x.get("id") or "").lower().startswith(a)]
         if not stores:
-            print(f"  no store matches {arg!r}" if arg else "  no stores")
+            # Through the same reporting as a non-empty answer. An empty
+            # list is exactly what a fleet of unreachable hosts produces,
+            # and returning early here said "no stores" for "nothing
+            # worked" — the failure this shell keeps being written to stop.
+            show_unreachable(self.unreachable)
+            if self.unreachable and len(self.unreachable) == len(TARGETS):
+                print(f"  no host answered, so nothing was listed")
+            else:
+                print(f"  no store matches {arg!r}" if arg else "  no stores")
             return
         # Named one thing: describe it, as `\\d relation` does. Named
         # several: list them, so the name can be narrowed.
