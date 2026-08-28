@@ -62,13 +62,29 @@ found within an hour of it existing:
   That is the argument for a position being an absolute byte offset
   rather than a clock: see [docs/plans/paging.md](../docs/plans/paging.md).
 
-### Two things it deliberately does not implement
+### What it does not implement, and what it must
 
-Because timberfs has them, and a second copy would drift — which is the
-defect this repo has spent several releases removing:
+**The selector** is never reimplemented — every `from` is a real
+`kind: "stores"` query. A second copy would drift, and a drifted selector
+answers a different question without saying so. That is the defect this
+repo has spent several releases removing.
 
-* **the selector** — every `from` is a real `kind: "stores"` query
-* **time parsing** — `--from X --dump-json` is asked what `X` means
+**Times are resolved here**, and that is not a compromise. A query
+document is meant to be self-contained: a client that speaks it needs the
+protocol and nothing else, so building one must not require a timberfs on
+the client's machine to interpret a string. This used to shell out to
+`--from X --dump-json` and read the milliseconds back, which failed
+outright where no timberfs was installed — and could never have been
+right for a remote store, since the probe ran locally.
+
+`window.from` is milliseconds because a document is a **value**. `11:10`
+means today, in the reader's timezone; a document carrying that text would
+mean a different instant tomorrow, and another one parsed at the far end.
+Resolution belongs at the edge where the person and their clock are.
+
+The duplication that remains is bounded, unlike the selector's: a
+disagreement about a date format yields a different *number*, never a
+search the server reads as a different question.
 
 ### Design notes
 

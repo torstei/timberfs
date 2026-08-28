@@ -15,11 +15,17 @@ reason the selection is a query and not a list.
 mistaken for one another, and a completer always knows which it is
 completing.
 
-Two things this deliberately does NOT implement, because timberfs
-already has them and a second copy would drift:
+The SELECTOR is deliberately not implemented: every resolution is a real
+`kind: "stores"` query, because a second copy of it would drift and a
+drifted selector answers a different question without saying so.
 
-  * the selector — every resolution is a real `kind: "stores"` query
-  * time parsing — `--from X --dump-json` is asked what X means
+Times ARE resolved here, and must be. A query document is meant to be
+SELF-CONTAINED — a client that speaks it needs the protocol and nothing
+else — so building one cannot require running a timberfs on THIS machine
+to interpret a string. `window.from` is milliseconds because a document
+is a value: `11:10` means today, and in the reader's timezone, so a
+document carrying the text would mean something different tomorrow and
+something else again at the far end.
 
 `--help` lists the flags; each has an environment variable beside it.
 
@@ -38,7 +44,7 @@ already has them and a second copy would drift:
                  and nothing is substituted.
   TIMBERFS_RC    views loaded at startup, default ~/.timberfsrc
 """
-import argparse, json, os, re, readline, shlex, subprocess, sys, threading, time
+import argparse, datetime, json, os, re, readline, shlex, subprocess, sys, threading, time
 
 CMD = shlex.split(os.environ.get("TIMBERFS_CMD", "timberfs query --query -"))
 HOST_TOKEN = "_TIMBERHOST_"
@@ -186,15 +192,59 @@ def run(doc, host=None):
     return p.stdout, p.stderr.strip(), p.returncode
 
 
+# What `timberfs query --from` accepts, in its order. Zoneless forms are
+# LOCAL time, and a bare time is today.
+TIME_FORMATS = [
+    ("%Y-%m-%d %H:%M:%S", "d"), ("%Y-%m-%dT%H:%M:%S", "d"),
+    ("%Y-%m-%d %H:%M", "d"),    ("%Y-%m-%dT%H:%M", "d"),
+    ("%Y.%m.%d %H:%M:%S", "d"), ("%Y.%m.%d %H:%M", "d"),
+    ("%Y-%m-%d", "d"),          ("%Y.%m.%d", "d"),
+    ("%H:%M:%S.%f", "t"),       ("%H:%M:%S", "t"), ("%H:%M", "t"),
+]
+
+
 def when(text):
-    """What does this time mean? Ask timberfs, which owns the answer."""
-    probe = subprocess.run(
-        ["timberfs", "query", "--from", text, "--dump-json"],
-        capture_output=True, text=True)
+    """A typed time, in milliseconds — resolved HERE.
+
+    Not by asking a local timberfs, which is what this used to do. A query
+    document is meant to be SELF-CONTAINED: a client that speaks it needs
+    the protocol and nothing else, and the whole point of this shell is
+    driving a timberfs somewhere else. Shelling out to a binary on THIS
+    machine to build a document for THAT one contradicts the arrangement,
+    and fails outright where none is installed.
+
+    Here is also the only correct place. `11:10` means 11:10 where the
+    person typing it is, and it means TODAY — a string carried in the
+    document would mean a different instant tomorrow, and a different one
+    again parsed in the server's timezone. Milliseconds are the resolved
+    form; the text is input to whatever resolves it, which keeps the
+    document a value.
+
+    The duplication that costs is bounded, unlike the selector's: a
+    disagreement here yields a different NUMBER, never a search the far
+    end reads as a different question."""
+    text = text.strip()
     try:
-        return json.loads(probe.stdout)["window"]["from"]
-    except Exception:
-        raise ValueError(f"timberfs does not read {text!r} as a time")
+        # An explicit offset needs no assumption; anything else takes this
+        # machine's zone, which is the one the reader is in.
+        return int(datetime.datetime.fromisoformat(text).timestamp() * 1000)
+    except ValueError:
+        pass
+    for fmt, kind in TIME_FORMATS:
+        try:
+            t = datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if kind == "t":
+            t = datetime.datetime.combine(datetime.date.today(), t.time())
+        return int(t.astimezone().timestamp() * 1000)
+    if text.isdigit():
+        n = int(text)
+        # Anything this large is already milliseconds.
+        return n if n > 100_000_000_000 else n * 1000
+    raise ValueError(
+        f"{text!r} is not a time I read — try RFC3339, "
+        f"'YYYY-MM-DD [HH:MM[:SS]]', 'HH:MM[:SS]' for today, or unix seconds")
 
 
 # --------------------------------------------------------------- render
@@ -266,12 +316,23 @@ def describe_store(s):
         print(f"  {k:12} {v}")
 
 
+def fmt_err(why):
+    """A fleet's worth of failures has to stay readable, so several hosts
+    get one truncated line each. With ONE, that line is the whole answer —
+    and timberfs puts the reason in the `Caused by:` that truncating cut
+    off."""
+    why = (why or "").strip()
+    if len(TARGETS) > 1:
+        return why.splitlines()[0][:100] if why else "no reason given"
+    return "\n     ".join(x for x in why.splitlines() if x.strip()) or "no reason given"
+
+
 def show_unreachable(bad):
     """Named FIRST, not as a footnote: a short list and a broken one look
     the same, and the point of merging hosts is that you stop counting
     them yourself."""
     for host, why in sorted((bad or {}).items(), key=lambda x: x[0] or ""):
-        print(f"  ⚠ {label(host)}: UNREACHABLE — {why.splitlines()[0][:90]}")
+        print(f"  ⚠ {label(host)}: UNREACHABLE — {fmt_err(why)}")
 
 
 def show_stores(stores, verbose=False, unreachable=None):
@@ -861,7 +922,7 @@ class Shell:
                 elif k == "stream-end" and f.get("status") == "limited":
                     more = True
         for host, why in bad.items():
-            print(f"  ⚠ {label(host)}: {why.splitlines()[0][:100]}")
+            print(f"  ⚠ {label(host)}: {fmt_err(why)}")
         # A host left unread has more by definition, whatever the ones that
         # did run said.
         if shown >= n and len(TARGETS) > 1:
@@ -922,7 +983,7 @@ class Shell:
             total += show_records(out, self.names) if kind == "records" \
                 else (sys.stdout.write(out) or len(out.strip().splitlines()))
         for host, why in bad.items():
-            print(f"  ⚠ {label(host)}: {why.splitlines()[0][:100]}")
+            print(f"  ⚠ {label(host)}: {fmt_err(why)}")
         if not total and not bad:
             note = self.why_empty(doc)
             if note: print(note)
@@ -972,7 +1033,7 @@ class Shell:
                     out, err, rc = run(d, host)
                     if rc != 0:
                         if complained.get(host) != err:
-                            print(f"  ⚠ {label(host)}: {err.splitlines()[0][:100]}")
+                            print(f"  ⚠ {label(host)}: {fmt_err(err)}")
                             complained[host] = err
                         continue
                     complained.pop(host, None)
