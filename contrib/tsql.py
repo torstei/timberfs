@@ -21,6 +21,8 @@ already has them and a second copy would drift:
   * the selector — every resolution is a real `kind: "stores"` query
   * time parsing — `--from X --dump-json` is asked what X means
 
+`--help` lists the flags; each has an environment variable beside it.
+
   TIMBERFS_CMD   argv prefix, default `timberfs query --query -`
   TIMBERFS_HOSTS comma-separated hosts to fan out to. Every occurrence of
                  _TIMBERHOST_ in TIMBERFS_CMD is replaced with the host:
@@ -36,7 +38,7 @@ already has them and a second copy would drift:
                  and nothing is substituted.
   TIMBERFS_RC    views loaded at startup, default ~/.timberfsrc
 """
-import json, os, re, readline, shlex, subprocess, sys, threading, time
+import argparse, json, os, re, readline, shlex, subprocess, sys, threading, time
 
 CMD = shlex.split(os.environ.get("TIMBERFS_CMD", "timberfs query --query -"))
 HOST_TOKEN = "_TIMBERHOST_"
@@ -933,7 +935,49 @@ class Shell:
             print("\n  stopped.")
 
 
-def main():
+def parse_args(argv):
+    ap = argparse.ArgumentParser(
+        prog="tsql", add_help=True,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="A SQL-ish console for timberfs.",
+        epilog="Every option defaults to the environment variable beside it, so\n"
+               "a flag overrides an export for one session and nothing else.\n"
+               "Inside the shell, `\\?` prints the statement syntax.")
+    ap.add_argument("--cmd", metavar="ARGV",
+                    default=os.environ.get("TIMBERFS_CMD", "timberfs query --query -"),
+                    help="how to reach a timberfs; it is handed the query document "
+                         "on stdin. $TIMBERFS_CMD")
+    ap.add_argument("--hosts", metavar="H,H",
+                    default=os.environ.get("TIMBERFS_HOSTS", ""),
+                    help="fan out to these hosts, substituting each for "
+                         f"{HOST_TOKEN} in --cmd. $TIMBERFS_HOSTS")
+    ap.add_argument("--rc", metavar="FILE",
+                    default=os.environ.get("TIMBERFS_RC",
+                                           os.path.expanduser("~/.timberfsrc")),
+                    help="statements run at startup. $TIMBERFS_RC")
+    ap.add_argument("--ttl", metavar="SECS", type=float,
+                    default=float(os.environ.get("TSQL_STORE_TTL", "30")),
+                    help="how long the store list is reused for completion and "
+                         "`\\d`. $TSQL_STORE_TTL")
+    ap.add_argument("-q", "--quiet", action="store_true",
+                    help="start without printing the help")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    global CMD, HOSTS, TARGETS, RC, STORE_TTL
+    a = parse_args(argv)
+    CMD = shlex.split(a.cmd)
+    HOSTS = [h.strip() for h in a.hosts.split(",") if h.strip()]
+    TARGETS = HOSTS or [None]
+    RC, STORE_TTL = a.rc, a.ttl
+    # Several hosts and nowhere to put them: every one would get the SAME
+    # command, so the same forest would be read N times and every entry
+    # come back N times, labelled with a different host each time. A wrong
+    # answer that looks like a busy fleet.
+    if len(TARGETS) > 1 and not any(HOST_TOKEN in x for x in CMD):
+        sys.exit(f"tsql: --hosts names {len(TARGETS)} hosts, but --cmd has no "
+                 f"{HOST_TOKEN} to put them in:\n      {a.cmd}")
     sh = Shell()
     # A space is the only delimiter: `[type=console` is ONE word to the
     # completer, which is what lets a predicate literal complete its own
@@ -941,7 +985,10 @@ def main():
     readline.set_completer(Complete(sh))
     readline.set_completer_delims(" ")
     readline.parse_and_bind("tab: complete")
-    print(HELP if "-q" not in sys.argv else "")
+    if not a.quiet:
+        print(HELP)
+        if len(TARGETS) > 1:
+            print(f"  {len(TARGETS)} hosts: {', '.join(TARGETS)}\n")
     if sh.views:
         print(f"  {len(sh.views)} logview(s) from {RC}: {', '.join(sorted(sh.views))}")
     while True:

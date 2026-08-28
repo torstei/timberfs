@@ -10,8 +10,10 @@ interfaces, and a client that lives outside the repo stops being run.
 **A prototype.** The grammar is still moving; do not build anything on it.
 
 ```sh
-export TIMBERFS_FORESTS=/var/log/timberfs
-./contrib/tsql.py
+./contrib/tsql.py --help          # options
+./contrib/tsql.py                 # the local forest
+./contrib/tsql.py --hosts web01,web02,db01 \
+                  --cmd "ssh _TIMBERHOST_ timberfs query --query -"
 ```
 
 ```sql
@@ -23,9 +25,25 @@ declare errs cursor for select records from console where entry has 'ERROR';
 fetch 100 from errs;
 ```
 
-`TIMBERFS_CMD` is the argv prefix, default `timberfs query --query -`.
-Point it at a wrapper to query another host — the tool only ever writes a
-document to a subprocess's stdin and reads the answer.
+Every option has an environment variable beside it, so a flag overrides an
+export for one session and nothing else:
+
+| flag | variable | |
+|---|---|---|
+| `--cmd` | `TIMBERFS_CMD` | how to reach a timberfs; it gets the document on stdin |
+| `--hosts` | `TIMBERFS_HOSTS` | fan out, substituting each host for `_TIMBERHOST_` in `--cmd` |
+| `--rc` | `TIMBERFS_RC` | statements run at startup |
+| `--ttl` | `TSQL_STORE_TTL` | how long the store list is reused |
+
+`--cmd` is only ever handed a document on stdin, so anything that reaches a
+timberfs works — a wrapper, `ssh`, a container exec.
+
+With several hosts the stores present as one set with a `HOST` column, and
+each remembers where it lives. Listings go out in parallel; reads go host by
+host and claim no order between them, for the reason a bounded timberfs
+answer is `order=sequential`. `limit N` is N in total, so a later host may go
+unread — it says so when that happens, and a host it cannot reach is named
+rather than quietly missing.
 
 ### What it is for
 
