@@ -45,13 +45,17 @@ answer is `order=sequential`. `limit N` is N in total, so a later host may go
 unread — it says so when that happens, and a host it cannot reach is named
 rather than quietly missing.
 
-A read first asks every host, **in parallel**, which of them hold a store the
-predicate selects, and reads only those. It does not evaluate the predicate
-itself — each host resolves its own, so the selector stays timberfs's.
-Measured on seven hosts at a second of latency each, where one holds the
-store: **7.0 s → 2.1 s**. Hosts with nothing are reported as a count rather
-than as a row of empty headers, and one that could not be probed is read
-anyway: skipping it would turn a failure into silence.
+A read goes to every host **at once** and is rendered in the order the hosts
+were given. There is no point asking first which of them hold a matching
+store: a read whose predicate matches nothing resolves to nothing and returns
+immediately — the same 0.00 s as asking. The cost was never the search, it
+was N round trips taken one after another. Measured on seven hosts at a
+second of latency each: **7.0 s → 1.1 s**.
+
+⚠ A `limit` is sent to every host and enforced across the answers, so a host
+whose output falls past the limit did work that is never shown — bounded by
+the limit itself, and the price of not paying the latency serially. Hosts
+with nothing are reported as a count rather than as a row of empty headers.
 
 ### What it is for
 
