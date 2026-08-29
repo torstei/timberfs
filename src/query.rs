@@ -328,12 +328,19 @@ pub(crate) fn read_chunk_raw(
 /// interval-overlap scan of the index, then the .grain Bloom pre-filter
 /// (every token of every --has argument must probably be in the chunk).
 /// Exact, entry-level filtering stays downstream.
+///
+/// `from_chunk` is where to START, by chunk number rather than by time.
+/// It belongs here, beside the window, because every bounded read reaches
+/// its chunks through this function — a seek implemented per read path is
+/// a member one of them would accept and ignore.
+#[allow(clippy::too_many_arguments)]
 pub fn select_chunks(
     file: &Path,
     chunks: &[ChunkRecord],
     seq_at_open: Option<u64>,
     from_ms: u64,
     to_ms: u64,
+    from_chunk: Option<u64>,
     has: &[String],
     any_of: &[String],
 ) -> anyhow::Result<(Vec<(usize, ChunkRecord)>, usize)> {
@@ -341,6 +348,10 @@ pub fn select_chunks(
         .iter()
         .enumerate()
         .filter(|(_, c)| c.last_write_ms >= from_ms && c.first_write_ms <= to_ms)
+        // A seek below everything the store still holds lands on the oldest
+        // survivor: the caller's position was dropped, and only the caller
+        // can report that.
+        .filter(|(_, c)| from_chunk.is_none_or(|n| c.seq >= n))
         .map(|(i, c)| (i, *c))
         .collect();
     let in_window = selected.len();
@@ -453,8 +464,11 @@ pub struct Window {
     /// it becomes explicit.
     pub from: Option<u64>,
     pub to: Option<u64>,
-    /// A resume position by chunk NUMBER: exact, where a timestamp can
-    /// match two chunks sharing a boundary millisecond.
+    /// Where to START, by chunk NUMBER: a place on the tape rather than
+    /// a time, and exact where a timestamp can match two chunks sharing a
+    /// boundary millisecond. It resumes a FOLLOWING read from a consumer's
+    /// cursor and SEEKS a bounded one — the same operation, which is why
+    /// it is not confined to the first.
     pub from_chunk: Option<u64>,
 }
 
@@ -607,12 +621,34 @@ impl Query {
             );
         }
         let following = self.follow.follow || self.limit.tail.is_some();
-        if self.window.from_chunk.is_some() && !following {
-            bail!(
-                "a chunk number is a resume position, and only a FOLLOWING read moves \
-                 forward from one — a windowed query selects by the timestamps the \
-                 lines carry"
-            );
+        // A chunk number is a PLACE on the tape, not a time — which is why
+        // it composes with a window's `to`, with predicates and with either
+        // axis, and why it is not confined to a following read: `from_chunk`
+        // with `max: {chunks: 1}` is a seek, and a pager is nothing but
+        // seeks. What it cannot compose with is a second START. Each of
+        // these names one, and there is no rule for which of two would win —
+        // so the answer is the refusal rather than a position the caller did
+        // not ask for.
+        if self.window.from_chunk.is_some() {
+            if self.window.from.is_some() {
+                bail!(
+                    "a chunk number and a `from` timestamp are both where to START, and \
+                     a read has one start — name the place OR the time"
+                );
+            }
+            if self.limit.tail.is_some() || self.limit.tail_chunks.is_some() {
+                bail!(
+                    "a chunk number says where to start and a tail says how far back \
+                     from the END, and a read has one start — ask for one of them"
+                );
+            }
+            if !self.cursor.is_empty() {
+                bail!(
+                    "a cursor is where a previous answer left each store, and a chunk \
+                     number is where to start — hand back the cursor to go on, or name \
+                     the chunk to go somewhere else"
+                );
+            }
         }
         // A CHUNK predicate is the token index, which has nothing to skip
         // on a live stream. An ENTRY predicate is just a filter, and
@@ -708,6 +744,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             files,
             from_ms,
             to_ms,
+            from_chunk,
             windowed,
             has,
             any,
@@ -723,15 +760,20 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
         );
     }
     if chunk_records {
-        return query_chunks_framed(files, from_ms, to_ms, has, any, max_chunks, deadline);
+        return query_chunks_framed(
+            files, from_ms, to_ms, from_chunk, has, any, max_chunks, deadline,
+        );
     }
     if files.len() == 1 {
-        return query_single(&files[0], from_ms, to_ms, has, any, max_chunks, deadline);
+        return query_single(
+            &files[0], from_ms, to_ms, from_chunk, has, any, max_chunks, deadline,
+        );
     }
     query_multi(
         files,
         from_ms,
         to_ms,
+        from_chunk,
         has,
         any,
         no_filename,
@@ -751,6 +793,7 @@ fn query_entries<W: Write>(
     files: &[std::path::PathBuf],
     from_ms: u64,
     to_ms: u64,
+    from_chunk: Option<u64>,
     windowed: bool,
     has: &[String],
     any: &[String],
@@ -813,6 +856,7 @@ fn query_entries<W: Write>(
             source.seq_at_open,
             from_ms.saturating_sub(WIDEN_MS),
             to_ms.saturating_add(WIDEN_MS),
+            from_chunk,
             has,
             any,
         )?;
@@ -848,6 +892,7 @@ fn query_entries<W: Write>(
                 source.seq_at_open,
                 from_ms,
                 to_ms,
+                from_chunk,
                 has,
                 any,
             )?
@@ -921,6 +966,13 @@ fn query_entries<W: Write>(
         }
         if to_ms < u64::MAX {
             write!(out, "\x1fto={to_ms}")?;
+        }
+        // Where the read STARTED, when a place rather than a time said so.
+        // The echo is the lineage: an answer outlives the request that
+        // produced it, and one recording `from`/`to`/`has` while dropping
+        // the position it began at describes a search nobody ran.
+        if let Some(n) = from_chunk {
+            write!(out, "\x1ffrom_chunk={n}")?;
         }
         for h in has {
             write!(out, "\x1fhas={h}")?;
@@ -1705,6 +1757,7 @@ fn query_chunks_framed(
     files: &[std::path::PathBuf],
     from_ms: u64,
     to_ms: u64,
+    from_chunk: Option<u64>,
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
@@ -1713,7 +1766,7 @@ fn query_chunks_framed(
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     write_chunks_framed(
-        &mut out, files, from_ms, to_ms, has, any, max_chunks, deadline,
+        &mut out, files, from_ms, to_ms, from_chunk, has, any, max_chunks, deadline,
     )?;
     out.flush()?;
     Ok(())
@@ -1727,6 +1780,7 @@ fn write_chunks_framed<W: Write>(
     files: &[std::path::PathBuf],
     from_ms: u64,
     to_ms: u64,
+    from_chunk: Option<u64>,
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
@@ -1752,6 +1806,7 @@ fn write_chunks_framed<W: Write>(
             source.seq_at_open,
             from_ms,
             to_ms,
+            from_chunk,
             has,
             any,
         )?;
@@ -1833,6 +1888,7 @@ fn query_single(
     file: &Path,
     from_ms: u64,
     to_ms: u64,
+    from_chunk: Option<u64>,
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
@@ -1846,6 +1902,7 @@ fn query_single(
         source.seq_at_open,
         from_ms,
         to_ms,
+        from_chunk,
         has,
         any,
     )?;
@@ -1901,6 +1958,7 @@ fn query_multi(
     files: &[std::path::PathBuf],
     from_ms: u64,
     to_ms: u64,
+    from_chunk: Option<u64>,
     has: &[String],
     any: &[String],
     no_filename: bool,
@@ -1928,6 +1986,7 @@ fn query_multi(
             handle.seq_at_open,
             from_ms,
             to_ms,
+            from_chunk,
             has,
             any,
         )?;
@@ -3102,6 +3161,146 @@ mod tests {
         );
     }
 
+    /// The refusal `view` turns on. A chunk number was confined to a
+    /// FOLLOWING read on the reasoning that it is a resume position; random
+    /// access is the second reason to name one, and `from_chunk` with a
+    /// one-chunk cap is a seek. What is refused now is a second START,
+    /// which is a different sentence.
+    #[test]
+    fn a_chunk_number_seeks_a_bounded_read() {
+        let mut seek = Query::default();
+        seek.window.from_chunk = Some(412_000);
+        seek.limit.max_chunks = Some(1);
+        seek.output.chunk_records = true;
+        assert!(
+            seek.validate().is_ok(),
+            "{:?}",
+            seek.validate().unwrap_err()
+        );
+
+        // ...and it still resumes a follow, which is where it came from.
+        let mut resume = Query::default();
+        resume.window.from_chunk = Some(412_000);
+        resume.follow.follow = true;
+        assert!(resume.validate().is_ok());
+    }
+
+    /// Each of these names where the read begins, and so does a chunk
+    /// number. Two starts have no rule for which wins, and the old code
+    /// silently picked one — a caller asking for a place got the tail it
+    /// also asked for, and never learnt that its position was dropped.
+    #[test]
+    fn a_read_has_one_start() {
+        let seeking = || {
+            let mut q = Query::default();
+            q.window.from_chunk = Some(412_000);
+            q
+        };
+        let refused = |name: &str, q: Query| {
+            assert!(
+                q.validate().is_err(),
+                "{name} beside a chunk number is two starts, and was accepted"
+            );
+        };
+        let mut q = seeking();
+        q.window.from = Some(1_000);
+        refused("a from timestamp", q);
+
+        let mut q = seeking();
+        q.limit.tail = Some(10);
+        refused("a tail of entries", q);
+
+        let mut q = seeking();
+        q.limit.tail_chunks = Some(10);
+        refused("a tail of chunks", q);
+
+        let mut q = seeking();
+        q.cursor.insert("79d7f23a".to_string(), 33_724_753_900);
+        refused("a cursor", q);
+    }
+
+    /// A chunk number is a place, not a time: it selects beside the window
+    /// rather than instead of it, so `to` still bounds the far end and a
+    /// predicate still narrows what comes back.
+    #[test]
+    fn a_seek_starts_at_the_number_and_survives_retention() {
+        let records = vec![
+            chunk(0, 100, 1000, 2000),
+            chunk(100, 100, 2000, 3000),
+            chunk(200, 100, 3000, 4000),
+        ];
+        let seq = |n: Option<u64>| -> Vec<u64> {
+            select_chunks(
+                Path::new("/nonexistent"),
+                &records,
+                None,
+                0,
+                u64::MAX,
+                n,
+                &[],
+                &[],
+            )
+            .unwrap()
+            .0
+            .iter()
+            .map(|(_, c)| c.seq)
+            .collect()
+        };
+        assert_eq!(seq(None), vec![0, 1, 2], "no seek reads the whole store");
+        assert_eq!(seq(Some(1)), vec![1, 2], "forward from the number named");
+        assert_eq!(
+            seq(Some(9)),
+            Vec::<u64>::new(),
+            "past the head selects nothing, rather than wrapping to the start"
+        );
+
+        // A head-drop leaves the numbers alone (they are what a position
+        // holds), so a seek below the floor lands on the oldest survivor
+        // rather than on nothing: only the caller knows the place it named
+        // was dropped, so only the caller can report it.
+        let trimmed: Vec<ChunkRecord> = records
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ChunkRecord {
+                seq: 5 + i as u64,
+                ..*c
+            })
+            .collect();
+        let survivors = select_chunks(
+            Path::new("/nonexistent"),
+            &trimmed,
+            None,
+            0,
+            u64::MAX,
+            Some(2),
+            &[],
+            &[],
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            survivors.iter().map(|(_, c)| c.seq).collect::<Vec<_>>(),
+            vec![5, 6, 7]
+        );
+        // The window still bounds the far end.
+        let bounded = select_chunks(
+            Path::new("/nonexistent"),
+            &records,
+            None,
+            0,
+            2500,
+            Some(1),
+            &[],
+            &[],
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            bounded.iter().map(|(_, c)| c.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
     fn chunk(uncomp_start: u64, len: u64, first: u64, last: u64) -> ChunkRecord {
         ChunkRecord {
             uncomp_start,
@@ -3269,7 +3468,9 @@ mod chunk_stream_tests {
     /// delimiters instead lands INSIDE a zstd frame, which contains 0x1e
     /// and 0x00 like any other bytes — the reason `len` is authoritative
     /// and not merely convenient.
-    fn records(buf: &[u8]) -> Vec<(String, std::collections::HashMap<String, String>, Vec<u8>)> {
+    pub(super) fn records(
+        buf: &[u8],
+    ) -> Vec<(String, std::collections::HashMap<String, String>, Vec<u8>)> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < buf.len() {
@@ -3317,6 +3518,7 @@ mod chunk_stream_tests {
             &[dir.join("app.log")],
             0,
             u64::MAX,
+            None, // from_chunk
             &[],
             &[],
             None,
@@ -3381,6 +3583,72 @@ mod chunk_stream_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The whole operation a pager performs: one chunk, named by number,
+    /// compressed and framed. It is `view`'s entire timberfs side, and
+    /// what it needed was a refusal relaxed rather than a read path
+    /// written — the chunk carries its own number back, so a client that
+    /// seeks somewhere can see where it landed.
+    #[test]
+    fn a_chunk_number_and_a_cap_of_one_is_a_seek() {
+        let (dir, _) = store_with_chunks("chunkseek", 3000);
+        let mut all = Vec::new();
+        write_chunks_framed(
+            &mut all,
+            &[dir.join("app.log")],
+            0,
+            u64::MAX,
+            None, // from_chunk
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let numbers: Vec<u64> = records(&all)
+            .iter()
+            .filter(|r| r.0 == "chunk")
+            .map(|r| r.1["chunk"].parse().unwrap())
+            .collect();
+        assert!(numbers.len() > 2, "expected several chunks: {numbers:?}");
+
+        let target = numbers[1];
+        let mut one = Vec::new();
+        write_chunks_framed(
+            &mut one,
+            &[dir.join("app.log")],
+            0,
+            u64::MAX,
+            Some(target),
+            &[],
+            &[],
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let recs = records(&one);
+        let got: Vec<&(String, std::collections::HashMap<String, String>, Vec<u8>)> =
+            recs.iter().filter(|r| r.0 == "chunk").collect();
+        assert_eq!(got.len(), 1, "a cap of one chunk is one chunk");
+        assert_eq!(got[0].1["chunk"], target.to_string());
+        // The frame is the stored one, not a re-compression: byte-identical
+        // to what the unseeked read shipped for the same number.
+        let whole = records(&all);
+        let same = whole
+            .iter()
+            .find(|r| r.0 == "chunk" && r.1["chunk"] == target.to_string())
+            .unwrap();
+        assert_eq!(got[0].2, same.2);
+        // The source line still counts the store, so a seek that lands
+        // nowhere is told apart from a store that holds nothing.
+        let src = recs.iter().find(|r| r.0 == "source").unwrap();
+        assert_eq!(
+            src.1["kept"].parse::<usize>().unwrap(),
+            numbers.len() - 1,
+            "the seek selected the tail of the store, and the cap sent one of it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_capped_chunk_read_says_which_bound_stopped_it() {
         // A short answer that cannot be told from a complete one is the
@@ -3392,6 +3660,7 @@ mod chunk_stream_tests {
             &[dir.join("app.log")],
             0,
             u64::MAX,
+            None, // from_chunk
             &[],
             &[],
             Some(2),
@@ -3413,8 +3682,73 @@ mod chunk_stream_tests {
 
 #[cfg(test)]
 mod served_bytes_tests {
-    use super::chunk_stream_tests::store_with_chunks;
+    use super::chunk_stream_tests::{records, store_with_chunks};
     use super::*;
+
+    /// The same seek in the ENTRY pipeline, which reaches its chunks
+    /// through the same selection — so what this checks is the half a
+    /// chunk dump has no way to: that the answer SAYS where it began.
+    /// `stream-start` echoes the selection so a stored answer describes
+    /// the search that produced it, and a position left out of that echo
+    /// makes a read from chunk 412,000 indistinguishable from one that
+    /// started at the store's floor.
+    #[test]
+    fn a_records_answer_seeks_and_says_it_did() {
+        let (dir, _) = store_with_chunks("seekrecords", 3000);
+        let read = |from_chunk: Option<u64>| {
+            let mut buf = Vec::new();
+            query_entries(
+                &mut buf,
+                &[dir.join("app.log")],
+                0,
+                u64::MAX,
+                from_chunk,
+                false,
+                &[],
+                &[],
+                None,
+                None,
+                &Default::default(),
+                true,  // no_filename
+                false, // show_write_time
+                false, // null_sep
+                true,  // records
+                None,
+                None,
+            )
+            .unwrap();
+            buf
+        };
+        let entry_chunks = |buf: &[u8]| -> Vec<u64> {
+            records(buf)
+                .iter()
+                .filter(|r| r.0 == "entry")
+                .filter_map(|r| r.1.get("chunk").map(|c| c.parse().unwrap()))
+                .collect()
+        };
+        let whole = read(None);
+        let all = entry_chunks(&whole);
+        let last = *all.last().unwrap();
+        assert!(last > 1, "expected several chunks, ended at {last}");
+
+        let seeked = read(Some(last));
+        assert_eq!(
+            entry_chunks(&seeked)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([last]),
+            "a seek to the last chunk answers with that chunk and nothing before it"
+        );
+        let start = records(&seeked).into_iter().next().unwrap();
+        assert_eq!(start.0, "stream-start");
+        assert_eq!(start.1.get("from_chunk"), Some(&last.to_string()));
+        assert_eq!(
+            records(&whole)[0].1.get("from_chunk"),
+            None,
+            "a read that did not seek must not claim to have"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Every record that serves bytes says where they sit: `offset` is
     /// where the run begins and `len` how long it is, so the record
@@ -3431,6 +3765,7 @@ mod served_bytes_tests {
             &[dir.join("app.log")],
             0,
             u64::MAX,
+            None, // from_chunk
             false,
             &[],
             &[],

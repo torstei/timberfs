@@ -185,8 +185,11 @@ pub struct DocWindow {
     pub from: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub to: Option<u64>,
-    /// A resume position by chunk NUMBER: exact, where a timestamp can
-    /// match two chunks that share a boundary millisecond.
+    /// Where to START, by chunk NUMBER: a place on the tape rather than a
+    /// time, and exact where a timestamp can match two chunks that share a
+    /// boundary millisecond. Unaffected by `axis`, which measures the
+    /// window's `from`/`to` — a chunk number is not a clock. Refused
+    /// beside anything else that names a start (`from`, `tail`, `cursor`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub from_chunk: Option<u64>,
 }

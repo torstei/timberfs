@@ -36,14 +36,21 @@ announced rather than discovered by having a request refused.
 Nothing. `max` truncates, `stream-end` says `status=limited`, and there the
 answer stops. None of what is there is a resume position:
 
-- `window.from_chunk` is for a FOLLOWING read and is refused on a windowed one
+- `window.from_chunk` was for a FOLLOWING read and refused on a windowed one
 - a timestamp separates neither two entries inside a chunk nor two chunks that
   share a boundary millisecond
 - an entry's `chunk=` names the chunk it sits in, not where in it, so resuming
   there re-delivers everything before it
 
-So a bound is "show me some", never "walk this result set". That is stated in
-the man page so nobody builds paging on `from_chunk`.
+So a bound is "show me some", never "walk this result set".
+
+`from_chunk` has since been relaxed onto a bounded read — see
+[view.md](view.md) — and none of that makes it a cursor. It is chunk-granular
+where a position is byte-exact, so resuming there still re-delivers the whole
+chunk you were inside; and it is a place in the STORE where a cursor is a place
+in an ANSWER, which is the distinction the two handles exist to keep. A read has
+one start, so naming both is refused rather than resolved. Page with the cursor;
+seek with the chunk number.
 
 ## The cursor is a separate object
 

@@ -49,6 +49,7 @@ are not covered by that — those are the same objects `info --json` and
 |---|---|
 | [query-chunk-sweep.json](query-chunk-sweep.json) | **`granularity: "chunks"`** — the chunks that MAY contain a term, emitted whole. A superset, and the cheapest thing a store can answer: the index alone decides it and nothing is decompressed. Ask for it when the next stage does its own matching. |
 | [query-raw-chunks.json](query-raw-chunks.json) | `kind: "chunks"` — compressed chunks verbatim, nothing decompressed at either end. |
+| [query-seek-to-chunk.json](query-seek-to-chunk.json) | **`window.from_chunk` with a cap of one chunk** — a seek, not a search. No predicate and no window: one chunk by number, which on a measured store is ~77 KiB of log for ~6 KiB on the wire. This is how a hit's coordinate is opened, and what a pager reads. |
 
 ## Two things worth knowing before you generate one
 
@@ -57,6 +58,11 @@ magnitude.** `entries` gives the entries that actually match. `chunks` gives
 the chunks that might contain them, whole — on a 1.2 GiB store, a term in
 five entries selects 398 chunks and 325,767 lines. Neither is wrong; they
 answer different questions, and the format will not guess which you meant.
+
+**A cursor and `from_chunk` are different handles.** A cursor is a place in
+an *answer* — hand it back and the same search goes on. `window.from_chunk`
+is a place in the *store*, so it opens the log somewhere rather than
+resuming a result set. A read has one start, so naming both is refused.
 
 **There is no way to name a store by path.** A path is neither unique nor
 stable and says nothing about what the store holds, so `stores.select` is a

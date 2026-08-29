@@ -3339,9 +3339,9 @@ PYEOF
 
 records_carry_the_chunk_number() {
     # The records stream labels each entry with the chunk it came from, and
-    # --from-chunk resumes at one exactly. The ABSENCE of the field is the
-    # live-edge signal, so a consumer can tell "no resumable position yet"
-    # from "chunk 0".
+    # --from-chunk starts at one exactly — resuming a follow, and seeking a
+    # bounded read. The ABSENCE of the field is the live-edge signal, so a
+    # consumer can tell "no resumable position yet" from "chunk 0".
     local d=/var/log/timberfs/recchunk store
     d=/var/log/timberfs/recchunk
     store="$d/recchunk.log"
@@ -3386,10 +3386,32 @@ for rec in raw.split(b"\x1e"):
 assert got and all(int(c) >= 1 for c in got), got
 PYEOF
 
-    # Requires --follow: a windowed read selects by the timestamps the lines
-    # carry, which is a different axis.
-    ! timberfs query --records --from-chunk 1 "$store" >/dev/null 2>&1 || return 1
-    rm -rf "$d" /tmp/rc.bin /tmp/rc1.bin
+    # A bounded read seeks there too: the same number, no --follow, and the
+    # answer starts at it rather than at the store's floor. `stream-start`
+    # echoes the position, so an answer that outlives its request still says
+    # where it began.
+    timberfs query --records --from-chunk 1 "$store" > /tmp/rc2.bin 2>/dev/null \
+        || return 1
+    python3 - /tmp/rc2.bin << 'PYEOF' || return 1
+import sys
+raw = open(sys.argv[1], "rb").read()
+got, start = [], {}
+for rec in raw.split(b"\x1e"):
+    head = rec.split(b"\x00", 1)[0].split(b"\x1f")
+    kv = dict(f.split(b"=", 1) for f in head[1:] if b"=" in f)
+    if rec.startswith(b"entry"):
+        got.append(kv.get(b"chunk", b"-").decode())
+    elif rec.startswith(b"stream-start"):
+        start = kv
+assert got == ["1", "2"], got
+assert start.get(b"from_chunk") == b"1", start
+PYEOF
+
+    # A read has one start. --from and --tail each name one, so each is
+    # refused beside a chunk number rather than silently winning.
+    ! timberfs query --records --from-chunk 1 --tail 5 "$store" >/dev/null 2>&1 \
+        || return 1
+    rm -rf "$d" /tmp/rc.bin /tmp/rc1.bin /tmp/rc2.bin
     return 0
 }
 
@@ -3891,7 +3913,7 @@ run_test "timber-otlp: --dry-run renders one LogRecord per entry" timber_otlp_dr
 run_test "timber-otlp: cursor resumes after a kill, no duplicates" timber_otlp_cursor_resumes_without_duplicates
 run_test "timber-otlp: a pre-numbering cursor converts to a chunk position" cursor_converts_from_a_write_time_position
 run_test "chunk numbers: dense, survive a head-drop, v1 index migrates on open" chunk_numbers_and_v1_migration
-run_test "records: entries carry chunk=, --from-chunk resumes at one" records_carry_the_chunk_number
+run_test "records: entries carry chunk=, --from-chunk resumes and seeks" records_carry_the_chunk_number
 run_test "consumers: list/info show lag and held bytes; a dropped position is a GAP" consumer_view_and_gap
 # P7: retain_unconsumed -- the third retention axis. A retaining follower's
 # position holds the store's head back, additively with age and size, and

@@ -1,0 +1,22 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "stores": {
+    "select": [
+      {
+        "key": "name",
+        "op": "=",
+        "value": "app"
+      }
+    ]
+  },
+  "window": {
+    "axis": "write",
+    "from_chunk": 412000
+  },
+  "max": {
+    "chunks": 1
+  },
+  "response_format": {
+    "kind": "chunks"
+  }
+}

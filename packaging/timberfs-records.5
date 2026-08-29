@@ -71,10 +71,20 @@ thing answering need not be a timberfs),
 .B to
 (the selection window in Unix milliseconds; omitted edges are
 unbounded),
+.B from_chunk
+(where the read STARTED when a chunk number rather than a time said so;
+absent when neither did),
 .B has
 (repeated; the chunk-level token requirements of the selection),
 .B any
 (repeated; chunk-level OR alternatives of the selection),
+.B granularity
+(what those predicates SELECTED \(em
+.B entries
+or
+.BR chunks ;
+present only where there are predicates, and it is the difference between
+an answer and a superset of one),
 .B sources
 (number of inputs),
 .B order
