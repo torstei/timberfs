@@ -40,7 +40,7 @@ content.
 ## The loop this exists for
 
 ```
-see F885495664326FQYNTW in imap01
+see F885495664326FQYNTW in mail01
   → search it across every host
   → hits carry host, store, chunk, offset
   → open that store, at that offset
@@ -145,8 +145,8 @@ another, and back to the shell. Give it a written form and all three are
 the same operation:
 
 ```
-timber://imap01/79d7f23a-b044-4a72-8be3-d26e0481d202#offset=33724753900
-timber://imap01/79d7f23a-…#chunk=498248
+timber://mail01/79d7f23a-b044-4a72-8be3-d26e0481d202#offset=33724753900
+timber://mail01/79d7f23a-…#chunk=498248
 timber:79d7f23a-…                       -- the store, no position, no host
 ```
 
@@ -188,13 +188,13 @@ scale, and has to be right before anything runs. Resolving a store today
 means asking every configured host for its store list and matching the
 id — a broadcast, which is exactly what /etc/hosts leaves you with.
 
-Something more like **DNS** already exists in one place. At Visena,
-`visena-timberfs hosts` derives the queryable set from service discovery
-— the ZooKeeper app registrations, each probed for whether the janitor2
-actually running there serves the query endpoint — and `visena-timberfs
-sh` execs timbersh with `TIMBERFS_HOSTS` already filled in. One command
-gets a fleet-wide shell with no list to maintain. That is a resolver, and
-it is derived rather than configured.
+Something more like **DNS** already exists in one place: a site-specific
+wrapper around timbersh, in use on one fleet. It derives the queryable
+set from service discovery — the ZooKeeper registrations, each probed for
+whether the agent actually running there serves the query endpoint — and
+execs timbersh with `TIMBERFS_HOSTS` already filled in. One command gets
+a fleet-wide shell with no list to maintain. That is a resolver, and it
+is derived rather than configured.
 
 The generalisation is a hook, not a feature: a `TIMBERFS_RESOLVER`
 command, the same shape as `TIMBERFS_CMD`, asked "who has this store" or
@@ -212,7 +212,7 @@ useful the day it exists, and they are not the same programs:
   FILE that can be generated, reviewed, checked in and shared, rather
   than an environment variable each person assembles. That alone covers
   most of what a small fleet needs.
-- Service discovery, as `visena-timberfs hosts` already does.
+- Service discovery, as the wrapper above already does.
 - Anything else: a registry, an inventory, a hosts file per environment.
 
 ⚠ And it is queried by more than one tool. The shell, the viewer, and
@@ -261,8 +261,8 @@ write-axis window with `max: {chunks: 1}`, which worked already.
 
 ## Why the client fetches chunks
 
-Measured on `visena-imap-email-server` at imap01 — 436,939 chunks,
-33.7 GB logical, 2.6 GB compressed:
+Measured on one mail server's log store — 436,939 chunks, 33.7 GB
+logical, 2.6 GB compressed:
 
 ```
 1 chunk  ≈  77 KiB of log  ≈  600–800 lines  ≈  10 screenfuls
@@ -297,7 +297,7 @@ any chunk yet. Both are facts the viewer holds — `first_seq`,
 the writer's flush age — so both are said:
 
 ```
-── visena-imap-email-server @ imap01 · chunk 498248 · offset 33 724 753 900 · 99%
+── acme-mail-server @ mail01 · chunk 498248 · offset 33 724 753 900 · 99%
 ── 436,888 chunks older; head is 61310 (2.9 GB dropped)
 ── end of chunk 498248 · newer lines may be unflushed (flush-age 5s)
 ```
