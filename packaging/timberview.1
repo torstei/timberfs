@@ -1,0 +1,133 @@
+.TH TIMBERVIEW 1 "2026-08-29" "timberfs" "User Commands"
+.SH NAME
+timberview \- read a timberfs store as a tape
+.SH SYNOPSIS
+.B timberview
+.RI [ --cmd " ARGV" ]
+.RI [ --hosts " H,H" ]
+.RI [ --at " TIME" ]
+.RI [ --chunk " N" ]
+.RI [ TARGET ]
+.SH DESCRIPTION
+A pager over a store. It opens the last chunk and scrolls back from
+there, with no predicate and no result set: where
+.BR timbersh (1)
+walks an ANSWER, this walks the LOG.
+.PP
+It does no entry parsing \(em no timestamps, no window verification, no
+token index. Chunks, decompressed, shown as lines. That is the feature:
+the two stores a query serves worst, one whose lines cannot be parsed
+and one with no index, are exactly the ones you most want to look at,
+and this asks nothing of the content.
+.PP
+.B TARGET
+is a store name, a path, a short id, or a
+.B timber:
+address. With none, the first store is opened and
+.B S
+switches between the rest.
+.SH OPTIONS
+.TP
+.BI \-\-cmd " ARGV"
+How to reach a timberfs; it is handed a
+.BR timberfs\-query\-document (5)
+on stdin. Default
+.BR "timberfs query --query -" .
+.RB ( $TIMBERFS_CMD )
+.TP
+.BI \-\-hosts " H,H"
+Ask these hosts, substituting each for
+.B _TIMBERHOST_
+in
+.BR \-\-cmd .
+A search covers all of them.
+.RB ( $TIMBERFS_HOSTS )
+.TP
+.BI \-\-at " TIME"
+Open at the chunk covering this instant. RFC3339,
+.BR "YYYY-MM-DD [HH:MM[:SS]]" ,
+.B HH:MM[:SS]
+for today, or unix seconds \(em resolved HERE, in the reader's timezone.
+.TP
+.BI \-\-chunk " N"
+Open at this chunk number.
+.SH KEYS
+.TP
+.BR j " " k " " \(ua " " \(da
+A line.
+.BR g "/" G
+go to the log's top and end \(em a seek, not a walk back.
+.TP
+.BR space " " b
+A page.
+.BR h " " l " " \(<- " " \(->
+scroll sideways when lines are not wrapped;
+.B w
+toggles wrapping. Neither is a default that can be argued into being
+correct, so it changes at runtime.
+.TP
+.BR Tab " " Shift\-Tab
+Move between the searchable tokens on the line. Those are exactly what
+.B --has
+matches \(em maximal ASCII-alphanumeric runs of 3 to 64 characters \(em so
+what can be picked is what can be searched, by construction. A word the
+index cannot hold, like
+.BR 26.1.18 ,
+is refused where you point at it rather than discovered later as an
+empty answer.
+.TP
+.BR Enter " " *
+Search the picked token everywhere: every store, on every host.
+.B /
+searches one you type, and
+.BR n "/" N
+cycle the hits.
+.TP
+.B y
+Show this line's address.
+.B S
+opens another store.
+.B ?
+lists the keys.
+.B q
+quits, printing the address you stopped at.
+.SH THE ADDRESS
+A coordinate is passed from a search to a viewer and back to a shell, so
+it has a written form:
+.PP
+.RS
+.EX
+timber://mail01/79d7f23a-b044-4a72-8be3-d26e0481d202#offset=33724753900
+timber://mail01/79d7f23a-\&...#chunk=498248
+timber:79d7f23a-\&...
+.EE
+.RE
+.PP
+The store id is the NAME and the host is a hint: bake the host in and a
+pasted link breaks the day a store moves. A position says which
+coordinate it is, because
+.B #offset=
+and
+.B #chunk=
+are different numbers and one that resolved to the wrong place silently
+would be worse than one that will not parse. Prefer an offset: it is
+absolute on the tape, so it stays valid until retention drops the data
+and then the store's own
+.B first_seq
+says it was dropped rather than "not found".
+.SH BOUNDARIES
+Retention moves the floor while you read, and the newest lines are in no
+chunk yet. Both are stated: the top says whether it is the top of the
+LOG or only of what is loaded, and how much fell off; the bottom names
+the writer, so the end of the tape is not mistaken for the end of the
+log.
+.SH EXIT STATUS
+.B 0
+on a normal exit;
+.B 1
+where no store could be opened or no chunk found there.
+.SH SEE ALSO
+.BR timbersh (1),
+.BR timberfs (1),
+.BR timberfs\-query\-document (5),
+.BR timberfs\-records (5)

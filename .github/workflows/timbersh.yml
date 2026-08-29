@@ -44,8 +44,9 @@ jobs:
 
       - name: It has to run
         run: |
-          python3 -m py_compile tools/timbersh
+          python3 -m py_compile tools/timbersh tools/timberview.py tools/timberview
           python3 tools/timbersh --help > /dev/null
+          python3 tools/timberview --help > /dev/null
 
       # Architecture: all — it is a script, and cargo-deb would have called
       # it amd64.
@@ -53,7 +54,7 @@ jobs:
         run: |
           V=$(tr -d '[:space:]' < tools/VERSION)
           root="$RUNNER_TEMP/pkg"
-          mkdir -p "$root/DEBIAN" "$root/usr/bin" \
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/timberfs-sh" \
                    "$root/usr/share/man/man1" "$root/usr/share/doc/timberfs-sh"
           cat > "$root/DEBIAN/control" <<EOF
           Package: timberfs-sh
@@ -61,15 +62,21 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: all
-          Depends: timberfs, python3
+          Depends: timberfs, python3, zstd
           Maintainer: Torstein Tauno Svendsen <torstei@gmail.com>
           Homepage: https://github.com/torstei/timberfs
-          Description: timbersh, an interactive shell for timberfs
-           A console for reading timberfs stores, in a grammar borrowed from
-           SQL. EXPERIMENTAL: the statements it accepts are not promised.
+          Description: timbersh and timberview, clients for timberfs
+           A console for reading timberfs stores in a grammar borrowed from
+           SQL, and a pager that reads one as a tape. EXPERIMENTAL: the
+           statements timbersh accepts are not promised.
           EOF
           install -m 755 tools/timbersh "$root/usr/bin/timbersh"
+          install -m 755 tools/timberview "$root/usr/bin/timberview"
+          # The module both front ends import: timbersh calls the viewer in
+          # process, and /usr/bin/timberview is the entry point beside it.
+          install -m 644 tools/timberview.py "$root/usr/share/timberfs-sh/timberview.py"
           gzip -9c packaging/timbersh.1 > "$root/usr/share/man/man1/timbersh.1.gz"
+          gzip -9c packaging/timberview.1 > "$root/usr/share/man/man1/timberview.1.gz"
           install -m 644 tools/README.md "$root/usr/share/doc/timberfs-sh/README.md"
           # Dual-licensed, like the crate. Both, not one silently chosen —
           # and NOT `|| true`, which would let a missing licence file ship
@@ -95,7 +102,7 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/dist/* \
             --title "timbersh $GITHUB_REF_NAME" \
-            --notes "The timberfs console. ⚠ EXPERIMENTAL — the statements it accepts are not promised.
+            --notes "The timberfs console and viewer. ⚠ EXPERIMENTAL — the statements timbersh accepts are not promised.
 
           \`\`\`sh
           apt install timberfs-sh

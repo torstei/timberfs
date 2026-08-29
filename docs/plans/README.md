@@ -36,7 +36,7 @@ messages and pull requests are for.
 - [logline-order.md](logline-order.md) — ordering a multi-store answer by the
   clock an entry CARRIES: the frontier merge that makes it streamable, and the
   per-chunk logline range it needs.
-- [view.md](view.md) — reading a store as a tape rather than a result set: a
-  pager over chunks, the identifier-to-coordinate loop it exists for, the
-  address that coordinate is written as, and the resolver that address
-  eventually wants.
+- [view.md](view.md) — reading a store as a tape rather than a result set.
+  A first version has shipped, so what is left here is the second front
+  end, the resolver the address is shaped for, and the questions that
+  version answered one way.

@@ -229,9 +229,22 @@ timbersh --hosts web01,web02,db01 --cmd "ssh _TIMBERHOST_ timberfs query --query
 select loglines from [type=apache] where logline since '00:00' and entry has 'error' limit 20;
 ```
 
-⚠ EXPERIMENTAL: its statements are not promised. It exists to be used
-against a real fleet, because a protocol nobody writes a client against is
-one whose awkward parts stay theoretical — see [tools/](tools/README.md).
+Beside it, `timberview` reads ONE store the way a pager reads a file — the
+last chunk first, back from there, no predicate and no result set. It
+parses nothing, so it works where a query helps least: a store whose lines
+timberfs cannot read, and one with no index. `Tab` moves between the
+tokens the index actually holds, `Enter` finds one on every host, and a
+hit is a coordinate you can open, cycle and paste:
+
+```sh
+timberview app.log
+timberview 'timber://mail01/79d7f23a-b044-4a72-8be3-d26e0481d202#offset=33724753900'
+```
+
+⚠ EXPERIMENTAL, both of them: timbersh's statements are not promised. They
+exist to be used against a real fleet, because a protocol nobody writes a
+client against is one whose awkward parts stay theoretical — see
+[tools/](tools/README.md).
 
 The deployment *shapes* all of this composes into — giving an application OTLP
 without touching it, a full-fidelity tier under an expensive backend, container

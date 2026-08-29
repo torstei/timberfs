@@ -41,6 +41,8 @@ timbersh --hosts web01,web02,db01 \
 ```
 
 ```sql
+view   [id=79d7f23a];              -- a pager over the tape, at the last chunk
+view   [] at '12:00';              -- or anchored at an instant
 add host web03;                    -- ask it too, from now on
 drop host web03;                   -- stop asking it
 create logview [type=console] console;
@@ -102,26 +104,6 @@ found within an hour of it existing:
   That is the argument for a position being an absolute byte offset
   rather than a clock: see [docs/plans/paging.md](../docs/plans/paging.md).
 
-### Tests
-
-```sh
-tests/timbersh/test-timbersh            # all
-tests/timbersh/test-timbersh short_id   # one, by substring
-```
-
-No VM, no timberfs, no network: `--cmd` points at a fake that answers from
-a script. `scripts/check.sh` runs them, so they gate a push like everything
-else.
-
-The fake **records every document it is asked**, which is the useful half —
-almost every bug here has been in what was *sent* rather than what was
-printed, and a test that reads only the output cannot see a window on the
-wrong axis or a cursor that lost a store's place.
-
-⚠ Each case was checked by reintroducing its bug and watching it fail. The
-paging test passed with the fix deleted, twice, for two different reasons
-before it meant anything.
-
 ### What it does not implement, and what it must
 
 **The selector** is never reimplemented — every `from` is a real
@@ -178,3 +160,89 @@ search the server reads as a different question.
 * `~/.timbershrc` is RUN, not read: a script of statements, the way
   `.psqlrc` is. `save` therefore refuses to default to it — writing the
   logviews back would delete whatever else it does.
+
+## `timberview` — a pager over one store
+
+⚠ **EXPERIMENTAL**, like everything else here.
+
+`select` walks a result set; `view` walks the log. They share the absolute
+tape offset and nothing else, which is why the handle is a chunk number
+rather than a cursor: a cursor is a place in an answer, and there is no
+answer to be in.
+
+```sh
+timberview app.log                 # the last chunk, and back from there
+timberview --at '12:00' app.log
+timberview 'timber://mail01/79d7f23a-…#offset=33724753900'
+```
+
+It parses nothing — no timestamps, no window verification, no `.grain`.
+Chunks, decompressed, shown as lines. That is the feature rather than a
+simplification: the two stores `select` serves worst, one whose lines
+timberfs cannot parse and one with no index, are exactly the ones you most
+want to look at.
+
+**The loop it exists for**: see an identifier, search it across every host,
+jump to the coordinate a hit comes back with. `Tab` moves between the
+searchable tokens on a line — exactly the runs `--has` matches, so what can
+be picked is what can be searched — and `Enter` finds one everywhere.
+A word the index cannot hold (`26.1.18`) is refused where you point at it,
+with the reason, rather than discovered later as an empty answer.
+
+**One module, two front ends.** timbersh calls it in process, because a
+separate program would have to leave the alt screen carrying "search this
+token", let the shell print, and re-enter at a coordinate — a flicker per
+hop. It reaches the log through four operations and nothing else:
+
+```
+stores()                        the list, to switch between
+bounds(store)                   first_seq, last_seq, what was dropped
+chunk(store, seq=N | at=MS)     lines + the ring around them
+search(token)                   addresses
+```
+
+Written against those, it is tested against a fake rather than a terminal,
+and the fan-out stays the shell's: `search` is handed a token and does not
+know there are ten hosts.
+
+**The client decompresses.** One chunk is ten screenfuls of log for a few
+KiB on the wire, so the run is held either side of where you are and
+scrolling never falls out of a window; asking the far end to decompress
+would cost 13× the bytes for nothing. `compression.zstd` is stdlib from
+Python 3.14 and `zstd -dcq` is the fallback, which is why the package
+depends on `zstd`.
+
+**A coordinate has a written form** — `timber://host/store-id#offset=N` —
+so a search returning one, opening one, and handing a place back to the
+shell are the same operation. The store id is the name and the host is a
+hint: bake the host in and a pasted link breaks the day a store moves.
+
+## Tests
+
+```sh
+tests/timbersh/test-timbersh              # all
+tests/timbersh/test-timbersh short_id     # one, by substring
+tests/timberview/test-timberview          # the viewer's model
+```
+
+No VM, no timberfs, no network. `scripts/check.sh` runs both, so they gate
+a push like everything else.
+
+For timbersh, `--cmd` points at a fake that answers from a script. For the
+viewer, the fake is one level up: it implements the four operations, which
+is a whole server as far as the viewer is concerned — so where you are,
+what a screen shows and what the boundaries say are testable without a
+terminal. The statements that DO open a screen (`view`) are driven through
+a pty, waiting on what the screen printed rather than on a sleep.
+
+The fake **records every document it is asked**, which is the useful half —
+almost every bug here has been in what was *sent* rather than what was
+printed, and a test that reads only the output cannot see a window on the
+wrong axis or a cursor that lost a store's place.
+
+⚠ Each case was checked by reintroducing its bug and watching it fail. The
+paging test passed with the fix deleted, twice, for two different reasons
+before it meant anything.
+
+The fake answers `chunks` with a real compressed frame, so a viewer that
+decodes what it sends is a viewer that decodes what timberfs sends.

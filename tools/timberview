@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""The viewer's own entry point. timbersh calls the same module in
+process — a separate process would have to leave the screen, print, and
+come back at a coordinate on every search, which is the opposite of what
+a pager is for."""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [p for p in (_HERE, "/usr/share/timberfs-sh")
+                if os.path.exists(os.path.join(p, "timberview.py"))]
+from timberview import main            # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

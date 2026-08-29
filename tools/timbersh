@@ -13,6 +13,7 @@ change under you; nothing here is a compatibility surface yet.
     select records from console where entry has 'ERROR' limit 100;
     select records from [] where chunk may have 'req-8f3a';
     tail   records from console;
+    view   [type=console] at '12:00';
 
 A LOGVIEW is a NAMED PREDICATE, re-resolved every time it is used — so a
 store that appears after you defined it is in it. That is the whole
@@ -26,11 +27,16 @@ The SELECTOR is deliberately not implemented: every resolution is a real
 `kind: "stores"` query, because a second copy of it would drift and a
 drifted selector answers a different question without saying so.
 
-Times ARE resolved here, and must be. A query document is meant to be
-SELF-CONTAINED — a client that speaks it needs the protocol and nothing
-else — so building one cannot require running a timberfs on THIS machine
-to interpret a string. `window.from` is milliseconds because a document
-is a value: `11:10` means today, and in the reader's timezone, so a
+`view` is a PAGER over one store rather than a query, and it runs in
+process: the loop is search, jump, search again, and a separate program
+would have to leave the screen on every hop. `timberview` is the same
+module with its own entry point.
+
+Times ARE resolved at this edge, and must be — `timberview.when`, shared
+by both front ends. A query document is meant to be SELF-CONTAINED, so
+building one cannot require running a timberfs on THIS machine to
+interpret a string. `window.from` is milliseconds because a document is
+a value: `11:10` means today, and in the reader's timezone, so a
 document carrying the text would mean something different tomorrow and
 something else again at the far end.
 
@@ -55,7 +61,15 @@ something else again at the far end.
   TIMBERSH_HISTSIZE
                  how many lines to keep, default 2000
 """
-import argparse, datetime, json, os, re, readline, shlex, subprocess, sys, threading, time
+import argparse, json, os, re, readline, shlex, subprocess, sys, threading, time
+
+# The viewer, and the pieces both front ends share. A checkout finds it
+# beside this script; the package installs it where both do.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [p for p in (_HERE, "/usr/share/timberfs-sh")
+                if os.path.exists(os.path.join(p, "timberview.py"))]
+import timberview
+from timberview import when
 
 CMD = shlex.split(os.environ.get("TIMBERFS_CMD", "timberfs query --query -"))
 HOST_TOKEN = "_TIMBERHOST_"
@@ -111,6 +125,15 @@ HELP = """
                                            anything it said went wrong
   add host web03;                          ask it too, from now on
   drop host web03;                         stop asking it
+
+  view   <source> [at <time> | at chunk N | at offset N];
+  view   'timber://host/store-id#offset=N';
+
+    A PAGER over the store, not a query: no predicate, no result set,
+    the last chunk first and back from there. It parses nothing -- so it
+    works on a store whose lines timberfs cannot read, and on one with
+    no index. Tab picks a searchable token, Enter finds it everywhere,
+    and it leaves you the address of where you stopped.
 
   select <kind> from <source> [where ...] [limit N [chunks]];
   tail   <kind> from <source> [where ...];
@@ -208,71 +231,20 @@ def argv_for(host):
     return CMD if host is None else [a.replace(HOST_TOKEN, host) for a in CMD]
 
 
-def run(doc, host=None):
+def run(doc, host=None, raw=False):
     """One document to one host. A transport that never started — ssh
     refusing, a wrapper missing — comes back as a non-zero rc with its own
-    words, and is reported rather than counted as an empty answer."""
+    words, and is reported rather than counted as an empty answer.
+
+    `raw` keeps the answer as BYTES: a `chunks` answer carries compressed
+    frames, and decoding those as text destroys them."""
     try:
-        p = subprocess.run(argv_for(host), input=json.dumps(doc),
-                           capture_output=True, text=True)
+        p = subprocess.run(argv_for(host), input=json.dumps(doc).encode(),
+                           capture_output=True)
     except OSError as e:
-        return "", str(e), 127
-    return p.stdout, p.stderr.strip(), p.returncode
-
-
-# What `timberfs query --from` accepts, in its order. Zoneless forms are
-# LOCAL time, and a bare time is today.
-TIME_FORMATS = [
-    ("%Y-%m-%d %H:%M:%S", "d"), ("%Y-%m-%dT%H:%M:%S", "d"),
-    ("%Y-%m-%d %H:%M", "d"),    ("%Y-%m-%dT%H:%M", "d"),
-    ("%Y.%m.%d %H:%M:%S", "d"), ("%Y.%m.%d %H:%M", "d"),
-    ("%Y-%m-%d", "d"),          ("%Y.%m.%d", "d"),
-    ("%H:%M:%S.%f", "t"),       ("%H:%M:%S", "t"), ("%H:%M", "t"),
-]
-
-
-def when(text):
-    """A typed time, in milliseconds — resolved HERE.
-
-    Not by asking a local timberfs, which is what this used to do. A query
-    document is meant to be SELF-CONTAINED: a client that speaks it needs
-    the protocol and nothing else, and the whole point of this shell is
-    driving a timberfs somewhere else. Shelling out to a binary on THIS
-    machine to build a document for THAT one contradicts the arrangement,
-    and fails outright where none is installed.
-
-    Here is also the only correct place. `11:10` means 11:10 where the
-    person typing it is, and it means TODAY — a string carried in the
-    document would mean a different instant tomorrow, and a different one
-    again parsed in the server's timezone. Milliseconds are the resolved
-    form; the text is input to whatever resolves it, which keeps the
-    document a value.
-
-    The duplication that costs is bounded, unlike the selector's: a
-    disagreement here yields a different NUMBER, never a search the far
-    end reads as a different question."""
-    text = text.strip()
-    try:
-        # An explicit offset needs no assumption; anything else takes this
-        # machine's zone, which is the one the reader is in.
-        return int(datetime.datetime.fromisoformat(text).timestamp() * 1000)
-    except ValueError:
-        pass
-    for fmt, kind in TIME_FORMATS:
-        try:
-            t = datetime.datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-        if kind == "t":
-            t = datetime.datetime.combine(datetime.date.today(), t.time())
-        return int(t.astimezone().timestamp() * 1000)
-    if text.isdigit():
-        n = int(text)
-        # Anything this large is already milliseconds.
-        return n if n > 100_000_000_000 else n * 1000
-    raise ValueError(
-        f"{text!r} is not a time I read — try RFC3339, "
-        f"'YYYY-MM-DD [HH:MM[:SS]]', 'HH:MM[:SS]' for today, or unix seconds")
+        return (b"" if raw else ""), str(e), 127
+    return ((p.stdout if raw else p.stdout.decode("utf-8", "replace")),
+            p.stderr.decode("utf-8", "replace").strip(), p.returncode)
 
 
 # --------------------------------------------------------------- render
@@ -661,8 +633,8 @@ def parse_where(toks, i):
 
 # ----------------------------------------------------------- completion
 BACKSLASH = ["\\d", "\\d+", "\\dv", "\\?", "\\q"]
-VERBS = ["select", "tail", "declare", "fetch", "close", "create", "drop",
-         "refresh", "add",
+VERBS = ["select", "tail", "view", "declare", "fetch", "close", "create",
+         "drop", "refresh", "add",
          "show", "save", "load", "help", "quit"]
 AFTER_ENTRY = ["has", "not", "substring", "regex"]
 AFTER_TIME = ["since", "until", "between"]
@@ -715,6 +687,12 @@ class Complete:
                     return [pre + v for v in sorted(self.sh.values_of(k))]
             pre = f"[{head}," if head else "["
             return [pre + k + "=" for k in sorted(self.sh.keys_of())]
+        if toks[0] == "view":
+            if prev == "view":
+                return sorted(self.sh.views) + ["["]
+            if prev == "at":
+                return ["chunk", "offset"]
+            return ["at"] if n == 3 else []
         if prev in ("select", "tail", "fetch"):
             return KINDS if prev != "fetch" else []
         if prev == "from":
@@ -786,7 +764,7 @@ class Shell:
         if os.path.exists(RC):
             self.load(RC, quiet=True)
 
-    def ask(self, doc, host=None):
+    def ask(self, doc, host=None, raw=False):
         """Every call to a host goes through here, so that what it said is
         RECORDED rather than thrown away.
 
@@ -800,7 +778,7 @@ class Shell:
         # startup listing could land last and erase the note from the
         # command the person actually ran.
         started = time.monotonic()
-        out, err, rc = run(doc, host)
+        out, err, rc = run(doc, host, raw)
         st = self.hosts.setdefault(host, {})
         if started < st.get("at", 0):
             return out, err, rc
@@ -1150,6 +1128,12 @@ class Shell:
             cur = self.cursors.get(toks[3][1])
             if cur is None: raise ValueError(f"no cursor `{toks[3][1]}`")
             return self.fetch(cur, n)
+        if head == "view":
+            if len(toks) < 2:
+                raise ValueError(
+                    "view <source> [at <time> | at chunk N | at offset N]  "
+                    "-- `view []` is every store")
+            return self.view(toks)
         if head in ("select", "tail"):
             kind = toks[1][1].lower()
             if kind not in KINDS: raise ValueError(f"`{kind}`? one of {KINDS}")
@@ -1166,6 +1150,64 @@ class Shell:
             if head == "tail": return self.tail(doc)
             return self.once(doc, kind)
         raise ValueError(f"`{head}`? try `help`")
+
+    def view(self, toks):
+        """A pager over the tape, IN PROCESS.
+
+        The loop is search, jump, search again. A separate command would
+        have to leave the screen carrying "search this token", let the
+        shell print, and re-enter at a coordinate — a flicker per hop,
+        which is the opposite of what a viewer is for."""
+        if not sys.stdout.isatty():
+            raise ValueError("`view` needs a terminal")
+        backend = timberview.QueryBackend(self.ask, TARGETS)
+        tok = toks[1]
+        if tok[0] == "str" and tok[1].startswith(timberview.SCHEME + ":"):
+            addr = timberview.parse_address(tok[1])
+            terms = self.expand_ids(
+                [{"key": "id", "op": "=", "value": addr.store}])
+            pos = timberview.position(str(addr))
+            rest = 2
+        else:
+            terms = self.source(tok)
+            pos, rest = self.view_at(toks, 2)
+        if rest < len(toks):
+            raise ValueError(f"`{toks[rest][1]}`? nothing follows a position")
+        stores = backend.select_stores(terms)
+        if not stores:
+            raise ValueError(
+                "that predicate selects NO STORE"
+                + (f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1
+                   else "") + ", so there is nothing to open")
+        try:
+            end = timberview.watch(backend, stores[0], **pos)
+        except timberview.Refused as e:
+            raise ValueError(str(e))
+        if len(stores) > 1:
+            print(f"  -- 1 of {len(stores)} stores matched; S switches "
+                  "between them")
+        print(f"  {end}")
+
+    def view_at(self, toks, i):
+        """`at` names a coordinate and says which one it is: a time, a
+        chunk number, or an offset are three different numbers."""
+        if i >= len(toks):
+            return {}, i
+        if toks[i][1].lower() != "at":
+            raise ValueError(
+                f"`{toks[i][1]}`? after a source comes `at <time>`, "
+                "`at chunk N` or `at offset N`")
+        i += 1
+        if i >= len(toks):
+            raise ValueError("`at` what? a time, `chunk N` or `offset N`")
+        w = toks[i][1].lower()
+        if w in ("chunk", "offset"):
+            i += 1
+            if i >= len(toks) or not toks[i][1].isdigit():
+                raise ValueError(f"`at {w}` wants a number")
+            return ({"seq": int(toks[i][1])} if w == "chunk"
+                    else {"offset": int(toks[i][1])}), i + 1
+        return {"at": when(toks[i][1])}, i + 1
 
     def fetch(self, cur, n):
         """One page, from a real cursor: the positions the last answer

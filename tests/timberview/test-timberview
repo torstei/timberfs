@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""timberview's tests. No curses, no timberfs, no network.
+
+The viewer reaches the log through four operations and nothing else, so
+a fake that implements those four is a whole server — which is what
+makes the half worth testing (where you are, what a screen shows, and
+what the boundaries say) testable at all.
+
+    tests/timberview/test-timberview           # all
+    tests/timberview/test-timberview boundary  # one, by substring
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
+import timberview as tv                                    # noqa: E402
+
+ID_A = "aaaaaaaa-1111-2222-3333-444444444444"
+ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
+
+
+class Fake:
+    """A store as a list of chunk texts, and the four operations over
+    it. `fetches` is what makes "a seek, not a walk" a testable claim."""
+
+    def __init__(self, texts, sid=ID_A, host=None, dropped=0, writer=None,
+                 first_seq=0, hits=None, others=()):
+        self.texts = list(texts)
+        self.first_seq = first_seq
+        self.fetches = 0
+        self.hits = hits or []
+        self.unplaced = 0
+        self.capped = False
+        start = dropped
+        self.chunks = []
+        for i, t in enumerate(self.texts):
+            self.chunks.append(tv.Chunk(first_seq + i, start, len(t),
+                                        1000 + i * 10, 1009 + i * 10,
+                                        t.encode()))
+            start += len(t)
+        self.store = {
+            "name": "app", "id": sid, "_host": host, "path": "/l/app.log",
+            "first_seq": first_seq, "last_seq": first_seq + len(texts) - 1,
+            "chunks": len(texts), "logical_bytes": sum(len(t) for t in texts),
+            "dropped_chunks": 0 if not dropped else 3,
+            "dropped_uncompressed_bytes": dropped, "labels": {},
+        }
+        if writer:
+            self.store["writer"] = writer
+        self.all = [self.store] + list(others)
+
+    def stores(self, fresh=False):
+        return self.all
+
+    def select_stores(self, terms, remember=False):
+        return self.all
+
+    def bounds(self, store):
+        return next((s for s in self.all if s["id"] == store["id"]), None)
+
+    def chunk(self, store, seq=None, at=None):
+        self.fetches += 1
+        if at is not None:
+            return next((c for c in self.chunks if c.wf <= at <= c.wl), None)
+        return next((c for c in self.chunks if c.seq == seq), None)
+
+    def search(self, token, limit=200):
+        return list(self.hits), self.unplaced, self.capped
+
+
+TESTS = []
+
+
+def test(fn):
+    TESTS.append(fn)
+    return fn
+
+
+def lines_of(view, w=200, h=40):
+    return [r["text"] for r in view.layout(w, h) if not r["edge"]]
+
+
+def edges_of(view, w=200, h=40):
+    return [r["text"] for r in view.layout(w, h) if r["edge"]]
+
+
+def opened(fake, **where):
+    v = tv.View(fake, fake.store)
+    v.open(**where)
+    return v
+
+
+# ------------------------------------------------------------- address
+@test
+def a_position_says_which_coordinate_it_is():
+    """`#offset=` and `#chunk=` are different numbers. A bare one would
+    resolve to the wrong place silently, which is worse than a link that
+    will not parse."""
+    assert tv.parse_address("timber://m1/x#offset=42").kind == "offset"
+    assert tv.parse_address("timber://m1/x#chunk=42").kind == "chunk"
+    for bad in ("timber://m1/x#42", "timber://m1/x#seq=42",
+                "timber://m1/x#offset=soon"):
+        try:
+            tv.parse_address(bad)
+            raise AssertionError(f"{bad} parsed")
+        except ValueError:
+            pass
+
+
+@test
+def an_address_is_identity_with_the_host_as_a_hint():
+    """The store id is the name; bake the host in and every pasted link
+    breaks the day a store moves."""
+    a = tv.parse_address("timber:79d7f23a-b044")
+    assert a.host is None and a.store == "79d7f23a-b044", a
+    for text in ("timber://mail01/79d7#offset=337", "timber://mail01/79d7",
+                 "timber:79d7#chunk=9"):
+        assert str(tv.parse_address(text)) == text, text
+
+
+# -------------------------------------------------------------- tokens
+@test
+def the_selectable_tokens_are_exactly_the_searchable_ones():
+    """`--has` matches maximal ASCII-alphanumeric runs of 3..64. Offering
+    anything else would offer a search that cannot be run — and offering
+    a 64-character PREFIX of a longer run would offer one that finds
+    something else."""
+    assert [t[2] for t in tv.tokens("GET /api req-8f3a x2")] \
+        == ["GET", "api", "req", "8f3a"], tv.tokens("GET /api req-8f3a x2")
+    assert tv.tokens("a" * 65) == []
+    assert [t[2] for t in tv.tokens("a" * 64)] == ["a" * 64]
+
+
+@test
+def a_version_number_is_refused_with_the_reason():
+    """`26.1.18` is three runs of under three characters, so no search
+    can find it. Said where you point at it, not discovered later as an
+    empty answer."""
+    f = Fake(["one line\n"])
+    v = opened(f)
+    v.search("26.1.18")
+    assert "under 3" in v.message and "26" in v.message, v.message
+    assert v.hits == []
+
+
+# ---------------------------------------------------------------- tape
+@test
+def a_line_across_a_chunk_boundary_is_one_line():
+    """Chunks are flush boundaries, not line boundaries. Splitting each
+    chunk on its own would show two halves and give the second one an
+    offset no line starts at."""
+    f = Fake(["alpha\nbra", "vo\ncharlie\n"])
+    v = opened(f, seq=0)
+    assert lines_of(v) == ["alpha", "bravo", "charlie"], lines_of(v)
+    assert [ln.offset for ln in v.tape.lines] == [0, 6, 12]
+
+
+@test
+def a_boundary_fragment_is_held_back_while_there_is_more_tape():
+    """Showing half a line is a truncation the reader cannot see. With
+    tape on that side the fragment waits for the chunk that completes
+    it; at the true edge there is nothing to wait for."""
+    f = Fake(["alpha\nbra", "vo\ncharlie\n"])
+    t = tv.Tape(f, f.store)
+    t.chunks = [f.chunks[0]]
+    t._rebuild()
+    assert [ln.text for ln in t.lines] == ["alpha"], t.lines
+    t.chunks = [f.chunks[1]]
+    t._rebuild()
+    assert [ln.text for ln in t.lines] == ["charlie"], t.lines
+
+
+@test
+def an_offset_is_absolute_on_the_tape():
+    """The coordinate a search hands back and the one the viewer shows
+    are the same number, so it counts from the tape's start and not from
+    the run that happens to be loaded."""
+    f = Fake(["a\nb\n", "c\nd\n"], dropped=1000)
+    v = opened(f, seq=1)
+    assert [ln.offset for ln in v.tape.lines] == [1000, 1002, 1004, 1006]
+    assert v.tape.index_of(1005) == 2
+
+
+@test
+def seeking_to_an_offset_bisects_rather_than_walks():
+    """There is no seek-by-offset on the wire, so the chunk is found by
+    bisecting on what each fetched chunk says its own range is. A walk
+    would be 500 round trips on this store."""
+    f = Fake([f"line {i}\n" * 4 for i in range(1000)])
+    f.fetches = 0
+    c = f.chunks[700]
+    t = tv.Tape(f, f.store)
+    got = t.locate(c.start + 3)
+    assert got.seq == 700, got.seq
+    assert f.fetches <= 12, f.fetches
+
+
+@test
+def an_offset_off_the_tape_says_which_way_it_rotted():
+    f = Fake(["a\nb\n"], dropped=4096)
+    t = tv.Tape(f, f.store)
+    try:
+        t.locate(12)
+        raise AssertionError("accepted an offset below the tape")
+    except tv.Refused as e:
+        assert "4 096" in str(e), str(e)
+
+
+@test
+def the_top_of_the_log_is_a_seek_not_a_walk():
+    """`g` on a store of a thousand chunks must not fetch a thousand
+    chunks."""
+    f = Fake([f"{i}\n" for i in range(1000)])
+    v = opened(f)
+    f.fetches = 0
+    v.home()
+    assert f.fetches <= 4, f.fetches
+    assert v.tape.at_top() and v.cur == 0
+
+
+# --------------------------------------------------- stated boundaries
+@test
+def the_top_of_the_log_is_not_the_top_of_what_is_loaded():
+    """An empty screen that could mean either is the defect this project
+    keeps removing from its answers."""
+    f = Fake(["a\n" * 4, "b\n" * 4, "c\n" * 4])
+    v = opened(f, seq=2)
+    assert not any("top of the log" in e for e in edges_of(v)), edges_of(v)
+    v.home()
+    assert any("top of the log" in e for e in edges_of(v)), edges_of(v)
+
+
+@test
+def what_retention_dropped_is_stated():
+    f = Fake(["a\n", "b\n"], dropped=3 * 1024 * 1024, first_seq=61310)
+    v = opened(f)
+    v.home()
+    notes = " ".join(edges_of(v))
+    assert "chunk 61310" in notes and "3 chunk(s) older" in notes, notes
+    assert "3.0 MiB" in notes, notes
+
+
+@test
+def the_live_edge_is_named_as_not_shown():
+    """The newest lines are in no chunk yet, so the bottom has to say
+    that the end of the tape is not the end of the log."""
+    f = Fake(["a\n"], writer="pid 4242")
+    v = opened(f)
+    assert "pid 4242" in edges_of(v)[-1], edges_of(v)
+    assert "not be flushed" in edges_of(v)[-1]
+    quiet = opened(Fake(["a\n"]))
+    assert "nothing is appending" in edges_of(quiet)[-1]
+
+
+# -------------------------------------------------------------- screen
+@test
+def a_screen_with_room_to_spare_backs_up():
+    """Opening at the last chunk lands on the last line. A pager shows a
+    full screen ending there, not one line and blank space."""
+    f = Fake(["".join(f"line {i}\n" for i in range(40))])
+    v = opened(f)
+    assert len(lines_of(v, 80, 10)) >= 9, lines_of(v, 80, 10)
+    assert lines_of(v, 80, 10)[-1] == "line 39"
+
+
+@test
+def long_lines_are_a_preference_not_a_policy():
+    """Wrapped, a wide structured line is unreadable; truncated, the end
+    of every stack frame is hidden. Both, at runtime."""
+    f = Fake(["x" * 30 + "\nshort\n"])
+    v = opened(f, seq=0)
+    v.cur = 0
+    assert lines_of(v, 10, 10)[0] == "x" * 10
+    v.scroll_h(10)
+    assert lines_of(v, 10, 10)[0] == "x" * 10
+    v.scroll_h(-10)
+    v.toggle_wrap()
+    rows = [r for r in v.layout(10, 10) if r["line"] == 0]
+    assert len(rows) == 3 and rows[1]["text"] == "x" * 10, rows
+
+
+@test
+def control_bytes_are_shown_rather_than_obeyed():
+    """A log line carries ANSI escapes and stray carriage returns. On a
+    raw-mode screen those repaint the terminal, so they are drawn as
+    text — visible, and not dropped."""
+    f = Fake(["a\x1b[31mred\x07\tb\n"])
+    v = opened(f, seq=0)
+    text = lines_of(v)[0]
+    assert "\x1b" not in text and "\x07" not in text, repr(text)
+    assert text.startswith("a·[31mred·"), repr(text)
+    assert "\t" not in text
+
+
+@test
+def the_header_says_where_on_the_tape_this_is():
+    f = Fake(["a\n" * 50, "b\n" * 50], dropped=100)
+    v = opened(f, seq=0)
+    v.cur = 0
+    assert "chunk 0" in v.header() and "offset 100" in v.header(), v.header()
+    v.end()
+    assert "chunk 1" in v.header() and "99%" in v.header(), v.header()
+
+
+# -------------------------------------------------------------- search
+@test
+def a_hit_is_a_coordinate_and_opening_it_is_a_seek():
+    f = Fake(["one\ntwo\n", "three\nfour\n"])
+    f.hits = [tv.Hit(tv.Address(ID_A, None, "offset", 8), f.store, "three")]
+    v = opened(f)
+    v.search("three")
+    assert len(v.hits) == 1, v.message
+    v.jump(v.hits[0])
+    assert v.line().text == "three", v.line().text
+    assert str(v.address()) == f"timber:{ID_A}#offset=8"
+
+
+@test
+def a_hit_in_another_store_switches_to_it():
+    """A search knows nothing about which log holds the identifier, so
+    following one has to be able to leave the store you opened."""
+    other = Fake(["hello\nworld\n"], sid=ID_B, host="mail01")
+    other.store["name"] = "mail"
+    f = Fake(["one\n"], others=[other.store])
+    f.chunk = other.chunk
+    f.hits = [tv.Hit(tv.Address(ID_B, "mail01", "offset", 6),
+                     other.store, "world")]
+    v = opened(f)
+    v.search("world")
+    v.jump(v.hits[0])
+    assert v.store["id"] == ID_B and v.line().text == "world"
+    assert str(v.address()) == f"timber://mail01/{ID_B}#offset=6"
+
+
+@test
+def a_pair_with_no_identity_is_refused_before_anything_is_read():
+    """A plain `append` leaves a pair with no manifest, which is not a
+    store: there is no id, so no place in it can be written down. Said
+    in timberfs's own words rather than crashing on the missing field."""
+    f = Fake(["a\n"])
+    del f.store["id"]
+    v = tv.View(f, f.store)
+    try:
+        v.open()
+        raise AssertionError("opened a pair with no identity")
+    except tv.Refused as e:
+        assert "identity --mint" in str(e), str(e)
+    assert f.fetches == 0, f.fetches
+
+
+@test
+def an_answer_that_stopped_at_a_bound_says_so():
+    """A capped search and an exhausted one are different answers, and
+    only one of them means "that is all of them"."""
+    f = Fake(["one\n"])
+    f.hits = [tv.Hit(tv.Address(ID_A, None, "offset", 0), f.store, "one")]
+    f.capped = True
+    f.unplaced = 2
+    v = opened(f)
+    v.search("one")
+    assert "stopped at a bound" in v.message, v.message
+    assert "2 at a live edge" in v.message, v.message
+
+
+def main():
+    want = sys.argv[1] if len(sys.argv) > 1 else ""
+    chosen = [t for t in TESTS if want in t.__name__]
+    failed = 0
+    for t in chosen:
+        try:
+            t()
+            print(f"  ok    {t.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"  FAIL  {t.__name__}\n        {e}")
+        except Exception as e:
+            failed += 1
+            print(f"  ERROR {t.__name__}\n        {type(e).__name__}: {e}")
+    print(f"\n{len(chosen) - failed}/{len(chosen)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

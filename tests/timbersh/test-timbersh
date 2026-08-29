@@ -8,11 +8,15 @@ bug that actually happened.
     tests/timbersh/test-timbersh          # all
     tests/timbersh/test-timbersh short_id # one, by substring
 """
-import json, os, shutil, subprocess, sys, tempfile
+import fcntl, json, os, pty, select, shutil, struct, subprocess, sys
+import tempfile, termios, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TIMBERSH = os.path.join(HERE, "..", "..", "tools", "timbersh")
 FAKE = os.path.join(HERE, "fake-timberfs")
+
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
+from timberview import when                                  # noqa: E402
 
 ID_A = "aaaaaaaa-1111-2222-3333-444444444444"
 ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
@@ -55,6 +59,67 @@ class Session:
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class Pty(Session):
+    """A session on a terminal, for the statements that open a screen.
+
+    `view` refuses a pipe, and a viewer driven by sleeps would be a test
+    that sometimes passes — so this waits for what the screen actually
+    printed before sending the next key."""
+
+    def start(self, rows=24, cols=110):
+        cmd = [sys.executable, TIMBERSH, "-q",
+               "--histfile", os.path.join(self.dir, "history"),
+               "--rc", os.path.join(self.dir, "nonexistent-rc"),
+               "--cmd", f"{FAKE} _TIMBERHOST_" if self.hosts else FAKE]
+        if self.hosts:
+            cmd += ["--hosts", ",".join(self.hosts)]
+        env = {**os.environ, "FAKE_DIR": self.dir, "TERM": "xterm"}
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.execve(cmd[0], cmd, env)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
+        self.seen = ""
+        return self
+
+    def expect(self, marker, timeout=20):
+        end = time.time() + timeout
+        while marker not in self.seen:
+            if time.time() > end:
+                raise AssertionError(
+                    f"waited {timeout}s for {marker!r}; saw:\n{self.seen[-800:]}")
+            r, _, _ = select.select([self.fd], [], [], 0.2)
+            if r:
+                try:
+                    self.seen += os.read(self.fd, 65536).decode(
+                        "utf-8", "replace")
+                except OSError:
+                    break
+        return self
+
+    def send(self, text):
+        os.write(self.fd, text.encode())
+        return self
+
+    def finish(self):
+        self.send("\\q\n")
+        end = time.time() + 10
+        while time.time() < end:
+            r, _, _ = select.select([self.fd], [], [], 0.2)
+            if not r:
+                continue
+            try:
+                self.seen += os.read(self.fd, 65536).decode("utf-8", "replace")
+            except OSError:
+                break
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        os.waitpid(self.pid, 0)
+        return self
 
 
 TESTS = []
@@ -269,6 +334,78 @@ def stores_that_matched_but_held_nothing_are_not_the_same_answer():
         "select records from [] where entry has 'X';")
     assert "nothing matched, in 2 store(s)" in s.out, s.out
     assert "NO STORE" not in s.out, s.out
+    s.cleanup()
+
+
+def tape(name, sid, n=9):
+    """A store with several chunks, and the chunks themselves — what a
+    pager needs and a one-chunk fixture cannot exercise.
+
+    `start` is the running total, because it IS the offset on the tape:
+    a fixture where the two disagree would let a viewer that computed
+    offsets from the wrong end still pass."""
+    chunks, at = [], 0
+    for i in range(n):
+        text = f"chunk {i} first line\nc{i}\n"
+        chunks.append({"seq": i, "start": at, "text": text,
+                       "wf": 0, "wl": 9_999_999_999_999})
+        at += len(text)
+    st = store(name, sid)
+    st.update(chunks=n, first_seq=0, last_seq=n - 1, logical_bytes=at,
+              dropped_chunks=0, dropped_uncompressed_bytes=0)
+    return st, chunks
+
+
+@test
+def view_seeks_to_a_chunk_and_asks_for_exactly_one():
+    """`view [] at chunk 7` is a SEEK: a chunk number, one chunk, and no
+    predicate at all. A `match` member here would make the pager a
+    search, which is the other motion entirely."""
+    st, chunks = tape("app", ID_A)
+    s = Pty({"": {"stores": [st], "chunks": chunks}}).start()
+    s.expect("timberfs=#")
+    s.send("view [] at chunk 7;\n").expect("q quit")
+    s.send("q").expect("timber:")
+    s.finish()
+    docs = s.docs("chunks")
+    assert docs, [r["doc"] for r in s.requests]
+    assert any(d["window"].get("from_chunk") == 7 for d in docs), docs
+    for d in docs:
+        assert d["window"]["axis"] == "write", d
+        assert d["max"] == {"chunks": 1}, d
+        assert "match" not in d, d
+    at = sum(len(c["text"]) for c in chunks[:7])
+    assert f"timber:{ID_A}#offset={at}" in s.seen, s.seen[-400:]
+    s.cleanup()
+
+
+@test
+def view_at_a_time_is_one_chunk_on_the_write_axis():
+    """A position in time is the chunk COVERING that instant — a window
+    whose ends are the same millisecond, on the axis a chunk has."""
+    st, chunks = tape("app", ID_A)
+    s = Pty({"": {"stores": [st], "chunks": chunks}}).start()
+    s.expect("timberfs=#")
+    s.send("view [] at '2026-08-29 12:00';\n").expect("q quit")
+    s.send("q").expect("timber:")
+    s.finish()
+    timed = [d for d in s.docs("chunks") if "from" in d["window"]]
+    assert timed, s.docs("chunks")
+    d, ms = timed[0], when("2026-08-29 12:00")
+    assert d["window"]["from"] == d["window"]["to"] == ms, d
+    assert d["window"]["axis"] == "write" and d["max"] == {"chunks": 1}, d
+    s.cleanup()
+
+
+@test
+def view_refuses_a_predicate_that_selects_no_store():
+    """Opening nothing would be a blank screen, which is the same answer
+    as an empty log."""
+    s = Pty({"": {"stores": []}}).start()
+    s.expect("timberfs=#")
+    s.send("view [name=nope];\n").expect("NO STORE")
+    s.finish()
+    assert not s.docs("chunks"), s.docs("chunks")
     s.cleanup()
 
 

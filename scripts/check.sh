@@ -27,4 +27,6 @@ cargo build --release
 # about them needs a package.
 echo "==> tests/timbersh/test-timbersh"
 tests/timbersh/test-timbersh
+echo "==> tests/timberview/test-timberview"
+tests/timberview/test-timberview
 echo "==> all checks passed"

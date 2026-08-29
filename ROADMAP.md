@@ -305,21 +305,19 @@ here.
   limits** a query server will want to declare — its own ceilings,
   announced rather than discovered by having a request refused. Design
   note: [docs/plans/paging.md](docs/plans/paging.md).
-- **`view`: reading a store as a tape** — a pager over chunks in
-  `timbersh`, opening at the last chunk and scrolling back, with no
-  predicate and no result set. It exists for a loop a result set cannot
-  close: point at an identifier, search it across every host, and jump to
-  the coordinate a hit comes back with — which an `entry` record can now
-  supply, carrying `offset` beside `chunk`. Lines rather than entries, so
-  it needs no index and no parseable timestamps: the two cases where
-  `select` helps least. The timberfs side is DONE: `from_chunk` on a
-  bounded read is a seek rather than a resume, so one chunk by number is
-  an ordinary request, and what is refused is now a second START rather
-  than a bounded read. Its own front end too (an entry-aware pager for a
-  `records` stream needs no fleet), which makes the coordinate a value
-  worth writing down — and the note carries that thread: an address that
-  names a store by IDENTITY, so that `TIMBERFS_HOSTS` can stop being
-  /etc/hosts for timberfs and become something resolved. Design note:
+- **`view`: reading a store as a tape** — SHIPPED, a first version. A pager
+  over chunks that opens at the last one and scrolls back, with no
+  predicate and no result set, for a loop a result set cannot close: point
+  at an identifier, search it across every host, jump to the coordinate a
+  hit comes back with. Lines rather than entries, so it needs no index and
+  no parseable timestamps — the two cases where `select` helps least. It
+  is one module reached two ways, `view` in timbersh and `timberview(1)`
+  beside it, over four operations and nothing else, and a coordinate now
+  has a written form (`timber://host/id#offset=N`) that names a store by
+  IDENTITY. What remains: the second backend (an entry-aware pager for a
+  piped `records` stream), holding several hosts open on one instant, and
+  the resolver the address is shaped for — so that `TIMBERFS_HOSTS` can
+  stop being /etc/hosts for timberfs. Design note:
   [docs/plans/view.md](docs/plans/view.md).
 - **Ordering by the clock an entry CARRIES**: a bounded answer reads stores
   one after another and claims no order between them, because a streaming
