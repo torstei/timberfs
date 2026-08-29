@@ -877,6 +877,10 @@ class Records:
         self.by_id = {s.get("id"): s for s in stores}
         self.lines, self.entries = [], 0
         self.unplaced, self.trouble = 0, None
+        # A bound stopped the read, so the bottom of this screen is not the
+        # end of the answer. Saying otherwise is the same lie as a tape
+        # that stops scrolling without saying why.
+        self.limited = False
         # Entries from a timberfs too old to say where they are, which
         # is not the same fact as an entry at the live edge.
         self.stale, self.old = 0, None
@@ -896,6 +900,9 @@ class Records:
             if kind == "source":
                 names[f.get("id")] = os.path.basename(f.get("path", "?"))
                 seen.append(f.get("id"))
+                continue
+            if kind == "stream-end":
+                self.limited = self.limited or f.get("status") == "limited"
                 continue
             if kind != "entry":
                 continue
@@ -967,8 +974,9 @@ class Records:
                 + f" · {self.what}")
 
     def top_notes(self):
-        note = (f"── {self.entries} entr"
-                f"{'y' if self.entries == 1 else 'ies'} matched · {self.what}")
+        note = (f"── {'the first ' if self.limited else ''}{self.entries} entr"
+                f"{'y' if self.entries == 1 else 'ies'}"
+                f"{'' if self.limited else ' matched'} · {self.what}")
         if self.unplaced:
             note += f" · {self.unplaced} at a live edge, with no place to open"
         if self.stale:
@@ -978,6 +986,9 @@ class Records:
         return [note]
 
     def bottom_note(self):
+        if self.limited:
+            return ("── the answer continues past here · a bound stopped the "
+                    "read · `o` opens the log around an entry")
         return ("── end of the answer · `o` opens the log around an entry"
                 if self.entries else "── nothing matched")
 

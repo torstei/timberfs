@@ -60,6 +60,9 @@ something else again at the far end.
                  line history, default ~/.timbersh-history, mode 0600
   TIMBERSH_HISTSIZE
                  how many lines to keep, default 2000
+  TIMBERSH_PAGE  entries per CALL on an unbounded read, default 10000 --
+                 not the statement's `limit`, which is how much of the
+                 answer you want
 """
 import argparse, json, os, re, readline, subprocess, sys, threading, time
 
@@ -86,6 +89,14 @@ TARGETS = [None]
 # `refresh` is the way to ask, which is better than a timer either way —
 # it happens when you know something changed, and it says what did.
 STORE_TTL = float(os.environ.get("TIMBERSH_STORE_TTL", "0"))
+# How much of an answer comes back per CALL, which is not the `limit` in
+# the statement: that says how much of the ANSWER you want, this says how
+# much of it may be in memory at once. Nothing streams — a call is one
+# `subprocess.run`, so an unbounded read holds the whole answer, times the
+# hosts asked in parallel — and a 1 GiB store on thirteen hosts is not a
+# query, it is an OOM. An unbounded read is walked a page at a time and
+# hands the positions back as the next page's cursor.
+PAGE = int(os.environ.get("TIMBERSH_PAGE", "10000"))
 RC = os.environ.get("TIMBERSH_RC", os.path.expanduser("~/.timbershrc"))
 HISTFILE = os.environ.get("TIMBERSH_HISTFILE",
                           os.path.expanduser("~/.timbersh-history"))
@@ -112,6 +123,11 @@ HELP = """
   host (no order is claimed between them) and `limit N` is N in total, so
   a later host may go unread -- it says so when that happens. A host that
   cannot be reached is named, never quietly missing.
+
+  Nothing streams, so an UNBOUNDED `records` read is walked a page at a
+  time (--page, default 10000 entries) rather than held whole. That is
+  not `limit`: the limit says how much of the answer you want, the page
+  says how much of it is in memory at once.
   \\d+                    ...the listing with chunk counts and write spans
   \\dv                    the logviews      \\?  this      \\q  quit
 
@@ -471,7 +487,7 @@ def show_loglines(out, by_path, header=None, limit=None):
     return n
 
 
-def show_records(out, names, header=None, limit=None):
+def show_records(out, names, header=None, limit=None, note=True):
     last, shown = None, 0
     for kind, f, payload in records(out):
         if kind == "source":
@@ -491,7 +507,7 @@ def show_records(out, names, header=None, limit=None):
             # about, said a second way.
             # Not where the CLIENT truncated: the server's count would
             # then describe more than was shown.
-            if (shown or header is None) and limit is None:
+            if note and (shown or header is None) and limit is None:
                 note = f"  -- {f.get('entries','?')} entries"
                 if f.get("status") == "limited":
                     note += f", STOPPED by {f.get('limit','a bound')}"
@@ -1229,6 +1245,13 @@ class Shell:
                 f"     Ask for `select records ...`.")
         if not sys.stdout.isatty():
             raise ValueError("`into view` needs a terminal")
+        # An answer screen is a CLOSED set — it materialises every entry it
+        # is handed — so this is bounded to one page rather than paged to
+        # the end: walking a gigabyte into it would only move where the
+        # memory goes. The screen says the answer continues; an explicit
+        # `limit` is taken as typed.
+        if not doc.get("max"):
+            doc = dict(doc, max={"entries": PAGE})
         backend = timberview.QueryBackend(self.ask, TARGETS)
         # The statement names the answer, minus the part that says where
         # to put it — which the screen it is on already says.
@@ -1377,6 +1400,29 @@ class Shell:
             print("  -- nothing more (for now)")
         cur["at"] = list(at.values())
 
+    def next_page(self, out, at):
+        """Where this page got to, merged into the cursor. True if a bound
+        stopped the read, which is what says there is more.
+
+        Positions MERGE onto what is already held rather than replacing
+        it. Every store EXAMINED reports one, barren ones included — drop
+        those and the next page rescans them from the window's start,
+        which on a fleet is most of the cost. A store that delivered
+        nothing reports the position it was RESUMED from, so paging past a
+        quiet store cannot lose its place. Across hosts they accumulate:
+        a position names a store by id, and a host never looks up one it
+        does not have."""
+        more = False
+        for k, f, _ in records(out):
+            if k == "position" and f.get("id"):
+                if "offset" in f:
+                    at[f["id"]] = {"id": f["id"], "offset": int(f["offset"])}
+                else:
+                    at.setdefault(f["id"], {"id": f["id"]})
+            elif k == "stream-end" and f.get("status") == "limited":
+                more = True
+        return more
+
     def why_empty(self, doc, bad=None):
         """Nothing came back — was anything even SEARCHED?
 
@@ -1413,17 +1459,14 @@ class Shell:
                    else "")
                 + ", so nothing was searched")
 
-    def once(self, doc, kind):
-        # A `stores` answer is a SET, so the hosts merge into one listing.
-        if kind == "stores":
-            return self.list_stores(doc)
+    def fan_out(self, doc):
+        """One document to every host AT ONCE, as {host: (out, err, rc)}.
 
-        # Every host gets the REAL question, and they get it at the same
-        # time. There is no point asking first whether a host holds a
-        # matching store: a read whose predicate matches nothing resolves
-        # to nothing and returns immediately — measured at the same 0.00 s
-        # as the question "do you have one". The cost was never the search,
-        # it was N round trips taken one after another.
+        There is no point asking first whether a host holds a matching
+        store: a read whose predicate matches nothing resolves to nothing
+        and returns immediately — measured at the same 0.00 s as the
+        question "do you have one". The cost was never the search, it was
+        N round trips taken one after another."""
         answers, lock = {}, threading.Lock()
 
         def one(host):
@@ -1439,36 +1482,81 @@ class Shell:
                 t.join()
         else:
             one(TARGETS[0])
+        return answers
 
-        # Rendered in the order the hosts were GIVEN, not the order they
-        # answered — the fan-out is a way to spend the latency once, not a
-        # licence to interleave machines.
+    def once(self, doc, kind):
+        # A `stores` answer is a SET, so the hosts merge into one listing.
+        if kind == "stores":
+            return self.list_stores(doc)
+
         want = doc.get("max", {}).get("entries")
-        total, empty, bad, stopped = 0, [], {}, None
-        for host in TARGETS:
-            out, err, rc = answers[host]
-            if rc != 0:
-                bad[host] = err or f"exit {rc}"
-                continue
-            if want is not None and total >= want:
-                # ⚠ It has already been fetched. A bound sent to every host
-                # in parallel is a bound each of them honours, so the total
-                # is enforced here — which is why a later host can do work
-                # that is never shown. Bounded by the limit itself, and the
-                # price of not paying the latency serially.
-                stopped = stopped or host
-                continue
-            head = f"  == {label(host)}" if len(TARGETS) > 1 else None
-            room = None if want is None else want - total
-            if kind == "records":
-                n = show_records(out, self.names, header=head, limit=room)
-            elif kind == "loglines":
-                n = show_loglines(out, self.paths_on(host), header=head, limit=room)
-            else:
-                n = sys.stdout.write(out) and 0 or len(out.strip().splitlines())
-            if not n:
-                empty.append(host)
-            total += n
+        # ⚠ Paged only where every entry that comes back is SHOWN.
+        #
+        # A `limit` is a total across hosts, enforced here, so a later host
+        # is asked for the whole bound and its entries are read and then
+        # dropped. Its `position` records cover what it DELIVERED, so a
+        # cursor built from that page resumes past exactly the entries
+        # nobody saw. An unbounded read shows all of it, and the positions
+        # are then what they say they are.
+        #
+        # Only `records` carries a `position` record at all, so the other
+        # kinds cannot be continued and are left as one call rather than
+        # bounded into a silent truncation.
+        paged = want is None and kind == "records"
+        total, bad, stopped = 0, {}, None
+        shown_by, unshown, at, pages = {}, set(), {}, 0
+        while True:
+            d = doc
+            if paged:
+                d = dict(doc, max={"entries": PAGE})
+                if at:
+                    d["cursor"] = list(at.values())
+            answers = self.fan_out(d)
+            # Rendered in the order the hosts were GIVEN, not the order
+            # they answered — the fan-out is a way to spend the latency
+            # once, not a licence to interleave machines.
+            more = False
+            for host in TARGETS:
+                out, err, rc = answers[host]
+                if rc != 0:
+                    bad[host] = err or f"exit {rc}"
+                    continue
+                if want is not None and total >= want:
+                    # ⚠ It has already been fetched. A bound sent to every
+                    # host in parallel is a bound each of them honours, so
+                    # the total is enforced here — which is why a later
+                    # host can do work that is never shown. Bounded by the
+                    # limit itself, and the price of not paying the
+                    # latency serially.
+                    stopped = stopped or host
+                    unshown.add(host)
+                    continue
+                head = f"  == {label(host)}" if len(TARGETS) > 1 else None
+                room = None if want is None else want - total
+                if kind == "records":
+                    n = show_records(out, self.names, header=head, limit=room,
+                                     note=not paged)
+                elif kind == "loglines":
+                    n = show_loglines(out, self.paths_on(host), header=head,
+                                      limit=room)
+                else:
+                    n = sys.stdout.write(out) and 0 or len(out.strip().splitlines())
+                shown_by[host] = shown_by.get(host, 0) + n
+                total += n
+                if paged:
+                    more = self.next_page(out, at) or more
+            pages += 1
+            if not more:
+                break
+        empty = [h for h in TARGETS
+                 if h not in bad and h not in unshown and not shown_by.get(h)]
+        # The per-call note was suppressed while paging — the server says
+        # `limited` on every page but the last, which is this shell's own
+        # bound and not a truncation of the answer — so the count is said
+        # once here instead, as a fleet total rather than per host.
+        if paged and total:
+            print(f"  -- {total} entries"
+                  + (f", in {pages} pages of {PAGE}" if pages > 1 else ""))
 
         if stopped is not None:
             print(f"  -- stopped at {want}; {label(stopped)} and any after it "
@@ -1632,6 +1720,11 @@ def parse_args(argv):
                     help="the hosts that command reaches. $TIMBERFS_HOSTS")
     ap.add_argument("--rc", metavar="FILE", default=RC,
                     help="statements run at startup. $TIMBERSH_RC")
+    ap.add_argument("--page", metavar="N", type=int, default=PAGE,
+                    help="entries per CALL on an unbounded read, default "
+                         "10000. Not the statement's `limit` — that is how "
+                         "much of the ANSWER you want, this is how much of "
+                         "it is in memory at once. $TIMBERSH_PAGE")
     ap.add_argument("--ttl", metavar="SECS", type=float,
                     default=float(os.environ.get("TIMBERSH_STORE_TTL", "0")),
                     help="expire the cached store list after SECS. Default 0, "
@@ -1648,9 +1741,12 @@ def parse_args(argv):
 
 
 def main(argv=None):
-    global FLEET, TARGETS, RC, STORE_TTL
+    global FLEET, TARGETS, RC, STORE_TTL, PAGE
     a = parse_args(argv)
     RC, STORE_TTL = a.rc, a.ttl
+    if a.page < 1:
+        sys.exit("timbersh: --page wants a positive number of entries")
+    PAGE = a.page
     try:
         FLEET = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts)
     except ValueError as e:
