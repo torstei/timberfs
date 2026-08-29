@@ -1078,8 +1078,13 @@ HELP_KEYS = """
   Tab  ⇧Tab      the searchable terms on this line — an identifier is
                  ONE of them, separators and all
   Enter  *       search the picked one, everywhere
-  /              search a token you type
+  /              search a term you type
   n  N           the next / previous hit
+
+  In the hit list the same keys work on the hits themselves: Tab walks
+  the terms of the highlighted one and * searches it, so the identifier
+  you are really after can be followed without opening anything. Enter
+  there still means go to that hit.
 
   S              another store       ?             this      q  quit
 
@@ -1279,32 +1284,49 @@ class Screen:
             c.curs_set(0)
 
     def do_search(self, stdscr, token):
+        """Search, show the hits, and let a term picked out of THEM be
+        the next search. Following an identifier is rarely one hop, and
+        the second one is usually visible in the answer to the first."""
         v = self.view
         if not token:
             v.message = v.nothing_pickable()
             return
-        try:
-            self.busy(stdscr, f"searching {len(v.backend.hosts)} target(s) "
-                              f"for {token}", lambda: v.search(token))
-        except Refused as e:
-            v.message = str(e)
+        while token:
+            try:
+                self.busy(stdscr, f"searching {len(v.backend.hosts)} "
+                                  f"target(s) for {token}",
+                          lambda t=token: v.search(t))
+            except Refused as e:
+                v.message = str(e)
+                return
+            if not v.hits:
+                return
+            # A list, because an identifier on six hosts is six answers
+            # and jumping to one of them silently picks for you.
+            what, value = self.choose(
+                stdscr, f"{token} — {len(v.hits)} hit(s)",
+                [self.hit_row(x) for x in v.hits],
+                searchable=True, terms_from=self.HIT_PREFIX)
+            if what == "term":
+                token = value
+                continue
+            if what == "open":
+                v.hit = value
+                self.reach(stdscr, f"hit {value + 1}",
+                           lambda: v.jump(v.hits[value]))
+                v.message = f"hit {value + 1}/{len(v.hits)}  {v.message}"
             return
-        if not v.hits:
-            return
-        # A list, because an identifier on six hosts is six answers and
-        # jumping to one of them silently picks for you.
-        i = self.choose(stdscr, f"{token} — {len(v.hits)} hit(s)",
-                        [self.hit_row(x) for x in v.hits])
-        if i is not None:
-            v.hit = i
-            self.reach(stdscr, f"hit {i + 1}", lambda: v.jump(v.hits[i]))
-            v.message = f"hit {i + 1}/{len(v.hits)}  {v.message}"
+
+    # Where a hit row's TEXT begins. Fixed, and truncated to it, so the
+    # terms offered are the log line's and never the store's name.
+    HIT_PREFIX = 29
 
     def hit_row(self, hit):
         where = (hit.store or {}).get("name", "?")
         if hit.address.host:
             where += f" @ {hit.address.host}"
-        return f"{where:28} {hit.text[:200]}"
+        return f"{where[:self.HIT_PREFIX - 1]:{self.HIT_PREFIX - 1}} " \
+               f"{hit.text[:200]}"
 
     def pick_store(self, stdscr):
         v = self.view
@@ -1328,8 +1350,8 @@ class Screen:
         title = "stores" if not bad else (
             "stores  ⚠ no answer from "
             + ", ".join(sorted(h or "(local)" for h in bad)))
-        i = self.choose(stdscr, title, rows)
-        if i is None:
+        what, i = self.choose(stdscr, title, rows)
+        if what != "open":
             return
         v.tape = Tape(v.backend, stores[i])
         self.reach(stdscr, stores[i].get("name", "that store"), v.open)
@@ -1344,37 +1366,81 @@ class Screen:
         stdscr.refresh()
         stdscr.getch()
 
-    def choose(self, stdscr, title, rows):
+    def choose(self, stdscr, title, rows, searchable=False, terms_from=0):
+        """Pick a row, or — where the rows are hits — a TERM out of one.
+
+        A hit list is text you are reading, so the identifier you are
+        really after is often sitting in it: `Tab` walks the terms of
+        the highlighted row and `*` searches the picked one, without
+        first opening the hit to get at it. `Enter` still means the
+        primary thing here, which is going there.
+
+        Answers `(what, value)`: `("open", index)`, `("term", text)`,
+        or `(None, None)` for a cancel."""
         c = self.curses
-        sel, top = 0, 0
+        sel, top, tok = 0, 0, 0
         while True:
-            h, w = stdscr.getmaxyx()
+            h, _ = stdscr.getmaxyx()
             body = max(1, h - 2)
             top = min(top, sel)
             if sel >= top + body:
                 top = sel - body + 1
+            picked = (self.term_of(rows[sel][terms_from:], tok)
+                      if searchable else None)
             stdscr.erase()
             self.put(stdscr, 0, f"── {title}", c.A_REVERSE)
             for y, i in enumerate(range(top, min(len(rows), top + body)),
                                   start=1):
-                self.put(stdscr, y, rows[i],
-                         c.A_REVERSE if i == sel else 0)
-            self.put(stdscr, h - 1,
-                     "  Enter open   j/k move   q back", c.A_REVERSE)
+                base = c.A_REVERSE if i == sel else 0
+                self.put(stdscr, y, rows[i], base)
+                if searchable and i == sel:
+                    found = terms(rows[i][terms_from:])
+                    for n, (a, b, _t) in enumerate(found):
+                        a, b = a + terms_from, b + terms_from
+                        if b <= stdscr.getmaxyx()[1] - 1:
+                            try:
+                                stdscr.chgat(y, a, b - a, base | (
+                                    c.A_BOLD if n == tok % max(1, len(found))
+                                    else c.A_UNDERLINE))
+                            except c.error:
+                                pass
+            # The picked term goes FIRST: on a narrow screen the key
+            # hints are what can be spared, and it is not.
+            foot = f"  [{picked}]  " if picked else "  "
+            foot += "Enter open   j/k move   q back"
+            if searchable:
+                foot += "   Tab term   * search it   / type one"
+            self.put(stdscr, h - 1, foot, c.A_REVERSE)
             stdscr.refresh()
             key = stdscr.getch()
             if key in (ord("q"), KEY_ESC):
-                return None
+                return None, None
             if key in (KEY_CR, KEY_LF, c.KEY_ENTER):
-                return sel
-            if key in (ord("j"), c.KEY_DOWN):
-                sel = min(len(rows) - 1, sel + 1)
+                return "open", sel
+            if searchable and key == KEY_TAB:
+                tok += 1
+            elif searchable and key in (c.KEY_BTAB, ord("p")):
+                tok -= 1
+            elif searchable and key == ord("*"):
+                if picked:
+                    return "term", picked
+            elif searchable and key == ord("/"):
+                typed = self.prompt(stdscr, "search term: ")
+                if typed:
+                    return "term", typed
+            elif key in (ord("j"), c.KEY_DOWN):
+                sel, tok = min(len(rows) - 1, sel + 1), 0
             elif key in (ord("k"), c.KEY_UP):
-                sel = max(0, sel - 1)
+                sel, tok = max(0, sel - 1), 0
             elif key in (ord(" "), c.KEY_NPAGE):
-                sel = min(len(rows) - 1, sel + body)
+                sel, tok = min(len(rows) - 1, sel + body), 0
             elif key == c.KEY_PPAGE:
-                sel = max(0, sel - body)
+                sel, tok = max(0, sel - body), 0
+
+    @staticmethod
+    def term_of(row, n):
+        found = terms(row)
+        return found[n % len(found)][2] if found else None
 
 
 

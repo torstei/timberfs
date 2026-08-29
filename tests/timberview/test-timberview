@@ -18,6 +18,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
 import timberview as tv                                    # noqa: E402
+from timberview import KEY_CR, KEY_TAB                     # noqa: E402
 
 ID_A = "aaaaaaaa-1111-2222-3333-444444444444"
 ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
@@ -590,16 +591,24 @@ def Screen_for_test():
 
 
 class Screenish:
-    """Enough of a curses window for `busy` to draw on."""
+    """Enough of a curses window to draw on, and to type at."""
 
-    def __init__(self):
+    def __init__(self, keys=()):
         self.painted = []
+        self.keys = list(keys)
+        self.exhausted = False
 
     def getmaxyx(self):
-        return (24, 80)
+        return (24, 200)
 
     def addnstr(self, y, x, text, n, attr=0):
         self.painted.append(text)
+
+    def erase(self):
+        pass
+
+    def chgat(self, y, x, n, attr):
+        pass
 
     def refresh(self):
         pass
@@ -608,8 +617,14 @@ class Screenish:
         pass
 
     def getch(self):
+        if self.keys:
+            return self.keys.pop(0)
+        # Never -1 forever: a screen that keeps answering "no key" makes
+        # a test that never ends, and a hanging test is worse than a
+        # failing one. `q` gets out of anything.
         time.sleep(0.02)
-        return -1
+        self.exhausted = True
+        return ord("q")
 
 
 @test
@@ -715,6 +730,37 @@ def a_wait_says_so_and_hands_back_what_it_waited_for():
     quiet = Screenish()
     assert screen.busy(quiet, "reading mail01", lambda: 3) == 3
     assert quiet.painted == [], quiet.painted
+
+
+@test
+def a_hit_list_is_itself_searchable():
+    """The identifier you are really after is often sitting in the
+    answer to the last search. `Tab` walks the terms of the highlighted
+    hit and `*` searches the picked one, without opening it first —
+    `Enter` still means the primary thing here, which is going there."""
+    uuid = "9da3dcf1-5a4b-4d36-b907-917daa60bd90"
+    rows = [f"{'app @ mail01':28} 12:00:01 INFO req={uuid} handled"]
+    screen = Screen_for_test()
+
+    # `12:00:01` is not offered at all — every run in it is under three
+    # characters. So the terms are INFO, req, the id, handled; two Tabs
+    # from the first reaches the id, and `*` searches it.
+    tabs = [KEY_TAB] * 2 + [ord("*")]
+    what, value = screen.choose(Screenish(tabs), "t", rows,
+                                searchable=True, terms_from=29)
+    assert (what, value) == ("term", uuid), (what, value)
+
+    # The store's own name is never offered: terms start at the text.
+    what, value = screen.choose(Screenish([ord("*")]), "t", rows,
+                                searchable=True, terms_from=29)
+    assert value != "app" and "mail01" not in str(value), value
+
+    # Enter still opens rather than searching.
+    assert screen.choose(Screenish([KEY_CR]), "t", rows, searchable=True,
+                         terms_from=29) == ("open", 0)
+    # And a list that is not searchable has none of it.
+    assert screen.choose(Screenish([ord("*"), ord("q")]), "t", rows) \
+        == (None, None)
 
 
 def main():

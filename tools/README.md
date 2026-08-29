@@ -273,6 +273,11 @@ and then matches the whole thing word-anchored — so the UUID is ONE term,
 and it is the one worth offering. Measured on a store where the whole id
 matched one entry, its piece `5a4b` matched every entry in the chunk.
 
+The hit list is searchable the same way: `Tab` walks the terms of the
+highlighted hit and `*` searches that one, because following an
+identifier is rarely one hop and the second one is usually sitting in the
+answer to the first. `Enter` there still opens the hit.
+
 So `Tab` offers the widest identifier at each position — separators and
 all, joined on `-` `.` `_` `:` but never across `=` or `/`, which separate
 fields rather than sit inside a name. A term the index cannot hold at all
