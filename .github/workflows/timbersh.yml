@@ -52,12 +52,11 @@ jobs:
       # Architecture: all — it is a script, and cargo-deb would have called
       # it amd64.
       #
-      # `Depends: timberfs` wants a version once the bounded `from_chunk`
-      # seek is released: the viewer needs it, 0.25.0 refuses it, and both
-      # builds report 0.25.0 so nothing but the refusal can tell them
-      # apart. Until then the viewer diagnoses that refusal at runtime,
-      # which is what a REMOTE target needs anyway — a dpkg dependency
-      # only ever constrains this machine.
+      # `timberfs (>= 0.26.0)`: the viewer is nothing but seeks, and the
+      # bounded `from_chunk` one landed there — a 0.25.0 beside it can
+      # serve `select` and cannot open anything. The runtime diagnosis
+      # stays for the case a dependency cannot reach: a REMOTE target,
+      # which no dpkg constraint on this machine says anything about.
       - name: Build the .deb
         run: |
           V=$(tr -d '[:space:]' < tools/VERSION)
@@ -70,7 +69,7 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: all
-          Depends: timberfs, python3, zstd
+          Depends: timberfs (>= 0.26.0), python3, zstd
           Maintainer: Torstein Tauno Svendsen <torstei@gmail.com>
           Homepage: https://github.com/torstei/timberfs
           Description: timbersh and timberview, clients for timberfs

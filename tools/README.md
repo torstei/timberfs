@@ -267,11 +267,12 @@ match.
 - **An answer is a closed set.** Both ends are ends, nothing extends, and
   the boundary says "end of the answer" rather than naming a chunk you
   are not in.
-- **An entry still at the live edge is shown and cannot be opened** — it
-  is in no chunk yet, so there is no place to go. Counted in the top
-  note and said if you try, not quietly dropped. On a store being
-  written this is ordinary: the newest matches are in the WAL, and a
-  read delivers them before they are in any chunk.
+- **An entry still at the live edge carries no offset either** — it is in
+  no chunk yet — so it opens by its write window like any other, landing
+  at the end of the tape near where it is about to be. The line itself
+  will not be found there, and the message says which coordinate was
+  used. On a store being written this is ordinary: the newest matches
+  are in the WAL, and a read delivers them before any chunk holds them.
 - ⚠ **An entry with no place is still an entry**, and an old target in a
   fleet must not make a term unusable. `offset` on an entry record
   landed in **0.26.0**, so a target still on 0.25.0 answers with entries
