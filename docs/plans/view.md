@@ -98,9 +98,10 @@ timberview /var/log/timberfs/app/app.log
 An entry-aware pager for a `records` stream — multi-line entries as
 units, `ts`/`wf`/`offset` per entry, indexable tokens highlighted — is
 useful to anyone piping timberfs output. That, rather than "usable on the
-box", is what makes it a tool: on a fleet nobody has a shell on, the
-viewer runs on a workstation and needs exactly the shell's transport
-config anyway.
+box", is what makes it a tool. A shell on the host is the wrong thing to
+reach for even where someone has one, and plenty of the people who should
+be reading these logs do not — so the viewer runs on a workstation and
+needs the shell's transport config either way.
 
 So: a module with its own entry point, in `timberfs-sh`, and timbersh
 calls it **in process**.
@@ -196,17 +197,33 @@ it is derived rather than configured.
 
 The generalisation is a hook, not a feature: a `TIMBERFS_RESOLVER`
 command, the same shape as `TIMBERFS_CMD`, asked "who has this store" or
-"what is the fleet" and answering with hosts. It keeps discovery out of
-timberfs, where it does not belong — timberfs is a single-node tool and
-the fan-out has always lived in the client.
+"what is the fleet" and answering with hosts and how to reach them. It
+keeps discovery out of timberfs, where it does not belong — timberfs is a
+single-node tool and the fan-out has always lived in the client.
 
-⚠ Deliberately NOT now. Broadcast resolution is fine at 30 hosts and the
-measured fleet is 8 queryable of 30; the hook earns itself when a
-pasted address names a store the local configuration has never heard of,
-which is the case the viewer will eventually create and does not yet.
-What matters today is only that the address carries **identity**, so that
-adding a resolver later changes how a name is looked up and not what the
-name is.
+The reason to define the hook early is that the cheap implementations are
+useful the day it exists, and they are not the same programs:
+
+- `ssh <host> timberfs list --json` over a list of hosts — a resolver in
+  one line, and the honest floor.
+- **A static directory**: a file of stores, the hosts holding them, and
+  the command that reaches each. Which is /etc/hosts again, except as a
+  FILE that can be generated, reviewed, checked in and shared, rather
+  than an environment variable each person assembles. That alone covers
+  most of what a small fleet needs.
+- Service discovery, as `visena-timberfs hosts` already does.
+- Anything else: a registry, an inventory, a hosts file per environment.
+
+⚠ And it is queried by more than one tool. The shell, the viewer, and
+whatever comes next all ask the same question — "where is this store" —
+and none of them should each grow their own answer. That is the same rule
+the selector already has, one layer down.
+
+⚠ What stays deferred is timberfs knowing any of this. Broadcast
+resolution is fine at the measured fleet (8 queryable of 30) and needs no
+hook at all, so nothing has to wait. What matters today is only that the
+address carries **identity**, so adding a resolver later changes how a
+name is looked up and not what the name is.
 
 ## The protocol change: one refusal
 
