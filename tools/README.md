@@ -272,13 +272,20 @@ match.
   note and said if you try, not quietly dropped. On a store being
   written this is ordinary: the newest matches are in the WAL, and a
   read delivers them before they are in any chunk.
-- ⚠ **A target too old to place an entry is a different fact, and says
-  so.** `offset` on an entry record landed in **0.26.0**; a target still
-  on 0.25.0 answers with entries that have no place at all. Reported as
-  "at a live edge" that is a claim about the DATA where the truth is
-  about the server, and it sends you looking at the wrong thing — so the
-  stream's own `server_version` settles it and the note names the target
-  and the version to upgrade past.
+- ⚠ **An entry with no place is still an entry**, and an old target in a
+  fleet must not make a term unusable. `offset` on an entry record
+  landed in **0.26.0**, so a target still on 0.25.0 answers with entries
+  that carry none — but they are listed, read, and searched from like
+  any other. Dropping them made a term that matched only there report
+  "no hit", which is false, and took the terms in those entries with it.
+- ⚠ **And they are opened anyway, by WHEN rather than where.** An entry
+  record has carried `wf` — the write window it arrived in — since long
+  before `offset`, and a write-axis window of one millisecond is a seek
+  to the chunk covering it. Measured against a live store, `wf` alone
+  lands on the entry's own chunk; the line is then found in what comes
+  back. What is lost is exactness, not the ability to open: the hit list
+  marks such a row `·`, and the message says it was opened by the window
+  and which target could not give an offset.
 - ⚠ Only `records` can go into a view. The other kinds carry no offset,
   so nothing in such an answer could say where it came from — refused as
   a statement, wherever it is run, rather than as a terminal problem.

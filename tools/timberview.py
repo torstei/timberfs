@@ -186,10 +186,19 @@ class Chunk:
 
 
 class Hit:
-    """A search result, which is an address plus enough to recognise it."""
+    """A search result: an address, enough to recognise it, and the
+    write window it arrived in.
 
-    def __init__(self, address, store, text, ts=None):
+    That window is the fallback coordinate. An entry record has carried
+    `wf` since long before it carried `offset`, and a write-axis window
+    of one millisecond IS a seek to the chunk that covers it — measured
+    against a live store, seeking by `wf` alone lands on the entry's own
+    chunk. So an answer that cannot say where an entry is can still say
+    WHEN, and when is enough to open the log around it."""
+
+    def __init__(self, address, store, text, ts=None, wf=None):
         self.address, self.store, self.text, self.ts = address, store, text, ts
+        self.wf = wf
 
 
 class Refused(Exception):
@@ -469,21 +478,26 @@ class QueryBackend:
                     continue
                 if kind != "entry":
                     continue
-                if "chunk" not in f or "offset" not in f:
-                    if version and version < PLACED_FROM:
-                        # Not the live edge: this timberfs cannot say
-                        # where ANY of its entries are.
-                        self.stale[host] = version
-                    else:
-                        unplaced += 1
-                    continue
                 sid = f.get("id") or (sources[0] if len(sources) == 1 else None)
                 store = by_id.get(sid)
                 text = (payload or b"").decode("utf-8", "replace")
-                hits.append(Hit(
-                    Address(sid, host, "offset", int(f["offset"])),
-                    store, text.split("\n")[0].rstrip(),
-                    int(f["ts"]) if f.get("ts") else None))
+                # A hit with no PLACE is still a hit. Dropping it made a
+                # term that matched only on a target which cannot place
+                # one read as "no hit" — which is false, and the one
+                # thing an answer must never say. It is listed, it can
+                # be read, its terms can be searched; only OPENING it is
+                # refused, and then with the reason.
+                if "chunk" in f and "offset" in f:
+                    where = Address(sid, host, "offset", int(f["offset"]))
+                else:
+                    where = Address(sid, host)      # the store, no position
+                    if version and version < PLACED_FROM:
+                        self.stale[host] = version
+                    else:
+                        unplaced += 1
+                hits.append(Hit(where, store, text.split("\n")[0].rstrip(),
+                                int(f["ts"]) if f.get("ts") else None,
+                                int(f["wf"]) if f.get("wf") else None))
         return hits, unplaced, capped
 
 
@@ -558,11 +572,11 @@ def grouped(n):
 
 
 class Line:
-    __slots__ = ("offset", "text", "_terms", "at", "store", "first")
+    __slots__ = ("offset", "text", "_terms", "at", "store", "first", "wf")
 
     def __init__(self, offset, raw):
         self.offset = offset
-        self.at = self.store = None
+        self.at = self.store = self.wf = None
         self.first = True
         self.text = sanitise(raw.decode("utf-8", "replace"))
         self._terms = None
@@ -622,21 +636,31 @@ class Tape:
         if not isinstance(self.source, Records):
             self.message = "this is the log — you are already in it"
             return False
-        at = self.source.address_of(self.line())
-        if at is None:
-            old = getattr(self.source, "old", None)
-            self.message = (
-                too_old_to_place("the target that answered") if old
-                else "that entry is still at the live edge — it is in no "
-                     "chunk yet, so there is no place to open")
+        self.source_old = getattr(self.source, "old", None)
+        line = self.line()
+        at, when = self.source.address_of(line), getattr(line, "wf", None)
+        if at is None and when is None:
+            self.message = ("that entry says neither where nor when it is, so "
+                            "there is nothing to open it by")
             return False
-        store = (getattr(self.line(), "store", None) or {})
+        store = (getattr(line, "store", None) or {})
         if not store.get("id"):
             self.message = "that entry does not say which store it came from"
             return False
+        text = line.text
         self.source = Tape(self.backend, store)
-        self.open(offset=at.value)
-        self.message = f"the log around {at}"
+        if at is not None:
+            self.open(offset=at.value)
+            self.message = f"the log around {at}"
+        else:
+            # No offset, but the write window is a seek to the chunk it
+            # arrived in — which is where it is.
+            self.open(at=when)
+            self.find(text)
+            old = "a target on " + ".".join(map(str, self.source_old)) \
+                if getattr(self, "source_old", None) else "the answer"
+            self.message = (f"{self.address()} — by its write window, since "
+                            f"{old} gave no exact offset")
         return True
 
     def open(self, seq=None, at=None, offset=None):
@@ -888,9 +912,11 @@ class Records:
                 else:
                     self.unplaced += 1
             body = (payload or b"").rstrip(b"\n").split(b"\n")
+            when = int(f["wf"]) if f.get("wf") else None
             for n, raw in enumerate(body):
                 line = Line(int(f.get("offset", 0)), raw)
                 line.at = where
+                line.wf = when
                 line.store = store
                 line.first = n == 0
                 self.lines.append(line)
@@ -987,21 +1013,31 @@ class View:
         if not isinstance(self.source, Records):
             self.message = "this is the log — you are already in it"
             return False
-        at = self.source.address_of(self.line())
-        if at is None:
-            old = getattr(self.source, "old", None)
-            self.message = (
-                too_old_to_place("the target that answered") if old
-                else "that entry is still at the live edge — it is in no "
-                     "chunk yet, so there is no place to open")
+        self.source_old = getattr(self.source, "old", None)
+        line = self.line()
+        at, when = self.source.address_of(line), getattr(line, "wf", None)
+        if at is None and when is None:
+            self.message = ("that entry says neither where nor when it is, so "
+                            "there is nothing to open it by")
             return False
-        store = (getattr(self.line(), "store", None) or {})
+        store = (getattr(line, "store", None) or {})
         if not store.get("id"):
             self.message = "that entry does not say which store it came from"
             return False
+        text = line.text
         self.source = Tape(self.backend, store)
-        self.open(offset=at.value)
-        self.message = f"the log around {at}"
+        if at is not None:
+            self.open(offset=at.value)
+            self.message = f"the log around {at}"
+        else:
+            # No offset, but the write window is a seek to the chunk it
+            # arrived in — which is where it is.
+            self.open(at=when)
+            self.find(text)
+            old = "a target on " + ".".join(map(str, self.source_old)) \
+                if getattr(self, "source_old", None) else "the answer"
+            self.message = (f"{self.address()} — by its write window, since "
+                            f"{old} gave no exact offset")
         return True
 
     def open(self, seq=None, at=None, offset=None):
@@ -1136,11 +1172,13 @@ class View:
         if capped:
             notes.append("stopped at a bound, so there may be more")
         if unplaced:
-            notes.append(f"{unplaced} at a live edge, not yet placed")
+            notes.append(f"{unplaced} not in a chunk yet, so opened by their "
+                         f"write window")
         stale = getattr(self.backend, "stale", {})
         if stale:
             notes.append(
-                "and " + ", ".join(f"{h or '(local)'} answered on "
+                "opened by write window from "
+                + ", ".join(f"{h or '(local)'} on "
                                    f"{'.'.join(map(str, v))}"
                                    for h, v in sorted(stale.items(),
                                                       key=lambda x: x[0] or ""))
@@ -1156,25 +1194,62 @@ class View:
 
     def jump(self, hit):
         """Open where a hit is, switching store and host if that is where
-        it turned out to be."""
+        it turned out to be.
+
+        An exact offset is a seek to the line. Without one — a target too
+        old to give it, or an entry not yet in a chunk — the write window
+        is a seek to the CHUNK, which is ten screenfuls around it, and
+        the line is then found in what came back."""
+        if hit.address.kind != "offset" and hit.wf is None:
+            self.message = ("that hit says neither where nor when it is, so "
+                            "there is nothing to open it by")
+            return False
         store = hit.store
         if store and store.get("id") != self.store.get("id"):
             self.source = Tape(self.backend, store)
-        self.open(offset=hit.address.value)
+        if hit.address.kind == "offset":
+            self.open(offset=hit.address.value)
+        else:
+            self.open(at=hit.wf)
+            self.find(hit.text)
         if self.term:
             for i, (_, _, t) in enumerate(self.line_terms()):
                 if t == self.term:
                     self.tok = i
                     break
-        self.message = str(hit.address)
+        if hit.address.kind == "offset":
+            self.message = str(hit.address)
+        else:
+            stale = getattr(self.backend, "stale", {}).get(hit.address.host)
+            self.message = (
+                f"{self.address()} — by its write window, not an exact offset"
+                + (f" ({hit.address.host or 'that target'} answered on "
+                   f"{'.'.join(map(str, stale))})" if stale
+                   else "; it was not in a chunk when the answer was made"))
+        return True
+
+    def find(self, text):
+        """Put the cursor on the line that IS this entry, in what a
+        window-seek brought back. The chunk is the right one; this is
+        which line of it."""
+        want = (text or "").strip()
+        if not want:
+            return False
+        for i, ln in enumerate(self.source.lines):
+            if ln.text.strip() == want:
+                self.cur = self.top = i
+                self.tok = 0
+                return True
+        return False
 
     def cycle(self, step):
         if not self.hits:
             self.message = "no hits to cycle — pick a token and press Enter"
             return
         self.hit = (self.hit + step) % len(self.hits)
-        self.jump(self.hits[self.hit])
-        self.message = f"hit {self.hit + 1}/{len(self.hits)}  {self.message}"
+        moved = self.jump(self.hits[self.hit])
+        self.message = (f"hit {self.hit + 1}/{len(self.hits)}  "
+                        + ("" if moved else "not opened: ") + self.message)
 
     # -- what a screen of this size shows
     def rowcount(self, i, width):
@@ -1563,7 +1638,12 @@ class Screen:
         where = (hit.store or {}).get("name", "?")
         if hit.address.host:
             where += f" @ {hit.address.host}"
-        return f"{where[:self.HIT_PREFIX - 1]:{self.HIT_PREFIX - 1}} " \
+        # A hit with no position is readable and not openable, and the
+        # list says which is which rather than letting Enter find out.
+        # `·` reads as "by its write window": the right chunk, found by
+        # when rather than where.
+        mark = " " if hit.address.kind == "offset" else "·"
+        return f"{mark}{where[:self.HIT_PREFIX - 2]:{self.HIT_PREFIX - 2}} " \
                f"{hit.text[:200]}"
 
     def pick_store(self, stdscr):

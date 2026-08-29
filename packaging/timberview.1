@@ -159,14 +159,23 @@ chunk yet \(em counted and said, never dropped. On a store being written
 that is ordinary: the newest matches are still in the write-ahead
 sidecar.
 .PP
-⚠ A target too old to place an entry is a DIFFERENT fact.
+⚠ An entry with no place is still an entry.
 .B offset
 on an entry record landed in 0.26.0, so a target still on 0.25.0 answers
-with entries that have no place at all. Calling that a live edge would
-be a claim about the data where the truth is about the server, so the
-stream's own
-.B server_version
-decides, and the note names the target and what to upgrade past.
+with entries carrying none \(em and they are listed, read and searched
+from like any other, because an old target in a fleet must not make a
+term unusable.
+.PP
+They are opened anyway, by WHEN rather than where: an entry record has
+carried
+.BR wf ,
+the write window it arrived in, since long before
+.BR offset ,
+and a write-axis window of one millisecond is a seek to the chunk
+covering it. The line is then found in what comes back. What is lost is
+exactness \(em such a hit is marked
+.B ·
+in the list, and the message says it was opened by the window.
 .PP
 ⚠ Reading from a pipe needs a keyboard from somewhere other than stdin,
 which is the answer:

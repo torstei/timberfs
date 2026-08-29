@@ -410,7 +410,7 @@ def an_answer_that_stopped_at_a_bound_says_so():
     v = opened(f)
     v.search("one")
     assert "stopped at a bound" in v.message, v.message
-    assert "2 at a live edge" in v.message, v.message
+    assert "2 not in a chunk yet" in v.message, v.message
 
 
 @test
@@ -807,9 +807,14 @@ def an_entry_at_the_live_edge_is_shown_but_cannot_be_opened():
     assert r.entries == 1 and r.unplaced == 1
     assert r.address_of(r.lines[0]) is None
     assert "live edge" in r.top_notes()[0], r.top_notes()
-    v = tv.View(Fake(["x\n"]), source=r)
-    assert v.leave_for_the_log() is False
-    assert "no chunk yet" in v.message, v.message
+    # It is opened by WHEN it arrived instead — the chunk it is in.
+    f = Fake(["fresh\nlater\n"])
+    f.chunks[0].wf, f.chunks[0].wl = 100, 200
+    r.lines[0].store = f.store
+    r.lines[0].wf = 150
+    v = tv.View(f, source=r)
+    assert v.leave_for_the_log() is True
+    assert "write window" in v.message, v.message
 
 
 @test
@@ -853,42 +858,88 @@ def a_target_too_old_to_place_an_entry_is_not_a_live_edge():
     "at the live edge" states a fact about the DATA where the truth is a
     fact about the server, so it sends you looking at the wrong thing.
     The stream says what produced it, which settles it."""
-    old = tv.Records(answer(("boom", {"ts": 1}), version="0.25.0"))
+    old = tv.Records(answer(("boom", {"ts": 1, "wf": 150}), version="0.25.0"))
     assert old.stale == 1 and old.unplaced == 0, (old.stale, old.unplaced)
     assert "0.25.0" in old.top_notes()[0], old.top_notes()
     assert "live edge" not in old.top_notes()[0], old.top_notes()
 
-    v = tv.View(Fake(["x\n"]), source=old)
-    assert v.leave_for_the_log() is False
-    assert "predates the coordinate" in v.message, v.message
-    assert "Upgrade" in v.message, v.message
+    # And still opened, by the window the old record does carry.
+    f = Fake(["boom\nnext\n"])
+    f.chunks[0].wf, f.chunks[0].wl = 100, 200
+    old.lines[0].store = f.store
+    v = tv.View(f, source=old)
+    assert v.leave_for_the_log() is True, v.message
+    assert "write window" in v.message and "0.25.0" in v.message, v.message
 
     # A current target with an unflushed entry is still the live edge.
-    fresh = tv.Records(answer(("boom", {"ts": 1}), version="0.26.0"))
+    fresh = tv.Records(answer(("boom", {"ts": 1, "wf": 150}), version="0.26.0"))
     assert fresh.unplaced == 1 and fresh.stale == 0
     assert "live edge" in fresh.top_notes()[0], fresh.top_notes()
 
 
 @test
-def a_search_says_which_target_could_not_place_its_hits():
-    """The same mistake one level up: every hit unplaced reads as "no
-    hit, all at a live edge" when it means one target is too old."""
+def a_hit_that_cannot_be_placed_is_still_a_hit():
+    """It used to be DROPPED, so a term matching only on a target that
+    cannot place one read as "no hit" — false, and the one thing an
+    answer must never say. A couple of old servers in a fleet must not
+    make a term unusable: the hits are listed, read and searched from;
+    only OPENING one is refused, and then with the reason."""
+    def host_answers(host):
+        body = f"boom on {host}".encode()
+        version = "0.25.0" if host == "old01" else "0.26.0"
+        fields = {"len": len(body), "ts": 1, "wf": 7}
+        if version == "0.26.0":
+            fields.update(chunk=4, offset=99)
+        return wire(("stream-start", {"server_version": f"timberfs, {version}"},
+                     None),
+                    ("source", {"path": f"/l/{host}.log", "id": ID_A}, None),
+                    ("entry", fields, body))
+
     def ask(doc, host=None, raw=False):
         if (doc.get("response_format") or {}).get("kind") == "stores":
             return json.dumps({"server_version": "t", "stores": []}), "", 0
-        body = b"boom"
-        return wire(("stream-start", {"server_version": "timberfs, 0.25.0"}, None),
-                    ("source", {"path": "/l/a.log", "id": ID_A}, None),
-                    ("entry", {"len": len(body), "ts": 1}, body)), "", 0
+        return host_answers(host), "", 0
 
-    b = tv.QueryBackend(ask, ["old01"])
+    b = tv.QueryBackend(ask, ["new01", "old01"])
     hits, unplaced, capped = b.search("boom")
-    assert hits == [] and unplaced == 0, (hits, unplaced)
+    assert len(hits) == 2, [h.text for h in hits]
+    assert [h.address.kind for h in hits] == ["offset", None], hits
     assert b.stale == {"old01": (0, 25, 0)}, b.stale
+    assert unplaced == 0, unplaced          # old, not unflushed
+    # The one that could not be placed still carries WHEN it arrived,
+    # which is what opens it.
+    assert hits[1].wf == 7, hits[1].wf
+
     v = tv.View(b, source=tv.Records(answer(("x", {"offset": 0}))))
     v.search("boom")
-    assert "old01 answered on 0.25.0" in v.message, v.message
-    assert "live edge" not in v.message, v.message
+    assert "2 hit(s)" in v.message, v.message
+    assert "old01 on 0.25.0" in v.message, v.message
+
+    # The list says which is exact and which is by the write window.
+    rows = [Screen_for_test().hit_row(h) for h in hits]
+    assert rows[0].startswith(" ") and rows[1].startswith("·"), rows
+
+
+@test
+def a_hit_with_no_offset_is_opened_by_its_write_window():
+    """An entry record has carried `wf` since long before `offset`, and
+    a write-axis window of one millisecond is a seek to the chunk that
+    covers it — measured against a live store, `wf` alone lands on the
+    entry's own chunk. So "cannot be opened" was a limitation of the
+    viewer, not a fact about the answer: what is lost is the exact line,
+    and that is found in the chunk that comes back."""
+    f = Fake(["alpha\nbravo\ncharlie\n"])
+    f.chunks[0].wf, f.chunks[0].wl = 500, 600
+    hit = tv.Hit(tv.Address(ID_A, None), f.store, "bravo", wf=550)
+    v = opened(f)
+    assert v.jump(hit) is True
+    assert v.line().text == "bravo", v.line().text
+    assert "write window" in v.message and "exact offset" in v.message, v.message
+
+    # With neither a place nor a time there is nothing to open it by,
+    # and that is said rather than guessed at.
+    assert v.jump(tv.Hit(tv.Address(ID_A, None), f.store, "x")) is False
+    assert "neither where nor when" in v.message, v.message
 
 
 def main():
