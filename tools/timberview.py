@@ -191,8 +191,11 @@ class Refused(Exception):
 NO_SEEK = "a chunk number is a resume position"
 NO_SEEK_WHY = (
     "\n      — that timberfs predates the bounded seek a pager is made of "
-    "(the `from_chunk` change after 0.25.0). Its version cannot tell you: "
-    "the builds either side of it report the same one.")
+    "(the `from_chunk` change after 0.25.0)."
+    "\n      Reach a newer one: put it earlier on PATH, or name it in "
+    "TIMBERFS_CMD or the target's `cmd`."
+    "\n      Its version cannot tell you which you have — the builds "
+    "either side of that change report the same one.")
 
 
 class QueryBackend:

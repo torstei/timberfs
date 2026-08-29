@@ -504,6 +504,9 @@ def a_timberfs_from_before_the_seek_is_diagnosed_not_relayed():
     except tv.Refused as e:
         assert "predates the bounded seek" in str(e), str(e)
         assert "resume position" in str(e), str(e)
+        # The remedy, not just the cause: a diagnosis you have to act on
+        # from first principles has done half its job.
+        assert "PATH" in str(e) and "TIMBERFS_CMD" in str(e), str(e)
         assert "report the same one" in str(e), str(e)
 
 
