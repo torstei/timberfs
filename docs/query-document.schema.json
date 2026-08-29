@@ -263,7 +263,7 @@
           "const": "stores"
         },
         {
-          "description": "Compressed chunks, verbatim — nothing decompressed at either end.\n⚠ Chunks do not align to a window, so the answer is a SUPERSET of\nwhat was asked for and the response must say what window it\nactually widened to.",
+          "description": "Compressed chunks, verbatim — nothing decompressed at either end.\n\nFramed as `timberfs-records(5)`: one `chunk` record per chunk,\ncarrying its RING — number, offsets, lengths, write window — and\nthe zstd frame as its payload. The ring is what makes the answer\nusable: without it a consumer has bytes it cannot bound, number,\nplace in time, or resume from.\n\n⚠ Chunks do not align to a window, so the answer is a SUPERSET of\nwhat was asked for. Each record says which window its chunk\nactually covers, so the widening is visible per chunk rather than\nasserted once.",
           "type": "string",
           "const": "chunks"
         }

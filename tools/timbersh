@@ -50,6 +50,10 @@ something else again at the far end.
                  remembers where it lives. Unset, there is one unnamed host
                  and nothing is substituted.
   TIMBERSH_RC    statements run at startup, default ~/.timbershrc
+  TIMBERSH_HISTFILE
+                 line history, default ~/.timbersh-history, mode 0600
+  TIMBERSH_HISTSIZE
+                 how many lines to keep, default 2000
 """
 import argparse, datetime, json, os, re, readline, shlex, subprocess, sys, threading, time
 
@@ -66,6 +70,9 @@ TARGETS = HOSTS or [None]
 # it happens when you know something changed, and it says what did.
 STORE_TTL = float(os.environ.get("TIMBERSH_STORE_TTL", "0"))
 RC = os.environ.get("TIMBERSH_RC", os.path.expanduser("~/.timbershrc"))
+HISTFILE = os.environ.get("TIMBERSH_HISTFILE",
+                          os.path.expanduser("~/.timbersh-history"))
+HISTSIZE = int(os.environ.get("TIMBERSH_HISTSIZE", "2000"))
 KINDS = ("records", "loglines", "stores", "chunks")
 OPS = ("!=", "!~", "!*", "=~", "=*", "=")
 
@@ -102,6 +109,8 @@ HELP = """
   show logviews;                           what is defined
   show hosts;                              what each one is, and whether
                                            anything it said went wrong
+  add host web03;                          ask it too, from now on
+  drop host web03;                         stop asking it
 
   select <kind> from <source> [where ...] [limit N [chunks]];
   tail   <kind> from <source> [where ...];
@@ -507,6 +516,26 @@ def label(host):
     return host or "(local)"
 
 
+def check_hosts(targets, cmd):
+    """What a host set and a command must agree about, or None.
+
+    Both directions are wrong in the same silent way. Several hosts with
+    nowhere to put them sends the SAME command to each, so one forest is
+    read N times and every entry comes back N times under a different
+    host's name. A placeholder with no host to fill it runs the command
+    with `_TIMBERHOST_` in it literally — which reaches something, or
+    nothing, and reports whatever that was."""
+    named = [h for h in targets if h]
+    token = any(HOST_TOKEN in x for x in cmd)
+    if named and not token:
+        return (f"the command has no {HOST_TOKEN} to put a host in:\n"
+                f"      {' '.join(cmd)}")
+    if token and not named:
+        return (f"the command has a {HOST_TOKEN} and no host to put in it, so it "
+                f"would run with the placeholder still in it:\n      {' '.join(cmd)}")
+    return None
+
+
 def unwrap(text):
     """An answer, as (stores, server_version).
 
@@ -633,7 +662,7 @@ def parse_where(toks, i):
 # ----------------------------------------------------------- completion
 BACKSLASH = ["\\d", "\\d+", "\\dv", "\\?", "\\q"]
 VERBS = ["select", "tail", "declare", "fetch", "close", "create", "drop",
-         "refresh",
+         "refresh", "add",
          "show", "save", "load", "help", "quit"]
 AFTER_ENTRY = ["has", "not", "substring", "regex"]
 AFTER_TIME = ["since", "until", "between"]
@@ -705,8 +734,13 @@ class Complete:
             return ["has", "substring", "regex"]
         if prev in ("logline", "written", "write"):
             return AFTER_TIME
+        if prev == "add":
+            return ["host"]
         if prev in ("create", "drop"):
-            return ["logview"]
+            return ["logview", "host"] if prev == "drop" else ["logview"]
+        # `drop host <TAB>` names one that is there.
+        if prev == "host" and toks[0] == "drop":
+            return [label(h) for h in TARGETS if h]
         # What follows `logview` depends on the verb: `drop` names one that
         # exists, `create` starts the predicate the new one will be.
         if prev == "logview":
@@ -977,6 +1011,40 @@ class Shell:
         if head == "help": print(HELP); return
         if head == "save": self.save(toks[1][1] if len(toks) > 1 else None); return
         if head == "load": self.load(toks[1][1] if len(toks) > 1 else RC); return
+        if head in ("add", "drop") and len(toks) > 1 \
+                and toks[1][1].lower().startswith("host"):
+            if len(toks) < 3:
+                raise ValueError(f"{head} host <name> [name ...]")
+            names = [t[1] for t in toks[2:] if t[1] != ","]
+            global TARGETS
+            now = [h for h in TARGETS if h]  # the unnamed host is not a host
+            for n in names:
+                if head == "add":
+                    if n in now:
+                        raise ValueError(f"`{n}` is already there")
+                    now.append(n)
+                else:
+                    if n not in now:
+                        raise ValueError(
+                            f"no host `{n}` — `show hosts;` lists them")
+                    now.remove(n)
+            if not now:
+                raise ValueError(
+                    "that is the last host; a shell with none has nothing to ask")
+            problem = check_hosts(now, CMD)
+            if problem:
+                raise ValueError(problem)
+            TARGETS = now
+            # The cached stores are tagged with the host they came from, so
+            # a changed set makes the cache answer for a fleet that is no
+            # longer the one being asked.
+            for h in list(self.hosts):
+                if h not in TARGETS:
+                    del self.hosts[h]
+            self.universe(fresh=True)
+            print(f"  {len(TARGETS)} host(s): {', '.join(label(h) for h in TARGETS)}")
+            show_unreachable(self.unreachable)
+            return
         if head == "refresh":
             before = {st.get("id") or st["name"]: st["name"]
                       for st in self.universe()}
@@ -1241,16 +1309,21 @@ class Shell:
         if stopped is not None:
             print(f"  -- stopped at {want}; {label(stopped)} and any after it "
                   f"were read but not shown")
-        # A host with nothing is counted, not given a header of its own:
-        # six empty headers is noise standing where an answer should be.
-        if empty and len(TARGETS) > 1:
-            print(f"  -- nothing on {len(empty)}: "
-                  + ", ".join(label(h) for h in TARGETS if h in empty))
-        report_errors(bad)
-        if not total and not bad and not empty:
+        # NOTHING came back, and nothing failed. Which host had nothing is
+        # then the one thing that does not matter: every host has nothing,
+        # and the tally reads identically whether the stores held no
+        # matching entry or the predicate selected no store at all. Say
+        # which — it costs one round trip, on the case that needs it.
+        if not total and not bad:
             note = self.why_empty(doc)
             if note:
                 print(note)
+        # A host with nothing is counted, not given a header of its own:
+        # six empty headers is noise standing where an answer should be.
+        elif empty and len(TARGETS) > 1:
+            print(f"  -- nothing on {len(empty)}: "
+                  + ", ".join(label(h) for h in TARGETS if h in empty))
+        report_errors(bad)
 
     def list_stores(self, doc):
         """One listing from every host, in parallel: a set has no order to
@@ -1316,6 +1389,54 @@ class Shell:
             print("\n  stopped.")
 
 
+def load_history(path, size):
+    """Read the history, and arrange for it to be written back.
+
+    ⚠ Mode 0600, and created that way rather than fixed afterwards. A
+    history of queries is a list of the identifiers someone went looking
+    for — request ids, customer names, hostnames — which is production
+    data sitting in a dotfile. `psql` has the same exposure and the same
+    answer.
+
+    Failure here never stops a session. A read-only home, a directory that
+    does not exist, a file someone else owns: none of that is a reason to
+    refuse to open a shell, so it is reported once and the session runs
+    without history."""
+    readline.set_history_length(size)
+    try:
+        readline.read_history_file(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"  ! history not read from {path}: {e}")
+
+    def save():
+        try:
+            # Create it 0600 rather than widening then narrowing: between
+            # those two calls the file is readable, and that window is the
+            # whole point of the mode.
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+            readline.write_history_file(path)
+        except OSError as e:
+            print(f"  ! history not saved to {path}: {e}")
+
+    return save
+
+
+def remember(line):
+    """Record a line, whether or not readline saw it.
+
+    In a terminal readline adds it as `input()` returns; through a pipe it
+    does not, because `input()` only uses readline on a tty. Adding it here
+    makes the history the same either way — and comparing against the last
+    entry is what stops a terminal getting two copies of every line."""
+    n = readline.get_current_history_length()
+    if n and readline.get_history_item(n) == line:
+        return
+    readline.add_history(line)
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(
         prog="timbersh", add_help=True,
@@ -1340,6 +1461,11 @@ def parse_args(argv):
                     help="expire the cached store list after SECS. Default 0, "
                          "which never expires it — `refresh` re-reads it. "
                          "$TIMBERSH_STORE_TTL")
+    ap.add_argument("--histfile", metavar="FILE", default=HISTFILE,
+                    help="where the line history is kept, mode 0600. "
+                         "$TIMBERSH_HISTFILE")
+    ap.add_argument("--histsize", metavar="N", type=int, default=HISTSIZE,
+                    help="how many lines to keep. $TIMBERSH_HISTSIZE")
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="start without printing the help")
     return ap.parse_args(argv)
@@ -1356,9 +1482,9 @@ def main(argv=None):
     # command, so the same forest would be read N times and every entry
     # come back N times, labelled with a different host each time. A wrong
     # answer that looks like a busy fleet.
-    if len(TARGETS) > 1 and not any(HOST_TOKEN in x for x in CMD):
-        sys.exit(f"timbersh: --hosts names {len(TARGETS)} hosts, but --cmd has no "
-                 f"{HOST_TOKEN} to put them in:\n      {a.cmd}")
+    problem = check_hosts(TARGETS, CMD)
+    if problem:
+        sys.exit(f"timbersh: {problem}")
     sh = Shell()
     # A space is the only delimiter: `[type=console` is ONE word to the
     # completer, which is what lets a predicate literal complete its own
@@ -1366,24 +1492,34 @@ def main(argv=None):
     readline.set_completer(Complete(sh))
     readline.set_completer_delims(" ")
     readline.parse_and_bind("tab: complete")
+    save_history = load_history(a.histfile, a.histsize)
     if not a.quiet:
         print(HELP)
         if len(TARGETS) > 1:
             print(f"  {len(TARGETS)} hosts: {', '.join(TARGETS)}\n")
     if sh.views:
         print(f"  {len(sh.views)} logview(s) from {RC}: {', '.join(sorted(sh.views))}")
-    while True:
-        try:
-            line = input("\ntimberfs=# ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print(); return
-        if not line: continue
-        try:
-            sh.do(line)
-        except SystemExit:
-            return
-        except Exception as e:
-            print(f"  ! {e}")
+    # Whatever ends the session — `\\q`, EOF, an interrupt, a statement
+    # that raised — the history is written. An exit path that skipped it
+    # would lose exactly the session someone wants back.
+    try:
+        while True:
+            try:
+                line = input("\ntimberfs=# ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if not line:
+                continue
+            remember(line)
+            try:
+                sh.do(line)
+            except SystemExit:
+                return
+            except Exception as e:
+                print(f"  ! {e}")
+    finally:
+        save_history()
 
 
 if __name__ == "__main__":

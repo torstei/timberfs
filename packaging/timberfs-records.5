@@ -38,10 +38,21 @@ splits key from value. Values never contain NUL or US (timberfs
 refuses to emit such a stream). Payload bytes are arbitrary \(em
 including NUL: the
 .B len
-field of the
-.B entry
-record is authoritative, and the payload's closing NUL is a
-consistency and resynchronization marker, not the framing.
+field is authoritative for EVERY record that carries a payload, and the
+payload's closing NUL is a consistency and resynchronization marker, not
+the framing.
+.PP
+⚠ This is not a stylistic preference. A
+.B chunk
+record's payload is a zstd frame, which contains
+.B 0x1e
+and
+.B 0x00
+like any other bytes \(em so a parser that splits the stream on a
+delimiter finds the middle of a compressed frame and desynchronises. Read
+the header up to the first NUL, take
+.I len
+bytes, expect a NUL, continue.
 .SH RECORD KINDS
 .TP
 .B stream-start
@@ -134,10 +145,67 @@ it can be recorded. It is a POSITION, not a fact about the entry, so unlike
 it is not carried into a destination store \(em an ingesting writer numbers
 its own chunks, or two fan-in sources would interleave into a sequence that
 is neither dense nor monotone),
+.B offset
+(where this run of bytes BEGINS on the store's tape: what has ever left
+the store plus where it sits in what remains, so retention cannot move it.
+With
+.B len
+above, the record states BOTH ends of what it served \(em and the runs
+CHAIN, so a consumer can check that what arrived is contiguous rather than
+trust that it is: the end of one entry is the start of the next, and the
+end of the last is the
+.B position
+that store reports. Same name and same quantity as that record's, because
+there is one kind of position here. Absent under the same condition as
+.BR chunk ,
+and for the same reason),
 .B src
 (source path; present only in multi-source streams \(em single-source
 streams name their source once, in
 .BR stream-start / source ).
+.TP
+.B chunk
+One per chunk, for
+.BR "response_format.kind: \(dqchunks\(dq" .
+The payload is the zstd frame exactly as stored \(em nothing is
+decompressed at either end. Fields:
+.B len
+(frame length in bytes, authoritative),
+.B id
+and
+.B src
+(which store, under the same rule as an entry),
+.B chunk
+(its number in that store),
+.B uncomp_start
+/
+.B uncomp_len
+(where it sits in the store's logical bytes, and how long it is once
+decompressed),
+.B wf
+/
+.B wl
+(the write window it covers).
+.RS
+.PP
+That is the chunk's RING, and it is what makes the answer usable: without
+it a consumer has bytes it cannot bound, number, place in time, or resume
+from. With it, the frames can be decompressed by any zstd, reassembled by
+.BR uncomp_start ,
+and checked against
+.BR uncomp_len .
+.PP
+⚠ Chunks do not align to a window, so this answer is a SUPERSET of what
+was asked for. Each record says which window ITS chunk covers, so the
+widening is visible per chunk rather than asserted once for the stream.
+.PP
+Not to be confused with
+.BR \-\-by\-write\-time ,
+which is the same SELECTION rendered as text: chunk contents concatenated,
+decompressed, for a pipe or a person. That answer cannot say where one
+chunk ended, and costs the decompression its reader did not ask for \(em
+measured on one store, 502,893 bytes for 23,834 stored.
+.RE
 .TP
 .B position
 One per store EXAMINED, after the entries and before

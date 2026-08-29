@@ -41,6 +41,8 @@ timbersh --hosts web01,web02,db01 \
 ```
 
 ```sql
+add host web03;                    -- ask it too, from now on
+drop host web03;                   -- stop asking it
 create logview [type=console] console;
 select stores  from console;
 select records from console where entry has 'ERROR' limit 100;
@@ -57,6 +59,8 @@ export for one session and nothing else:
 | `--cmd` | `TIMBERFS_CMD` | how to reach a timberfs; it gets the document on stdin |
 | `--hosts` | `TIMBERFS_HOSTS` | fan out, substituting each host for `_TIMBERHOST_` in `--cmd` |
 | `--rc` | `TIMBERSH_RC` | statements run at startup |
+| `--histfile` | `TIMBERSH_HISTFILE` | line history, `~/.timbersh-history`, mode 0600 |
+| `--histsize` | `TIMBERSH_HISTSIZE` | how many lines to keep (2000) |
 | `--ttl` | `TIMBERSH_STORE_TTL` | expire the cached store list after N seconds; 0 (default) never expires it |
 
 `--cmd` is only ever handed a document on stdin, so anything that reaches a
@@ -97,6 +101,26 @@ found within an hour of it existing:
   Fifteen of eighteen entries, in the first fleet it was pointed at.
   That is the argument for a position being an absolute byte offset
   rather than a clock: see [docs/plans/paging.md](../docs/plans/paging.md).
+
+### Tests
+
+```sh
+tests/timbersh/test-timbersh            # all
+tests/timbersh/test-timbersh short_id   # one, by substring
+```
+
+No VM, no timberfs, no network: `--cmd` points at a fake that answers from
+a script. `scripts/check.sh` runs them, so they gate a push like everything
+else.
+
+The fake **records every document it is asked**, which is the useful half —
+almost every bug here has been in what was *sent* rather than what was
+printed, and a test that reads only the output cannot see a window on the
+wrong axis or a cursor that lost a store's place.
+
+⚠ Each case was checked by reintroducing its bug and watching it fail. The
+paging test passed with the fix deleted, twice, for two different reasons
+before it meant anything.
 
 ### What it does not implement, and what it must
 

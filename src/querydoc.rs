@@ -398,9 +398,17 @@ pub enum Kind {
     /// same document asking for a different answer.
     Stores,
     /// Compressed chunks, verbatim — nothing decompressed at either end.
+    ///
+    /// Framed as `timberfs-records(5)`: one `chunk` record per chunk,
+    /// carrying its RING — number, offsets, lengths, write window — and
+    /// the zstd frame as its payload. The ring is what makes the answer
+    /// usable: without it a consumer has bytes it cannot bound, number,
+    /// place in time, or resume from.
+    ///
     /// ⚠ Chunks do not align to a window, so the answer is a SUPERSET of
-    /// what was asked for and the response must say what window it
-    /// actually widened to.
+    /// what was asked for. Each record says which window its chunk
+    /// actually covers, so the widening is visible per chunk rather than
+    /// asserted once.
     Chunks,
 }
 
@@ -813,6 +821,10 @@ impl Document {
                 null_sep: fmt.options.null_separated,
                 records: fmt.kind == Kind::Records,
                 by_write_time: fmt.kind == Kind::Chunks,
+                // The document's `chunks` is for a machine: framed, with
+                // the rings, compressed. `--by-write-time` stays the text
+                // dump it has always been.
+                chunk_records: fmt.kind == Kind::Chunks,
             },
             follow: Follow::default(),
         };
@@ -890,6 +902,7 @@ mod tests {
                 null_sep: true,
                 records: true,
                 by_write_time: false,
+                chunk_records: false,
             },
             follow: Follow::default(),
         }

@@ -21,4 +21,10 @@ echo "==> cargo test"
 cargo test
 echo "==> cargo build --release"
 cargo build --release
+# timbersh's own tests. Seconds, and they need no VM, no timberfs and no
+# network — `--cmd` points at a fake that answers from a script and records
+# what it was asked. Gated here rather than in the VM suite because nothing
+# about them needs a package.
+echo "==> tests/timbersh/test-timbersh"
+tests/timbersh/test-timbersh
 echo "==> all checks passed"

@@ -1329,6 +1329,9 @@ fn main() -> anyhow::Result<()> {
                     null_sep,
                     records,
                     by_write_time,
+                    // `--by-write-time` is the text dump it has always
+                    // been; framed chunks are the document's answer.
+                    chunk_records: false,
                 },
                 follow: query::Follow { follow, poll },
             };

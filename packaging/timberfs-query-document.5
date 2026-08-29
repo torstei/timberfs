@@ -474,7 +474,12 @@ not a bare name, because the options are orthogonal to the kind. Kinds:
 (the typed stream \(em see
 .BR timberfs\-records (5)),
 .B chunks
-(compressed chunks verbatim, nothing decompressed at either end),
+(compressed chunks verbatim, nothing decompressed at either end \(em
+framed as
+.BR timberfs\-records (5),
+one
+.B chunk
+record per chunk, each carrying its ring),
 .B stores
 (the matched stores themselves, with no entries read).
 .RS

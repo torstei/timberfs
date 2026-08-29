@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""timbersh's tests. No VM, no timberfs, no network.
+
+`--cmd` is injectable and `--rc` runs statements, so a whole session is a
+subprocess with a scripted server on the other end. Every case here is a
+bug that actually happened.
+
+    tests/timbersh/test-timbersh          # all
+    tests/timbersh/test-timbersh short_id # one, by substring
+"""
+import json, os, shutil, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TIMBERSH = os.path.join(HERE, "..", "..", "tools", "timbersh")
+FAKE = os.path.join(HERE, "fake-timberfs")
+
+ID_A = "aaaaaaaa-1111-2222-3333-444444444444"
+ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
+
+
+class Session:
+    """One timbersh run against a scripted server."""
+
+    def __init__(self, scenario, hosts=None, extra=()):
+        self.dir = tempfile.mkdtemp(prefix="timbersh-test-")
+        json.dump(scenario, open(os.path.join(self.dir, "scenario.json"), "w"))
+        self.hosts = hosts
+        self.extra = list(extra)
+
+    def run(self, *statements):
+        cmd = [sys.executable, TIMBERSH, "-q",
+               "--histfile", os.path.join(self.dir, "history"),
+               "--rc", os.path.join(self.dir, "nonexistent-rc"),
+               "--cmd", f"{FAKE} _TIMBERHOST_" if self.hosts else FAKE]
+        if self.hosts:
+            cmd += ["--hosts", ",".join(self.hosts)]
+        cmd += self.extra
+        p = subprocess.run(cmd, input="\n".join(statements) + "\n\\q\n",
+                           capture_output=True, text=True,
+                           env={**os.environ, "FAKE_DIR": self.dir})
+        self.out, self.err, self.code = p.stdout, p.stderr, p.returncode
+        return self
+
+    @property
+    def requests(self):
+        path = os.path.join(self.dir, "requests.jsonl")
+        if not os.path.exists(path):
+            return []
+        return [json.loads(l) for l in open(path) if l.strip()]
+
+    def docs(self, kind=None):
+        return [r["doc"] for r in self.requests
+                if kind is None
+                or (r["doc"].get("response_format") or {}).get("kind") == kind]
+
+    def cleanup(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+TESTS = []
+
+
+def test(fn):
+    TESTS.append(fn)
+    return fn
+
+
+def store(name, sid, **labels):
+    return {"name": name, "id": sid, "labels": labels, "path": f"/l/{name}.log",
+            "chunks": 1, "compressed_bytes": 57, "logical_bytes": 100,
+            "first_seq": 0, "last_seq": 0, "dropped_chunks": 0,
+            "dropped_bytes": 0, "dropped_uncompressed_bytes": 0,
+            "next_seq": 1, "index_declared": False, "wal_declared": False,
+            "kind": "pair", "handle": name, "dir": "/l", "followers": [],
+            "retain_unconsumed": False, "rings_bytes": 100}
+
+
+@test
+def an_incoherent_axis_never_reaches_a_host():
+    """`written since` cannot answer with loglines, and nine hosts each
+    relaying that verdict is not a better error than one. It also cost
+    nine round trips to learn what the shell already knew."""
+    s = Session({h: {"stores": []} for h in ("a", "b", "c")},
+                hosts=["a", "b", "c"]).run(
+        "select loglines from [svc=web] where written since '2026-08-18';")
+    assert "cannot answer with loglines" in s.out, s.out
+    assert "logline since" in s.out, s.out
+    # The whole point: nothing was sent.
+    assert s.docs("loglines") == [], s.requests
+    s.cleanup()
+
+
+@test
+def a_logline_window_on_chunks_is_refused_before_the_axis_is_rewritten():
+    """`build` sets the axis to `write` for chunks, so a check that ran
+    after the defaults let this through with the timestamp silently
+    applied to the other clock."""
+    s = Session({"": {"stores": []}}).run(
+        "select chunks from [svc=web] where logline since '00:00';")
+    assert "logline window has nothing to apply to" in s.out, s.out
+    assert s.docs("chunks") == [], s.requests
+    s.cleanup()
+
+
+@test
+def a_short_id_is_expanded_before_the_document_leaves():
+    """`\\d` prints 8 of 36 characters and `id=` is exact, so the obvious
+    next move selected nothing. It is resolved here; the wire gets the
+    whole id."""
+    s = Session({"": {"stores": [store("a1", ID_A), store("b1", ID_B)]}}).run(
+        "select stores from [id=aaaaaaaa];")
+    terms = [d["stores"]["select"] for d in s.docs("stores") if d["stores"].get("select")]
+    assert terms and terms[-1][0]["value"] == ID_A, terms
+    assert terms[-1][0]["op"] == "=", terms
+    s.cleanup()
+
+
+@test
+def an_ambiguous_short_id_is_refused_rather_than_picked_from():
+    s = Session({"": {"stores": [store("a1", ID_A), store("a2", "aaaaaaaa-9999-0000-0000-000000000000")]}}).run(
+        "select stores from [id=aaaaaaaa];")
+    assert "ambiguous" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_bare_array_from_an_older_server_still_works():
+    """The deployed fleet answers without the envelope. The SHAPE says
+    which, so an old server is one whose version is unknown."""
+    s = Session({"": {"stores": [store("a1", ID_A)], "bare": True}}).run("\\d", "show hosts;")
+    assert "a1" in s.out, s.out
+    assert "(not reported)" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def every_host_failing_is_not_an_empty_forest():
+    """`\\d` said "no stores" when nothing had answered — the reason was
+    collected and then returned past."""
+    s = Session({h: {"fail": "ssh: connect: No route to host", "code": 255}
+                 for h in ("a", "b")}, hosts=["a", "b"]).run("\\d")
+    assert "UNREACHABLE" in s.out, s.out
+    assert "no host answered" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def one_failure_is_reported_once_and_in_full():
+    """Nine hosts each printed a truncated first line — which is not the
+    reason. `visena-timberfs` opens with a colon and puts the sentence
+    underneath."""
+    why = "The query document was refused:\n  the write axis yields raw chunks today"
+    s = Session({h: {"fail": why, "code": 3} for h in ("a", "b", "c")},
+                hosts=["a", "b", "c"]).run("select loglines from [svc=web];")
+    assert "all 3 hosts" in s.out, s.out
+    assert "the write axis yields raw chunks today" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_limit_is_a_total_across_hosts():
+    recs = lambda n, sid: [{"id": sid, "text": f"line {i}"} for i in range(n)]
+    s = Session({"a": {"stores": [store("a1", ID_A)], "records": recs(3, ID_A)},
+                 "b": {"stores": [store("b1", ID_B)], "records": recs(3, ID_B)}},
+                hosts=["a", "b"]).run("select records from [svc=web] limit 4;")
+    shown = sum(1 for l in s.out.splitlines() if "line " in l)
+    assert shown == 4, (shown, s.out)
+    s.cleanup()
+
+
+@test
+def a_quiet_store_keeps_its_place_across_pages():
+    """A position with no offset means the START OF THE WINDOW, so handing
+    the answer back verbatim re-read every store that had gone quiet.
+
+    It takes THREE pages and a server that changes its mind: A must have a
+    position, then report none while B still moves. A fake that says the
+    same thing every time cannot produce that, and a test built on one
+    passes with the merge removed."""
+    s = Session({"": {
+        "stores": [store("a1", ID_A), store("b1", ID_B)],
+        "status": "limited",
+        "sequence": [
+            {"records": [{"id": ID_A, "text": "a-one"}],
+             "positions": [{"id": ID_A, "offset": 100}, {"id": ID_B}]},
+            # A delivered nothing this page: its position carries NO offset.
+            {"records": [{"id": ID_B, "text": "b-one"}],
+             "positions": [{"id": ID_A}, {"id": ID_B, "offset": 200}]},
+            {"records": [], "positions": [{"id": ID_A}, {"id": ID_B}]},
+        ]}}).run(
+        "declare c cursor for select records from [svc=web];",
+        "fetch 1 from c;", "fetch 1 from c;", "fetch 1 from c;")
+    cursors = [d.get("cursor") for d in s.docs("records") if d.get("cursor")]
+    assert len(cursors) >= 2, s.requests
+    third = {c["id"]: c for c in cursors[-1]}
+    # A went quiet on page two. Its place must survive that.
+    assert third.get(ID_A, {}).get("offset") == 100, cursors[-1]
+    assert third.get(ID_B, {}).get("offset") == 200, cursors[-1]
+    s.cleanup()
+
+
+@test
+def hosts_can_be_added_and_dropped_at_runtime():
+    s = Session({"a": {"stores": [store("a1", ID_A)]},
+                 "b": {"stores": [store("b1", ID_B)]}}, hosts=["a"]).run(
+        "add host b;", "\\d", "drop host a;", "show hosts;",
+        "drop host nosuch;", "add host b;", "drop host b;")
+    assert "2 host(s): a, b" in s.out, s.out
+    assert "b1" in s.out and "a1" in s.out, s.out
+    assert "1 host(s): b" in s.out, s.out
+    assert "no host `nosuch`" in s.out, s.out
+    assert "already there" in s.out, s.out
+    assert "that is the last host" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_host_set_and_a_command_must_agree_both_ways():
+    """Several hosts with nowhere to put them reads one forest N times.
+    A placeholder with no host runs it literally — which printed "no
+    stores" and read as an empty forest."""
+    d = tempfile.mkdtemp(prefix="timbersh-test-")
+    json.dump({}, open(os.path.join(d, "scenario.json"), "w"))
+    env = {**os.environ, "FAKE_DIR": d}
+    many = subprocess.run([sys.executable, TIMBERSH, "-q", "--hosts", "a,b",
+                           "--cmd", FAKE], input="\\q\n", capture_output=True,
+                          text=True, env=env)
+    assert many.returncode != 0 and "no _TIMBERHOST_" in many.stderr, many.stderr
+    none = subprocess.run([sys.executable, TIMBERSH, "-q",
+                           "--cmd", f"{FAKE} _TIMBERHOST_"], input="\\q\n",
+                          capture_output=True, text=True, env=env)
+    assert none.returncode != 0 and "no host to put in it" in none.stderr, none.stderr
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test
+def the_history_survives_the_session():
+    s = Session({"": {"stores": []}})
+    s.run("\\d", "show hosts;")
+    hist = open(os.path.join(s.dir, "history")).read().splitlines()
+    assert hist[:2] == ["\\d", "show hosts;"], hist
+    assert oct(os.stat(os.path.join(s.dir, "history")).st_mode & 0o777) == "0o600"
+    s.cleanup()
+
+
+@test
+def a_predicate_that_selects_no_store_says_so():
+    """`[host=imap01]` where the label holds the FQDN matches nothing, on
+    every host including the one with the data — and the answer was
+    `nothing on 10`, the same words as "the stores held no matching
+    entry". Opposite problems: one means the data is not there, the other
+    means the question never ran."""
+    s = Session({h: {"stores": [], "records": []} for h in ("a", "b")},
+                hosts=["a", "b"]).run(
+        "select records from [host=imap01] where entry has 'X';")
+    assert "NO STORE" in s.out, s.out
+    assert "nothing was searched" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def stores_that_matched_but_held_nothing_are_not_the_same_answer():
+    """The other side of it: the predicate was right and the entries are
+    not there. Saying `NO STORE` here would send someone to fix a
+    selector that is already correct."""
+    s = Session({h: {"stores": [store(f"{h}1", ID_A if h == "a" else ID_B)],
+                     "records": []} for h in ("a", "b")},
+                hosts=["a", "b"]).run(
+        "select records from [] where entry has 'X';")
+    assert "nothing matched, in 2 store(s)" in s.out, s.out
+    assert "NO STORE" not in s.out, s.out
+    s.cleanup()
+
+
+def main():
+    want = sys.argv[1] if len(sys.argv) > 1 else ""
+    chosen = [t for t in TESTS if want in t.__name__]
+    failed = 0
+    for t in chosen:
+        try:
+            t()
+            print(f"  ok    {t.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"  FAIL  {t.__name__}\n        {e}")
+        except Exception as e:
+            failed += 1
+            print(f"  ERROR {t.__name__}\n        {type(e).__name__}: {e}")
+    print(f"\n{len(chosen) - failed}/{len(chosen)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
