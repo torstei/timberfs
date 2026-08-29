@@ -315,8 +315,12 @@ here.
   beside it, over four operations and nothing else, and a coordinate now
   has a written form (`timber://host/id#offset=N`) that names a store by
   IDENTITY. What remains: the second backend (an entry-aware pager for a
-  piped `records` stream) and holding several hosts open on one instant.
-  Design note: [docs/plans/view.md](docs/plans/view.md).
+  piped `records` stream); "what happened in $FOO around here", the
+  drill-down that starts from where you ARE and collides with the
+  viewer's no-parsing rule; taking a line selection away as bytes or as
+  the document that reproduces it; and getting the address into a
+  clipboard, over ssh, without failing silently. Design note:
+  [docs/plans/view.md](docs/plans/view.md).
 - **A fleet is a list of TARGETS, and a resolver derives it** — SHIPPED.
   `TIMBERFS_CMD` with `_TIMBERHOST_` in it made the transport a property of
   the SESSION, so every host had to be reached the same way and an `ssh`

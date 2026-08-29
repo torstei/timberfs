@@ -55,20 +55,68 @@ store backend it ships with is the same one either front end uses, so
 today's `timberview app.log` proves the seam holds but not that a second
 kind of source fits behind it.
 
-## Not built: aligning several hosts on one moment
+## Not built: "what happened in $FOO around here"
 
-Every position has a write window, so "show me http01 *here*" is the
-chunk covering that instant:
+The motion a reader actually makes: drilling down, finding something,
+and wanting the same moment in a different store. It starts from **where
+you are** rather than from a typed time, which is what makes it an
+interaction rather than a flag.
 
-```json
-{"window": {"axis": "write", "from": WF, "to": WF},
- "max": {"chunks": 1}, "response_format": {"kind": "chunks"}}
-```
+The far end is ready — a write-axis window whose ends are the same
+millisecond, with `max: {chunks: 1}`, is the chunk covering an instant,
+and `at '12:00'` already does it. What is missing is where the instant
+comes from, and there it meets the viewer's own rule: **it parses
+nothing.** Three ways out, and they are not equally good:
 
-The viewer can already open one store that way (`at '12:00'`, and
-`#at=` in an address). What it cannot do is hold several open at once,
-which is what an incident actually needs. That is a layout question
-before it is a protocol one, and nothing in the wire has to change.
+- **The chunk's write window.** Free, already on screen, and coarse: a
+  chunk can span minutes, so "here" becomes "somewhere in here".
+- **The timestamp as a TERM.** `Tab` now selects `2026-08-29T12:02:30.100`
+  whole, and `when()` already resolves that string. Nothing is parsed by
+  the viewer — the READER pointed at it — so the rule survives intact,
+  and it costs no round trip. It only works where the reader can see a
+  timestamp, which is the case that motivates the feature anyway.
+- **Ask timberfs.** A `records` read at that offset answers with the
+  entry's own `ts`, parsed by the thing whose job that is. Exact, works
+  on a line whose timestamp is not selectable, and costs a round trip.
+
+The second is the cheapest thing that is not a lie, and the third is the
+one that always works; they are not exclusive.
+
+⚠ The UI half is the unsolved part, and is why this waits. Does the
+other store REPLACE the view or sit beside it? Two panes is a different
+program from a pager. And which store — a picker, or "the same labels on
+another host", which is what an incident usually means? Better answered
+after living with the single-store version for a while.
+
+## Not built: taking a selection away
+
+Mark a run of lines and get it out — to a file, or to the clipboard.
+
+- **The unit is lines**, not entries: lines are what the viewer shows,
+  and entries would mean parsing.
+- **A selection is a RANGE**, so it is two coordinates where an address
+  is one. `#offset=A..B` is still a PLACE, so it may belong in the
+  address grammar rather than beside it — unlike a search, which does
+  not.
+- ⚠ **What is exported matters more than where it goes.** The bytes are
+  the obvious answer and the weaker one: this project's habit is to hand
+  back something that can be RE-RUN. A selection is a start, a bound and
+  a store — which is to say a query document, and `--dump-json` already
+  renders one. Offering both is cheap; offering only the bytes throws
+  away the half that survives being pasted into a ticket.
+
+## Not built: getting the address OUT
+
+`y` shows the address of the line you are on and `q` prints it on the
+way out, so it can be read and selected with a mouse. What is missing is
+the clipboard — and the case that matters is a workstation viewing a
+fleet, which means it has to work over ssh and through a multiplexer.
+
+⚠ OSC 52 does, and its failure mode is **silence**: a terminal that does
+not support it does nothing and says nothing, which is the failure this
+project keeps removing from its answers. So a copy must either be
+confirmable or must keep showing the address, so that the fallback —
+selecting it by hand — is always there.
 
 ## /etc/hosts, and the DNS that would replace it
 
