@@ -29,6 +29,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 
 import timberfs_client
 from timberfs_client import when                              # noqa: F401
@@ -221,9 +223,20 @@ class QueryBackend:
     passes its own, which is what makes the viewer's fan-out the shell's
     fan-out rather than a second one."""
 
+    CACHE = 8
+    # How long a store's bounds are believed. Retention moves the floor
+    # while you read, so they cannot be remembered from when the store
+    # was opened — but re-reading them before every seek puts a whole
+    # round trip in front of a chunk that is often already cached.
+    FRESH = 10.0
+
     def __init__(self, ask, hosts=(None,)):
         self.ask, self.hosts = ask, list(hosts)
         self._stores = None
+        # A chunk's bytes never change once written, so a cached one
+        # cannot go stale — which is what makes reading ahead safe.
+        self._chunks, self._inflight = {}, set()
+        self._lock = threading.Lock()
         # A host that could not be reached is NAMED. A short answer and a
         # broken one look identical, and this is the difference between
         # "not in the logs" and "one machine did not answer".
@@ -246,21 +259,49 @@ class QueryBackend:
             return self._stores
         return self.select_stores([], remember=True)
 
+    def each_host(self, work):
+        """`work(host)` on every host AT ONCE. There is nothing to be
+        gained by asking them in turn: the cost is the latency, not the
+        search, and a reader waiting on ten hosts serially is waiting
+        nine times longer than the fleet needs."""
+        out, lock = {}, threading.Lock()
+
+        def one(host):
+            try:
+                value = work(host)
+            except (Refused, json.JSONDecodeError) as e:
+                with lock:
+                    self.unreachable[host] = str(e)
+                return
+            with lock:
+                out[host] = value
+                self.unreachable.pop(host, None)
+
+        if len(self.hosts) == 1:
+            one(self.hosts[0])
+            return out
+        threads = [threading.Thread(target=one, args=(h,), daemon=True)
+                   for h in self.hosts]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return out
+
     def select_stores(self, terms, remember=False):
         doc = {"v": DOC_V, "stores": {"select": list(terms)},
                "response_format": {"kind": "stores"}}
+        answers = self.each_host(lambda h: json.loads(self._run(doc, h) or "[]"))
         got = []
         for host in self.hosts:
-            try:
-                payload = json.loads(self._run(doc, host) or "[]")
-            except (Refused, json.JSONDecodeError) as e:
-                self.unreachable[host] = str(e)
+            payload = answers.get(host)
+            if payload is None:
                 continue
-            self.unreachable.pop(host, None)
             found = (payload.get("stores", []) if isinstance(payload, dict)
                      else payload)
             for st in found:
                 st["_host"] = host
+                st["_read_at"] = time.monotonic()
             got.extend(found)
         got.sort(key=lambda s: (s.get("_host") or "", s.get("name") or ""))
         if remember:
@@ -281,13 +322,53 @@ class QueryBackend:
         if not found:
             return None
         found[0]["_host"] = store.get("_host")
+        found[0]["_read_at"] = time.monotonic()
         return found[0]
+
+    def prefetch(self, store, *seqs):
+        """Read ahead, off the critical path.
+
+        Optional: a backend without it simply never reads ahead. One
+        chunk is ten screenfuls, so fetching the neighbours while the
+        reader is looking at this one is the difference between
+        scrolling and waiting."""
+        for seq in seqs:
+            if seq is None or seq < 0:
+                continue
+            key = (store.get("id"), seq)
+            with self._lock:
+                if key in self._chunks or key in self._inflight:
+                    continue
+                self._inflight.add(key)
+            threading.Thread(target=self._read_ahead, args=(store, seq, key),
+                             daemon=True).start()
+
+    def _read_ahead(self, store, seq, key):
+        try:
+            self.chunk(store, seq=seq)
+        except (Refused, ValueError, RuntimeError):
+            pass          # the foreground will meet the same refusal, and say so
+        finally:
+            with self._lock:
+                self._inflight.discard(key)
+
+    def _remember(self, key, chunk):
+        with self._lock:
+            self._chunks[key] = chunk
+            while len(self._chunks) > self.CACHE:
+                self._chunks.pop(next(iter(self._chunks)))
 
     def chunk(self, store, seq=None, at=None):
         """One chunk, by number or by the instant it covers.
 
         `max: {chunks: 1}` beside a start is a seek, and a pager is
         nothing but seeks."""
+        key = (store.get("id"), seq) if seq is not None else None
+        if key is not None:
+            with self._lock:
+                hit = self._chunks.get(key)
+            if hit is not None:
+                return hit
         win = {"axis": "write"}
         if seq is not None:
             win["from_chunk"] = int(seq)
@@ -308,9 +389,11 @@ class QueryBackend:
             raise
         for kind, f, payload in frames(out):
             if kind == "chunk":
-                return Chunk(int(f["chunk"]), int(f["uncomp_start"]),
-                             int(f["uncomp_len"]), int(f.get("wf", 0)),
-                             int(f.get("wl", 0)), unzstd(payload))
+                got = Chunk(int(f["chunk"]), int(f["uncomp_start"]),
+                            int(f["uncomp_len"]), int(f.get("wf", 0)),
+                            int(f.get("wl", 0)), unzstd(payload))
+                self._remember((store.get("id"), got.seq), got)
+                return got
         return None
 
     def search(self, token, limit=200):
@@ -323,14 +406,12 @@ class QueryBackend:
                "max": {"entries": limit},
                "response_format": {"kind": "records"}}
         by_id = {s.get("id"): s for s in self.stores()}
+        answers = self.each_host(lambda h: self._run(doc, h, raw=True))
         hits, unplaced, capped = [], 0, False
         for host in self.hosts:
-            try:
-                out = self._run(doc, host, raw=True)
-            except Refused as e:
-                self.unreachable[host] = str(e)
+            out = answers.get(host)
+            if out is None:
                 continue
-            self.unreachable.pop(host, None)
             # An entry names its store only where the read spanned
             # several, so with one source the `source` record is the
             # attribution and the entries inherit it.
@@ -465,6 +546,12 @@ class Tape:
         return self.store.get("last_seq")
 
     def refresh(self):
+        """The store as it is now — unless it was just read. A seek to a
+        cached chunk otherwise pays a round trip for numbers that cannot
+        have moved in the time since."""
+        age = time.monotonic() - (self.store.get("_read_at") or 0)
+        if age < getattr(self.backend, "FRESH", 0):
+            return
         fresh = self.backend.bounds(self.store)
         if fresh:
             self.store = fresh
@@ -488,9 +575,26 @@ class Tape:
                 f"{self.first_seq}..{self.last_seq}")
         self.chunks = [c]
         self._rebuild()
-        self.extend_up()
-        self.extend_down()
+        # The neighbours are READ AHEAD rather than waited for: one chunk
+        # is already ten screenfuls, so a screen can be drawn now and the
+        # scroll that needs them will find them there. The line each edge
+        # holds back until they land is off the screen you landed on.
+        self.read_ahead()
         return c
+
+    def read_ahead(self):
+        """Ask for the chunks either side, off the critical path."""
+        ahead = getattr(self.backend, "prefetch", None)
+        if not ahead or not self.chunks:
+            return
+        lo, hi = self.chunks[0].seq, self.chunks[-1].seq
+        want = []
+        if self.first_seq is not None and lo > self.first_seq:
+            want.append(lo - 1)
+        if self.last_seq is not None and hi < self.last_seq:
+            want.append(hi + 1)
+        if want:
+            ahead(self.store, *want)
 
     def locate(self, offset):
         """Which chunk holds an absolute offset.
@@ -573,6 +677,7 @@ class Tape:
         self.chunks.insert(0, c)
         del self.chunks[self.KEEP:]
         self._rebuild()
+        self.read_ahead()
         return True
 
     def extend_down(self):
@@ -585,6 +690,7 @@ class Tape:
         if len(self.chunks) > self.KEEP:
             del self.chunks[0]
         self._rebuild()
+        self.read_ahead()
         return True
 
     def index_of(self, offset):
@@ -641,12 +747,19 @@ class View:
                 "--mint` makes the pair a store")
         self.tape.refresh()
         c = self.tape.open(seq=seq, at=at, offset=offset)
-        if offset is not None:
-            self.cur = self.tape.index_of(offset)
-        elif self.tape.at_bottom() and seq is None and at is None:
+        anchor = offset if offset is not None else c.start
+        landed_at_the_end = seq is None and at is None and offset is None
+        if landed_at_the_end and self.tape.at_bottom():
             self.cur = max(0, len(self.tape.lines) - 1)
         else:
-            self.cur = self.tape.index_of(c.start)
+            self.cur = self.tape.index_of(anchor)
+        # What you land ON has to be real. A run that does not begin at
+        # the store's first chunk holds its first line back as a
+        # possible fragment, so landing at the top of one means reaching
+        # for the chunk before it — the one read the read-ahead cannot
+        # be left to do, because it is on the screen you asked for.
+        if self.cur < 2 and not self.tape.at_top() and self.tape.extend_up():
+            self.cur = self.tape.index_of(anchor)
         self.top = self.cur
         self.tok = 0
         return c
@@ -963,11 +1076,68 @@ class Screen:
     def __init__(self, view):
         self.view = view
 
-    def run(self, stdscr):
+    SPIN = "|/-\\"
+
+    def busy(self, stdscr, what, fn):
+        """Run a round trip on a worker and keep saying so.
+
+        A pager over a fleet spends real time waiting, and a screen that
+        stops answering is indistinguishable from one that has hung. It
+        redraws only the STATUS line — the model is being mutated on the
+        other thread, and reading it here to redraw would be reading it
+        half-built.
+
+        Interrupting gives up on the answer rather than the session: the
+        subprocess is left to finish into nothing, which beats a viewer
+        that cannot be got out of when a host stops responding."""
+        box, done = {}, threading.Event()
+
+        def work():
+            try:
+                box["value"] = fn()
+            except BaseException as e:            # noqa: BLE001 — re-raised below
+                box["error"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=work, daemon=True).start()
+        began, n = time.monotonic(), 0
+        stdscr.timeout(120)
+        try:
+            while not done.is_set():
+                waited = time.monotonic() - began
+                # Nothing is drawn for a fast answer: a flash of "waiting"
+                # on every keystroke is its own kind of noise.
+                if waited > 0.3:
+                    h, _ = stdscr.getmaxyx()
+                    self.put(stdscr, h - 1,
+                             f" {self.SPIN[n % len(self.SPIN)]}  {what}"
+                             f"   {waited:.1f}s   ^C gives up",
+                             self.curses.A_REVERSE)
+                    stdscr.refresh()
+                    n += 1
+                stdscr.getch()          # paces the loop, and eats held keys
+        except KeyboardInterrupt:
+            # Anywhere in the loop, not just in the read: an interrupt
+            # gives up on the ANSWER rather than on the session.
+            raise Refused(f"gave up waiting for {what}") from None
+        finally:
+            stdscr.timeout(-1)
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def setup(self, stdscr):
         import curses
         curses.curs_set(0)
         stdscr.keypad(True)
         self.curses = curses
+
+    def run(self, stdscr):
+        self.setup(stdscr)
+        return self.loop(stdscr)
+
+    def loop(self, stdscr):
         while True:
             self.draw(stdscr)
             try:
@@ -1014,17 +1184,17 @@ class Screen:
         if key in (ord("q"), KEY_ESC):
             return False
         elif key in (ord("j"), c.KEY_DOWN):
-            v.move(1)
+            self.scroll(stdscr, lambda: v.move(1))
         elif key in (ord("k"), c.KEY_UP):
-            v.move(-1)
+            self.scroll(stdscr, lambda: v.move(-1))
         elif key in (ord(" "), c.KEY_NPAGE, ord("f")):
-            v.page(1, h - 2)
+            self.scroll(stdscr, lambda: v.page(1, h - 2))
         elif key in (ord("b"), c.KEY_PPAGE):
-            v.page(-1, h - 2)
+            self.scroll(stdscr, lambda: v.page(-1, h - 2))
         elif key == ord("g"):
-            v.home()
+            self.reach(stdscr, "the top of the log", v.home)
         elif key == ord("G"):
-            v.end()
+            self.reach(stdscr, "the end of the log", v.end)
         elif key in (ord("h"), c.KEY_LEFT):
             v.scroll_h(-8)
         elif key in (ord("l"), c.KEY_RIGHT):
@@ -1053,6 +1223,25 @@ class Screen:
             stdscr.clear()
         return True
 
+    def reach(self, stdscr, what, fn):
+        """A move that is a seek, so it says which one it is waiting on."""
+        try:
+            self.busy(stdscr, f"{what} · {self.view.store.get('name')}", fn)
+        except Refused as e:
+            self.view.message = str(e)
+
+    def scroll(self, stdscr, fn):
+        """A move that MIGHT reach for a chunk. Usually it is local and
+        nothing is said; where the run has to grow, the read shows up as
+        the wait it is rather than as a frozen screen."""
+        v = self.view
+        try:
+            self.busy(stdscr, f"reading {v.store.get('name')}"
+                      + (f" on {v.store['_host']}" if v.store.get("_host") else ""),
+                      fn)
+        except Refused as e:
+            v.message = str(e)
+
     def prompt(self, stdscr, label):
         c = self.curses
         h, w = stdscr.getmaxyx()
@@ -1075,7 +1264,12 @@ class Screen:
         if not token:
             v.message = v.nothing_pickable()
             return
-        v.search(token)
+        try:
+            self.busy(stdscr, f"searching {len(v.backend.hosts)} target(s) "
+                              f"for {token}", lambda: v.search(token))
+        except Refused as e:
+            v.message = str(e)
+            return
         if not v.hits:
             return
         # A list, because an identifier on six hosts is six answers and
@@ -1084,7 +1278,7 @@ class Screen:
                         [self.hit_row(x) for x in v.hits])
         if i is not None:
             v.hit = i
-            v.jump(v.hits[i])
+            self.reach(stdscr, f"hit {i + 1}", lambda: v.jump(v.hits[i]))
             v.message = f"hit {i + 1}/{len(v.hits)}  {v.message}"
 
     def hit_row(self, hit):
@@ -1095,7 +1289,12 @@ class Screen:
 
     def pick_store(self, stdscr):
         v = self.view
-        stores = self.view.backend.stores()
+        try:
+            stores = self.busy(stdscr, "the store list",
+                               self.view.backend.stores)
+        except Refused as e:
+            v.message = str(e)
+            return
         if not stores:
             v.message = "no stores"
             return
@@ -1114,10 +1313,7 @@ class Screen:
         if i is None:
             return
         v.tape = Tape(v.backend, stores[i])
-        try:
-            v.open()
-        except Refused as e:
-            v.message = str(e)
+        self.reach(stdscr, stores[i].get("name", "that store"), v.open)
 
     def help(self, stdscr):
         c = self.curses
@@ -1165,11 +1361,26 @@ class Screen:
 
 
 def watch(backend, store, seq=None, at=None, offset=None):
-    """Open the viewer and return the address it was left at."""
+    """Open the viewer and return the address it was left at.
+
+    The FIRST read happens inside curses, because it is the slowest one
+    and the one with nothing on screen yet to explain it. A failure
+    there still unwinds the terminal and reaches the caller intact —
+    which matters for the refusals that are several lines long."""
     import curses
     view = View(backend, store)
-    view.open(seq=seq, at=at, offset=offset)
-    return curses.wrapper(Screen(view).run)
+    screen = Screen(view)
+    where = view.store.get("name") or "the store"
+    if view.store.get("_host"):
+        where += f" on {view.store['_host']}"
+
+    def go(stdscr):
+        screen.setup(stdscr)
+        screen.busy(stdscr, f"opening {where}",
+                    lambda: view.open(seq=seq, at=at, offset=offset))
+        return screen.loop(stdscr)
+
+    return curses.wrapper(go)
 
 
 # ------------------------------------------------------------ opening

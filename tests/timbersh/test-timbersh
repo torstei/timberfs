@@ -389,6 +389,9 @@ def view_seeks_to_a_chunk_and_asks_for_exactly_one():
         assert d["window"]["axis"] == "write", d
         assert d["max"] == {"chunks": 1}, d
         assert "match" not in d, d
+    # The address is chunk 7's own start: landing at the top of a chunk
+    # reaches for the one before it, so the line held back as a possible
+    # fragment is resolved rather than skipped over.
     at = sum(len(c["text"]) for c in chunks[:7])
     assert f"timber:{ID_A}#offset={at}" in s.seen, s.seen[-400:]
     s.cleanup()

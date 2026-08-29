@@ -284,6 +284,32 @@ Written against those, it is tested against a fake rather than a terminal,
 and the fan-out stays the shell's: `search` is handed a token and does not
 know there are ten hosts.
 
+**Latency is the cost, so it is spent once.** A pager over a fleet waits
+on real round trips, and the three things that made that felt as
+sluggishness are gone: every target is asked **at once** rather than in
+turn (the same fix, and the same reason, as timbersh's `7.0 s → 1.1 s`);
+opening waits for **one** chunk rather than three, because the neighbours
+are read ahead while you are looking at the one you landed on; and a
+chunk once fetched is **cached**, which is safe precisely because a
+chunk's bytes never change after it is written. Measured against three
+targets at 400 ms each:
+
+| | before | after |
+|---|---|---|
+| the store list, at startup | 1.23 s | **0.41 s** |
+| opening a store | 0.83 s | **0.42 s** |
+| `G` — seek to the end | 0.83 s | **0.01 s** |
+| `Enter` — search the fleet | 1.24 s | **0.42 s** |
+| scrolling into the next chunk | 0.42 s | **0.00 s** |
+
+**What is left, it says.** A screen that stops answering cannot be told
+from one that has hung, so a read that takes longer than 0.3 s paints
+what it is waiting for, on which host, and for how long — and `^C` gives
+up on that answer rather than on the session. Nothing is drawn for a
+fast one: a flash of "waiting" on every keystroke is its own kind of
+noise. The FIRST read is inside that too, since it is the slowest and
+the one with nothing on screen yet to explain it.
+
 **The client decompresses.** One chunk is ten screenfuls of log for a few
 KiB on the wire, so the run is held either side of where you are and
 scrolling never falls out of a window; asking the far end to decompress

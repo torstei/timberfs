@@ -129,6 +129,19 @@ absolute on the tape, so it stays valid until retention drops the data
 and then the store's own
 .B first_seq
 says it was dropped rather than "not found".
+.SH WAITING
+A pager over a fleet spends real time on round trips. Every target is
+asked at once rather than in turn, the chunks either side of where you
+landed are read ahead while you read the one you are on, and a chunk
+once fetched is cached \(em safe because a chunk's bytes never change
+after it is written.
+.PP
+What is left says so: a read that takes longer than a moment paints what
+it is waiting for, on which host, and for how long.
+.B ^C
+gives up on that answer and returns you to the screen, rather than
+ending the session \(em so a host that has stopped responding cannot
+strand you.
 .SH WHEN SOMETHING IS DOWN
 A target that does not answer is NAMED and the rest are still asked \(em
 one machine being down must not stop you reading the logs that are

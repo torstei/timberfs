@@ -12,6 +12,8 @@ what the boundaries say) testable at all.
 import json
 import os
 import sys
+import threading
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
@@ -151,12 +153,32 @@ def a_version_number_is_refused_with_the_reason():
 
 # ---------------------------------------------------------------- tape
 @test
+def landing_at_the_top_of_a_chunk_shows_its_first_line():
+    """A run that does not begin at the store's first chunk holds its
+    first line back — it may be the tail of a line that began in the
+    chunk before. Landing THERE has to reach for that chunk: the held
+    line is the one at the top of the screen you asked for."""
+    f = Fake(["a\nb\nc\n", "d\ne\nf\n", "g\nh\n"])
+    v = opened(f, seq=1)
+    assert v.line().text == "d", (v.line().text, lines_of(v))
+    assert v.address().value == v.tape.chunks[0].start + 6, v.address()
+    # Landing at the END needs no such read: the held line is a screen
+    # away, and the read-ahead has it by the time anyone scrolls there.
+    quiet = Fake(["a\n" * 9, "b\n" * 9])
+    w = opened(quiet)
+    assert len(w.tape.chunks) == 1, w.tape.chunks
+
+
+@test
 def a_line_across_a_chunk_boundary_is_one_line():
     """Chunks are flush boundaries, not line boundaries. Splitting each
     chunk on its own would show two halves and give the second one an
     offset no line starts at."""
     f = Fake(["alpha\nbra", "vo\ncharlie\n"])
     v = opened(f, seq=0)
+    # Opening reads ONE chunk, so the straddling line is still held back.
+    assert lines_of(v) == ["alpha"], lines_of(v)
+    v.tape.extend_down()
     assert lines_of(v) == ["alpha", "bravo", "charlie"], lines_of(v)
     assert [ln.offset for ln in v.tape.lines] == [0, 6, 12]
 
@@ -311,6 +333,11 @@ def the_header_says_where_on_the_tape_this_is():
 # -------------------------------------------------------------- search
 @test
 def a_hit_is_a_coordinate_and_opening_it_is_a_seek():
+    """A hit on a chunk's FIRST line is the case that catches a viewer
+    reading ahead: that line is the one the run holds back as a possible
+    fragment, so landing on it would show the next line and report the
+    wrong offset. The chunk before it is fetched rather than left to the
+    read-ahead."""
     f = Fake(["one\ntwo\n", "three\nfour\n"])
     f.hits = [tv.Hit(tv.Address(ID_A, None, "offset", 8), f.store, "three")]
     v = opened(f)
@@ -522,6 +549,155 @@ def upgrading_the_other_end_is_not_something_this_machine_can_do():
     assert named.startswith("mail01: timberfs is too old — upgrade it there")
     assert "PATH" not in named, named
     assert "`cmd`" in named, named
+
+
+def _z(data):
+    """A real zstd frame, so a decode that would fail on the wire fails
+    here too."""
+    try:
+        from compression.zstd import compress
+        return compress(data)
+    except ImportError:
+        import subprocess
+        return subprocess.run(["zstd", "-q", "-c"], input=data,
+                              capture_output=True).stdout
+
+
+def Screen_for_test():
+    """`busy` needs the curses MODULE for its attribute constants, and
+    nothing else — no terminal."""
+    import curses
+    screen = tv.Screen(None)
+    screen.curses = curses
+    return screen
+
+
+class Screenish:
+    """Enough of a curses window for `busy` to draw on."""
+
+    def __init__(self):
+        self.painted = []
+
+    def getmaxyx(self):
+        return (24, 80)
+
+    def addnstr(self, y, x, text, n, attr=0):
+        self.painted.append(text)
+
+    def refresh(self):
+        pass
+
+    def timeout(self, ms):
+        pass
+
+    def getch(self):
+        time.sleep(0.02)
+        return -1
+
+
+@test
+def a_chunk_is_cached_because_its_bytes_never_change():
+    """A chunk is immutable once written, which is what makes reading it
+    twice a waste rather than a risk."""
+    live = {None: {"name": "app", "id": ID_A, "chunks": 3, "first_seq": 0,
+                   "last_seq": 2, "logical_bytes": 30, "dropped_chunks": 0,
+                   "dropped_uncompressed_bytes": 0, "labels": {}}}
+    seen = []
+
+    def ask(doc, host=None, raw=False):
+        kind = (doc.get("response_format") or {}).get("kind")
+        if kind == "stores":
+            return json.dumps({"server_version": "t", "stores": [live[None]]}), "", 0
+        seen.append(doc["window"].get("from_chunk"))
+        body = b"a line\n"
+        return wire(("chunk", {"len": len(_z(body)), "chunk": 1,
+                               "uncomp_start": 0, "uncomp_len": len(body),
+                               "wf": 1, "wl": 2}, _z(body))), "", 0
+
+    b = tv.QueryBackend(ask, [None])
+    assert b.chunk(live[None], seq=1).seq == 1
+    assert b.chunk(live[None], seq=1).seq == 1
+    assert seen == [1], seen
+
+
+@test
+def the_neighbours_are_read_ahead_so_the_scroll_is_local():
+    """One chunk is ten screenfuls, so the reader is looking at this one
+    for a while — which is exactly when to fetch the next. Opening waits
+    for ONE round trip; the scroll that needs the neighbour finds it."""
+    f = Fake(["a\n" * 8, "b\n" * 8, "c\n" * 8])
+    asked = []
+    f.prefetch = lambda store, *seqs: asked.extend(seqs)
+    v = opened(f)                       # the live end, where a pager opens
+    assert len(v.tape.chunks) == 1, v.tape.chunks
+    assert asked == [1], asked
+
+
+@test
+def every_target_is_asked_at_once():
+    """Four hosts one after another is four latencies for one answer.
+    Counted rather than timed: the claim is that they overlap."""
+    inflight, peak, lock = [0], [0], threading.Lock()
+
+    def ask(doc, host=None, raw=False):
+        with lock:
+            inflight[0] += 1
+            peak[0] = max(peak[0], inflight[0])
+        time.sleep(0.05)
+        with lock:
+            inflight[0] -= 1
+        return json.dumps({"server_version": "t", "stores": []}), "", 0
+
+    b = tv.QueryBackend(ask, ["a", "b", "c", "d"])
+    b.stores()
+    assert peak[0] == 4, f"peak concurrency {peak[0]}, so they went in turn"
+
+
+@test
+def bounds_just_read_are_not_read_again():
+    """Retention moves the floor while you read, so the numbers cannot be
+    remembered from when the store was opened — but re-reading them in
+    front of a chunk that is already cached puts a whole round trip
+    where none is needed."""
+    f = Fake(["a\n" * 4, "b\n" * 4])
+    f.store["_read_at"] = time.monotonic()
+    f.FRESH = 10.0
+    reads = []
+    real = f.bounds
+    f.bounds = lambda st: (reads.append(1), real(st))[1]
+    t = tv.Tape(f, f.store)
+    t.refresh()
+    assert reads == [], "re-read bounds that had just been read"
+    f.store["_read_at"] = time.monotonic() - 60
+    t.refresh()
+    assert reads == [1], "never re-read bounds that had gone stale"
+
+
+@test
+def a_wait_says_so_and_hands_back_what_it_waited_for():
+    """A screen that stops answering is indistinguishable from one that
+    has hung, which is what a fleet-latency pager looks like without
+    this."""
+    scr = Screenish()
+    screen = Screen_for_test()
+    assert screen.busy(scr, "reading mail01", lambda: (time.sleep(0.5), 7)[1]) == 7
+    assert any("reading mail01" in t for t in scr.painted), scr.painted
+    assert any("^C gives up" in t for t in scr.painted), scr.painted
+
+    # A failure on the worker is the caller's failure, not a swallowed one.
+    def boom():
+        raise tv.Refused("mail01 did not answer")
+    try:
+        screen.busy(Screenish(), "reading mail01", boom)
+        raise AssertionError("a failure on the worker was swallowed")
+    except tv.Refused as e:
+        assert "did not answer" in str(e)
+
+    # And a fast answer draws nothing: a flash on every keystroke is its
+    # own kind of noise.
+    quiet = Screenish()
+    assert screen.busy(quiet, "reading mail01", lambda: 3) == 3
+    assert quiet.painted == [], quiet.painted
 
 
 def main():
