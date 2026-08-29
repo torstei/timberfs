@@ -478,20 +478,21 @@ fn run() -> anyhow::Result<()> {
                 // that a cursor is never written ahead of a durability
                 // proof. Resolution is a pure function of (wl, rings), so a
                 // crash before that simply resolves again.
-                if c.seq.is_none() && c.delivered > 0 {
+                {
                     let before = c.wl;
-                    match c.resolve(records.as_deref().unwrap_or_default()) {
-                        Some(seq) => note!(
+                    match c.resolve_if_pre_numbering(records.as_deref().unwrap_or_default()) {
+                        Some(Ok(seq)) => note!(
                             "timber-otlp: converting a pre-numbering cursor: write time {} \
                              resolves to chunk {seq}, re-read from its start — up to one \
                              chunk may be re-delivered (at-least-once), and nothing is \
                              skipped",
                             timberfs::query::fmt_ms(before)
                         ),
-                        None => note!(
+                        Some(Err(())) => note!(
                             "timber-otlp: a pre-numbering cursor and no chunks to resolve \
                              it against yet; honouring --start until there are"
                         ),
+                        None => {}
                     }
                 }
                 report_resume(&c, records.as_deref());

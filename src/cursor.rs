@@ -188,6 +188,22 @@ impl Cursor {
         Some(seq)
     }
 
+    /// Should this cursor be converted at all, and to what?
+    ///
+    /// `Some(Ok(seq))` converted, `Some(Err(()))` needed converting but had
+    /// no chunks to resolve against yet, `None` nothing to do. The GUARD is
+    /// the part worth having in one place: a cursor with no `seq` and
+    /// nothing delivered is not pre-numbering, it is NEW — its `wl` is a
+    /// default rather than a position, and resolving against it would
+    /// silently override `--start`. Only a cursor that has delivered
+    /// something has a write time that means anything.
+    pub fn resolve_if_pre_numbering(&mut self, records: &[ChunkRecord]) -> Option<Result<u64, ()>> {
+        if self.seq.is_some() || self.delivered == 0 {
+            return None;
+        }
+        Some(self.resolve(records).ok_or(()))
+    }
+
     /// Atomic and durable: a torn or empty cursor after a crash would be
     /// unreadable, and an unreadable cursor stops the shipper. tmp +
     /// fsync + rename + fsync of the directory; the pre-rename content is
@@ -687,6 +703,46 @@ mod tests {
         // Idempotent, which is what lets it be persisted only after a
         // delivery rather than at startup.
         assert_eq!(c.resolve(&records), Some(1));
+    }
+
+    /// The guard, which decides whether to convert at all. A cursor with
+    /// no `seq` and nothing delivered is NOT pre-numbering — it is new, and
+    /// its `wl` is a default rather than a position. Resolving against that
+    /// would override `--start` with a chunk nobody chose, which is a
+    /// silent skip of everything before it.
+    #[test]
+    fn only_a_cursor_that_delivered_something_is_pre_numbering() {
+        let records = three();
+        let mut fresh = cur(0, 0);
+        fresh.seq = None;
+        fresh.delivered = 0;
+        assert_eq!(
+            fresh.resolve_if_pre_numbering(&records),
+            None,
+            "a new cursor has no position to convert"
+        );
+        assert_eq!(fresh.seq, None, "...and must be left alone for --start");
+
+        let mut old = cur(0, 0);
+        old.seq = None;
+        old.wl = 250;
+        old.delivered = 9;
+        assert_eq!(old.resolve_if_pre_numbering(&records), Some(Ok(1)));
+
+        // Already numbered: nothing to do, and the position stands.
+        let mut numbered = cur(2, 5);
+        assert_eq!(numbered.resolve_if_pre_numbering(&records), None);
+        assert_eq!((numbered.seq, numbered.n), (Some(2), 5));
+
+        // A store with no chunks yet is told apart from "nothing to do":
+        // the shipper honours --start until there are some, and says so.
+        let mut nothing_to_resolve = cur(0, 0);
+        nothing_to_resolve.seq = None;
+        nothing_to_resolve.delivered = 9;
+        assert_eq!(
+            nothing_to_resolve.resolve_if_pre_numbering(&[]),
+            Some(Err(()))
+        );
     }
 
     #[test]
