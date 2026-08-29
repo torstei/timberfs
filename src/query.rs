@@ -3863,6 +3863,65 @@ mod paging_tests {
             .collect()
     }
 
+    /// `--max` is an exact hard cap, not "about this many". It counts
+    /// ENTRIES, so it has to survive a chunk boundary landing mid-cap —
+    /// which is why the store here spreads its entries over several chunks
+    /// rather than holding them in one.
+    #[test]
+    fn a_max_is_an_exact_cap_on_entries() {
+        let lines: Vec<(String, u64)> = (1..=40).map(|i| (format!("line {i}"), i)).collect();
+        let refs: Vec<(&str, u64)> = lines.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        let d = store_of("maxcap", &refs);
+        let files = [d.join("app.log")];
+        assert_eq!(bodies(&read(&files, &Default::default(), None)).len(), 40);
+        for cap in [1, 5, 39, 40, 41] {
+            let got = bodies(&read(&files, &Default::default(), Some(cap)));
+            assert_eq!(
+                got.len(),
+                (cap as usize).min(40),
+                "a cap of {cap} was not exact"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The fleet view: many logs read as one, interleaved by time and
+    /// attributed per line. Attribution lives in the filename, and every
+    /// output line gets exactly one prefix even where a chunk boundary
+    /// splits a line.
+    #[test]
+    fn the_text_fleet_view_interleaves_and_attributes_every_line() {
+        let a = store_of("fleeta", &[("alpha one", 1_000), ("alpha two", 3_000)]);
+        let b = store_of("fleetb", &[("beta one", 2_000), ("beta boom", 4_000)]);
+        let files = [a.join("app.log"), b.join("app.log")];
+        let mut out = Vec::new();
+        write_multi(
+            &mut out,
+            &files,
+            0,
+            u64::MAX,
+            None,
+            &[],
+            &[],
+            false, // no_filename: attribute every line
+            None,
+            &Budget::Unbounded,
+        )
+        .unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(
+            lines.iter().all(|l| l.contains("app.log:")),
+            "every line carries exactly one prefix: {text}"
+        );
+        // Interleaved by write time: the two stores alternate.
+        let who: Vec<bool> = lines.iter().map(|l| l.contains("fleeta")).collect();
+        assert_eq!(who, vec![true, false, true, false], "{text}");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
     /// A framed answer claims order WITHIN a store and none between, so a
     /// store's entries come back contiguous. Built so the two rules
     /// disagree: the write windows alternate, so a read that interleaved
