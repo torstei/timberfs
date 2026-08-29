@@ -951,6 +951,40 @@ mod tests {
         assert_eq!(serde_json::from_str::<Document>(&text).unwrap(), doc);
     }
 
+    /// The job `--dump-json` is uniquely good for: telling a client what a
+    /// typed time MEANS, so it does not write a second date parser. The
+    /// answer is a document, so the same call also shows that naming no
+    /// store is every store rather than an error.
+    #[test]
+    fn a_typed_time_becomes_a_number_a_client_can_read_back() {
+        let mut q = q();
+        q.window.from = Some(crate::query::parse_time("2026-08-28 11:10").unwrap());
+        q.window.to = None;
+        q.sources = vec![];
+        q.matching = Default::default();
+        let doc = Document::of(&q).unwrap();
+        let from = doc.window.as_ref().unwrap().from.unwrap();
+        // Milliseconds since the epoch, and a 2026 date is a 13-digit
+        // number: the check is that a wall-clock string came back as one
+        // scale, not that a particular zone was applied.
+        assert!(
+            (1_700_000_000_000..2_000_000_000_000).contains(&from),
+            "not epoch milliseconds: {from}"
+        );
+        let text = serde_json::to_string(&doc).unwrap();
+        assert!(text.contains(&from.to_string()), "{text}");
+        assert!(
+            doc.stores.select.is_empty(),
+            "no store named is EVERY store, which is what an empty predicate is"
+        );
+        // A time that means nothing is refused, and says which one — not
+        // reported as a missing argument for one that was given.
+        let e = crate::query::parse_time("not a time")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unrecognized time"), "{e}");
+    }
+
     #[test]
     fn a_store_cannot_be_named_by_its_path() {
         // A path is neither a store's identity nor a way to find one. It
