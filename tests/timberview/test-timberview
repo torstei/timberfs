@@ -942,6 +942,48 @@ def a_hit_with_no_offset_is_opened_by_its_write_window():
     assert "neither where nor when" in v.message, v.message
 
 
+@test
+def tabbing_brings_the_term_into_view():
+    """A log line is 200 characters and a screen is 80, so Tab walks
+    straight off the edge unless the sideways scroll follows the pick.
+    Only on a PICK: scrolling by hand and having the screen snap back
+    would be the same fight from the other side."""
+    far = "x" * 150
+    f = Fake([f"alpha {far} omega9\n"])
+    v = opened(f, seq=0)
+    v.cur = 0
+    assert v.col == 0
+
+    # Tab to the term at the far right; the window follows it.
+    while v.selected() != "omega9":
+        v.pick(1)
+    v.layout(80, 10)
+    span = v.selected_span()
+    assert v.col <= span[0] and span[1] <= v.col + 80, (v.col, span)
+    # And not flush against the edge it just came from: a term with no
+    # context beside it reads as the end of the line.
+    assert span[1] < v.col + 80, (v.col, span)
+
+    # And back to the first, which is off to the LEFT from there.
+    while v.selected() != "alpha":
+        v.pick(1)
+    v.layout(80, 10)
+    span = v.selected_span()
+    assert v.col <= span[0] and span[1] <= v.col + 80, (v.col, span)
+
+    # Scrolling by hand is not undone by the next redraw.
+    v.scroll_h(40)
+    where = v.col
+    v.layout(80, 10)
+    assert v.col == where, (v.col, where)
+
+    # Wrapped, there is no sideways scroll to follow.
+    v.toggle_wrap()
+    v.pick(1)
+    v.layout(80, 10)
+    assert v.col == 0, v.col
+
+
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else ""
     chosen = [t for t in TESTS if want in t.__name__]

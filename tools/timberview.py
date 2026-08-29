@@ -1002,6 +1002,11 @@ class View:
         self.message = ""
         self.hits, self.hit = [], -1
         self.term = None
+        # Set when the PICK moved, so the next layout brings the term
+        # into view. Only then: scrolling sideways by hand and having
+        # the screen snap back would be the same fight from the other
+        # side.
+        self.follow_term = False
 
     # -- opening
     def leave_for_the_log(self):
@@ -1138,11 +1143,30 @@ class View:
             self.message = self.nothing_pickable()
             return None
         self.tok = (self.tok + step) % len(toks)
+        self.follow_term = True
         return toks[self.tok][2]
 
     def selected(self):
         toks = self.line_terms()
         return toks[self.tok][2] if toks and self.tok < len(toks) else None
+
+    def selected_span(self):
+        toks = self.line_terms()
+        return toks[self.tok] if toks and self.tok < len(toks) else None
+
+    def bring_term_into_view(self, width):
+        """Tab across a 200-character log line walks straight off the
+        screen otherwise: the pick moves and the sideways scroll does
+        not follow it. A little context either side, so the term does
+        not sit against the edge it just came from."""
+        span = self.selected_span()
+        if self.wrap or not span:
+            return
+        margin = min(8, max(0, (width - (span[1] - span[0])) // 2))
+        if span[0] < self.col + margin:
+            self.col = max(0, span[0] - margin)
+        elif span[1] > self.col + width - margin:
+            self.col = max(0, span[1] - width + margin)
 
     def nothing_pickable(self):
         ln = self.line()
@@ -1216,6 +1240,7 @@ class View:
             for i, (_, _, t) in enumerate(self.line_terms()):
                 if t == self.term:
                     self.tok = i
+                    self.follow_term = True
                     break
         if hit.address.kind == "offset":
             self.message = str(hit.address)
@@ -1280,6 +1305,9 @@ class View:
         self.cur = max(0, min(self.cur, len(lines) - 1))
         if self.cur < self.top:
             self.top = self.cur
+        if self.follow_term:
+            self.bring_term_into_view(width)
+            self.follow_term = False
         rows = self._build(width, height)
         seen = [r["line"] for r in rows if r["line"] is not None]
         if seen and self.cur > seen[-1]:
