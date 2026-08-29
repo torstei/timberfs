@@ -13,6 +13,7 @@ change under you; nothing here is a compatibility surface yet.
     select records from console where entry has 'ERROR' limit 100;
     select records from [] where chunk may have 'req-8f3a';
     tail   records from console;
+    view   [type=console] at '12:00';
 
 A LOGVIEW is a NAMED PREDICATE, re-resolved every time it is used — so a
 store that appears after you defined it is in it. That is the whole
@@ -26,11 +27,16 @@ The SELECTOR is deliberately not implemented: every resolution is a real
 `kind: "stores"` query, because a second copy of it would drift and a
 drifted selector answers a different question without saying so.
 
-Times ARE resolved here, and must be. A query document is meant to be
-SELF-CONTAINED — a client that speaks it needs the protocol and nothing
-else — so building one cannot require running a timberfs on THIS machine
-to interpret a string. `window.from` is milliseconds because a document
-is a value: `11:10` means today, and in the reader's timezone, so a
+`view` is a PAGER over one store rather than a query, and it runs in
+process: the loop is search, jump, search again, and a separate program
+would have to leave the screen on every hop. `timberview` is the same
+module with its own entry point.
+
+Times ARE resolved at this edge, and must be — `timberview.when`, shared
+by both front ends. A query document is meant to be SELF-CONTAINED, so
+building one cannot require running a timberfs on THIS machine to
+interpret a string. `window.from` is milliseconds because a document is
+a value: `11:10` means today, and in the reader's timezone, so a
 document carrying the text would mean something different tomorrow and
 something else again at the far end.
 
@@ -55,14 +61,25 @@ something else again at the far end.
   TIMBERSH_HISTSIZE
                  how many lines to keep, default 2000
 """
-import argparse, datetime, json, os, re, readline, shlex, subprocess, sys, threading, time
+import argparse, json, os, re, readline, subprocess, sys, threading, time
 
-CMD = shlex.split(os.environ.get("TIMBERFS_CMD", "timberfs query --query -"))
-HOST_TOKEN = "_TIMBERHOST_"
-HOSTS = [h.strip() for h in os.environ.get("TIMBERFS_HOSTS", "").split(",") if h.strip()]
-# `None` is the one unnamed host: no fan-out, no substitution, and every
-# host-aware path below collapses to what it did before.
-TARGETS = HOSTS or [None]
+# The viewer, and the pieces both front ends share. A checkout finds
+# them beside this script; the package installs them where both do.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [p for p in (_HERE, "/usr/share/timberfs-sh")
+                if os.path.exists(os.path.join(p, "timberview.py"))]
+import timberfs_client
+import timberview
+from timberfs_client import HOST_TOKEN, when
+
+# The fleet, as TARGETS (names) and FLEET (the targets themselves). A
+# name is the currency everywhere below — the HOST column, a store's
+# `_host`, the host in an address — and only the transport looks up the
+# command behind it.
+FLEET = timberfs_client.Fleet([timberfs_client.Target(None,
+                                                      timberfs_client.DEFAULT_CMD)],
+                              "the default")
+TARGETS = [None]
 # How long the store list is reused for completion and `\d`. ZERO is
 # never: the list is read once and kept, because a store appearing
 # mid-session is rare and paying a round trip for it on a schedule is not.
@@ -112,8 +129,23 @@ HELP = """
   add host web03;                          ask it too, from now on
   drop host web03;                         stop asking it
 
-  select <kind> from <source> [where ...] [limit N [chunks]];
+  view   <source> [at <time> | at chunk N | at offset N];
+  view   'timber://host/store-id#offset=N';
+
+    A PAGER over the store, not a query: no predicate, no result set,
+    the last chunk first and back from there. It parses nothing -- so it
+    works on a store whose lines timberfs cannot read, and on one with
+    no index. Tab picks a searchable token, Enter finds it everywhere,
+    and it leaves you the address of where you stopped.
+
+  select <kind> from <source> [where ...] [limit N [chunks]] [into view];
   tail   <kind> from <source> [where ...];
+
+    `into view` puts the ANSWER on the pager's screen instead of on the
+    terminal: multi-line entries stay whole, Tab and Enter search as
+    they do anywhere, and `o` leaves the answer for the LOG around that
+    entry. Only `records` can -- it is the kind that carries the offset
+    a line needs to say where it came from.
 
     <kind>    records | loglines | stores | chunks
     <source>  a view name, or a predicate literal like [type=console].
@@ -205,74 +237,29 @@ def parse_pred(text):
 
 # ------------------------------------------------------------- timberfs
 def argv_for(host):
-    return CMD if host is None else [a.replace(HOST_TOKEN, host) for a in CMD]
+    """The argv that reaches one target. A LOOKUP, not a substitution:
+    two hosts may be reached in completely different ways, which is why
+    the command belongs to the target."""
+    t = FLEET.by_name(host)
+    if t is None:
+        raise ValueError(f"no target named {host!r} — `show hosts;` lists them")
+    return t.cmd
 
 
-def run(doc, host=None):
+def run(doc, host=None, raw=False):
     """One document to one host. A transport that never started — ssh
     refusing, a wrapper missing — comes back as a non-zero rc with its own
-    words, and is reported rather than counted as an empty answer."""
+    words, and is reported rather than counted as an empty answer.
+
+    `raw` keeps the answer as BYTES: a `chunks` answer carries compressed
+    frames, and decoding those as text destroys them."""
     try:
-        p = subprocess.run(argv_for(host), input=json.dumps(doc),
-                           capture_output=True, text=True)
+        p = subprocess.run(argv_for(host), input=json.dumps(doc).encode(),
+                           capture_output=True)
     except OSError as e:
-        return "", str(e), 127
-    return p.stdout, p.stderr.strip(), p.returncode
-
-
-# What `timberfs query --from` accepts, in its order. Zoneless forms are
-# LOCAL time, and a bare time is today.
-TIME_FORMATS = [
-    ("%Y-%m-%d %H:%M:%S", "d"), ("%Y-%m-%dT%H:%M:%S", "d"),
-    ("%Y-%m-%d %H:%M", "d"),    ("%Y-%m-%dT%H:%M", "d"),
-    ("%Y.%m.%d %H:%M:%S", "d"), ("%Y.%m.%d %H:%M", "d"),
-    ("%Y-%m-%d", "d"),          ("%Y.%m.%d", "d"),
-    ("%H:%M:%S.%f", "t"),       ("%H:%M:%S", "t"), ("%H:%M", "t"),
-]
-
-
-def when(text):
-    """A typed time, in milliseconds — resolved HERE.
-
-    Not by asking a local timberfs, which is what this used to do. A query
-    document is meant to be SELF-CONTAINED: a client that speaks it needs
-    the protocol and nothing else, and the whole point of this shell is
-    driving a timberfs somewhere else. Shelling out to a binary on THIS
-    machine to build a document for THAT one contradicts the arrangement,
-    and fails outright where none is installed.
-
-    Here is also the only correct place. `11:10` means 11:10 where the
-    person typing it is, and it means TODAY — a string carried in the
-    document would mean a different instant tomorrow, and a different one
-    again parsed in the server's timezone. Milliseconds are the resolved
-    form; the text is input to whatever resolves it, which keeps the
-    document a value.
-
-    The duplication that costs is bounded, unlike the selector's: a
-    disagreement here yields a different NUMBER, never a search the far
-    end reads as a different question."""
-    text = text.strip()
-    try:
-        # An explicit offset needs no assumption; anything else takes this
-        # machine's zone, which is the one the reader is in.
-        return int(datetime.datetime.fromisoformat(text).timestamp() * 1000)
-    except ValueError:
-        pass
-    for fmt, kind in TIME_FORMATS:
-        try:
-            t = datetime.datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-        if kind == "t":
-            t = datetime.datetime.combine(datetime.date.today(), t.time())
-        return int(t.astimezone().timestamp() * 1000)
-    if text.isdigit():
-        n = int(text)
-        # Anything this large is already milliseconds.
-        return n if n > 100_000_000_000 else n * 1000
-    raise ValueError(
-        f"{text!r} is not a time I read — try RFC3339, "
-        f"'YYYY-MM-DD [HH:MM[:SS]]', 'HH:MM[:SS]' for today, or unix seconds")
+        return (b"" if raw else ""), str(e), 127
+    return ((p.stdout if raw else p.stdout.decode("utf-8", "replace")),
+            p.stderr.decode("utf-8", "replace").strip(), p.returncode)
 
 
 # --------------------------------------------------------------- render
@@ -516,26 +503,6 @@ def label(host):
     return host or "(local)"
 
 
-def check_hosts(targets, cmd):
-    """What a host set and a command must agree about, or None.
-
-    Both directions are wrong in the same silent way. Several hosts with
-    nowhere to put them sends the SAME command to each, so one forest is
-    read N times and every entry comes back N times under a different
-    host's name. A placeholder with no host to fill it runs the command
-    with `_TIMBERHOST_` in it literally — which reaches something, or
-    nothing, and reports whatever that was."""
-    named = [h for h in targets if h]
-    token = any(HOST_TOKEN in x for x in cmd)
-    if named and not token:
-        return (f"the command has no {HOST_TOKEN} to put a host in:\n"
-                f"      {' '.join(cmd)}")
-    if token and not named:
-        return (f"the command has a {HOST_TOKEN} and no host to put in it, so it "
-                f"would run with the placeholder still in it:\n      {' '.join(cmd)}")
-    return None
-
-
 def unwrap(text):
     """An answer, as (stores, server_version).
 
@@ -621,7 +588,10 @@ def parse_where(toks, i):
     SUBJECT carries what the document makes required — granularity and
     axis — so neither can be defaulted by accident."""
     conds = []
-    while i < len(toks) and toks[i][1] not in (";", "limit"):
+    # What ENDS a where clause. Lowercased, so a shouted LIMIT stops it
+    # too — and `into`, which names where the answer goes rather than
+    # what it contains.
+    while i < len(toks) and toks[i][1].lower() not in (";", "limit", "into"):
         w = toks[i][1].lower()
         if w == "and": i += 1; continue
         if w in ("entry", "chunk"):
@@ -661,8 +631,8 @@ def parse_where(toks, i):
 
 # ----------------------------------------------------------- completion
 BACKSLASH = ["\\d", "\\d+", "\\dv", "\\?", "\\q"]
-VERBS = ["select", "tail", "declare", "fetch", "close", "create", "drop",
-         "refresh", "add",
+VERBS = ["select", "tail", "view", "declare", "fetch", "close", "create",
+         "drop", "refresh", "add",
          "show", "save", "load", "help", "quit"]
 AFTER_ENTRY = ["has", "not", "substring", "regex"]
 AFTER_TIME = ["since", "until", "between"]
@@ -715,6 +685,12 @@ class Complete:
                     return [pre + v for v in sorted(self.sh.values_of(k))]
             pre = f"[{head}," if head else "["
             return [pre + k + "=" for k in sorted(self.sh.keys_of())]
+        if toks[0] == "view":
+            if prev == "view":
+                return sorted(self.sh.views) + ["["]
+            if prev == "at":
+                return ["chunk", "offset"]
+            return ["at"] if n == 3 else []
         if prev in ("select", "tail", "fetch"):
             return KINDS if prev != "fetch" else []
         if prev == "from":
@@ -786,7 +762,7 @@ class Shell:
         if os.path.exists(RC):
             self.load(RC, quiet=True)
 
-    def ask(self, doc, host=None):
+    def ask(self, doc, host=None, raw=False):
         """Every call to a host goes through here, so that what it said is
         RECORDED rather than thrown away.
 
@@ -800,7 +776,7 @@ class Shell:
         # startup listing could land last and erase the note from the
         # command the person actually ran.
         started = time.monotonic()
-        out, err, rc = run(doc, host)
+        out, err, rc = run(doc, host, raw)
         st = self.hosts.setdefault(host, {})
         if started < st.get("at", 0):
             return out, err, rc
@@ -1002,6 +978,7 @@ class Shell:
                            unreachable=self.unreachable)
 
     def do(self, line):
+        global FLEET, TARGETS
         if line.lstrip().startswith("\\"):
             return self.backslash(line.lstrip())
         toks = [t for t in lex(line) if t[1] != ";"]
@@ -1016,25 +993,34 @@ class Shell:
             if len(toks) < 3:
                 raise ValueError(f"{head} host <name> [name ...]")
             names = [t[1] for t in toks[2:] if t[1] != ","]
-            global TARGETS
-            now = [h for h in TARGETS if h]  # the unnamed host is not a host
+            now = [t for t in FLEET.targets if t.name]
             for n in names:
                 if head == "add":
-                    if n in now:
+                    if any(t.name == n for t in now):
                         raise ValueError(f"`{n}` is already there")
-                    now.append(n)
+                    # A host needs a command to be reached BY, and only
+                    # the `--cmd` shape carries one that generalises. A
+                    # resolver derives its answer, so the way to add a
+                    # host there is to add it there and `refresh`.
+                    if not FLEET.template:
+                        raise ValueError(
+                            f"the fleet comes from {FLEET.source}, which says "
+                            f"how to reach each target — there is no command "
+                            f"to reach `{n}` with. Add it there and `refresh`")
+                    now.append(timberfs_client.Target(
+                        n, [a.replace(timberfs_client.HOST_TOKEN, n)
+                            for a in FLEET.template]))
                 else:
-                    if n not in now:
+                    if not any(t.name == n for t in now):
                         raise ValueError(
                             f"no host `{n}` — `show hosts;` lists them")
-                    now.remove(n)
+                    now = [t for t in now if t.name != n]
             if not now:
                 raise ValueError(
                     "that is the last host; a shell with none has nothing to ask")
-            problem = check_hosts(now, CMD)
-            if problem:
-                raise ValueError(problem)
-            TARGETS = now
+            FLEET = timberfs_client.Fleet(now, FLEET.source, FLEET.unusable,
+                                          FLEET.template, FLEET._how)
+            TARGETS = FLEET.names
             # The cached stores are tagged with the host they came from, so
             # a changed set makes the cache answer for a fleet that is no
             # longer the one being asked.
@@ -1046,6 +1032,23 @@ class Shell:
             show_unreachable(self.unreachable)
             return
         if head == "refresh":
+            was = set(FLEET.names)
+            try:
+                FLEET = FLEET.again()
+            except ValueError as e:
+                raise ValueError(f"the fleet could not be re-resolved: {e}")
+            TARGETS = FLEET.names
+            gained, lost = set(FLEET.names) - was, was - set(FLEET.names)
+            if gained or lost:
+                bits = [f"{len(TARGETS)} target(s) from {FLEET.source}"]
+                if gained:
+                    bits.append("new: " + ", ".join(sorted(map(label, gained))))
+                if lost:
+                    bits.append("gone: " + ", ".join(sorted(map(label, lost))))
+                print("  " + "   ".join(bits))
+            for h in list(self.hosts):
+                if h not in TARGETS:
+                    del self.hosts[h]
             before = {st.get("id") or st["name"]: st["name"]
                       for st in self.universe()}
             after = {st.get("id") or st["name"]: st["name"]
@@ -1064,6 +1067,9 @@ class Shell:
             return
         if head == "show" and len(toks) > 1 and toks[1][1].lower().startswith("host"):
             self.universe()  # cheap: cached, and it is what fills this in
+            print(f"  {len(TARGETS)} target(s), from {FLEET.source}")
+            for name, why in FLEET.unusable:
+                print(f"  ⚠ {label(name)} was not asked: {why}")
             w = max([len(label(h)) for h in TARGETS] + [4])
             print(f"  {'HOST':{w}}  {'VERSION':20}  STORES  STATUS")
             for host in TARGETS:
@@ -1088,6 +1094,12 @@ class Shell:
                 # The note timberfs printed and still exited 0 on. Kept
                 # because it is the sentence that explains an answer which
                 # looks wrong, and it used to be discarded.
+                # What actually runs. It is per target now, so a fleet
+                # reached several different ways says so here rather
+                # than being assumed uniform.
+                t = FLEET.by_name(host)
+                if t:
+                    print(f"  {'':{w}}  via: {' '.join(t.cmd)}")
                 if st.get("note"):
                     for line in st["note"].splitlines():
                         if line.strip():
@@ -1150,6 +1162,12 @@ class Shell:
             cur = self.cursors.get(toks[3][1])
             if cur is None: raise ValueError(f"no cursor `{toks[3][1]}`")
             return self.fetch(cur, n)
+        if head == "view":
+            if len(toks) < 2:
+                raise ValueError(
+                    "view <source> [at <time> | at chunk N | at offset N]  "
+                    "-- `view []` is every store")
+            return self.view(toks)
         if head in ("select", "tail"):
             kind = toks[1][1].lower()
             if kind not in KINDS: raise ValueError(f"`{kind}`? one of {KINDS}")
@@ -1162,10 +1180,113 @@ class Shell:
                 n = int(toks[i + 1][1])
                 unit = (toks[i + 2][1].lower() if i + 2 < len(toks) else "entries")
                 limit = {"chunks" if unit.startswith("chunk") else "entries": n}
+                i += 3 if i + 2 < len(toks) and not unit.startswith("into") else 2
+            into = False
+            if i < len(toks) and toks[i][1].lower() == "into":
+                if i + 1 >= len(toks) or toks[i + 1][1].lower() != "view":
+                    raise ValueError("`into` what? `into view` is the one there is")
+                into = True
             doc = build(kind, terms, conds, limit)
+            if into:
+                if head != "select":
+                    raise ValueError("`tail` does not end, so it has no answer "
+                                     "to put in a view")
+                return self.into_view(doc, kind, line)
             if head == "tail": return self.tail(doc)
             return self.once(doc, kind)
         raise ValueError(f"`{head}`? try `help`")
+
+    def into_view(self, doc, kind, line):
+        """The answer, in the pager instead of on the terminal.
+
+        `select` walks a result set and `view` walks the log — different
+        motions, and this puts the first on the second's screen. It
+        works because an entry record carries `chunk` and `offset`, so
+        every line in the answer knows where it CAME from: Tab and the
+        search work as they do anywhere, and Enter leaves the answer for
+        the log around that entry."""
+        # The statement is wrong or right wherever it is run, so it is
+        # judged before the terminal is.
+        if kind != "records":
+            raise ValueError(
+                f"`select {kind} ... into view` cannot work — only `records` "
+                f"carries the offset a line needs to say where it came from, "
+                f"and without one nothing in the answer could be opened.\n"
+                f"     Ask for `select records ...`.")
+        if not sys.stdout.isatty():
+            raise ValueError("`into view` needs a terminal")
+        backend = timberview.QueryBackend(self.ask, TARGETS)
+        # The statement names the answer, minus the part that says where
+        # to put it — which the screen it is on already says.
+        what = re.sub(r"\s+into\s+view\s*;?\s*$", "", line.strip(),
+                      flags=re.I).rstrip(";")
+        streams = backend.records(doc)
+        answer = timberview.Records(streams, stores=backend.stores(), what=what)
+        if not answer.entries:
+            note = self.why_empty(doc)
+            print(note if note else "  -- nothing matched")
+            return
+        end = timberview.watch_source(backend, answer)
+        report_errors(backend.unreachable)
+        print(f"  {end}" if end else "  -- left the answer")
+
+    def view(self, toks):
+        """A pager over the tape, IN PROCESS.
+
+        The loop is search, jump, search again. A separate command would
+        have to leave the screen carrying "search this token", let the
+        shell print, and re-enter at a coordinate — a flicker per hop,
+        which is the opposite of what a viewer is for."""
+        if not sys.stdout.isatty():
+            raise ValueError("`view` needs a terminal")
+        backend = timberview.QueryBackend(self.ask, TARGETS)
+        tok = toks[1]
+        if tok[0] == "str" and tok[1].startswith(timberview.SCHEME + ":"):
+            addr = timberview.parse_address(tok[1])
+            terms = self.expand_ids(
+                [{"key": "id", "op": "=", "value": addr.store}])
+            pos = timberview.position(str(addr))
+            rest = 2
+        else:
+            terms = self.source(tok)
+            pos, rest = self.view_at(toks, 2)
+        if rest < len(toks):
+            raise ValueError(f"`{toks[rest][1]}`? nothing follows a position")
+        stores = backend.select_stores(terms)
+        if not stores:
+            raise ValueError(
+                "that predicate selects NO STORE"
+                + (f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1
+                   else "") + ", so there is nothing to open")
+        try:
+            end = timberview.watch(backend, stores[0], **pos)
+        except timberview.Refused as e:
+            raise ValueError(str(e))
+        if len(stores) > 1:
+            print(f"  -- 1 of {len(stores)} stores matched; S switches "
+                  "between them")
+        print(f"  {end}")
+
+    def view_at(self, toks, i):
+        """`at` names a coordinate and says which one it is: a time, a
+        chunk number, or an offset are three different numbers."""
+        if i >= len(toks):
+            return {}, i
+        if toks[i][1].lower() != "at":
+            raise ValueError(
+                f"`{toks[i][1]}`? after a source comes `at <time>`, "
+                "`at chunk N` or `at offset N`")
+        i += 1
+        if i >= len(toks):
+            raise ValueError("`at` what? a time, `chunk N` or `offset N`")
+        w = toks[i][1].lower()
+        if w in ("chunk", "offset"):
+            i += 1
+            if i >= len(toks) or not toks[i][1].isdigit():
+                raise ValueError(f"`at {w}` wants a number")
+            return ({"seq": int(toks[i][1])} if w == "chunk"
+                    else {"offset": int(toks[i][1])}), i + 1
+        return {"at": when(toks[i][1])}, i + 1
 
     def fetch(self, cur, n):
         """One page, from a real cursor: the positions the last answer
@@ -1445,15 +1566,27 @@ def parse_args(argv):
                     "EXPERIMENTAL: the grammar is not promised.",
         epilog="Every option defaults to the environment variable beside it, so\n"
                "a flag overrides an export for one session and nothing else.\n"
+               "\n"
+               "WHERE THE FLEET IS, most explicit first: --resolver, --targets\n"
+               "or --cmd/--hosts (one of them, not two); then $TIMBERFS_RESOLVER,\n"
+               "$TIMBERFS_TARGETS, $TIMBERFS_CMD/$TIMBERFS_HOSTS; then\n"
+               "~/.config/timberfs/targets.json, /etc/timberfs/targets.json; then\n"
+               "one local `timberfs query --query -`. `show hosts;` says which won.\n"
+               "\n"
                "Inside the shell, `\\?` prints the statement syntax.")
+    ap.add_argument("--resolver", metavar="CMD",
+                    help="a command that prints the fleet as a target "
+                         "document. $TIMBERFS_RESOLVER")
+    ap.add_argument("--targets", metavar="FILE",
+                    help="the same document, from a file. $TIMBERFS_TARGETS; "
+                         "else ~/.config/timberfs/targets.json, else "
+                         "/etc/timberfs/targets.json")
     ap.add_argument("--cmd", metavar="ARGV",
-                    default=os.environ.get("TIMBERFS_CMD", "timberfs query --query -"),
-                    help="how to reach a timberfs; it is handed the query document "
-                         "on stdin. $TIMBERFS_CMD")
+                    help="one command reaching every host, with "
+                         f"{HOST_TOKEN} substituted per --hosts. Default "
+                         "`timberfs query --query -`. $TIMBERFS_CMD")
     ap.add_argument("--hosts", metavar="H,H",
-                    default=os.environ.get("TIMBERFS_HOSTS", ""),
-                    help="fan out to these hosts, substituting each for "
-                         f"{HOST_TOKEN} in --cmd. $TIMBERFS_HOSTS")
+                    help="the hosts that command reaches. $TIMBERFS_HOSTS")
     ap.add_argument("--rc", metavar="FILE", default=RC,
                     help="statements run at startup. $TIMBERSH_RC")
     ap.add_argument("--ttl", metavar="SECS", type=float,
@@ -1472,19 +1605,14 @@ def parse_args(argv):
 
 
 def main(argv=None):
-    global CMD, HOSTS, TARGETS, RC, STORE_TTL
+    global FLEET, TARGETS, RC, STORE_TTL
     a = parse_args(argv)
-    CMD = shlex.split(a.cmd)
-    HOSTS = [h.strip() for h in a.hosts.split(",") if h.strip()]
-    TARGETS = HOSTS or [None]
     RC, STORE_TTL = a.rc, a.ttl
-    # Several hosts and nowhere to put them: every one would get the SAME
-    # command, so the same forest would be read N times and every entry
-    # come back N times, labelled with a different host each time. A wrong
-    # answer that looks like a busy fleet.
-    problem = check_hosts(TARGETS, CMD)
-    if problem:
-        sys.exit(f"timbersh: {problem}")
+    try:
+        FLEET = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts)
+    except ValueError as e:
+        sys.exit(f"timbersh: {e}")
+    TARGETS = FLEET.names
     sh = Shell()
     # A space is the only delimiter: `[type=console` is ONE word to the
     # completer, which is what lets a predicate literal complete its own
@@ -1496,7 +1624,11 @@ def main(argv=None):
     if not a.quiet:
         print(HELP)
         if len(TARGETS) > 1:
-            print(f"  {len(TARGETS)} hosts: {', '.join(TARGETS)}\n")
+            print(f"  {len(TARGETS)} hosts from {FLEET.source}: "
+                  f"{', '.join(label(h) for h in TARGETS)}\n")
+    # Named on the way in, not discovered as a gap in an answer.
+    for name, why in FLEET.unusable:
+        print(f"  ⚠ {label(name)} was not asked: {why}")
     if sh.views:
         print(f"  {len(sh.views)} logview(s) from {RC}: {', '.join(sorted(sh.views))}")
     # Whatever ends the session — `\\q`, EOF, an interrupt, a statement

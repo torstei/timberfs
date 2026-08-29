@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""The fleet resolver's tests. No timberfs, no network, no terminal.
+
+    tests/timberfs-client/test-timberfs-client          # all
+    tests/timberfs-client/test-timberfs-client empty    # one, by substring
+"""
+import contextlib
+import json
+import os
+import shutil
+import stat
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
+import timberfs_client as fc                                  # noqa: E402
+
+V = fc.DOC_V
+TESTS = []
+
+
+def test(fn):
+    TESTS.append(fn)
+    return fn
+
+
+@contextlib.contextmanager
+def env(**kw):
+    """`resolve` reads the environment, so every case states the whole
+    of it — otherwise a developer's own export decides the answer."""
+    keep = {k: os.environ.get(k) for k in
+            ("TIMBERFS_RESOLVER", "TIMBERFS_TARGETS", "TIMBERFS_CMD",
+             "TIMBERFS_HOSTS")}
+    try:
+        for k in keep:
+            os.environ.pop(k, None)
+        for k, v in kw.items():
+            os.environ[k] = v
+        yield
+    finally:
+        for k, v in keep.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+@contextlib.contextmanager
+def tmp():
+    d = tempfile.mkdtemp(prefix="fleet-test-")
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def doc(*targets):
+    return json.dumps({"v": V, "targets": list(targets)})
+
+
+def script(d, name, body):
+    p = os.path.join(d, name)
+    open(p, "w").write("#!/bin/sh\n" + body + "\n")
+    os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+    return p
+
+
+# ------------------------------------------------------------- the shape
+@test
+def a_command_belongs_to_the_target_not_the_session():
+    """The whole point. `ssh mail01 timberfs …` and a wrapper taking the
+    host as an argument are one fleet, and neither has to be expressible
+    as the other with a placeholder swapped in — which is what
+    `TIMBERFS_CMD` + `_TIMBERHOST_` forced."""
+    targets, unusable = fc.parse(doc(
+        {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query"]},
+        {"name": "web01", "cmd": ["site-wrapper", "query", "web01"]}), "test")
+    assert unusable == []
+    assert [t.name for t in targets] == ["mail01", "web01"]
+    assert targets[0].cmd[0] == "ssh" and targets[1].cmd[0] == "site-wrapper"
+
+
+@test
+def a_cmd_is_a_list_so_nothing_is_split_again():
+    """An argument containing a space survives whole. Written as one
+    string it would have to be re-split at this end, under rules we
+    would have had to invent."""
+    targets, _ = fc.parse(doc(
+        {"name": "h", "cmd": ["ssh", "-o", "ProxyCommand=nc %h 22", "h",
+                              "timberfs"]}), "test")
+    assert targets[0].cmd[2] == "ProxyCommand=nc %h 22", targets[0].cmd
+
+
+@test
+def an_envelope_that_is_not_ours_is_refused():
+    """A version that does not match exactly, and an unknown member of
+    the envelope, are mistakes worth naming rather than best efforts."""
+    for bad, want in (
+            (json.dumps({"v": "2.0", "targets": []}), "this build speaks"),
+            (json.dumps({"v": V, "targets": [], "extra": 1}), "unknown member"),
+            (json.dumps({"v": V}), "`targets` is a list"),
+            (json.dumps([{"cmd": ["x"]}]), "is an object with"),
+            ("not json at all", "not JSON")):
+        try:
+            fc.parse(bad, "test")
+            raise AssertionError(f"accepted {bad!r}")
+        except ValueError as e:
+            assert want in str(e), f"{bad!r} -> {e}"
+
+
+@test
+def a_target_this_build_cannot_reach_is_named_not_dropped():
+    """A future reach method — a URL, say — must leave that ONE target
+    unreachable-with-a-reason, not refuse the whole fleet and not
+    vanish. A host that was never asked reads exactly like a host that
+    had nothing, and that is the difference this repo keeps removing."""
+    targets, unusable = fc.parse(doc(
+        {"name": "mail01", "cmd": ["ssh", "mail01"]},
+        {"name": "web01", "url": "https://web01/timberfs"}), "test")
+    assert [t.name for t in targets] == ["mail01"]
+    assert len(unusable) == 1 and unusable[0][0] == "web01"
+    assert "url" in unusable[0][1] and "`cmd`" in unusable[0][1], unusable
+
+
+@test
+def a_malformed_cmd_is_an_error_not_a_shrug():
+    for bad in ([], "ssh mail01", ["ssh", 3]):
+        try:
+            fc.parse(doc({"name": "h", "cmd": bad}), "test")
+            raise AssertionError(f"accepted cmd {bad!r}")
+        except ValueError as e:
+            assert "non-empty list of strings" in str(e), str(e)
+
+
+# ----------------------------------------------------------- what holds
+@test
+def an_empty_fleet_is_refused_rather_than_answered_locally():
+    """The hazard this inherits: an empty host list used to fall back to
+    one unnamed target, so a session quietly asked THIS machine instead
+    of the fleet and the answer looked like a fleet that held nothing."""
+    try:
+        fc.check([], "the resolver")
+        raise AssertionError("accepted an empty fleet")
+    except ValueError as e:
+        assert "nothing to ask" in str(e), str(e)
+
+
+@test
+def two_targets_under_one_name_are_refused():
+    """Two answers labelled the same cannot be told apart — and the name
+    is what an address is written with."""
+    for pair, want in (
+            ([fc.Target("a", ["x"]), fc.Target("a", ["y"])], "twice"),
+            ([fc.Target(None, ["x"]), fc.Target(None, ["y"])], "no name")):
+        try:
+            fc.check(pair, "test")
+            raise AssertionError(f"accepted {pair}")
+        except ValueError as e:
+            assert want in str(e), str(e)
+
+
+@test
+def the_placeholder_check_survived_the_move():
+    """Both directions are still wrong in the same silent way: hosts
+    with nowhere to put them read one forest N times under N names, and
+    a placeholder with no host runs with the placeholder in it."""
+    try:
+        fc.from_cmd_hosts("timberfs query --query -", "a,b", "test")
+        raise AssertionError("accepted hosts with no placeholder")
+    except ValueError as e:
+        assert "no _TIMBERHOST_" in str(e), str(e)
+    try:
+        fc.from_cmd_hosts("ssh _TIMBERHOST_ timberfs", "", "test")
+        raise AssertionError("accepted a placeholder with no host")
+    except ValueError as e:
+        assert "no host to put in it" in str(e), str(e)
+
+
+# ------------------------------------------------------------ resolving
+@test
+def a_resolver_that_failed_is_fatal_and_says_why():
+    """Falling back to a default would answer a question about one fleet
+    with a different one."""
+    with tmp() as d, env():
+        bad = script(d, "bad", "echo 'zookeeper is not answering' >&2; exit 3")
+        try:
+            fc.resolve(resolver=bad)
+            raise AssertionError("survived a failing resolver")
+        except ValueError as e:
+            assert "exit 3" in str(e) and "zookeeper" in str(e), str(e)
+        try:
+            fc.resolve(resolver=os.path.join(d, "nothing-here"))
+            raise AssertionError("survived a missing resolver")
+        except ValueError as e:
+            assert "could not run" in str(e), str(e)
+
+
+@test
+def a_flag_beats_an_export_and_two_flags_are_a_usage_error():
+    """A flag overrides an export for one session, as everywhere here.
+    Two flags is different: they are three ways to answer one question,
+    typed together, and preferring one silently is the mistake this
+    whole change is about."""
+    with tmp() as d, env(TIMBERFS_CMD="ssh _TIMBERHOST_ timberfs",
+                         TIMBERFS_HOSTS="from-the-export"):
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "from-the-flag", "cmd": ["x"]}))
+        assert fc.resolve(targets=f).names == ["from-the-flag"]
+        try:
+            fc.resolve(targets=f, cmd="timberfs")
+            raise AssertionError("accepted two flags")
+        except ValueError as e:
+            assert "three ways" in str(e), str(e)
+
+
+@test
+def the_most_explicit_source_wins_and_says_so():
+    """`show hosts` answers "what am I talking to", which now includes
+    where the list came from — so an export that is no longer in charge
+    cannot be mistaken for one that is."""
+    with tmp() as d, env():
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "file", "cmd": ["x"]}))
+        r = script(d, "r", f"cat {f}")
+        os.environ["TIMBERFS_CMD"] = "ssh _TIMBERHOST_ timberfs"
+        os.environ["TIMBERFS_HOSTS"] = "env-host"
+        assert fc.resolve().names == ["env-host"]
+        assert "TIMBERFS_CMD" in fc.resolve().source
+        os.environ["TIMBERFS_TARGETS"] = f
+        assert fc.resolve().names == ["file"]
+        os.environ["TIMBERFS_RESOLVER"] = r
+        assert fc.resolve().source == "$TIMBERFS_RESOLVER"
+
+
+@test
+def with_nothing_set_it_is_one_local_timberfs_found_on_path():
+    """Not an absolute path: a checkout, or an install under another
+    prefix, would not be reached by one."""
+    with env():
+        f = fc.resolve()
+        assert f.names == [None] and f.source == "the default", f.source
+        assert f.targets[0].cmd[0] == "timberfs", f.targets[0].cmd
+
+
+@test
+def a_resolver_is_asked_one_question_and_gets_no_arguments():
+    """"What is the fleet". "Who has this store" has not been thought
+    through, and passing an argument now would design it by accident."""
+    with tmp() as d, env():
+        r = script(d, "r", 'printf \'{"v": "%s", "targets": [{"name": "%s",'
+                           ' "cmd": ["x"]}]}\' "$V" "argv=$*"'
+                           .replace("$V", V))
+        assert fc.resolve(resolver=r).names == ["argv="], \
+            fc.resolve(resolver=r).names
+
+
+@test
+def refresh_re_resolves_rather_than_remembering():
+    """A resolver DERIVES its answer, so asking again is how a fleet
+    that changed becomes visible."""
+    with tmp() as d, env():
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]}))
+        r = script(d, "r", f"cat {f}")
+        fleet = fc.resolve(resolver=r)
+        assert fleet.names == ["one"]
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]},
+                               {"name": "two", "cmd": ["y"]}))
+        assert fleet.again().names == ["one", "two"]
+
+
+def main():
+    want = sys.argv[1] if len(sys.argv) > 1 else ""
+    chosen = [t for t in TESTS if want in t.__name__]
+    failed = 0
+    for t in chosen:
+        try:
+            t()
+            print(f"  ok    {t.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"  FAIL  {t.__name__}\n        {e}")
+        except Exception as e:
+            failed += 1
+            print(f"  ERROR {t.__name__}\n        {type(e).__name__}: {e}")
+    print(f"\n{len(chosen) - failed}/{len(chosen)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

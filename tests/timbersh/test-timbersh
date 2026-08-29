@@ -8,11 +8,15 @@ bug that actually happened.
     tests/timbersh/test-timbersh          # all
     tests/timbersh/test-timbersh short_id # one, by substring
 """
-import json, os, shutil, subprocess, sys, tempfile
+import fcntl, json, os, pty, re, select, shutil, struct, subprocess, sys
+import tempfile, termios, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TIMBERSH = os.path.join(HERE, "..", "..", "tools", "timbersh")
 FAKE = os.path.join(HERE, "fake-timberfs")
+
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
+from timberview import when                                  # noqa: E402
 
 ID_A = "aaaaaaaa-1111-2222-3333-444444444444"
 ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
@@ -21,20 +25,37 @@ ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
 class Session:
     """One timbersh run against a scripted server."""
 
-    def __init__(self, scenario, hosts=None, extra=()):
+    def __init__(self, scenario, hosts=None, extra=(), resolver=False):
         self.dir = tempfile.mkdtemp(prefix="timbersh-test-")
         json.dump(scenario, open(os.path.join(self.dir, "scenario.json"), "w"))
         self.hosts = hosts
         self.extra = list(extra)
+        self.resolver = self.write_resolver(hosts) if resolver else None
+
+    def write_resolver(self, hosts):
+        """A resolver is a program that prints the fleet. Each target
+        gets its OWN argv here, which is the shape a placeholder could
+        not express."""
+        doc = {"v": "1.0-EXPERIMENTAL",
+               "targets": [{"name": h, "cmd": [FAKE, h]} for h in hosts]}
+        path = os.path.join(self.dir, "resolver")
+        open(path, "w").write(
+            "#!/bin/sh\ncat <<'EOF'\n" + json.dumps(doc)
+            + "\nEOF\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def where(self):
+        if self.resolver:
+            return ["--resolver", self.resolver]
+        return ["--cmd", f"{FAKE} _TIMBERHOST_" if self.hosts else FAKE] + (
+            ["--hosts", ",".join(self.hosts)] if self.hosts else [])
 
     def run(self, *statements):
         cmd = [sys.executable, TIMBERSH, "-q",
                "--histfile", os.path.join(self.dir, "history"),
-               "--rc", os.path.join(self.dir, "nonexistent-rc"),
-               "--cmd", f"{FAKE} _TIMBERHOST_" if self.hosts else FAKE]
-        if self.hosts:
-            cmd += ["--hosts", ",".join(self.hosts)]
-        cmd += self.extra
+               "--rc", os.path.join(self.dir, "nonexistent-rc")]
+        cmd += self.where() + self.extra
         p = subprocess.run(cmd, input="\n".join(statements) + "\n\\q\n",
                            capture_output=True, text=True,
                            env={**os.environ, "FAKE_DIR": self.dir})
@@ -55,6 +76,72 @@ class Session:
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class Pty(Session):
+    """A session on a terminal, for the statements that open a screen.
+
+    `view` refuses a pipe, and a viewer driven by sleeps would be a test
+    that sometimes passes — so this waits for what the screen actually
+    printed before sending the next key."""
+
+    def start(self, rows=24, cols=110):
+        cmd = [sys.executable, TIMBERSH, "-q",
+               "--histfile", os.path.join(self.dir, "history"),
+               "--rc", os.path.join(self.dir, "nonexistent-rc")]
+        cmd += self.where() + self.extra
+        env = {**os.environ, "FAKE_DIR": self.dir, "TERM": "xterm"}
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.execve(cmd[0], cmd, env)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
+        self.seen = ""
+        return self
+
+    @property
+    def plain(self):
+        """What the screen SAYS. curses splits a line into styled runs
+        wherever a term is highlighted, so the text of a rendered line
+        is never contiguous in the raw stream."""
+        return re.sub(r"\x1b[\[(][0-9;?]*[A-Za-z]", "", self.seen)
+
+    def expect(self, marker, timeout=20):
+        end = time.time() + timeout
+        while marker not in self.plain:
+            if time.time() > end:
+                raise AssertionError(
+                    f"waited {timeout}s for {marker!r}; saw:\n{self.plain[-800:]}")
+            r, _, _ = select.select([self.fd], [], [], 0.2)
+            if r:
+                try:
+                    self.seen += os.read(self.fd, 65536).decode(
+                        "utf-8", "replace")
+                except OSError:
+                    break
+        return self
+
+    def send(self, text):
+        os.write(self.fd, text.encode())
+        return self
+
+    def finish(self):
+        self.send("\\q\n")
+        end = time.time() + 10
+        while time.time() < end:
+            r, _, _ = select.select([self.fd], [], [], 0.2)
+            if not r:
+                continue
+            try:
+                self.seen += os.read(self.fd, 65536).decode("utf-8", "replace")
+            except OSError:
+                break
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        os.waitpid(self.pid, 0)
+        return self
 
 
 TESTS = []
@@ -269,6 +356,205 @@ def stores_that_matched_but_held_nothing_are_not_the_same_answer():
         "select records from [] where entry has 'X';")
     assert "nothing matched, in 2 store(s)" in s.out, s.out
     assert "NO STORE" not in s.out, s.out
+    s.cleanup()
+
+
+def tape(name, sid, n=9):
+    """A store with several chunks, and the chunks themselves — what a
+    pager needs and a one-chunk fixture cannot exercise.
+
+    `start` is the running total, because it IS the offset on the tape:
+    a fixture where the two disagree would let a viewer that computed
+    offsets from the wrong end still pass."""
+    chunks, at = [], 0
+    for i in range(n):
+        text = f"chunk {i} first line\nc{i}\n"
+        chunks.append({"seq": i, "start": at, "text": text,
+                       "wf": 0, "wl": 9_999_999_999_999})
+        at += len(text)
+    st = store(name, sid)
+    st.update(chunks=n, first_seq=0, last_seq=n - 1, logical_bytes=at,
+              dropped_chunks=0, dropped_uncompressed_bytes=0)
+    return st, chunks
+
+
+@test
+def view_seeks_to_a_chunk_and_asks_for_exactly_one():
+    """`view [] at chunk 7` is a SEEK: a chunk number, one chunk, and no
+    predicate at all. A `match` member here would make the pager a
+    search, which is the other motion entirely."""
+    st, chunks = tape("app", ID_A)
+    s = Pty({"": {"stores": [st], "chunks": chunks}}).start()
+    s.expect("timberfs=#")
+    s.send("view [] at chunk 7;\n").expect("q quit")
+    s.send("q").expect("timber:")
+    s.finish()
+    docs = s.docs("chunks")
+    assert docs, [r["doc"] for r in s.requests]
+    assert any(d["window"].get("from_chunk") == 7 for d in docs), docs
+    for d in docs:
+        assert d["window"]["axis"] == "write", d
+        assert d["max"] == {"chunks": 1}, d
+        assert "match" not in d, d
+    # The address is chunk 7's own start: landing at the top of a chunk
+    # reaches for the one before it, so the line held back as a possible
+    # fragment is resolved rather than skipped over.
+    at = sum(len(c["text"]) for c in chunks[:7])
+    assert f"timber:{ID_A}#offset={at}" in s.plain, s.plain[-400:]
+    s.cleanup()
+
+
+@test
+def view_at_a_time_is_one_chunk_on_the_write_axis():
+    """A position in time is the chunk COVERING that instant — a window
+    whose ends are the same millisecond, on the axis a chunk has."""
+    st, chunks = tape("app", ID_A)
+    s = Pty({"": {"stores": [st], "chunks": chunks}}).start()
+    s.expect("timberfs=#")
+    s.send("view [] at '2026-08-29 12:00';\n").expect("q quit")
+    s.send("q").expect("timber:")
+    s.finish()
+    timed = [d for d in s.docs("chunks") if "from" in d["window"]]
+    assert timed, s.docs("chunks")
+    d, ms = timed[0], when("2026-08-29 12:00")
+    assert d["window"]["from"] == d["window"]["to"] == ms, d
+    assert d["window"]["axis"] == "write" and d["max"] == {"chunks": 1}, d
+    s.cleanup()
+
+
+@test
+def view_refuses_a_predicate_that_selects_no_store():
+    """Opening nothing would be a blank screen, which is the same answer
+    as an empty log."""
+    s = Pty({"": {"stores": []}}).start()
+    s.expect("timberfs=#")
+    s.send("view [name=nope];\n").expect("NO STORE")
+    s.finish()
+    assert not s.docs("chunks"), s.docs("chunks")
+    s.cleanup()
+
+
+@test
+def a_fleet_can_be_reached_several_different_ways_at_once():
+    """The defect this replaced: one command with `_TIMBERHOST_` in it
+    made the transport a property of the SESSION, so an ssh-shaped host
+    and a wrapper taking the host as an argument could not be in one
+    fleet. Each target carries its own argv, and both are asked."""
+    hosts = ["alpha", "beta"]
+    s = Session({h: {"stores": [store(f"{h}1", ID_A if h == "alpha" else ID_B)]}
+                 for h in hosts}, hosts=hosts, resolver=True)
+    s.run("\\d")
+    assert "alpha1" in s.out and "beta1" in s.out, s.out
+    assert {r["host"] for r in s.requests} == {"alpha", "beta"}, s.requests
+    s.cleanup()
+
+
+@test
+def show_hosts_says_where_the_fleet_came_from_and_what_runs():
+    """"What am I talking to" now includes which of several sources won
+    — so an export that is no longer in charge cannot be mistaken for
+    one that is — and the command, which is per target rather than one
+    shape assumed for all of them."""
+    s = Session({"alpha": {"stores": []}}, hosts=["alpha"], resolver=True)
+    s.run("show hosts;")
+    assert "--resolver" in s.out, s.out
+    assert "via:" in s.out and "fake-timberfs alpha" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def add_host_under_a_resolver_says_where_to_add_it():
+    """`add host` needs a command to reach the new host WITH, and only
+    the `--cmd` shape carries one that generalises. Inventing one would
+    reach the wrong thing, or nothing, and report whatever that was."""
+    s = Session({"alpha": {"stores": []}}, hosts=["alpha"], resolver=True)
+    s.run("add host web03;")
+    assert "no command to reach" in s.out, s.out
+    assert "refresh" in s.out, s.out
+    s.cleanup()
+    # With a template there IS one, so it still works.
+    t = Session({h: {"stores": []} for h in ("alpha", "web03")},
+                hosts=["alpha"]).run("add host web03;", "show hosts;")
+    assert "2 host(s): alpha, web03" in t.out, t.out
+    t.cleanup()
+
+
+@test
+def a_resolver_that_failed_stops_the_session():
+    """Falling back to a default would answer a question about one fleet
+    with a different one — and an empty fleet used to mean "ask this
+    machine", which reads exactly like a fleet that held nothing."""
+    d = tempfile.mkdtemp(prefix="timbersh-test-")
+    bad = os.path.join(d, "bad")
+    open(bad, "w").write("#!/bin/sh\necho 'discovery is down' >&2\nexit 4\n")
+    os.chmod(bad, 0o755)
+    p = subprocess.run([sys.executable, TIMBERSH, "-q", "--resolver", bad],
+                       input="\\q\n", capture_output=True, text=True)
+    assert p.returncode != 0, p
+    assert "exit 4" in p.stderr and "discovery is down" in p.stderr, p.stderr
+    empty = os.path.join(d, "empty")
+    open(empty, "w").write(
+        '#!/bin/sh\necho \'{"v": "1.0-EXPERIMENTAL", "targets": []}\'\n')
+    os.chmod(empty, 0o755)
+    q = subprocess.run([sys.executable, TIMBERSH, "-q", "--resolver", empty],
+                       input="\\q\n", capture_output=True, text=True)
+    assert q.returncode != 0 and "nothing to ask" in q.stderr, q.stderr
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test
+def one_target_being_down_does_not_stop_the_others():
+    """Something in the system being down must not prevent inspecting
+    the logs that ARE available. The failure is named — once, in full —
+    and every other target still answers."""
+    hosts = ["alpha", "beta", "gone"]
+    s = Session({"alpha": {"stores": [store("a1", ID_A)],
+                           "records": [{"id": ID_A, "text": "hit on alpha"}]},
+                 "beta": {"stores": [store("b1", ID_B)],
+                          "records": [{"id": ID_B, "text": "hit on beta"}]},
+                 "gone": {"fail": "ssh: connect to host gone: No route to host",
+                          "code": 255}},
+                hosts=hosts, resolver=True).run(
+        "\\d", "select records from [] where entry has 'hit' limit 9;")
+    assert "a1" in s.out and "b1" in s.out, s.out
+    assert "hit on alpha" in s.out and "hit on beta" in s.out, s.out
+    assert "No route to host" in s.out, s.out
+    assert "gone" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def only_records_can_go_into_a_view():
+    """The other kinds carry no offset, so nothing in such an answer
+    could say where it came from or be opened. Judged as a statement,
+    wherever it is run — not as a terminal problem."""
+    s = Session({"": {"stores": [store("app", ID_A)]}}).run(
+        "select loglines from [] where entry has 'X' into view;")
+    assert "only `records`" in s.out, s.out
+    assert "terminal" not in s.out, s.out
+    s.cleanup()
+
+
+@test
+def select_into_view_asks_for_records_and_pages_the_answer():
+    """`select` walks an answer and `view` walks the log; this puts the
+    first on the second's screen, which works because an entry record
+    carries the offset it came from."""
+    st, chunks = tape("app", ID_A)
+    s = Pty({"": {"stores": [st], "chunks": chunks,
+                  "records": [{"id": ID_A, "text": "boom at 12:00"}]}}).start()
+    s.expect("timberfs=#")
+    s.send("select records from [] where entry has 'boom' into view;\n")
+    # `o log around` is the footer only an ANSWER has; Enter searches
+    # here exactly as it does on the tape.
+    s.expect("o log around")
+    assert "1 entry matched" in s.plain, s.plain[-400:]
+    assert "boom at 12:00" in s.plain, s.plain[-400:]
+    s.send("q").expect("timberfs=#")
+    s.finish()
+    docs = s.docs("records")
+    assert docs, [r["doc"] for r in s.requests]
+    assert docs[-1]["match"]["all"] == [{"has": "boom"}], docs[-1]
     s.cleanup()
 
 

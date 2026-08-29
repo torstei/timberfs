@@ -16,8 +16,12 @@ unnamed one):
     {"alpha": {"stores": [ ... ], "loglines": "...", "records": [...]},
      "beta":  {"fail": "ssh: no route to host", "code": 255},
      "old":   {"stores": [...], "bare": true}}     <- pre-envelope server
+
+A `chunks` answer carries COMPRESSED frames, so the fake compresses too:
+a viewer that decodes what this sends is a viewer that decodes what
+timberfs sends.
 """
-import json, os, sys
+import json, os, subprocess, sys
 
 FAKE_DIR = os.environ["FAKE_DIR"]
 host = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -53,7 +57,59 @@ if "fail" in me:
 if "note" in me:                       # stderr on a SUCCESSFUL call
     print(me["note"], file=sys.stderr)
 
-if kind == "stores":
+def zstd(data):
+    try:
+        from compression.zstd import compress          # stdlib from 3.14
+        return compress(data)
+    except ImportError:
+        pass
+    p = subprocess.run(["zstd", "-q", "-c"], input=data, capture_output=True)
+    if p.returncode:
+        sys.exit(f"fake-timberfs: no way to compress a chunk: {p.stderr!r}")
+    return p.stdout
+
+
+def chunk_answer(me, doc):
+    """`timberfs-records(5)` framing for chunks: the header states a
+    `len`, then that many bytes of frame. The payload is binary, so it
+    is written to the buffer rather than printed."""
+    win = doc.get("window") or {}
+    chunks = me.get("chunks", [])
+    want = win.get("from_chunk")
+    if want is not None:
+        chunks = [c for c in chunks if c["seq"] >= want]
+    elif "from" in win:
+        lo, hi = win["from"], win.get("to", win["from"])
+        chunks = [c for c in chunks
+                  if c.get("wl", 0) >= lo and c.get("wf", 0) <= hi]
+    cap = (doc.get("max") or {}).get("chunks")
+    if cap is not None:
+        chunks = chunks[:cap]
+    sid = (me.get("stores") or [{}])[0].get("id", "?")
+    out = [f"\x1estream-start\x1fv=1\x1fserver_version="
+           f"{me.get('version', 'timberfs, 0.25.0')}\x1forder=sequential"
+           f"\x1fsources=1\0".encode()]
+    out.append(f"\x1esource\x1fpath=/l/x.log\x1fid={sid}"
+               f"\x1fkept={len(chunks)}\x1ftotal={len(me.get('chunks', []))}"
+               f"\0".encode())
+    for c in chunks:
+        body = c["text"].encode()
+        frame = zstd(body)
+        out.append(f"\x1echunk\x1flen={len(frame)}\x1fid={sid}"
+                   f"\x1fchunk={c['seq']}\x1funcomp_start={c['start']}"
+                   f"\x1funcomp_len={len(body)}\x1fwf={c.get('wf', 0)}"
+                   f"\x1fwl={c.get('wl', 0)}\0".encode())
+        out.append(frame + b"\0")
+    out.append(f"\x1estream-end\x1fchunks={len(chunks)}"
+               f"\x1fchunks_total={len(me.get('chunks', []))}"
+               f"\x1fstatus=exhausted\0".encode())
+    sys.stdout.buffer.write(b"".join(out))
+    sys.stdout.buffer.flush()
+
+
+if kind == "chunks":
+    chunk_answer(me, doc)
+elif kind == "stores":
     stores = me.get("stores", [])
     # A server from before the envelope answers with the bare array.
     if me.get("bare"):

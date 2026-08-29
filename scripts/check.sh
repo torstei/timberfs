@@ -25,6 +25,10 @@ cargo build --release
 # network — `--cmd` points at a fake that answers from a script and records
 # what it was asked. Gated here rather than in the VM suite because nothing
 # about them needs a package.
+echo "==> tests/timberfs-client/test-timberfs-client"
+tests/timberfs-client/test-timberfs-client
 echo "==> tests/timbersh/test-timbersh"
 tests/timbersh/test-timbersh
+echo "==> tests/timberview/test-timberview"
+tests/timberview/test-timberview
 echo "==> all checks passed"

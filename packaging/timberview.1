@@ -1,0 +1,246 @@
+.TH TIMBERVIEW 1 "2026-08-29" "timberfs" "User Commands"
+.SH NAME
+timberview \- read a timberfs store as a tape
+.SH SYNOPSIS
+.B timberview
+.RI [ --resolver " CMD" ]
+.RI [ --targets " FILE" ]
+.RI [ --cmd " ARGV" ]
+.RI [ --hosts " H,H" ]
+.RI [ --at " TIME" ]
+.RI [ --chunk " N" ]
+.RI [ TARGET ]
+.SH DESCRIPTION
+A pager over a store. It opens the last chunk and scrolls back from
+there, with no predicate and no result set: where
+.BR timbersh (1)
+walks an ANSWER, this walks the LOG.
+.PP
+It does no entry parsing \(em no timestamps, no window verification, no
+token index. Chunks, decompressed, shown as lines. That is the feature:
+the two stores a query serves worst, one whose lines cannot be parsed
+and one with no index, are exactly the ones you most want to look at,
+and this asks nothing of the content.
+.PP
+.B TARGET
+is a store name, a path, a short id, or a
+.B timber:
+address. With none, the first store is opened and
+.B S
+switches between the rest.
+.SH OPTIONS
+.TP
+.BI \-\-resolver " CMD"
+A command that prints the fleet as a target document \(em a name and the
+argv that reaches it, per target. See
+.BR timbersh (1),
+WHERE THE FLEET IS, for the document and the order the sources are tried
+in.
+.RB ( $TIMBERFS_RESOLVER )
+.TP
+.BI \-\-targets " FILE"
+The same document, from a file.
+.RB ( $TIMBERFS_TARGETS )
+.TP
+.BI \-\-cmd " ARGV"
+One command reaching every host, with
+.B _TIMBERHOST_
+substituted per
+.BR \-\-hosts .
+It is handed a
+.BR timberfs\-query\-document (5)
+on stdin. Default
+.BR "timberfs query --query -" .
+.RB ( $TIMBERFS_CMD )
+.TP
+.BI \-\-hosts " H,H"
+The hosts that command reaches. A search covers all of them.
+.RB ( $TIMBERFS_HOSTS )
+.TP
+.BI \-\-at " TIME"
+Open at the chunk covering this instant. RFC3339,
+.BR "YYYY-MM-DD [HH:MM[:SS]]" ,
+.B HH:MM[:SS]
+for today, or unix seconds \(em resolved HERE, in the reader's timezone.
+.TP
+.BI \-\-chunk " N"
+Open at this chunk number.
+.SH KEYS
+.TP
+.BR j " " k " " \(ua " " \(da
+A line.
+.BR g "/" G
+go to the log's top and end \(em a seek, not a walk back.
+.TP
+.BR space " " b
+A page.
+.BR h " " l " " \(<- " " \(->
+scroll sideways when lines are not wrapped;
+.B w
+toggles wrapping. Neither is a default that can be argued into being
+correct, so it changes at runtime.
+.TP
+.BR Tab " " Shift\-Tab
+Move between the searchable TERMS on the line \(em the widest identifier
+at each position, separators and all.
+.PP
+.RS
+A term is not an index token. The index holds alphanumeric runs of 3 to
+64 characters, so a UUID is five of them and none of them is the id; a
+.B has
+term may carry the separators an identifier is written with, and
+timberfs ANDs the runs inside it before matching the whole thing
+word-anchored. So the UUID is ONE term, and the one worth offering: its
+pieces are far less selective. Runs are joined on
+.BR - " " . " " _ " " :
+but never across
+.B =
+or
+.BR / ,
+which separate fields rather than sit inside a name.
+.PP
+A term the index cannot hold at all \(em
+.BR 26.1.18 ,
+three runs of under three characters \(em is refused where you point at
+it rather than discovered later as an empty answer.
+.RE
+.TP
+.BR Enter " " *
+Search the picked token everywhere: every store, on every host.
+.B /
+searches one you type, and
+.BR n "/" N
+cycle the hits. The hit list itself takes the same keys:
+.B Tab
+walks the terms of the highlighted hit and
+.B *
+searches that one, so an identifier can be followed without opening
+anything first.
+.B Enter
+there still goes to the hit.
+.TP
+.B y
+Show this line's address.
+.B S
+opens another store.
+.B ?
+lists the keys.
+.B q
+quits, printing the address you stopped at.
+.SH AN ANSWER INSTEAD OF A STORE
+A
+.BR timberfs\-records (5)
+stream on standard input is paged as an ANSWER rather than a store:
+.PP
+.RS
+.EX
+timberfs query --records --from 13:00 --has ERROR app.log | timberview
+.EE
+.RE
+.PP
+timbersh reaches the same screen with
+.BR "select ... into view" .
+An entry record carries the chunk and offset it came from, so every line
+in an answer knows its place:
+.B Tab
+and the search work as they do anywhere \(em
+.B Enter
+searches the picked term on an answer exactly as it does on the tape \(em
+and
+.B o
+leaves the answer for the LOG around that entry, which is what you
+usually want next.
+.PP
+A multi-line entry is ONE entry: the lines of a stack trace belong to
+the entry that raised it. An answer is a closed set, so both ends are
+ends and the boundary says so rather than naming a chunk. An entry still
+at the live edge carries no offset either, because no chunk holds it
+yet \(em so it opens by its write window like any other, landing at the
+end of the tape near where it is about to be. On a store being written
+that is ordinary: the newest matches are still in the write-ahead
+sidecar.
+.PP
+⚠ An entry with no place is still an entry.
+.B offset
+on an entry record landed in 0.26.0, so a target still on 0.25.0 answers
+with entries carrying none \(em and they are listed, read and searched
+from like any other, because an old target in a fleet must not make a
+term unusable.
+.PP
+They are opened anyway, by WHEN rather than where: an entry record has
+carried
+.BR wf ,
+the write window it arrived in, since long before
+.BR offset ,
+and a write-axis window of one millisecond is a seek to the chunk
+covering it. The line is then found in what comes back. What is lost is
+exactness \(em such a hit is marked
+.B ·
+in the list, and the message says it was opened by the window.
+.PP
+⚠ Reading from a pipe needs a keyboard from somewhere other than stdin,
+which is the answer:
+.I /dev/tty
+is reopened for keys, as every pager does.
+.SH THE ADDRESS
+A coordinate is passed from a search to a viewer and back to a shell, so
+it has a written form:
+.PP
+.RS
+.EX
+timber://mail01/79d7f23a-b044-4a72-8be3-d26e0481d202#offset=33724753900
+timber://mail01/79d7f23a-\&...#chunk=498248
+timber:79d7f23a-\&...
+.EE
+.RE
+.PP
+The store id is the NAME and the host is a hint: bake the host in and a
+pasted link breaks the day a store moves. A position says which
+coordinate it is, because
+.B #offset=
+and
+.B #chunk=
+are different numbers and one that resolved to the wrong place silently
+would be worse than one that will not parse. Prefer an offset: it is
+absolute on the tape, so it stays valid until retention drops the data
+and then the store's own
+.B first_seq
+says it was dropped rather than "not found".
+.SH WAITING
+A pager over a fleet spends real time on round trips. Every target is
+asked at once rather than in turn, the chunks either side of where you
+landed are read ahead while you read the one you are on, and a chunk
+once fetched is cached \(em safe because a chunk's bytes never change
+after it is written.
+.PP
+What is left says so: a read that takes longer than a moment paints what
+it is waiting for, on which host, and for how long.
+.B ^C
+gives up on that answer and returns you to the screen, rather than
+ending the session \(em so a host that has stopped responding cannot
+strand you.
+.SH WHEN SOMETHING IS DOWN
+A target that does not answer is NAMED and the rest are still asked \(em
+one machine being down must not stop you reading the logs that are
+available. It is said in each of the three places the failure would
+otherwise be invisible: an unreachable fleet reports that nothing was
+LISTED rather than that there is no store, a store that was not found
+names who was not asked (it may be on exactly that host), and a chunk
+that could not be read says so where the boundary marker goes, so a
+scroll that stopped is not the same screen as the end of the log.
+.SH BOUNDARIES
+Retention moves the floor while you read, and the newest lines are in no
+chunk yet. Both are stated: the top says whether it is the top of the
+LOG or only of what is loaded, and how much fell off; the bottom names
+the writer, so the end of the tape is not mistaken for the end of the
+log.
+.SH EXIT STATUS
+.B 0
+on a normal exit;
+.B 1
+where no store could be opened or no chunk found there.
+.SH SEE ALSO
+.BR timbersh (1),
+.BR timberfs (1),
+.BR timberfs\-query\-document (5),
+.BR timberfs\-records (5)

@@ -12,8 +12,16 @@ without notice. Do not build anything on the grammar.
 Shipped as its own package, `timberfs-sh`, so that `timberfs` keeps a
 dependency list of `fuse3, libc6` and installs on a bare host: a Python
 script in the main package would put an interpreter there for one
-optional tool. `apt install timberfs` pulls no Python; `apt install
-timberfs-sh` pulls both it and timberfs.
+optional tool. `apt install timberfs` pulls no Python.
+
+⚠ `timberfs-sh` **recommends** timberfs rather than depending on it.
+These are clients that speak `timberfs-query-document(5)` over a
+transport, and against a fleet that transport is `ssh` or a site
+wrapper — they need no timberfs on the machine they run on, which is
+the same reason times are resolved here rather than by shelling out to
+one. The default `TIMBERFS_CMD` is a local `timberfs`, so apt installs
+it and the zero-config case works; `--no-install-recommends` is the
+workstation that only ever reads other machines.
 
 It releases on its own tag, and its version is `tools/VERSION`:
 
@@ -41,6 +49,8 @@ timbersh --hosts web01,web02,db01 \
 ```
 
 ```sql
+view   [id=79d7f23a];              -- a pager over the tape, at the last chunk
+view   [] at '12:00';              -- or anchored at an instant
 add host web03;                    -- ask it too, from now on
 drop host web03;                   -- stop asking it
 create logview [type=console] console;
@@ -56,14 +66,16 @@ export for one session and nothing else:
 
 | flag | variable | |
 |---|---|---|
-| `--cmd` | `TIMBERFS_CMD` | how to reach a timberfs; it gets the document on stdin |
-| `--hosts` | `TIMBERFS_HOSTS` | fan out, substituting each host for `_TIMBERHOST_` in `--cmd` |
+| `--resolver` | `TIMBERFS_RESOLVER` | a command that prints the fleet — see below |
+| `--targets` | `TIMBERFS_TARGETS` | the same document, from a file |
+| `--cmd` | `TIMBERFS_CMD` | one command reaching every host, with `_TIMBERHOST_` substituted |
+| `--hosts` | `TIMBERFS_HOSTS` | the hosts that command reaches |
 | `--rc` | `TIMBERSH_RC` | statements run at startup |
 | `--histfile` | `TIMBERSH_HISTFILE` | line history, `~/.timbersh-history`, mode 0600 |
 | `--histsize` | `TIMBERSH_HISTSIZE` | how many lines to keep (2000) |
 | `--ttl` | `TIMBERSH_STORE_TTL` | expire the cached store list after N seconds; 0 (default) never expires it |
 
-`--cmd` is only ever handed a document on stdin, so anything that reaches a
+A target is only ever handed a document on stdin, so anything that reaches a
 timberfs works — a wrapper, `ssh`, a container exec.
 
 With several hosts the stores present as one set with a `HOST` column, and
@@ -101,26 +113,6 @@ found within an hour of it existing:
   Fifteen of eighteen entries, in the first fleet it was pointed at.
   That is the argument for a position being an absolute byte offset
   rather than a clock: see [docs/plans/paging.md](../docs/plans/paging.md).
-
-### Tests
-
-```sh
-tests/timbersh/test-timbersh            # all
-tests/timbersh/test-timbersh short_id   # one, by substring
-```
-
-No VM, no timberfs, no network: `--cmd` points at a fake that answers from
-a script. `scripts/check.sh` runs them, so they gate a push like everything
-else.
-
-The fake **records every document it is asked**, which is the useful half —
-almost every bug here has been in what was *sent* rather than what was
-printed, and a test that reads only the output cannot see a window on the
-wrong axis or a cursor that lost a store's place.
-
-⚠ Each case was checked by reintroducing its bug and watching it fail. The
-paging test passed with the fix deleted, twice, for two different reasons
-before it meant anything.
 
 ### What it does not implement, and what it must
 
@@ -178,3 +170,266 @@ search the server reads as a different question.
 * `~/.timbershrc` is RUN, not read: a script of statements, the way
   `.psqlrc` is. `save` therefore refuses to default to it — writing the
   logviews back would delete whatever else it does.
+
+## Where the fleet is
+
+A **target** is a name and the command that reaches it. The command belongs
+to the target, not to the session — which is the whole point: an
+`ssh mail01 timberfs …` and a site wrapper taking the host as an argument
+are one fleet, and neither has to be expressible as the other with a
+placeholder swapped into it. `TIMBERFS_CMD` + `_TIMBERHOST_` could not do
+that, and it is still there as one *producer* of a target list rather than
+as the only way to describe a fleet.
+
+The document a resolver prints, and the file that holds the same thing:
+
+```json
+{"v": "1.0-EXPERIMENTAL",
+ "targets": [
+   {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
+   {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
+   {"cmd": ["timberfs", "query", "--query", "-"]}
+ ]}
+```
+
+`cmd` is a **list** because a command line written as one string has to be
+split again at this end, under rules we would have had to invent and get
+wrong — the same call the query document makes for `stores.select`. A
+`name` is what the `HOST` column and a `timber://<host>/…` address say; it
+is a **hint and not identity**, so renaming a target, or changing how it is
+reached, leaves every written address valid.
+
+**Where it comes from**, most explicit first — `show hosts;` says which won:
+
+```
+--resolver | --targets | --cmd/--hosts        one of them, not two
+$TIMBERFS_RESOLVER
+$TIMBERFS_TARGETS
+$TIMBERFS_CMD / $TIMBERFS_HOSTS
+~/.config/timberfs/targets.json, /etc/timberfs/targets.json
+one local `timberfs query --query -`          found on PATH
+```
+
+A flag beats an export as everywhere else here. Two *flags* is a usage
+error — they are three ways to answer one question, typed together, and
+preferring one silently is the mistake this replaced. Two *exports* is not:
+a stale one in a profile is ordinary, so the order decides and the
+provenance is reported rather than assumed.
+
+⚠ **A resolver that failed is fatal, and an empty fleet is refused.**
+Falling back would answer a question about one fleet with a different one,
+and the empty case is worse: a session that quietly asks the local machine
+instead looks exactly like a fleet that held nothing.
+
+⚠ **A TARGET that failed is not.** Something in the system being down must
+not stop you reading the logs that are available, so a target that does not
+answer is named and the rest are still asked — in a listing, in a search,
+and in the viewer's store picker. The two are different failures: the
+resolver is how you know what the fleet IS, and being wrong about that
+makes every later answer describe the wrong thing; one machine refusing a
+connection only means that machine's logs are missing from this answer,
+which is worth saying and not worth stopping for.
+
+The three ways that has to hold, because they read the same when it does
+not: an unreachable fleet must say **"nothing was listed"** rather than
+"no store" · a store that was not found must name **who was not asked**,
+since it may be on exactly that host · and a chunk that could not be read
+must say so **where the boundary marker would go**, or a scroll that
+stopped is the same screen as the end of the log.
+
+⚠ **A target this build cannot reach is NAMED, never dropped.** A future
+`{"name": …, "url": …}` leaves that one target unreachable-with-a-reason
+and the rest of the fleet working — refusing all of it over one would be
+the wrong blast radius, and dropping it silently would make a host that was
+never asked read as a host that had nothing.
+
+The resolver is asked **one** question — what is the fleet — and gets no
+arguments. "Who has this store" is a different question that has not been
+thought through, and reserving an argument for it now would design it by
+accident. `refresh` re-runs it, because a resolver derives its answer.
+
+## An answer on the pager's screen
+
+```sql
+select records from [] where entry has 'ERROR' limit 50 into view;
+```
+```sh
+timberfs query --records --from 13:00 --has ERROR app.log | timberview
+```
+
+`select` walks a result set and `view` walks the log — different motions,
+and this puts the first on the second's screen. What makes it fit is that
+an entry record carries `chunk` and `offset`, so every line in an answer
+knows the PLACE it came from: the same coordinate the tape is addressed
+by. `Tab` and the search work as they do anywhere — `Enter` searches the
+picked term on an answer exactly as it does on the tape, because a key
+that changes meaning with the screen is the surprise a mode is. `y`
+gives you that entry's address, and **`o` leaves the answer for the log
+around it** — the one motion an answer cannot make for itself, since
+what you usually want next is what was happening either side of a
+match.
+
+- **A multi-line entry is one entry.** The lines of a stack trace belong
+  to the entry that raised it; splitting them would be the same lie as
+  splitting a line across a chunk boundary.
+- **An answer is a closed set.** Both ends are ends, nothing extends, and
+  the boundary says "end of the answer" rather than naming a chunk you
+  are not in.
+- **An entry still at the live edge carries no offset either** — it is in
+  no chunk yet — so it opens by its write window like any other, landing
+  at the end of the tape near where it is about to be. The line itself
+  will not be found there, and the message says which coordinate was
+  used. On a store being written this is ordinary: the newest matches
+  are in the WAL, and a read delivers them before any chunk holds them.
+- ⚠ **An entry with no place is still an entry**, and an old target in a
+  fleet must not make a term unusable. `offset` on an entry record
+  landed in **0.26.0**, so a target still on 0.25.0 answers with entries
+  that carry none — but they are listed, read, and searched from like
+  any other. Dropping them made a term that matched only there report
+  "no hit", which is false, and took the terms in those entries with it.
+- ⚠ **And they are opened anyway, by WHEN rather than where.** An entry
+  record has carried `wf` — the write window it arrived in — since long
+  before `offset`, and a write-axis window of one millisecond is a seek
+  to the chunk covering it. Measured against a live store, `wf` alone
+  lands on the entry's own chunk; the line is then found in what comes
+  back. What is lost is exactness, not the ability to open: the hit list
+  marks such a row `·`, and the message says it was opened by the window
+  and which target could not give an offset.
+- ⚠ Only `records` can go into a view. The other kinds carry no offset,
+  so nothing in such an answer could say where it came from — refused as
+  a statement, wherever it is run, rather than as a terminal problem.
+
+Reading a piped answer needs a keyboard from somewhere other than stdin,
+which is the answer: `timberview` reopens `/dev/tty` for keys, as every
+pager does, and says so plainly where a session has no controlling
+terminal to reopen.
+
+## `timberview` — a pager over one store
+
+⚠ **EXPERIMENTAL**, like everything else here.
+
+`select` walks a result set; `view` walks the log. They share the absolute
+tape offset and nothing else, which is why the handle is a chunk number
+rather than a cursor: a cursor is a place in an answer, and there is no
+answer to be in.
+
+```sh
+timberview app.log                 # the last chunk, and back from there
+timberview --at '12:00' app.log
+timberview 'timber://mail01/79d7f23a-…#offset=33724753900'
+```
+
+It parses nothing — no timestamps, no window verification, no `.grain`.
+Chunks, decompressed, shown as lines. That is the feature rather than a
+simplification: the two stores `select` serves worst, one whose lines
+timberfs cannot parse and one with no index, are exactly the ones you most
+want to look at.
+
+**The loop it exists for**: see an identifier, search it across every host,
+jump to the coordinate a hit comes back with. `Tab` moves between the
+searchable **terms** on a line and `Enter` finds one everywhere.
+
+⚠ A term is not an index token, and conflating them is what made a UUID
+unselectable. The *index* holds alphanumeric runs of 3–64, so
+`9da3dcf1-5a4b-4d36-b907-917daa60bd90` is five of them and none is the id.
+A **`has` term** is wider: timberfs ANDs the runs inside it on the index
+and then matches the whole thing word-anchored — so the UUID is ONE term,
+and it is the one worth offering. Measured on a store where the whole id
+matched one entry, its piece `5a4b` matched every entry in the chunk.
+
+The hit list is searchable the same way: `Tab` walks the terms of the
+highlighted hit and `*` searches that one, because following an
+identifier is rarely one hop and the second one is usually sitting in the
+answer to the first. `Enter` there still opens the hit.
+
+So `Tab` offers the widest identifier at each position — separators and
+all, joined on `-` `.` `_` `:` but never across `=` or `/`, which separate
+fields rather than sit inside a name. A term the index cannot hold at all
+(`26.1.18`, three runs of under three characters) is refused where you
+point at it, with the reason, rather than discovered later as an empty
+answer.
+
+**One module, two front ends.** timbersh calls it in process, because a
+separate program would have to leave the alt screen carrying "search this
+token", let the shell print, and re-enter at a coordinate — a flicker per
+hop. It reaches the log through four operations and nothing else:
+
+```
+stores()                        the list, to switch between
+bounds(store)                   first_seq, last_seq, what was dropped
+chunk(store, seq=N | at=MS)     lines + the ring around them
+search(token)                   addresses
+```
+
+Written against those, it is tested against a fake rather than a terminal,
+and the fan-out stays the shell's: `search` is handed a token and does not
+know there are ten hosts.
+
+**Latency is the cost, so it is spent once.** A pager over a fleet waits
+on real round trips, and the three things that made that felt as
+sluggishness are gone: every target is asked **at once** rather than in
+turn (the same fix, and the same reason, as timbersh's `7.0 s → 1.1 s`);
+opening waits for **one** chunk rather than three, because the neighbours
+are read ahead while you are looking at the one you landed on; and a
+chunk once fetched is **cached**, which is safe precisely because a
+chunk's bytes never change after it is written. Measured against three
+targets at 400 ms each:
+
+| | before | after |
+|---|---|---|
+| the store list, at startup | 1.23 s | **0.41 s** |
+| opening a store | 0.83 s | **0.42 s** |
+| `G` — seek to the end | 0.83 s | **0.01 s** |
+| `Enter` — search the fleet | 1.24 s | **0.42 s** |
+| scrolling into the next chunk | 0.42 s | **0.00 s** |
+
+**What is left, it says.** A screen that stops answering cannot be told
+from one that has hung, so a read that takes longer than 0.3 s paints
+what it is waiting for, on which host, and for how long — and `^C` gives
+up on that answer rather than on the session. Nothing is drawn for a
+fast one: a flash of "waiting" on every keystroke is its own kind of
+noise. The FIRST read is inside that too, since it is the slowest and
+the one with nothing on screen yet to explain it.
+
+**The client decompresses.** One chunk is ten screenfuls of log for a few
+KiB on the wire, so the run is held either side of where you are and
+scrolling never falls out of a window; asking the far end to decompress
+would cost 13× the bytes for nothing. `compression.zstd` is stdlib from
+Python 3.14 and `zstd -dcq` is the fallback, which is why the package
+depends on `zstd`.
+
+**A coordinate has a written form** — `timber://host/store-id#offset=N` —
+so a search returning one, opening one, and handing a place back to the
+shell are the same operation. The store id is the name and the host is a
+hint: bake the host in and a pasted link breaks the day a store moves.
+
+## Tests
+
+```sh
+tests/timbersh/test-timbersh              # all
+tests/timbersh/test-timbersh short_id     # one, by substring
+tests/timberview/test-timberview          # the viewer's model
+tests/timberfs-client/test-timberfs-client   # the fleet resolver
+```
+
+No VM, no timberfs, no network. `scripts/check.sh` runs all three, so they
+gate a push like everything else.
+
+For timbersh, `--cmd` points at a fake that answers from a script. For the
+viewer, the fake is one level up: it implements the four operations, which
+is a whole server as far as the viewer is concerned — so where you are,
+what a screen shows and what the boundaries say are testable without a
+terminal. The statements that DO open a screen (`view`) are driven through
+a pty, waiting on what the screen printed rather than on a sleep.
+
+The fake **records every document it is asked**, which is the useful half —
+almost every bug here has been in what was *sent* rather than what was
+printed, and a test that reads only the output cannot see a window on the
+wrong axis or a cursor that lost a store's place.
+
+⚠ Each case was checked by reintroducing its bug and watching it fail. The
+paging test passed with the fix deleted, twice, for two different reasons
+before it meant anything.
+
+The fake answers `chunks` with a real compressed frame, so a viewer that
+decodes what it sends is a viewer that decodes what timberfs sends.

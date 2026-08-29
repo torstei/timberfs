@@ -1,0 +1,1006 @@
+#!/usr/bin/env python3
+"""timberview's tests. No curses, no timberfs, no network.
+
+The viewer reaches the log through four operations and nothing else, so
+a fake that implements those four is a whole server — which is what
+makes the half worth testing (where you are, what a screen shows, and
+what the boundaries say) testable at all.
+
+    tests/timberview/test-timberview           # all
+    tests/timberview/test-timberview boundary  # one, by substring
+"""
+import json
+import os
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
+import timberview as tv                                    # noqa: E402
+from timberview import KEY_CR, KEY_TAB                     # noqa: E402
+
+ID_A = "aaaaaaaa-1111-2222-3333-444444444444"
+ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
+
+
+class Fake:
+    """A store as a list of chunk texts, and the four operations over
+    it. `fetches` is what makes "a seek, not a walk" a testable claim."""
+
+    def __init__(self, texts, sid=ID_A, host=None, dropped=0, writer=None,
+                 first_seq=0, hits=None, others=()):
+        self.texts = list(texts)
+        self.first_seq = first_seq
+        self.fetches = 0
+        self.hits = hits or []
+        self.unplaced = 0
+        self.capped = False
+        self.unreachable = {}
+        self.fail_at = set()
+        start = dropped
+        self.chunks = []
+        for i, t in enumerate(self.texts):
+            self.chunks.append(tv.Chunk(first_seq + i, start, len(t),
+                                        1000 + i * 10, 1009 + i * 10,
+                                        t.encode()))
+            start += len(t)
+        self.store = {
+            "name": "app", "id": sid, "_host": host, "path": "/l/app.log",
+            "first_seq": first_seq, "last_seq": first_seq + len(texts) - 1,
+            "chunks": len(texts), "logical_bytes": sum(len(t) for t in texts),
+            "dropped_chunks": 0 if not dropped else 3,
+            "dropped_uncompressed_bytes": dropped, "labels": {},
+        }
+        if writer:
+            self.store["writer"] = writer
+        self.all = [self.store] + list(others)
+
+    def stores(self, fresh=False):
+        return self.all
+
+    def select_stores(self, terms, remember=False):
+        return self.all
+
+    def bounds(self, store):
+        return next((s for s in self.all if s["id"] == store["id"]), None)
+
+    def chunk(self, store, seq=None, at=None):
+        self.fetches += 1
+        if seq in self.fail_at:
+            raise tv.Refused(f"mail01 did not answer: no route to host")
+        if at is not None:
+            return next((c for c in self.chunks if c.wf <= at <= c.wl), None)
+        return next((c for c in self.chunks if c.seq == seq), None)
+
+    def search(self, token, limit=200):
+        return list(self.hits), self.unplaced, self.capped
+
+
+TESTS = []
+
+
+def test(fn):
+    TESTS.append(fn)
+    return fn
+
+
+def lines_of(view, w=200, h=40):
+    return [r["text"] for r in view.layout(w, h) if not r["edge"]]
+
+
+def edges_of(view, w=200, h=40):
+    return [r["text"] for r in view.layout(w, h) if r["edge"]]
+
+
+def opened(fake, **where):
+    v = tv.View(fake, fake.store)
+    v.open(**where)
+    return v
+
+
+# ------------------------------------------------------------- address
+@test
+def a_position_says_which_coordinate_it_is():
+    """`#offset=` and `#chunk=` are different numbers. A bare one would
+    resolve to the wrong place silently, which is worse than a link that
+    will not parse."""
+    assert tv.parse_address("timber://m1/x#offset=42").kind == "offset"
+    assert tv.parse_address("timber://m1/x#chunk=42").kind == "chunk"
+    for bad in ("timber://m1/x#42", "timber://m1/x#seq=42",
+                "timber://m1/x#offset=soon"):
+        try:
+            tv.parse_address(bad)
+            raise AssertionError(f"{bad} parsed")
+        except ValueError:
+            pass
+
+
+@test
+def an_address_is_identity_with_the_host_as_a_hint():
+    """The store id is the name; bake the host in and every pasted link
+    breaks the day a store moves."""
+    a = tv.parse_address("timber:79d7f23a-b044")
+    assert a.host is None and a.store == "79d7f23a-b044", a
+    for text in ("timber://mail01/79d7#offset=337", "timber://mail01/79d7",
+                 "timber:79d7#chunk=9"):
+        assert str(tv.parse_address(text)) == text, text
+
+
+# -------------------------------------------------------------- tokens
+@test
+def an_identifier_is_one_term_not_its_pieces():
+    """The distinction that made a UUID unsearchable. The INDEX holds
+    alphanumeric runs, so `9da3dcf1-5a4b-…` is five of them — but a
+    `has` TERM may carry the separators an identifier is written with,
+    and timberfs ANDs the runs inside it. Offering the pieces offered
+    the wrong search: in one store `5a4b` matched every entry where the
+    whole id matched one."""
+    uuid = "9da3dcf1-5a4b-4d36-b907-917daa60bd90"
+    assert [t[2] for t in tv.terms(f"req={uuid} handled")] \
+        == ["req", uuid, "handled"]
+    assert [t[2] for t in tv.terms("at com.example.Thing.method(Thing.java:42)")] \
+        == ["com.example.Thing.method", "Thing.java:42"]
+    # `=` and `/` separate FIELDS, so they do not join a term.
+    assert [t[2] for t in tv.terms("GET /api/v1/x ref=REQ3999")] \
+        == ["GET", "api", "ref", "REQ3999"], tv.terms("GET /api/v1/x ref=REQ3999")
+    # `v1` and `x` are dropped for the reason they always were: the index
+    # cannot hold a run of under three characters.
+    # A term still has to be findable: the index must hold one of its
+    # runs, and a 65-character run is not one of them.
+    assert tv.terms("a" * 65) == []
+    assert [t[2] for t in tv.terms("a" * 64)] == ["a" * 64]
+    assert tv.terms("26.1.18") == []
+
+
+@test
+def a_version_number_is_refused_with_the_reason():
+    """`26.1.18` is three runs of under three characters, so no search
+    can find it. Said where you point at it, not discovered later as an
+    empty answer."""
+    f = Fake(["one line\n"])
+    v = opened(f)
+    v.search("26.1.18")
+    assert "under 3" in v.message and "26" in v.message, v.message
+    assert v.hits == []
+    # But the id it was mistaken for IS one term, and is accepted.
+    f.hits = [tv.Hit(tv.Address(ID_A, None, "offset", 0), f.store, "x")]
+    v.search("9da3dcf1-5a4b-4d36-b907-917daa60bd90")
+    assert v.hits, v.message
+
+
+# ---------------------------------------------------------------- tape
+@test
+def landing_at_the_top_of_a_chunk_shows_its_first_line():
+    """A run that does not begin at the store's first chunk holds its
+    first line back — it may be the tail of a line that began in the
+    chunk before. Landing THERE has to reach for that chunk: the held
+    line is the one at the top of the screen you asked for."""
+    f = Fake(["a\nb\nc\n", "d\ne\nf\n", "g\nh\n"])
+    v = opened(f, seq=1)
+    assert v.line().text == "d", (v.line().text, lines_of(v))
+    assert v.address().value == v.source.chunks[0].start + 6, v.address()
+    # Landing at the END needs no such read: the held line is a screen
+    # away, and the read-ahead has it by the time anyone scrolls there.
+    quiet = Fake(["a\n" * 9, "b\n" * 9])
+    w = opened(quiet)
+    assert len(w.source.chunks) == 1, w.source.chunks
+
+
+@test
+def a_line_across_a_chunk_boundary_is_one_line():
+    """Chunks are flush boundaries, not line boundaries. Splitting each
+    chunk on its own would show two halves and give the second one an
+    offset no line starts at."""
+    f = Fake(["alpha\nbra", "vo\ncharlie\n"])
+    v = opened(f, seq=0)
+    # Opening reads ONE chunk, so the straddling line is still held back.
+    assert lines_of(v) == ["alpha"], lines_of(v)
+    v.source.extend_down()
+    assert lines_of(v) == ["alpha", "bravo", "charlie"], lines_of(v)
+    assert [ln.offset for ln in v.source.lines] == [0, 6, 12]
+
+
+@test
+def a_boundary_fragment_is_held_back_while_there_is_more_tape():
+    """Showing half a line is a truncation the reader cannot see. With
+    tape on that side the fragment waits for the chunk that completes
+    it; at the true edge there is nothing to wait for."""
+    f = Fake(["alpha\nbra", "vo\ncharlie\n"])
+    t = tv.Tape(f, f.store)
+    t.chunks = [f.chunks[0]]
+    t._rebuild()
+    assert [ln.text for ln in t.lines] == ["alpha"], t.lines
+    t.chunks = [f.chunks[1]]
+    t._rebuild()
+    assert [ln.text for ln in t.lines] == ["charlie"], t.lines
+
+
+@test
+def an_offset_is_absolute_on_the_tape():
+    """The coordinate a search hands back and the one the viewer shows
+    are the same number, so it counts from the tape's start and not from
+    the run that happens to be loaded."""
+    f = Fake(["a\nb\n", "c\nd\n"], dropped=1000)
+    v = opened(f, seq=1)
+    assert [ln.offset for ln in v.source.lines] == [1000, 1002, 1004, 1006]
+    assert v.source.index_of(1005) == 2
+
+
+@test
+def seeking_to_an_offset_bisects_rather_than_walks():
+    """There is no seek-by-offset on the wire, so the chunk is found by
+    bisecting on what each fetched chunk says its own range is. A walk
+    would be 500 round trips on this store."""
+    f = Fake([f"line {i}\n" * 4 for i in range(1000)])
+    f.fetches = 0
+    c = f.chunks[700]
+    t = tv.Tape(f, f.store)
+    got = t.locate(c.start + 3)
+    assert got.seq == 700, got.seq
+    assert f.fetches <= 12, f.fetches
+
+
+@test
+def an_offset_off_the_tape_says_which_way_it_rotted():
+    f = Fake(["a\nb\n"], dropped=4096)
+    t = tv.Tape(f, f.store)
+    try:
+        t.locate(12)
+        raise AssertionError("accepted an offset below the tape")
+    except tv.Refused as e:
+        assert "4 096" in str(e), str(e)
+
+
+@test
+def the_top_of_the_log_is_a_seek_not_a_walk():
+    """`g` on a store of a thousand chunks must not fetch a thousand
+    chunks."""
+    f = Fake([f"{i}\n" for i in range(1000)])
+    v = opened(f)
+    f.fetches = 0
+    v.home()
+    assert f.fetches <= 4, f.fetches
+    assert v.source.at_top() and v.cur == 0
+
+
+# --------------------------------------------------- stated boundaries
+@test
+def the_top_of_the_log_is_not_the_top_of_what_is_loaded():
+    """An empty screen that could mean either is the defect this project
+    keeps removing from its answers."""
+    f = Fake(["a\n" * 4, "b\n" * 4, "c\n" * 4])
+    v = opened(f, seq=2)
+    assert not any("top of the log" in e for e in edges_of(v)), edges_of(v)
+    v.home()
+    assert any("top of the log" in e for e in edges_of(v)), edges_of(v)
+
+
+@test
+def what_retention_dropped_is_stated():
+    f = Fake(["a\n", "b\n"], dropped=3 * 1024 * 1024, first_seq=61310)
+    v = opened(f)
+    v.home()
+    notes = " ".join(edges_of(v))
+    assert "chunk 61310" in notes and "3 chunk(s) older" in notes, notes
+    assert "3.0 MiB" in notes, notes
+
+
+@test
+def the_live_edge_is_named_as_not_shown():
+    """The newest lines are in no chunk yet, so the bottom has to say
+    that the end of the tape is not the end of the log."""
+    f = Fake(["a\n"], writer="pid 4242")
+    v = opened(f)
+    assert "pid 4242" in edges_of(v)[-1], edges_of(v)
+    assert "not be flushed" in edges_of(v)[-1]
+    quiet = opened(Fake(["a\n"]))
+    assert "nothing is appending" in edges_of(quiet)[-1]
+
+
+# -------------------------------------------------------------- screen
+@test
+def a_screen_with_room_to_spare_backs_up():
+    """Opening at the last chunk lands on the last line. A pager shows a
+    full screen ending there, not one line and blank space."""
+    f = Fake(["".join(f"line {i}\n" for i in range(40))])
+    v = opened(f)
+    assert len(lines_of(v, 80, 10)) >= 9, lines_of(v, 80, 10)
+    assert lines_of(v, 80, 10)[-1] == "line 39"
+
+
+@test
+def long_lines_are_a_preference_not_a_policy():
+    """Wrapped, a wide structured line is unreadable; truncated, the end
+    of every stack frame is hidden. Both, at runtime."""
+    f = Fake(["x" * 30 + "\nshort\n"])
+    v = opened(f, seq=0)
+    v.cur = 0
+    assert lines_of(v, 10, 10)[0] == "x" * 10
+    v.scroll_h(10)
+    assert lines_of(v, 10, 10)[0] == "x" * 10
+    v.scroll_h(-10)
+    v.toggle_wrap()
+    rows = [r for r in v.layout(10, 10) if r["line"] == 0]
+    assert len(rows) == 3 and rows[1]["text"] == "x" * 10, rows
+
+
+@test
+def control_bytes_are_shown_rather_than_obeyed():
+    """A log line carries ANSI escapes and stray carriage returns. On a
+    raw-mode screen those repaint the terminal, so they are drawn as
+    text — visible, and not dropped."""
+    f = Fake(["a\x1b[31mred\x07\tb\n"])
+    v = opened(f, seq=0)
+    text = lines_of(v)[0]
+    assert "\x1b" not in text and "\x07" not in text, repr(text)
+    assert text.startswith("a·[31mred·"), repr(text)
+    assert "\t" not in text
+
+
+@test
+def the_header_says_where_on_the_tape_this_is():
+    f = Fake(["a\n" * 50, "b\n" * 50], dropped=100)
+    v = opened(f, seq=0)
+    v.cur = 0
+    assert "chunk 0" in v.header() and "offset 100" in v.header(), v.header()
+    v.end()
+    assert "chunk 1" in v.header() and "99%" in v.header(), v.header()
+
+
+# -------------------------------------------------------------- search
+@test
+def a_hit_is_a_coordinate_and_opening_it_is_a_seek():
+    """A hit on a chunk's FIRST line is the case that catches a viewer
+    reading ahead: that line is the one the run holds back as a possible
+    fragment, so landing on it would show the next line and report the
+    wrong offset. The chunk before it is fetched rather than left to the
+    read-ahead."""
+    f = Fake(["one\ntwo\n", "three\nfour\n"])
+    f.hits = [tv.Hit(tv.Address(ID_A, None, "offset", 8), f.store, "three")]
+    v = opened(f)
+    v.search("three")
+    assert len(v.hits) == 1, v.message
+    v.jump(v.hits[0])
+    assert v.line().text == "three", v.line().text
+    assert str(v.address()) == f"timber:{ID_A}#offset=8"
+
+
+@test
+def a_hit_in_another_store_switches_to_it():
+    """A search knows nothing about which log holds the identifier, so
+    following one has to be able to leave the store you opened."""
+    other = Fake(["hello\nworld\n"], sid=ID_B, host="mail01")
+    other.store["name"] = "mail"
+    f = Fake(["one\n"], others=[other.store])
+    f.chunk = other.chunk
+    f.hits = [tv.Hit(tv.Address(ID_B, "mail01", "offset", 6),
+                     other.store, "world")]
+    v = opened(f)
+    v.search("world")
+    v.jump(v.hits[0])
+    assert v.store["id"] == ID_B and v.line().text == "world"
+    assert str(v.address()) == f"timber://mail01/{ID_B}#offset=6"
+
+
+@test
+def a_pair_with_no_identity_is_refused_before_anything_is_read():
+    """A plain `append` leaves a pair with no manifest, which is not a
+    store: there is no id, so no place in it can be written down. Said
+    in timberfs's own words rather than crashing on the missing field."""
+    f = Fake(["a\n"])
+    del f.store["id"]
+    v = tv.View(f, f.store)
+    try:
+        v.open()
+        raise AssertionError("opened a pair with no identity")
+    except tv.Refused as e:
+        assert "identity --mint" in str(e), str(e)
+    assert f.fetches == 0, f.fetches
+
+
+@test
+def an_answer_that_stopped_at_a_bound_says_so():
+    """A capped search and an exhausted one are different answers, and
+    only one of them means "that is all of them"."""
+    f = Fake(["one\n"])
+    f.hits = [tv.Hit(tv.Address(ID_A, None, "offset", 0), f.store, "one")]
+    f.capped = True
+    f.unplaced = 2
+    v = opened(f)
+    v.search("one")
+    assert "stopped at a bound" in v.message, v.message
+    assert "2 not in a chunk yet" in v.message, v.message
+
+
+@test
+def a_target_that_did_not_answer_is_not_an_empty_fleet():
+    """One machine being down must not stop you reading the logs that
+    ARE there — and when it stops everything, "nothing was listed" and
+    "there is nothing" are opposite problems that read the same."""
+    f = Fake(["a\n"])
+    f.all = []
+    f.unreachable = {"gone1": "gone1 did not answer: no route to host"}
+    try:
+        tv.resolve(f, None)
+        raise AssertionError("an unreachable fleet read as an empty one")
+    except tv.Refused as e:
+        assert "did not answer" in str(e) and "gone1" in str(e), str(e)
+        assert "nothing was listed" in str(e), str(e)
+
+
+@test
+def a_store_that_is_missing_says_who_was_not_asked():
+    """The store you are looking for may be on the host that did not
+    answer, so "no store matches" alone would send you looking in the
+    wrong place."""
+    f = Fake(["a\n"])
+    f.unreachable = {"gone1": "gone1 did not answer: no route to host"}
+    try:
+        tv.resolve(f, "mystery")
+        raise AssertionError("accepted a missing store with no note")
+    except tv.Refused as e:
+        assert "no store matches" in str(e) and "gone1" in str(e), str(e)
+
+
+@test
+def a_chunk_that_could_not_be_read_is_not_the_end_of_the_tape():
+    """A host that goes away mid-scroll leaves the run unable to grow.
+    Saying nothing makes that screen identical to the end of the log,
+    which is the boundary this viewer exists to state."""
+    def only_chunk_one():
+        f = Fake(["a\n" * 4, "b\n" * 4, "c\n" * 4])
+        v = opened(f, seq=1)
+        f.fail_at = {0, 2}
+        v.source.chunks = [c for c in v.source.chunks if c.seq == 1]
+        v.source._rebuild()
+        return f, v
+
+    f, v = only_chunk_one()
+    v.top = v.cur = 0
+    assert v.source.extend_up() is False
+    edges = edges_of(v)
+    assert any("chunk 0 could not be read" in e for e in edges), edges
+    assert not any("top of the log" in e for e in edges), edges
+
+    f, v = only_chunk_one()
+    v.cur = len(v.source.lines) - 1
+    assert v.source.extend_down() is False
+    edges = edges_of(v)
+    assert any("chunk 2 could not be read" in e for e in edges), edges
+    assert not any("end of chunk" in e for e in edges), edges
+
+
+# The tests above fake the BACKEND. These fake the TRANSPORT instead, so
+# they exercise the four operations themselves — which is where "one
+# target being down does not stop the others" actually lives.
+def wire(*records):
+    out = b"\x1estream-start\x1fv=1\x1fsources=1\0"
+    for kind, fields, payload in records:
+        head = kind + "".join(f"\x1f{k}={v}" for k, v in fields.items())
+        out += b"\x1e" + head.encode() + b"\0"
+        if payload is not None:
+            out += payload + b"\0"
+    return out + b"\x1estream-end\x1fstatus=exhausted\0"
+
+
+def transport(live, dead):
+    """`ask` for a fleet where `dead` refuses and `live` answers."""
+    def ask(doc, host=None, raw=False):
+        if host in dead:
+            return (b"" if raw else ""), "ssh: no route to host", 255
+        kind = (doc.get("response_format") or {}).get("kind")
+        if kind == "stores":
+            return json.dumps({"server_version": "timberfs, 0.25.0",
+                               "stores": [live[host]]}), "", 0
+        if kind == "records":
+            body = f"found on {host}".encode()
+            return wire(("source", {"path": f"/l/{host}.log",
+                                    "id": live[host]["id"]}, None),
+                        ("entry", {"len": len(body), "ts": 1,
+                                   "chunk": 0, "offset": 7}, body)), "", 0
+        return b"", "", 0
+    return ask
+
+
+@test
+def one_target_being_down_does_not_stop_the_others():
+    """Something in the system being down must not prevent reading the
+    logs that ARE available. The dead target is named — in the listing,
+    in the search, and in the store picker's title — and never dropped,
+    because a host that was not asked must not read as one that had
+    nothing."""
+    live = {"web01": {"name": "access", "id": ID_A, "chunks": 1,
+                      "first_seq": 0, "last_seq": 0, "logical_bytes": 10,
+                      "dropped_chunks": 0, "dropped_uncompressed_bytes": 0,
+                      "path": "/l/access.log", "labels": {}}}
+    b = tv.QueryBackend(transport(live, {"gone99"}), ["web01", "gone99"])
+    stores = b.stores()
+    assert [s["name"] for s in stores] == ["access"], stores
+    assert list(b.unreachable) == ["gone99"], b.unreachable
+    assert "no route to host" in b.unreachable["gone99"], b.unreachable
+
+    hits, unplaced, capped = b.search("found")
+    assert [h.address.host for h in hits] == ["web01"], hits
+    assert list(b.unreachable) == ["gone99"], b.unreachable
+
+    v = tv.View(b, stores[0])
+    v.search("found")
+    assert "1 hit(s)" in v.message and "not searched: gone99" in v.message, \
+        v.message
+
+
+@test
+def a_timberfs_from_before_the_seek_is_diagnosed_not_relayed():
+    """The first wall anyone meets. On its own the refusal reads as the
+    caller's mistake — a chunk number with `max: {chunks: 1}` is exactly
+    the legal thing — and no version check can catch it, because the
+    builds either side of that change report the same version."""
+    def ask(doc, host=None, raw=False):
+        if (doc.get("response_format") or {}).get("kind") == "chunks":
+            return b"", ("Error: a chunk number is a resume position, and "
+                         "only a FOLLOWING read moves forward from one"), 1
+        return json.dumps({"server_version": "timberfs, 0.25.0",
+                           "stores": []}), "", 0
+    b = tv.QueryBackend(ask, [None])
+    try:
+        b.chunk({"id": ID_A}, seq=7)
+        raise AssertionError("a refusal became an answer")
+    except tv.Refused as e:
+        # What to DO, on the first line. Someone meeting this wants a fix
+        # rather than a protocol lesson, and the mechanism read first is
+        # what made the original message sound like their own mistake.
+        first = str(e).splitlines()[0]
+        assert first.startswith("timberfs is too old — upgrade it"), first
+        assert "PATH" in str(e) and "TIMBERFS_CMD" in str(e), str(e)
+        assert "report the same one" in str(e), str(e)
+        # timberfs's own words are kept, and kept LAST.
+        assert str(e).splitlines()[-1].startswith("      It said:"), str(e)
+        assert "resume position" in str(e), str(e)
+
+
+@test
+def upgrading_the_other_end_is_not_something_this_machine_can_do():
+    """Nothing on PATH here fixes a timberfs on another host, so the
+    remedy names the target instead."""
+    named = tv.too_old("mail01", "a chunk number is a resume position")
+    assert named.startswith("mail01: timberfs is too old — upgrade it there")
+    assert "PATH" not in named, named
+    assert "`cmd`" in named, named
+
+
+def _z(data):
+    """A real zstd frame, so a decode that would fail on the wire fails
+    here too."""
+    try:
+        from compression.zstd import compress
+        return compress(data)
+    except ImportError:
+        import subprocess
+        return subprocess.run(["zstd", "-q", "-c"], input=data,
+                              capture_output=True).stdout
+
+
+def Screen_for_test():
+    """`busy` needs the curses MODULE for its attribute constants, and
+    nothing else — no terminal."""
+    import curses
+    screen = tv.Screen(None)
+    screen.curses = curses
+    return screen
+
+
+class Screenish:
+    """Enough of a curses window to draw on, and to type at."""
+
+    def __init__(self, keys=()):
+        self.painted = []
+        self.keys = list(keys)
+        self.exhausted = False
+
+    def getmaxyx(self):
+        return (24, 200)
+
+    def addnstr(self, y, x, text, n, attr=0):
+        self.painted.append(text)
+
+    def erase(self):
+        pass
+
+    def chgat(self, y, x, n, attr):
+        pass
+
+    def refresh(self):
+        pass
+
+    def timeout(self, ms):
+        pass
+
+    def getch(self):
+        if self.keys:
+            return self.keys.pop(0)
+        # Never -1 forever: a screen that keeps answering "no key" makes
+        # a test that never ends, and a hanging test is worse than a
+        # failing one. `q` gets out of anything.
+        time.sleep(0.02)
+        self.exhausted = True
+        return ord("q")
+
+
+@test
+def a_chunk_is_cached_because_its_bytes_never_change():
+    """A chunk is immutable once written, which is what makes reading it
+    twice a waste rather than a risk."""
+    live = {None: {"name": "app", "id": ID_A, "chunks": 3, "first_seq": 0,
+                   "last_seq": 2, "logical_bytes": 30, "dropped_chunks": 0,
+                   "dropped_uncompressed_bytes": 0, "labels": {}}}
+    seen = []
+
+    def ask(doc, host=None, raw=False):
+        kind = (doc.get("response_format") or {}).get("kind")
+        if kind == "stores":
+            return json.dumps({"server_version": "t", "stores": [live[None]]}), "", 0
+        seen.append(doc["window"].get("from_chunk"))
+        body = b"a line\n"
+        return wire(("chunk", {"len": len(_z(body)), "chunk": 1,
+                               "uncomp_start": 0, "uncomp_len": len(body),
+                               "wf": 1, "wl": 2}, _z(body))), "", 0
+
+    b = tv.QueryBackend(ask, [None])
+    assert b.chunk(live[None], seq=1).seq == 1
+    assert b.chunk(live[None], seq=1).seq == 1
+    assert seen == [1], seen
+
+
+@test
+def the_neighbours_are_read_ahead_so_the_scroll_is_local():
+    """One chunk is ten screenfuls, so the reader is looking at this one
+    for a while — which is exactly when to fetch the next. Opening waits
+    for ONE round trip; the scroll that needs the neighbour finds it."""
+    f = Fake(["a\n" * 8, "b\n" * 8, "c\n" * 8])
+    asked = []
+    f.prefetch = lambda store, *seqs: asked.extend(seqs)
+    v = opened(f)                       # the live end, where a pager opens
+    assert len(v.source.chunks) == 1, v.source.chunks
+    assert asked == [1], asked
+
+
+@test
+def every_target_is_asked_at_once():
+    """Four hosts one after another is four latencies for one answer.
+    Counted rather than timed: the claim is that they overlap."""
+    inflight, peak, lock = [0], [0], threading.Lock()
+
+    def ask(doc, host=None, raw=False):
+        with lock:
+            inflight[0] += 1
+            peak[0] = max(peak[0], inflight[0])
+        time.sleep(0.05)
+        with lock:
+            inflight[0] -= 1
+        return json.dumps({"server_version": "t", "stores": []}), "", 0
+
+    b = tv.QueryBackend(ask, ["a", "b", "c", "d"])
+    b.stores()
+    assert peak[0] == 4, f"peak concurrency {peak[0]}, so they went in turn"
+
+
+@test
+def bounds_just_read_are_not_read_again():
+    """Retention moves the floor while you read, so the numbers cannot be
+    remembered from when the store was opened — but re-reading them in
+    front of a chunk that is already cached puts a whole round trip
+    where none is needed."""
+    f = Fake(["a\n" * 4, "b\n" * 4])
+    f.store["_read_at"] = time.monotonic()
+    f.FRESH = 10.0
+    reads = []
+    real = f.bounds
+    f.bounds = lambda st: (reads.append(1), real(st))[1]
+    t = tv.Tape(f, f.store)
+    t.refresh()
+    assert reads == [], "re-read bounds that had just been read"
+    f.store["_read_at"] = time.monotonic() - 60
+    t.refresh()
+    assert reads == [1], "never re-read bounds that had gone stale"
+
+
+@test
+def a_wait_says_so_and_hands_back_what_it_waited_for():
+    """A screen that stops answering is indistinguishable from one that
+    has hung, which is what a fleet-latency pager looks like without
+    this."""
+    scr = Screenish()
+    screen = Screen_for_test()
+    assert screen.busy(scr, "reading mail01", lambda: (time.sleep(0.5), 7)[1]) == 7
+    assert any("reading mail01" in t for t in scr.painted), scr.painted
+    assert any("^C gives up" in t for t in scr.painted), scr.painted
+
+    # A failure on the worker is the caller's failure, not a swallowed one.
+    def boom():
+        raise tv.Refused("mail01 did not answer")
+    try:
+        screen.busy(Screenish(), "reading mail01", boom)
+        raise AssertionError("a failure on the worker was swallowed")
+    except tv.Refused as e:
+        assert "did not answer" in str(e)
+
+    # And a fast answer draws nothing: a flash on every keystroke is its
+    # own kind of noise.
+    quiet = Screenish()
+    assert screen.busy(quiet, "reading mail01", lambda: 3) == 3
+    assert quiet.painted == [], quiet.painted
+
+
+@test
+def a_hit_list_is_itself_searchable():
+    """The identifier you are really after is often sitting in the
+    answer to the last search. `Tab` walks the terms of the highlighted
+    hit and `*` searches the picked one, without opening it first —
+    `Enter` still means the primary thing here, which is going there."""
+    uuid = "9da3dcf1-5a4b-4d36-b907-917daa60bd90"
+    rows = [f"{'app @ mail01':28} 12:00:01 INFO req={uuid} handled"]
+    screen = Screen_for_test()
+
+    # `12:00:01` is not offered at all — every run in it is under three
+    # characters. So the terms are INFO, req, the id, handled; two Tabs
+    # from the first reaches the id, and `*` searches it.
+    tabs = [KEY_TAB] * 2 + [ord("*")]
+    what, value = screen.choose(Screenish(tabs), "t", rows,
+                                searchable=True, terms_from=29)
+    assert (what, value) == ("term", uuid), (what, value)
+
+    # The store's own name is never offered: terms start at the text.
+    what, value = screen.choose(Screenish([ord("*")]), "t", rows,
+                                searchable=True, terms_from=29)
+    assert value != "app" and "mail01" not in str(value), value
+
+    # Enter still opens rather than searching.
+    assert screen.choose(Screenish([KEY_CR]), "t", rows, searchable=True,
+                         terms_from=29) == ("open", 0)
+    # And a list that is not searchable has none of it.
+    assert screen.choose(Screenish([ord("*"), ord("q")]), "t", rows) \
+        == (None, None)
+
+
+def answer(*entries, source_id=ID_A, path="/l/app.log", version="0.26.0"):
+    """A `records` stream, as timberfs writes one."""
+    recs = [("stream-start", {"v": 1, "server_version": f"timberfs, {version}"},
+             None),
+            ("source", {"path": path, "id": source_id}, None)]
+    for text, fields in entries:
+        body = text.encode()
+        recs.append(("entry", {"len": len(body), **fields}, body))
+    return wire(*recs)
+
+
+@test
+def a_multi_line_entry_is_one_entry():
+    """A stack trace belongs to the entry that raised it. Splitting it
+    would be the same lie as splitting a line across a chunk boundary —
+    and every one of its lines names the place the ENTRY came from."""
+    r = tv.Records(answer(("boom\n  at A\n  at B", {"offset": 40, "ts": 1})))
+    assert r.entries == 1 and len(r.lines) == 3, (r.entries, len(r.lines))
+    assert [ln.text for ln in r.lines] == ["boom", "  at A", "  at B"]
+    assert [ln.first for ln in r.lines] == [True, False, False]
+    assert {str(r.address_of(ln)) for ln in r.lines} \
+        == {f"timber:{ID_A}#offset=40"}
+
+
+@test
+def an_answer_is_a_closed_set():
+    """Both ends are ends: nothing extends, and the boundary says "the
+    answer" rather than naming a chunk that is not what you are in."""
+    r = tv.Records(answer(("one", {"offset": 0})))
+    assert r.at_top() and r.at_bottom()
+    assert r.extend_up() is False and r.extend_down() is False
+    assert "end of the answer" in r.bottom_note()
+    assert "chunk" not in r.bottom_note()
+    assert "1 entry matched" in r.top_notes()[0], r.top_notes()
+
+
+@test
+def an_entry_at_the_live_edge_is_shown_but_cannot_be_opened():
+    """It is real and it matched, so it is in the answer. It is in no
+    chunk yet, so there is no place to open — said, not guessed at."""
+    r = tv.Records(answer(("fresh", {"ts": 9})))       # no offset
+    assert r.entries == 1 and r.unplaced == 1
+    assert r.address_of(r.lines[0]) is None
+    assert "live edge" in r.top_notes()[0], r.top_notes()
+    # It is opened by WHEN it arrived instead — the chunk it is in.
+    f = Fake(["fresh\nlater\n"])
+    f.chunks[0].wf, f.chunks[0].wl = 100, 200
+    r.lines[0].store = f.store
+    r.lines[0].wf = 150
+    v = tv.View(f, source=r)
+    assert v.leave_for_the_log() is True
+    assert "write window" in v.message, v.message
+
+
+@test
+def enter_searches_on_every_pager_screen():
+    """It used to mean "open the log" in an ANSWER and "search this
+    term" on the tape — so picking an identifier in an answer and
+    pressing Enter did something else entirely, and could fail with a
+    message about opening, which was never what was asked for. Leaving
+    an answer for the log is its own key."""
+    f = Fake(["one\ntwo\n"])
+    r = tv.Records(answer(("boom REQ3999", {"offset": 0})))
+    for source, where in ((r, "an answer"), (None, "the tape")):
+        v = (tv.View(f, source=source) if source is not None
+             else opened(f))
+        screen = Screen_for_test()
+        screen.view = v
+        asked = []
+        screen.do_search = lambda _s, token: asked.append(token)
+        v.tok = 1 if source is not None else 0
+        screen.step(Screenish(), KEY_CR)
+        assert asked and asked[0] == v.selected(), (where, asked)
+
+
+@test
+def two_streams_do_not_borrow_each_others_attribution():
+    """Each host's answer names its own sources, and a one-source stream
+    leaves the id off its entries. Read together without resetting, the
+    second host's entries would inherit the first host's store."""
+    a = answer(("from a", {"offset": 1}), source_id=ID_A, path="/l/a.log")
+    b = answer(("from b", {"offset": 2}), source_id=ID_B, path="/l/b.log")
+    r = tv.Records([a, b])
+    assert [str(r.address_of(ln)) for ln in r.lines] == \
+        [f"timber:{ID_A}#offset=1", f"timber:{ID_B}#offset=2"], \
+        [str(r.address_of(ln)) for ln in r.lines]
+
+
+@test
+def a_target_too_old_to_place_an_entry_is_not_a_live_edge():
+    """`offset` on an entry record landed in 0.26.0. A target still on
+    0.25.0 answers with entries that have no place — and calling that
+    "at the live edge" states a fact about the DATA where the truth is a
+    fact about the server, so it sends you looking at the wrong thing.
+    The stream says what produced it, which settles it."""
+    old = tv.Records(answer(("boom", {"ts": 1, "wf": 150}), version="0.25.0"))
+    assert old.stale == 1 and old.unplaced == 0, (old.stale, old.unplaced)
+    assert "0.25.0" in old.top_notes()[0], old.top_notes()
+    assert "live edge" not in old.top_notes()[0], old.top_notes()
+
+    # And still opened, by the window the old record does carry.
+    f = Fake(["boom\nnext\n"])
+    f.chunks[0].wf, f.chunks[0].wl = 100, 200
+    old.lines[0].store = f.store
+    v = tv.View(f, source=old)
+    assert v.leave_for_the_log() is True, v.message
+    assert "write window" in v.message and "0.25.0" in v.message, v.message
+
+    # A current target with an unflushed entry is still the live edge.
+    fresh = tv.Records(answer(("boom", {"ts": 1, "wf": 150}), version="0.26.0"))
+    assert fresh.unplaced == 1 and fresh.stale == 0
+    assert "live edge" in fresh.top_notes()[0], fresh.top_notes()
+
+
+@test
+def a_hit_that_cannot_be_placed_is_still_a_hit():
+    """It used to be DROPPED, so a term matching only on a target that
+    cannot place one read as "no hit" — false, and the one thing an
+    answer must never say. A couple of old servers in a fleet must not
+    make a term unusable: the hits are listed, read and searched from;
+    only OPENING one is refused, and then with the reason."""
+    def host_answers(host):
+        body = f"boom on {host}".encode()
+        version = "0.25.0" if host == "old01" else "0.26.0"
+        fields = {"len": len(body), "ts": 1, "wf": 7}
+        if version == "0.26.0":
+            fields.update(chunk=4, offset=99)
+        return wire(("stream-start", {"server_version": f"timberfs, {version}"},
+                     None),
+                    ("source", {"path": f"/l/{host}.log", "id": ID_A}, None),
+                    ("entry", fields, body))
+
+    def ask(doc, host=None, raw=False):
+        if (doc.get("response_format") or {}).get("kind") == "stores":
+            return json.dumps({"server_version": "t", "stores": []}), "", 0
+        return host_answers(host), "", 0
+
+    b = tv.QueryBackend(ask, ["new01", "old01"])
+    hits, unplaced, capped = b.search("boom")
+    assert len(hits) == 2, [h.text for h in hits]
+    assert [h.address.kind for h in hits] == ["offset", None], hits
+    assert b.stale == {"old01": (0, 25, 0)}, b.stale
+    assert unplaced == 0, unplaced          # old, not unflushed
+    # The one that could not be placed still carries WHEN it arrived,
+    # which is what opens it.
+    assert hits[1].wf == 7, hits[1].wf
+
+    v = tv.View(b, source=tv.Records(answer(("x", {"offset": 0}))))
+    v.search("boom")
+    assert "2 hit(s)" in v.message, v.message
+    assert "old01 on 0.25.0" in v.message, v.message
+
+    # The list says which is exact and which is by the write window.
+    rows = [Screen_for_test().hit_row(h) for h in hits]
+    assert rows[0].startswith(" ") and rows[1].startswith("·"), rows
+
+
+@test
+def a_hit_with_no_offset_is_opened_by_its_write_window():
+    """An entry record has carried `wf` since long before `offset`, and
+    a write-axis window of one millisecond is a seek to the chunk that
+    covers it — measured against a live store, `wf` alone lands on the
+    entry's own chunk. So "cannot be opened" was a limitation of the
+    viewer, not a fact about the answer: what is lost is the exact line,
+    and that is found in the chunk that comes back."""
+    f = Fake(["alpha\nbravo\ncharlie\n"])
+    f.chunks[0].wf, f.chunks[0].wl = 500, 600
+    hit = tv.Hit(tv.Address(ID_A, None), f.store, "bravo", wf=550)
+    v = opened(f)
+    assert v.jump(hit) is True
+    assert v.line().text == "bravo", v.line().text
+    assert "write window" in v.message and "exact offset" in v.message, v.message
+
+    # With neither a place nor a time there is nothing to open it by,
+    # and that is said rather than guessed at.
+    assert v.jump(tv.Hit(tv.Address(ID_A, None), f.store, "x")) is False
+    assert "neither where nor when" in v.message, v.message
+
+
+@test
+def tabbing_brings_the_term_into_view():
+    """A log line is 200 characters and a screen is 80, so Tab walks
+    straight off the edge unless the sideways scroll follows the pick.
+    Only on a PICK: scrolling by hand and having the screen snap back
+    would be the same fight from the other side."""
+    far = "x" * 150
+    f = Fake([f"alpha {far} omega9\n"])
+    v = opened(f, seq=0)
+    v.cur = 0
+    assert v.col == 0
+
+    # Tab to the term at the far right; the window follows it.
+    while v.selected() != "omega9":
+        v.pick(1)
+    v.layout(80, 10)
+    span = v.selected_span()
+    assert v.col <= span[0] and span[1] <= v.col + 80, (v.col, span)
+    # And not flush against the edge it just came from: a term with no
+    # context beside it reads as the end of the line.
+    assert span[1] < v.col + 80, (v.col, span)
+
+    # And back to the first, which is off to the LEFT from there.
+    while v.selected() != "alpha":
+        v.pick(1)
+    v.layout(80, 10)
+    span = v.selected_span()
+    assert v.col <= span[0] and span[1] <= v.col + 80, (v.col, span)
+
+    # Scrolling by hand is not undone by the next redraw.
+    v.scroll_h(40)
+    where = v.col
+    v.layout(80, 10)
+    assert v.col == where, (v.col, where)
+
+    # Wrapped, there is no sideways scroll to follow.
+    v.toggle_wrap()
+    v.pick(1)
+    v.layout(80, 10)
+    assert v.col == 0, v.col
+
+
+def main():
+    want = sys.argv[1] if len(sys.argv) > 1 else ""
+    chosen = [t for t in TESTS if want in t.__name__]
+    failed = 0
+    for t in chosen:
+        try:
+            t()
+            print(f"  ok    {t.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"  FAIL  {t.__name__}\n        {e}")
+        except Exception as e:
+            failed += 1
+            print(f"  ERROR {t.__name__}\n        {type(e).__name__}: {e}")
+    print(f"\n{len(chosen) - failed}/{len(chosen)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

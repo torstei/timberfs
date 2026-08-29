@@ -305,21 +305,37 @@ here.
   limits** a query server will want to declare — its own ceilings,
   announced rather than discovered by having a request refused. Design
   note: [docs/plans/paging.md](docs/plans/paging.md).
-- **`view`: reading a store as a tape** — a pager over chunks in
-  `timbersh`, opening at the last chunk and scrolling back, with no
-  predicate and no result set. It exists for a loop a result set cannot
-  close: point at an identifier, search it across every host, and jump to
-  the coordinate a hit comes back with — which an `entry` record can now
-  supply, carrying `offset` beside `chunk`. Lines rather than entries, so
-  it needs no index and no parseable timestamps: the two cases where
-  `select` helps least. The timberfs side is DONE: `from_chunk` on a
-  bounded read is a seek rather than a resume, so one chunk by number is
-  an ordinary request, and what is refused is now a second START rather
-  than a bounded read. Its own front end too (an entry-aware pager for a
-  `records` stream needs no fleet), which makes the coordinate a value
-  worth writing down — and the note carries that thread: an address that
-  names a store by IDENTITY, so that `TIMBERFS_HOSTS` can stop being
-  /etc/hosts for timberfs and become something resolved. Design note:
+- **`view`: reading a store as a tape** — SHIPPED, a first version. A pager
+  over chunks that opens at the last one and scrolls back, with no
+  predicate and no result set, for a loop a result set cannot close: point
+  at an identifier, search it across every host, jump to the coordinate a
+  hit comes back with. Lines rather than entries, so it needs no index and
+  no parseable timestamps — the two cases where `select` helps least. It
+  is one module reached two ways, `view` in timbersh and `timberview(1)`
+  beside it, over four operations and nothing else, and a coordinate now
+  has a written form (`timber://host/id#offset=N`) that names a store by
+  IDENTITY. An ANSWER is read on the same screen — `select ... into view`
+  in timbersh, or a piped `records` stream — because an entry record
+  carries the offset it came from, so `Enter` leaves the answer for the
+  log around a match. What remains: "what happened in $FOO around here", the
+  drill-down that starts from where you ARE and collides with the
+  viewer's no-parsing rule; taking a line selection away as bytes or as
+  the document that reproduces it; and getting the address into a
+  clipboard, over ssh, without failing silently. Design note:
+  [docs/plans/view.md](docs/plans/view.md).
+- **A fleet is a list of TARGETS, and a resolver derives it** — SHIPPED.
+  `TIMBERFS_CMD` with `_TIMBERHOST_` in it made the transport a property of
+  the SESSION, so every host had to be reached the same way and an `ssh`
+  could not sit beside a site wrapper taking the host as an argument. A
+  target is now a name and the argv that reaches it; `$TIMBERFS_RESOLVER`
+  is any command printing that list, `~/.config/timberfs/targets.json` holds
+  the same document, and the old variables are one producer of it rather
+  than the only way to describe a fleet. A resolver that failed is fatal and
+  an empty fleet refused, because a session that quietly asks the local
+  machine looks exactly like a fleet that held nothing; a target this build
+  cannot reach is named rather than dropped. What remains is the other half
+  of DNS — "who has this store", deliberately not designed yet, since
+  broadcast is fine at the measured fleet. Design note:
   [docs/plans/view.md](docs/plans/view.md).
 - **Ordering by the clock an entry CARRIES**: a bounded answer reads stores
   one after another and claims no order between them, because a streaming
