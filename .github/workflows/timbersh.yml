@@ -52,11 +52,19 @@ jobs:
       # Architecture: all — it is a script, and cargo-deb would have called
       # it amd64.
       #
-      # `timberfs (>= 0.26.0)`: the viewer is nothing but seeks, and the
-      # bounded `from_chunk` one landed there — a 0.25.0 beside it can
-      # serve `select` and cannot open anything. The runtime diagnosis
-      # stays for the case a dependency cannot reach: a REMOTE target,
-      # which no dpkg constraint on this machine says anything about.
+      # timberfs is RECOMMENDED, not depended on. These are clients that
+      # speak `timberfs-query-document(5)` over a transport, and against
+      # a fleet that transport is `ssh` or a site wrapper — verified with
+      # no timberfs anywhere on PATH. The default `TIMBERFS_CMD` is a
+      # local one, so apt still installs it and the zero-config case
+      # works; `--no-install-recommends` is the workstation that only
+      # ever talks to other machines.
+      #
+      # The version belongs there too, and only as a hint: the viewer is
+      # nothing but seeks and the bounded `from_chunk` one landed in
+      # 0.26.0. What a dpkg constraint cannot reach is the case that
+      # matters anyway — a REMOTE target, about which it says nothing —
+      # so the runtime diagnosis is the real guard.
       - name: Build the .deb
         run: |
           V=$(tr -d '[:space:]' < tools/VERSION)
@@ -69,7 +77,8 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: all
-          Depends: timberfs (>= 0.26.0), python3, zstd
+          Depends: python3, zstd
+          Recommends: timberfs (>= 0.26.0)
           Maintainer: Torstein Tauno Svendsen <torstei@gmail.com>
           Homepage: https://github.com/torstei/timberfs
           Description: timbersh and timberview, clients for timberfs

@@ -12,8 +12,16 @@ without notice. Do not build anything on the grammar.
 Shipped as its own package, `timberfs-sh`, so that `timberfs` keeps a
 dependency list of `fuse3, libc6` and installs on a bare host: a Python
 script in the main package would put an interpreter there for one
-optional tool. `apt install timberfs` pulls no Python; `apt install
-timberfs-sh` pulls both it and timberfs.
+optional tool. `apt install timberfs` pulls no Python.
+
+⚠ `timberfs-sh` **recommends** timberfs rather than depending on it.
+These are clients that speak `timberfs-query-document(5)` over a
+transport, and against a fleet that transport is `ssh` or a site
+wrapper — they need no timberfs on the machine they run on, which is
+the same reason times are resolved here rather than by shelling out to
+one. The default `TIMBERFS_CMD` is a local `timberfs`, so apt installs
+it and the zero-config case works; `--no-install-recommends` is the
+workstation that only ever reads other machines.
 
 It releases on its own tag, and its version is `tools/VERSION`:
 
