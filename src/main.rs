@@ -1638,6 +1638,28 @@ mod cli_tests {
         Cli::command().debug_assert();
     }
 
+    /// `--dump-json` reads nothing, so requiring a store made the one job
+    /// it is uniquely good for impossible: telling a client what a typed
+    /// time means, without that client writing a second date parser. The
+    /// rule lives in one clap attribute, so it is checked here rather than
+    /// by installing a package and running the binary.
+    #[test]
+    fn only_a_read_that_reads_needs_a_store() {
+        assert!(
+            Cli::try_parse_from(["timberfs", "query", "--from", "11:00", "--dump-json"]).is_ok(),
+            "--dump-json reads nothing, so it needs no store"
+        );
+        assert!(
+            Cli::try_parse_from(["timberfs", "query", "--query", "q.json"]).is_ok(),
+            "a document names its own stores"
+        );
+        let e = match Cli::try_parse_from(["timberfs", "query", "--from", "11:00"]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a real read ran with no store"),
+        };
+        assert!(e.contains("FILES"), "a real read must still name one: {e}");
+    }
+
     /// Every subcommand must appear in the man page. Documentation drift
     /// is invisible to every other check: `forward-intake` and
     /// `otlp-intake` were each shipped before this existed, and only an

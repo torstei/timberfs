@@ -556,6 +556,64 @@ pub struct Limit {
     pub deadline_ms: Option<u64>,
 }
 
+/// The read's remaining time, ASKED rather than computed at each site.
+///
+/// A deadline is the one bound whose effect depends on the clock, so
+/// "it fired" can only be asserted against a real clock as a margin — a
+/// bet on how fast the machine is, which the next slow CI runner
+/// collects. Behind this seam the read paths ask a value instead, and a
+/// test constructs one that is already out of time. What then gets
+/// asserted is what an expired budget DOES — the answer names the
+/// deadline, the staircase holds, no entry is invented — which is a
+/// property the code guarantees rather than a race it usually wins.
+pub(crate) enum Budget {
+    /// No deadline was asked for.
+    Unbounded,
+    /// The real one, and the only kind `cmd_query` builds.
+    Wall {
+        start: std::time::Instant,
+        limit: std::time::Duration,
+    },
+    /// Out of time from the `fire_on`-th ask onwards. Tests only, and it
+    /// exists for the one property a budget that expires immediately
+    /// cannot express: the deadline landing PART WAY through a fleet, so
+    /// the stores before it are whole and the ones after it were never
+    /// opened.
+    #[cfg(test)]
+    OnAsk {
+        asks: std::cell::Cell<u64>,
+        fire_on: u64,
+    },
+}
+
+impl Budget {
+    pub(crate) fn of(deadline_ms: Option<u64>) -> Self {
+        match deadline_ms {
+            None => Budget::Unbounded,
+            Some(ms) => Budget::Wall {
+                start: std::time::Instant::now(),
+                limit: std::time::Duration::from_millis(ms),
+            },
+        }
+    }
+
+    /// Has the read run out of time? Every site that used to compare an
+    /// elapsed duration asks this instead, so there is one answer and one
+    /// place to make it deterministic.
+    pub(crate) fn expired(&self) -> bool {
+        match self {
+            Budget::Unbounded => false,
+            Budget::Wall { start, limit } => start.elapsed() >= *limit,
+            #[cfg(test)]
+            Budget::OnAsk { asks, fire_on } => {
+                let n = asks.get() + 1;
+                asks.set(n);
+                n >= *fire_on
+            }
+        }
+    }
+}
+
 /// What comes out. Every field here shapes the OUTPUT rather than
 /// selecting anything, which is why they group together and why the
 /// document's response format will be a kind plus options rather than a
@@ -684,7 +742,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     let entry_preds = q.matching.entry_preds()?;
     let (max, tail) = (q.limit.max, q.limit.tail);
     let (max_chunks, tail_chunks) = (q.limit.max_chunks, q.limit.tail_chunks);
-    let deadline = q.limit.deadline_ms.map(std::time::Duration::from_millis);
+    let budget = Budget::of(q.limit.deadline_ms);
     let (follow, poll) = (q.follow.follow, q.follow.poll);
     let Output {
         no_filename,
@@ -756,17 +814,17 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             null_sep,
             records,
             max,
-            deadline,
+            &budget,
         );
     }
     if chunk_records {
         return query_chunks_framed(
-            files, from_ms, to_ms, from_chunk, has, any, max_chunks, deadline,
+            files, from_ms, to_ms, from_chunk, has, any, max_chunks, &budget,
         );
     }
     if files.len() == 1 {
         return query_single(
-            &files[0], from_ms, to_ms, from_chunk, has, any, max_chunks, deadline,
+            &files[0], from_ms, to_ms, from_chunk, has, any, max_chunks, &budget,
         );
     }
     query_multi(
@@ -778,7 +836,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
         any,
         no_filename,
         max_chunks,
-        deadline,
+        &budget,
     )
 }
 
@@ -805,12 +863,8 @@ fn query_entries<W: Write>(
     null_sep: bool,
     records: bool,
     max: Option<u64>,
-    deadline: Option<std::time::Duration>,
+    budget: &Budget,
 ) -> anyhow::Result<()> {
-    // Started before the first store is opened: SELECTION is work too, and
-    // on a fleet it is the part that runs before any byte can come back.
-    let began = std::time::Instant::now();
-    let expired = |d: Option<std::time::Duration>| d.is_some_and(|d| began.elapsed() >= d);
     struct Src {
         path: std::path::PathBuf,
         guard: Option<(PathBuf, String)>,
@@ -839,7 +893,7 @@ fn query_entries<W: Write>(
     let mut stopped_by: Option<&'static str> = None;
     let mut srcs: Vec<Src> = Vec::new();
     for f in files {
-        if expired(deadline) {
+        if budget.expired() {
             stopped_by = Some("deadline");
             break;
         }
@@ -1032,7 +1086,7 @@ fn query_entries<W: Write>(
     // which has no next page.
     let mut chunks_out = 0u64;
     while let Some(i) = (0..srcs.len()).find(|&i| srcs[i].pos < srcs[i].chunks.len()) {
-        if expired(deadline) {
+        if budget.expired() {
             stopped_by = Some("deadline");
             break;
         }
@@ -1761,12 +1815,12 @@ fn query_chunks_framed(
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
-    deadline: Option<std::time::Duration>,
+    budget: &Budget,
 ) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     write_chunks_framed(
-        &mut out, files, from_ms, to_ms, from_chunk, has, any, max_chunks, deadline,
+        &mut out, files, from_ms, to_ms, from_chunk, has, any, max_chunks, budget,
     )?;
     out.flush()?;
     Ok(())
@@ -1784,9 +1838,8 @@ fn write_chunks_framed<W: Write>(
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
-    deadline: Option<std::time::Duration>,
+    budget: &Budget,
 ) -> anyhow::Result<()> {
-    let began = std::time::Instant::now();
     write!(
         out,
         "\x1estream-start\x1fv=1\x1fserver_version={}\x1forder=sequential\x1fsources={}",
@@ -1836,7 +1889,7 @@ fn write_chunks_framed<W: Write>(
                 stopped = Some("max.chunks");
                 break;
             }
-            if deadline.is_some_and(|d| began.elapsed() >= d) {
+            if budget.expired() {
                 stopped = Some("deadline");
                 break;
             }
@@ -1892,9 +1945,30 @@ fn query_single(
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
-    deadline: Option<std::time::Duration>,
+    budget: &Budget,
 ) -> anyhow::Result<()> {
-    let began = std::time::Instant::now();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write_single(
+        &mut out, file, from_ms, to_ms, from_chunk, has, any, max_chunks, budget,
+    )
+}
+
+/// The dump itself, over any writer — the same split `write_chunks_framed`
+/// has, and for the same reason: a test reads what a consumer would
+/// receive rather than a paraphrase of it.
+#[allow(clippy::too_many_arguments)]
+fn write_single<W: Write>(
+    out: &mut W,
+    file: &Path,
+    from_ms: u64,
+    to_ms: u64,
+    from_chunk: Option<u64>,
+    has: &[String],
+    any: &[String],
+    max_chunks: Option<u64>,
+    budget: &Budget,
+) -> anyhow::Result<()> {
     let mut source = open_source(file)?;
     let (selected, in_window) = select_chunks(
         file,
@@ -1909,8 +1983,6 @@ fn query_single(
     let total_chunks = source.records.len();
     let guard = seq_guard(file);
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
     let mut uncomp_total = 0u64;
     // A chunk cap needs no parsing at all here: stop after N have gone
     // out. This is the path where the unit is genuinely free.
@@ -1922,7 +1994,7 @@ fn query_single(
         // No stream-end here to carry a status, so the note IS the marker:
         // a dump that stops early with nothing saying so reads as one that
         // ended.
-        if deadline.is_some_and(|d| began.elapsed() >= d) {
+        if budget.expired() {
             crate::note!("timberfs: the deadline stopped this read; the answer is partial");
             break;
         }
@@ -1963,9 +2035,37 @@ fn query_multi(
     any: &[String],
     no_filename: bool,
     max_chunks: Option<u64>,
-    deadline: Option<std::time::Duration>,
+    budget: &Budget,
 ) -> anyhow::Result<()> {
-    let began = std::time::Instant::now();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write_multi(
+        &mut out,
+        files,
+        from_ms,
+        to_ms,
+        from_chunk,
+        has,
+        any,
+        no_filename,
+        max_chunks,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_multi<W: Write>(
+    out: &mut W,
+    files: &[std::path::PathBuf],
+    from_ms: u64,
+    to_ms: u64,
+    from_chunk: Option<u64>,
+    has: &[String],
+    any: &[String],
+    no_filename: bool,
+    max_chunks: Option<u64>,
+    budget: &Budget,
+) -> anyhow::Result<()> {
     struct Src {
         path: PathBuf,
         guard: Option<(PathBuf, String)>,
@@ -2009,8 +2109,6 @@ fn query_multi(
         });
     }
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
     // Counted across sources: a fleet view capped at 5 chunks reads five
     // in time order, not five per store.
     let mut chunks_out = 0u64;
@@ -2021,7 +2119,7 @@ fn query_multi(
         // A raw dump has no stream-end to carry a status, so the note IS
         // the marker: a log that stops early with nothing saying so reads
         // as a log that ended.
-        if deadline.is_some_and(|d| began.elapsed() >= d) {
+        if budget.expired() {
             crate::note!("timberfs: the deadline stopped this read; the answer is partial");
             break;
         }
@@ -3522,7 +3620,7 @@ mod chunk_stream_tests {
             &[],
             &[],
             None,
-            None,
+            &Budget::Unbounded,
         )
         .unwrap();
         let recs = records(&buf);
@@ -3601,7 +3699,7 @@ mod chunk_stream_tests {
             &[],
             &[],
             None,
-            None,
+            &Budget::Unbounded,
         )
         .unwrap();
         let numbers: Vec<u64> = records(&all)
@@ -3622,7 +3720,7 @@ mod chunk_stream_tests {
             &[],
             &[],
             Some(1),
-            None,
+            &Budget::Unbounded,
         )
         .unwrap();
         let recs = records(&one);
@@ -3664,7 +3762,7 @@ mod chunk_stream_tests {
             &[],
             &[],
             Some(2),
-            None,
+            &Budget::Unbounded,
         )
         .unwrap();
         let recs = records(&buf);
@@ -3677,6 +3775,394 @@ mod chunk_stream_tests {
             "the total must say how much was NOT sent"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::chunk_stream_tests::records;
+    use super::*;
+    use crate::store::{Config, Store};
+
+    /// A store whose entries are the lines given, each stamped, and each
+    /// sealed into its own chunk at the write time given. Two kinds of
+    /// control, both needed here: the STAMP makes every line its own entry
+    /// (an unstamped one is a continuation of the line before), and the
+    /// per-chunk write time is what lets two stores' windows be
+    /// interleaved on purpose.
+    pub(super) fn store_of(tag: &str, lines: &[(&str, u64)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("timberfs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            chunk_size: 1 << 20,
+            level: 3,
+            flush_age_ms: 60_000,
+        };
+        let mut st = Store::open(&dir, cfg).unwrap();
+        st.create("app.log").unwrap();
+        crate::bark::ensure_identified(&dir, "app.log").unwrap();
+        let f = st.files.get_mut("app.log").unwrap();
+        for (i, (text, write_ms)) in lines.iter().enumerate() {
+            let line = format!("2026-08-28T10:{:02}:{:02}Z {text}\n", i / 60, i % 60);
+            f.append_stamped(line.as_bytes(), *write_ms, &cfg).unwrap();
+            f.flush_chunk(&cfg).unwrap();
+        }
+        dir
+    }
+
+    fn read(
+        files: &[std::path::PathBuf],
+        cursor: &std::collections::BTreeMap<String, u64>,
+        max: Option<u64>,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        query_entries(
+            &mut buf,
+            files,
+            0,
+            u64::MAX,
+            None,
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            cursor,
+            false,
+            false,
+            false,
+            true, // records
+            max,
+            &Budget::Unbounded,
+        )
+        .unwrap();
+        buf
+    }
+
+    fn bodies(buf: &[u8]) -> Vec<String> {
+        records(buf)
+            .into_iter()
+            .filter(|r| r.0 == "entry")
+            .map(|r| {
+                let line = String::from_utf8_lossy(&r.2);
+                line.trim()
+                    .split_once(' ')
+                    .map_or(String::new(), |(_, b)| b.to_string())
+            })
+            .collect()
+    }
+
+    /// The cursor a client hands back: VERBATIM, whatever the answer said.
+    /// A position with no offset is dropped exactly as the format says —
+    /// which is the behaviour that used to lose a quiet store.
+    fn cursor_of(buf: &[u8]) -> std::collections::BTreeMap<String, u64> {
+        records(buf)
+            .into_iter()
+            .filter(|r| r.0 == "position")
+            .filter_map(|r| Some((r.1.get("id")?.clone(), r.1.get("offset")?.parse().ok()?)))
+            .collect()
+    }
+
+    /// A framed answer claims order WITHIN a store and none between, so a
+    /// store's entries come back contiguous. Built so the two rules
+    /// disagree: the write windows alternate, so a read that interleaved
+    /// them would emit a b a b.
+    #[test]
+    fn a_framed_answer_reads_stores_one_after_another() {
+        let a = store_of("seqa", &[("seq a1", 1_000), ("seq a2", 3_000)]);
+        let b = store_of("seqb", &[("seq b1", 2_000), ("seq b2", 4_000)]);
+        let files = [a.join("app.log"), b.join("app.log")];
+        let buf = read(&files, &Default::default(), None);
+        let got = bodies(&buf);
+        assert_eq!(got.len(), 4, "{got:?}");
+        let runs: Vec<char> = got
+            .iter()
+            .map(|e| e.chars().nth(4).unwrap()) // "seq a1" -> 'a'
+            .fold(Vec::new(), |mut acc, c| {
+                if acc.last() != Some(&c) {
+                    acc.push(c);
+                }
+                acc
+            });
+        assert_eq!(runs, vec!['a', 'b'], "stores interleaved: {got:?}");
+        // ...and the answer SAYS so, rather than leaving it to be inferred.
+        let start = &records(&buf)[0];
+        assert_eq!(start.0, "stream-start");
+        assert_eq!(start.1.get("order"), Some(&"sequential".to_string()));
+
+        // The TEXT fleet view still interleaves: it makes many logs
+        // readable as one, and has no next page to contradict.
+        let mut text = Vec::new();
+        write_multi(
+            &mut text,
+            &files,
+            0,
+            u64::MAX,
+            None,
+            &[],
+            &[],
+            true, // no_filename
+            None,
+            &Budget::Unbounded,
+        )
+        .unwrap();
+        let order: String = String::from_utf8_lossy(&text)
+            .lines()
+            .filter_map(|l| l.split_whitespace().last().and_then(|w| w.chars().next()))
+            .collect();
+        assert_eq!(order, "abab", "the text view stopped interleaving");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// The defect: a store that delivered nothing on a page reported a
+    /// `position` with NO offset, and an offsetless cursor entry IS the
+    /// start of the window — so handing the answer back, exactly as the
+    /// format says to, re-read every store that had gone quiet.
+    ///
+    /// Two stores of different lengths is what shows it. Stores are read
+    /// one after another, so the short one is exhausted while the long one
+    /// is still going, and the page after that used to re-deliver it.
+    #[test]
+    fn a_quiet_store_keeps_its_place_across_pages() {
+        let a = store_of(
+            "quieta",
+            &[("quiet A entry 1", 1_000), ("quiet A entry 2", 1_100)],
+        );
+        let b = store_of(
+            "quietb",
+            &[
+                ("quiet B entry 1", 1_000),
+                ("quiet B entry 2", 1_100),
+                ("quiet B entry 3", 1_200),
+                ("quiet B entry 4", 1_300),
+            ],
+        );
+        let files = [a.join("app.log"), b.join("app.log")];
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = Default::default();
+        for _ in 0..8 {
+            let buf = read(&files, &cursor, Some(2));
+            let got = bodies(&buf);
+            let done = got.is_empty();
+            seen.extend(got);
+            cursor = cursor_of(&buf);
+            if done {
+                break;
+            }
+        }
+        seen.sort();
+        let mut once = seen.clone();
+        once.dedup();
+        assert_eq!(once.len(), 6, "delivered twice or lost: {seen:?}");
+        assert_eq!(seen.len(), 6, "an entry came back on two pages: {seen:?}");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// Every entry once, in order, on a store whose entries ALL share a
+    /// timestamp — the case that makes paging by clock lose everything
+    /// sharing the last one. A position is an offset on the tape, so six
+    /// entries of the same second are six distinct positions.
+    #[test]
+    fn paging_walks_a_result_set_a_page_at_a_time() {
+        let lines: Vec<(String, u64)> = (1..=6)
+            .map(|i| (format!("page entry {i}"), 1_000u64))
+            .collect();
+        let refs: Vec<(&str, u64)> = lines.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        let d = store_of("pagesame", &refs);
+        let files = [d.join("app.log")];
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = Default::default();
+        for _ in 0..8 {
+            let buf = read(&files, &cursor, Some(2));
+            let got = bodies(&buf);
+            if got.is_empty() {
+                break;
+            }
+            seen.extend(got);
+            cursor = cursor_of(&buf);
+        }
+        let want: Vec<String> = (1..=6).map(|i| format!("page entry {i}")).collect();
+        assert_eq!(seen, want, "every entry once, in order");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::chunk_stream_tests::{records, store_with_chunks};
+    use super::*;
+
+    /// Three stores, a records read, and whatever budget is handed in.
+    fn read(files: &[std::path::PathBuf], budget: &Budget) -> Vec<u8> {
+        let mut buf = Vec::new();
+        query_entries(
+            &mut buf,
+            files,
+            0,
+            u64::MAX,
+            None,  // from_chunk
+            false, // windowed
+            &[],
+            &[],
+            None,
+            None,
+            &Default::default(),
+            false, // no_filename: several stores, so they are labelled
+            false, // show_write_time
+            false, // null_sep
+            true,  // records
+            None,
+            budget,
+        )
+        .unwrap();
+        buf
+    }
+
+    fn field<'a>(
+        recs: &'a [(String, std::collections::HashMap<String, String>, Vec<u8>)],
+        kind: &str,
+        key: &str,
+    ) -> Option<&'a String> {
+        recs.iter().find(|r| r.0 == kind).and_then(|r| r.1.get(key))
+    }
+
+    /// A deadline that cannot fire must not, or every other assertion about
+    /// one is passing for the wrong reason.
+    #[test]
+    fn a_budget_with_time_left_does_not_stop_the_read() {
+        let (dir, _) = store_with_chunks("dlwhole", 400);
+        let files = [dir.join("app.log")];
+        let roomy = Budget::Wall {
+            start: std::time::Instant::now(),
+            limit: std::time::Duration::from_secs(600),
+        };
+        let recs = records(&read(&files, &roomy));
+        assert_eq!(
+            field(&recs, "stream-end", "status"),
+            Some(&"exhausted".into())
+        );
+        assert_eq!(field(&recs, "stream-end", "entries"), Some(&"400".into()));
+        assert_eq!(
+            field(&recs, "stream-end", "limit"),
+            None,
+            "nothing stopped it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An expired budget NAMES itself. It used to borrow an entry cap's
+    /// name, so "your limit stopped me" pointed at the wrong bound to
+    /// raise. Asserted against a budget that is out of time by
+    /// construction — the VM test bet a 1 ms deadline against ~300 chunks
+    /// measured at 10–20 ms, which is a wager on the runner, not a
+    /// property of the code.
+    #[test]
+    fn an_expired_budget_stops_the_read_and_says_so() {
+        let (dir, _) = store_with_chunks("dlfires", 400);
+        let files = [dir.join("app.log")];
+        let spent = Budget::OnAsk {
+            asks: std::cell::Cell::new(0),
+            fire_on: 1,
+        };
+        let recs = records(&read(&files, &spent));
+        assert_eq!(
+            field(&recs, "stream-end", "status"),
+            Some(&"limited".into())
+        );
+        assert_eq!(
+            field(&recs, "stream-end", "limit"),
+            Some(&"deadline".into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The STAIRCASE: a bounded read takes stores one after another, so
+    /// when the budget runs out the stores before it are whole, the one it
+    /// landed in is partial, and the ones after it were never opened —
+    /// `chunks_read=0` beside a non-zero `chunks_selected`. This is the
+    /// shape a client needs to resume correctly, and the reason the budget
+    /// has to be able to expire PART WAY: with one that fires immediately
+    /// the property holds trivially at store one and proves nothing.
+    #[test]
+    fn the_stores_after_the_one_it_stopped_in_were_never_opened() {
+        let dirs: Vec<_> = ["dlstair1", "dlstair2", "dlstair3"]
+            .iter()
+            .map(|t| store_with_chunks(t, 400).0)
+            .collect();
+        let files: Vec<_> = dirs.iter().map(|d| d.join("app.log")).collect();
+        // The budget is asked once per store as the read opens it, then
+        // once per chunk. Three stores of six chunks, so firing on the
+        // 12th ask lands inside the SECOND store: 3 + 6 (store one, whole)
+        // + 2, and the 9th chunk-ask stops it. The assertions below check
+        // that placement rather than trusting it — a budget that fired too
+        // early or too late fails them, loudly, instead of satisfying the
+        // staircase trivially.
+        let recs = records(&read(
+            &files,
+            &Budget::OnAsk {
+                asks: std::cell::Cell::new(0),
+                fire_on: 12,
+            },
+        ));
+        let steps: Vec<(u64, u64)> = recs
+            .iter()
+            .filter(|r| r.0 == "position")
+            .map(|r| {
+                (
+                    r.1["chunks_read"].parse().unwrap(),
+                    r.1["chunks_selected"].parse().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(steps.len(), 3, "a position per store EXAMINED: {steps:?}");
+        let stopped_in = steps
+            .iter()
+            .position(|(read, selected)| *read > 0 && read < selected)
+            .unwrap_or_else(|| panic!("the budget stopped inside no store: {steps:?}"));
+        // Both ends must exist, or the staircase is not being tested: with
+        // nothing before it there is no "whole" case, and with nothing
+        // after it there is no "never opened" case.
+        assert!(
+            stopped_in > 0 && stopped_in < steps.len() - 1,
+            "the budget fired at the edge of the fleet, so this proves nothing: {steps:?}"
+        );
+        for (read, selected) in &steps[..stopped_in] {
+            assert_eq!(
+                read, selected,
+                "a store before the stop is whole: {steps:?}"
+            );
+        }
+        for (read, selected) in &steps[stopped_in + 1..] {
+            assert_eq!(*read, 0, "a store after the stop was opened: {steps:?}");
+            assert!(*selected > 0, "...and it had been selected: {steps:?}");
+        }
+        assert_eq!(
+            field(&recs, "stream-end", "limit"),
+            Some(&"deadline".into())
+        );
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Both refusals are the query's, not the command's, so they hold for
+    /// a document exactly as for the flags.
+    #[test]
+    fn a_deadline_of_zero_and_a_deadline_on_a_follow_are_refused() {
+        let mut zero = Query::default();
+        zero.limit.deadline_ms = Some(0);
+        let e = zero.validate().unwrap_err().to_string();
+        assert!(e.contains("zero"), "{e}");
+
+        let mut following = Query::default();
+        following.limit.deadline_ms = Some(5_000);
+        following.follow.follow = true;
+        assert!(
+            following.validate().is_err(),
+            "a follow has no end to bound"
+        );
     }
 }
 
@@ -3714,7 +4200,7 @@ mod served_bytes_tests {
                 false, // null_sep
                 true,  // records
                 None,
-                None,
+                &Budget::Unbounded,
             )
             .unwrap();
             buf
@@ -3777,7 +4263,7 @@ mod served_bytes_tests {
             false, // null_sep
             true,  // records
             None,
-            None,
+            &Budget::Unbounded,
         )
         .unwrap();
 
