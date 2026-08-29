@@ -312,13 +312,14 @@ here.
   the coordinate a hit comes back with — which an `entry` record can now
   supply, carrying `offset` beside `chunk`. Lines rather than entries, so
   it needs no index and no parseable timestamps: the two cases where
-  `select` helps least. The whole timberfs side is relaxing one refusal —
-  `from_chunk` on a bounded read is a seek, not a resume. Its own front
-  end too (an entry-aware pager for a `records` stream needs no fleet),
-  which makes the coordinate a value worth writing down — and the note
-  carries that thread: an address that names a store by IDENTITY, so that
-  `TIMBERFS_HOSTS` can stop being /etc/hosts for timberfs and become
-  something resolved. Design note:
+  `select` helps least. The timberfs side is DONE: `from_chunk` on a
+  bounded read is a seek rather than a resume, so one chunk by number is
+  an ordinary request, and what is refused is now a second START rather
+  than a bounded read. Its own front end too (an entry-aware pager for a
+  `records` stream needs no fleet), which makes the coordinate a value
+  worth writing down — and the note carries that thread: an address that
+  names a store by IDENTITY, so that `TIMBERFS_HOSTS` can stop being
+  /etc/hosts for timberfs and become something resolved. Design note:
   [docs/plans/view.md](docs/plans/view.md).
 - **Ordering by the clock an entry CARRIES**: a bounded answer reads stores
   one after another and claims no order between them, because a streaming

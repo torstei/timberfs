@@ -154,8 +154,40 @@ and
 .B to
 are milliseconds since the epoch.
 .B from_chunk
-is a resume position by chunk number: exact, where a timestamp can match
-two chunks that share a boundary millisecond.
+is where to START, by chunk number: a place on the tape rather than a
+time, and exact where a timestamp can match two chunks that share a
+boundary millisecond. It is unaffected by
+.B axis
+\(em that measures
+.B from
+and
+.BR to ,
+and a chunk number is not a clock.
+.RS
+.PP
+It RESUMES a following read from the position a consumer's cursor holds,
+and it SEEKS a bounded one \(em the same operation. Beside
+.B "max: {chunks: 1}"
+and
+.B "response_format.kind: \(dqchunks\(dq"
+it is a seek to exactly one chunk, which is what a pager asks for, and
+each
+.B chunk
+record carries its own number back so a client can see where it landed.
+.PP
+A read has ONE start, so it is REFUSED beside anything else that names
+one \(em
+.BR from ,
+a
+.BR tail ,
+a
+.BR cursor .
+Two starts have no rule for which wins, and picking one silently is how a
+caller resumes somewhere it did not ask for. Everything that is not a
+start composes: the window's
+.BR to ,
+the predicates, either axis.
+.RE
 .TP
 .B match
 Predicates, flat: every
@@ -452,15 +484,19 @@ naming which one), a
 .B position
 record per store says where each one got to, and
 .B cursor
-hands those back. That is a page.
+hands those back. That is a page, and
+.B deadline
+bounds how LONG it may take rather than how much it returns.
 .PP
-What is NOT here yet is a
-.BR deadline :
-a bound on how long a search may take, rather than on how much it
-returns. A slow fleet-wide read is slow because it READS a lot, not
-because it matches a lot, so a caller who wants an answer within a few
-seconds cannot ask for one. That, and the service-imposed limits a query
-server will want, are the next things.
+What is NOT here yet are the service-imposed limits a query server will
+want to declare \(em its own ceilings on what a request may ask for,
+announced rather than discovered by having a request refused.
+.PP
+A page is not the only way to move. A cursor is a place in an ANSWER,
+where
+.B window.from_chunk
+is a place in the STORE \(em so walking a result set and opening the log
+at a coordinate are different motions, and they do not share a handle.
 .TP
 .B response_format
 A

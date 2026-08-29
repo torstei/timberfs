@@ -1,10 +1,11 @@
 # view: reading a store as a tape, not as a result set
 
-**Status: NOT BUILT.** One timberfs change (a refusal to relax), and a
-command in timbersh. Everything it rests on is already true: a chunk is
-addressable by number, carries its ring, and ships compressed; an entry
-record carries the chunk AND the offset it sits at; and a search already
-returns both.
+**Status: the timberfs side is DONE; the viewer is NOT BUILT.**
+`window.from_chunk` seeks a bounded read, which was the whole protocol
+change — what is left is the command in timbersh. Everything else it rests
+on was already true: a chunk is addressable by number, carries its ring,
+and ships compressed; an entry record carries the chunk AND the offset it
+sits at; and a search already returns both.
 
 See [paging.md](paging.md) for walking a result set — this is the other
 motion, and the difference is the point.
@@ -225,10 +226,10 @@ hook at all, so nothing has to wait. What matters today is only that the
 address carries **identity**, so adding a resolver later changes how a
 name is looked up and not what the name is.
 
-## The protocol change: one refusal
+## The protocol change: one refusal — DONE
 
-`from_chunk` is a chunk number, exact where a timestamp is not. It is
-refused on a bounded read:
+`from_chunk` is a chunk number, exact where a timestamp is not. It used to
+be refused on a bounded read:
 
 > a chunk number is a resume position, and only a FOLLOWING read moves
 > forward from one — a windowed query selects by the timestamps the lines
@@ -237,12 +238,26 @@ refused on a bounded read:
 That was written when resuming a follow was the only reason to name a
 chunk. Random access is a second reason: `from_chunk: N` with
 `max: {chunks: 1}` and `kind: "chunks"` is a seek, and a pager is nothing
-but seeks. Relaxing the refusal is the entire timberfs side.
+but seeks.
 
-Nothing else is needed. A search hit already carries `chunk` and
-`offset`, so seek-to-hit is a seek to a number the answer gave. `at
-'12:00'` is a write-axis window with `max: {chunks: 1}`, which works
-today.
+The refusal did not disappear, it got smaller and truer. A chunk number is
+a PLACE, so it composes with everything that is not a place — the window's
+far end, the predicates, either axis — and conflicts only with a second
+START. `from`, a `tail` and a `cursor` each name one, and each was being
+silently preferred over `from_chunk` where the two met; those three are now
+refused instead of quietly resolved, which is the rule stated once rather
+than three accidents.
+
+Two things fell out of doing it. The seek lives in `select_chunks`, the one
+function every bounded read reaches its chunks through, so no read path can
+implement the member and no other path can forget it. And `stream-start`
+echoes `from_chunk`, because an answer outlives the request that produced
+it: one recording `from`/`to`/`has` while dropping the position it began at
+describes a search nobody ran.
+
+Nothing else was needed. A search hit already carries `chunk` and `offset`,
+so seek-to-hit is a seek to a number the answer gave. `at '12:00'` is a
+write-axis window with `max: {chunks: 1}`, which worked already.
 
 ## Why the client fetches chunks
 

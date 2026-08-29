@@ -400,14 +400,17 @@ enum Command {
         /// where the writer's --flush-age decides instead
         #[arg(long, value_name = "SECS", requires = "follow")]
         poll: Option<f64>,
-        /// Resume at this chunk NUMBER (see `timberfs index`), the position
-        /// a consumer's cursor holds. Exact, unlike --from: a number names
+        /// Start at this chunk NUMBER (see `timberfs index`) — a place on
+        /// the tape rather than a time. Exact, unlike --from: a number names
         /// one chunk, where a timestamp can match two that share a boundary
         /// millisecond — and chunk numbers only move forward, where the
         /// write axis is a wall clock that an NTP step can push backwards.
-        /// A number older than anything the store still holds starts at the
-        /// oldest chunk it has
-        #[arg(long, value_name = "N", requires = "follow", conflicts_with_all = ["from", "tail"])]
+        /// Resumes a --follow from a consumer's cursor, and starts a bounded
+        /// read there; a chunk cap beside it (the query document's
+        /// `max: {chunks: 1}`) makes that a seek to exactly one. A number
+        /// older than anything the store still holds starts at the oldest
+        /// chunk it has
+        #[arg(long, value_name = "N", conflicts_with_all = ["from", "tail"])]
         from_chunk: Option<u64>,
         /// Give up after this many seconds and answer with what was read.
         /// A bound on how LONG rather than how much: a fleet read is slow
@@ -1300,10 +1303,6 @@ fn main() -> anyhow::Result<()> {
                     to,
                     from_chunk,
                 },
-                // The flags are the chunk sweep, and have always been:
-                // `--has` selects chunks via the token index. Entry
-                // granularity is the document's, and `timber-filter` is
-                // its command-line equivalent.
                 // The flags are the chunk sweep, and have always been:
                 // `--has` selects chunks via the token index. The richer
                 // predicates (substring, regex, caseless, negated) are the
