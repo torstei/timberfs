@@ -240,6 +240,42 @@ arguments. "Who has this store" is a different question that has not been
 thought through, and reserving an argument for it now would design it by
 accident. `refresh` re-runs it, because a resolver derives its answer.
 
+## An answer on the pager's screen
+
+```sql
+select records from [] where entry has 'ERROR' limit 50 into view;
+```
+```sh
+timberfs query --records --from 13:00 --has ERROR app.log | timberview
+```
+
+`select` walks a result set and `view` walks the log — different motions,
+and this puts the first on the second's screen. What makes it fit is that
+an entry record carries `chunk` and `offset`, so every line in an answer
+knows the PLACE it came from: the same coordinate the tape is addressed
+by. `Tab` and the search work as they do anywhere, `y` gives you that
+entry's address, and **`Enter` leaves the answer for the log around it** —
+the one motion an answer cannot make for itself, since what you usually
+want next is what was happening either side of a match.
+
+- **A multi-line entry is one entry.** The lines of a stack trace belong
+  to the entry that raised it; splitting them would be the same lie as
+  splitting a line across a chunk boundary.
+- **An answer is a closed set.** Both ends are ends, nothing extends, and
+  the boundary says "end of the answer" rather than naming a chunk you
+  are not in.
+- **An entry still at the live edge is shown and cannot be opened** — it
+  is in no chunk yet, so there is no place to go. Counted and said, not
+  quietly dropped.
+- ⚠ Only `records` can go into a view. The other kinds carry no offset,
+  so nothing in such an answer could say where it came from — refused as
+  a statement, wherever it is run, rather than as a terminal problem.
+
+Reading a piped answer needs a keyboard from somewhere other than stdin,
+which is the answer: `timberview` reopens `/dev/tty` for keys, as every
+pager does, and says so plainly where a session has no controlling
+terminal to reopen.
+
 ## `timberview` — a pager over one store
 
 ⚠ **EXPERIMENTAL**, like everything else here.

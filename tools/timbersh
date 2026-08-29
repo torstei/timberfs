@@ -138,8 +138,14 @@ HELP = """
     no index. Tab picks a searchable token, Enter finds it everywhere,
     and it leaves you the address of where you stopped.
 
-  select <kind> from <source> [where ...] [limit N [chunks]];
+  select <kind> from <source> [where ...] [limit N [chunks]] [into view];
   tail   <kind> from <source> [where ...];
+
+    `into view` puts the ANSWER on the pager's screen instead of on the
+    terminal: multi-line entries stay whole, Tab and the search work as
+    they do anywhere, and Enter leaves the answer for the LOG around
+    that entry. Only `records` can -- it is the kind that carries the
+    offset a line needs to say where it came from.
 
     <kind>    records | loglines | stores | chunks
     <source>  a view name, or a predicate literal like [type=console].
@@ -582,7 +588,10 @@ def parse_where(toks, i):
     SUBJECT carries what the document makes required — granularity and
     axis — so neither can be defaulted by accident."""
     conds = []
-    while i < len(toks) and toks[i][1] not in (";", "limit"):
+    # What ENDS a where clause. Lowercased, so a shouted LIMIT stops it
+    # too — and `into`, which names where the answer goes rather than
+    # what it contains.
+    while i < len(toks) and toks[i][1].lower() not in (";", "limit", "into"):
         w = toks[i][1].lower()
         if w == "and": i += 1; continue
         if w in ("entry", "chunk"):
@@ -1171,10 +1180,55 @@ class Shell:
                 n = int(toks[i + 1][1])
                 unit = (toks[i + 2][1].lower() if i + 2 < len(toks) else "entries")
                 limit = {"chunks" if unit.startswith("chunk") else "entries": n}
+                i += 3 if i + 2 < len(toks) and not unit.startswith("into") else 2
+            into = False
+            if i < len(toks) and toks[i][1].lower() == "into":
+                if i + 1 >= len(toks) or toks[i + 1][1].lower() != "view":
+                    raise ValueError("`into` what? `into view` is the one there is")
+                into = True
             doc = build(kind, terms, conds, limit)
+            if into:
+                if head != "select":
+                    raise ValueError("`tail` does not end, so it has no answer "
+                                     "to put in a view")
+                return self.into_view(doc, kind, line)
             if head == "tail": return self.tail(doc)
             return self.once(doc, kind)
         raise ValueError(f"`{head}`? try `help`")
+
+    def into_view(self, doc, kind, line):
+        """The answer, in the pager instead of on the terminal.
+
+        `select` walks a result set and `view` walks the log — different
+        motions, and this puts the first on the second's screen. It
+        works because an entry record carries `chunk` and `offset`, so
+        every line in the answer knows where it CAME from: Tab and the
+        search work as they do anywhere, and Enter leaves the answer for
+        the log around that entry."""
+        # The statement is wrong or right wherever it is run, so it is
+        # judged before the terminal is.
+        if kind != "records":
+            raise ValueError(
+                f"`select {kind} ... into view` cannot work — only `records` "
+                f"carries the offset a line needs to say where it came from, "
+                f"and without one nothing in the answer could be opened.\n"
+                f"     Ask for `select records ...`.")
+        if not sys.stdout.isatty():
+            raise ValueError("`into view` needs a terminal")
+        backend = timberview.QueryBackend(self.ask, TARGETS)
+        # The statement names the answer, minus the part that says where
+        # to put it — which the screen it is on already says.
+        what = re.sub(r"\s+into\s+view\s*;?\s*$", "", line.strip(),
+                      flags=re.I).rstrip(";")
+        streams = backend.records(doc)
+        answer = timberview.Records(streams, stores=backend.stores(), what=what)
+        if not answer.entries:
+            note = self.why_empty(doc)
+            print(note if note else "  -- nothing matched")
+            return
+        end = timberview.watch_source(backend, answer)
+        report_errors(backend.unreachable)
+        print(f"  {end}" if end else "  -- left the answer")
 
     def view(self, toks):
         """A pager over the tape, IN PROCESS.

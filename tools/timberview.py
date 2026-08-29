@@ -407,6 +407,13 @@ class QueryBackend:
                 return got
         return None
 
+    def records(self, doc):
+        """A `records` answer from every target, in the order they were
+        given. The streams stay separate: each is self-contained, and
+        joining them would lose which host attributed what."""
+        answers = self.each_host(lambda h: self._run(doc, h, raw=True))
+        return [answers[h] for h in self.hosts if answers.get(h)]
+
     def search(self, token, limit=200):
         """Where that token appears, as addresses.
 
@@ -522,10 +529,12 @@ def grouped(n):
 
 
 class Line:
-    __slots__ = ("offset", "text", "_terms")
+    __slots__ = ("offset", "text", "_terms", "at", "store", "first")
 
     def __init__(self, offset, raw):
         self.offset = offset
+        self.at = self.store = None
+        self.first = True
         self.text = sanitise(raw.decode("utf-8", "replace"))
         self._terms = None
 
@@ -574,6 +583,26 @@ class Tape:
         fresh = self.backend.bounds(self.store)
         if fresh:
             self.store = fresh
+
+    def leave_for_the_log(self):
+        """From a result set into the LOG around the entry you are on.
+
+        The one motion a result set cannot do for itself: an answer is
+        the entries that matched, and what you usually want next is what
+        was happening around one of them."""
+        at = self.source.address_of(self.line())
+        if at is None:
+            self.message = ("that entry is still at the live edge — it is in "
+                            "no chunk yet, so there is no place to open")
+            return False
+        store = (getattr(self.line(), "store", None) or {})
+        if not store.get("id"):
+            self.message = "that entry does not say which store it came from"
+            return False
+        self.source = Tape(self.backend, store)
+        self.open(offset=at.value)
+        self.message = f"the log around {at}"
+        return True
 
     def open(self, seq=None, at=None, offset=None):
         """Land somewhere and load the neighbours. With nothing named,
@@ -712,6 +741,39 @@ class Tape:
         self.read_ahead()
         return True
 
+    def address_of(self, line):
+        return Address(self.store.get("id"), self.store.get("_host"),
+                       "offset", line.offset if line else self.tape_start)
+
+    def describe(self, line):
+        """The header: which store, and where on its tape."""
+        s = self.store
+        off = line.offset if line else self.tape_start
+        span = max(1, self.tape_end - self.tape_start)
+        pct = min(100, max(0, int(100 * (off - self.tape_start) / span)))
+        where = f"{s.get('name')}"
+        if s.get("_host"):
+            where += f" @ {s['_host']}"
+        return (f"── {where} · chunk {self.chunk_of(off)} · "
+                f"offset {grouped(off)} · {pct}%")
+
+    def top_notes(self):
+        s = self.store
+        notes = [f"── top of the log · chunk {s.get('first_seq')}"]
+        if s.get("dropped_chunks"):
+            notes.append(
+                f"── {grouped(s['dropped_chunks'])} chunk(s) older were "
+                f"dropped ({human(s.get('dropped_uncompressed_bytes', 0))} "
+                f"off the tape)")
+        return notes
+
+    def bottom_note(self):
+        s = self.store
+        tail = (f"a writer holds it ({s['writer']}), so newer lines may not "
+                "be flushed yet" if s.get("writer")
+                else "nothing is appending")
+        return f"── end of chunk {s.get('last_seq')} · {tail}"
+
     def index_of(self, offset):
         """The line holding an offset, or the nearest one after it. Line
         numbers move when the run does; an offset does not, so every
@@ -734,6 +796,116 @@ class Tape:
         return self.chunks[0].seq if self.chunks else None
 
 
+class Records:
+    """A RESULT SET, read the way the tape is read.
+
+    `select` walks an answer and `view` walks the log — different
+    motions, and this is the first one given the second's screen. What
+    makes it fit is that an entry record carries `chunk` and `offset`,
+    so every line here knows the PLACE it came from: the same coordinate
+    the tape is addressed by, and the reason `Enter` can leave a result
+    set for the log around one of its entries.
+
+    A multi-line entry is one entry — the lines of a stack trace belong
+    to the entry that raised it, and splitting them would be the same
+    lie as splitting a line across a chunk boundary.
+
+    It is a CLOSED set: both ends are ends, nothing extends, and the
+    header counts entries rather than naming a chunk."""
+
+    def __init__(self, streams, stores=(), what="a result"):
+        self.what = what
+        self.by_id = {s.get("id"): s for s in stores}
+        self.lines, self.entries = [], 0
+        self.unplaced, self.trouble = 0, None
+        self.chunks = []
+        for stream in ([streams] if isinstance(streams, bytes) else streams):
+            self._read(stream)
+        self.store = {"name": what, "id": None}
+
+    def _read(self, stream):
+        # Per stream: each host's answer names its own sources, and a
+        # one-source stream's entries carry no id of their own.
+        names, seen = {}, []
+        for kind, f, payload in frames(stream):
+            if kind == "source":
+                names[f.get("id")] = os.path.basename(f.get("path", "?"))
+                seen.append(f.get("id"))
+                continue
+            if kind != "entry":
+                continue
+            sid = f.get("id") or (seen[0] if len(seen) == 1 else None)
+            store = self.by_id.get(sid) or {"id": sid, "name": names.get(sid)}
+            # An entry still at the live edge is real and has no place
+            # yet, so it is SHOWN and simply cannot be opened.
+            where = (Address(sid, store.get("_host"), "offset",
+                             int(f["offset"])) if "offset" in f else None)
+            if where is None:
+                self.unplaced += 1
+            body = (payload or b"").rstrip(b"\n").split(b"\n")
+            for n, raw in enumerate(body):
+                line = Line(int(f.get("offset", 0)), raw)
+                line.at = where
+                line.store = store
+                line.first = n == 0
+                self.lines.append(line)
+            self.entries += 1
+
+    # -- a closed set: there is nothing either side of it
+    def at_top(self):
+        return True
+
+    def at_bottom(self):
+        return True
+
+    def extend_up(self):
+        return False
+
+    def extend_down(self):
+        return False
+
+    def read_ahead(self):
+        pass
+
+    def refresh(self):
+        pass
+
+    def index_of(self, offset):
+        for i, ln in enumerate(self.lines):
+            if ln.offset >= offset:
+                return i
+        return max(0, len(self.lines) - 1)
+
+    def chunk_of(self, offset):
+        return None
+
+    def address_of(self, line):
+        return getattr(line, "at", None)
+
+    def describe(self, line):
+        """Which entry's store you are ON — which is not the same one
+        line to line, and is the point of showing an answer this way."""
+        store = getattr(line, "store", None) or {}
+        where = store.get("name") or "?"
+        if store.get("_host"):
+            where += f" @ {store['_host']}"
+        at = self.address_of(line)
+        return (f"── {where}"
+                + (f" · offset {grouped(at.value)}" if at else " · live edge")
+                + f" · {self.entries} entr{'y' if self.entries == 1 else 'ies'}"
+                + f" · {self.what}")
+
+    def top_notes(self):
+        return [f"── {self.entries} entr"
+                f"{'y' if self.entries == 1 else 'ies'} matched · {self.what}"
+                + ("" if not self.unplaced else
+                   f" · {self.unplaced} at a live edge, with no place to open")]
+
+    def bottom_note(self):
+        return ("── end of the answer · Enter opens the log around an entry"
+                if self.entries else "── nothing matched")
+
+
 # ---------------------------------------------------------------- view
 NEAR = 200          # lines from an edge at which the next chunk is fetched
 
@@ -744,9 +916,9 @@ class View:
     Free of curses on purpose: this is the half worth testing, and it is
     tested against a fake backend rather than a terminal."""
 
-    def __init__(self, backend, store):
+    def __init__(self, backend, store=None, source=None):
         self.backend = backend
-        self.tape = Tape(backend, store)
+        self.source = source if source is not None else Tape(backend, store)
         self.wrap = False
         self.col = 0
         self.top = self.cur = 0
@@ -756,6 +928,26 @@ class View:
         self.term = None
 
     # -- opening
+    def leave_for_the_log(self):
+        """From a result set into the LOG around the entry you are on.
+
+        The one motion a result set cannot do for itself: an answer is
+        the entries that matched, and what you usually want next is what
+        was happening around one of them."""
+        at = self.source.address_of(self.line())
+        if at is None:
+            self.message = ("that entry is still at the live edge — it is in "
+                            "no chunk yet, so there is no place to open")
+            return False
+        store = (getattr(self.line(), "store", None) or {})
+        if not store.get("id"):
+            self.message = "that entry does not say which store it came from"
+            return False
+        self.source = Tape(self.backend, store)
+        self.open(offset=at.value)
+        self.message = f"the log around {at}"
+        return True
+
     def open(self, seq=None, at=None, offset=None):
         # A pair with no manifest is not a store, so there is no id to
         # write a place in it as — and an address is the point.
@@ -764,57 +956,56 @@ class View:
                 f"{self.store.get('name')!r} carries no identity, so a "
                 "place in it cannot be written down — `timberfs identity "
                 "--mint` makes the pair a store")
-        self.tape.refresh()
-        c = self.tape.open(seq=seq, at=at, offset=offset)
+        self.source.refresh()
+        c = self.source.open(seq=seq, at=at, offset=offset)
         anchor = offset if offset is not None else c.start
         landed_at_the_end = seq is None and at is None and offset is None
-        if landed_at_the_end and self.tape.at_bottom():
-            self.cur = max(0, len(self.tape.lines) - 1)
+        if landed_at_the_end and self.source.at_bottom():
+            self.cur = max(0, len(self.source.lines) - 1)
         else:
-            self.cur = self.tape.index_of(anchor)
+            self.cur = self.source.index_of(anchor)
         # What you land ON has to be real. A run that does not begin at
         # the store's first chunk holds its first line back as a
         # possible fragment, so landing at the top of one means reaching
         # for the chunk before it — the one read the read-ahead cannot
         # be left to do, because it is on the screen you asked for.
-        if self.cur < 2 and not self.tape.at_top() and self.tape.extend_up():
-            self.cur = self.tape.index_of(anchor)
+        if self.cur < 2 and not self.source.at_top() and self.source.extend_up():
+            self.cur = self.source.index_of(anchor)
         self.top = self.cur
         self.tok = 0
         return c
 
     @property
     def store(self):
-        return self.tape.store
+        return self.source.store
 
     def line(self):
-        return self.tape.lines[self.cur] if self.tape.lines else None
+        return self.source.lines[self.cur] if self.source.lines else None
 
     def address(self):
-        ln = self.line()
-        off = ln.offset if ln else self.tape.tape_start
-        return Address(self.store.get("id"), self.store.get("_host"),
-                       "offset", off)
+        """Where the cursor line IS. On a result set that is the entry's
+        own store, which is not the same one line to line."""
+        return self.source.address_of(self.line())
 
     # -- movement. Every mutation of the run keeps the place by OFFSET,
     # because a line number belongs to a run and an offset to the tape.
     def _keep_place(self, fn):
-        lines = self.tape.lines
+        lines = self.source.lines
         top_off = lines[self.top].offset if lines else None
         cur_off = lines[self.cur].offset if lines else None
         fn()
         if top_off is not None:
-            self.top = self.tape.index_of(top_off)
-            self.cur = self.tape.index_of(cur_off)
+            self.top = self.source.index_of(top_off)
+            self.cur = self.source.index_of(cur_off)
 
     def _widen(self):
-        if self.cur < NEAR and not self.tape.at_top():
-            self._keep_place(self.tape.extend_up)
-        if len(self.tape.lines) - self.cur < NEAR and not self.tape.at_bottom():
-            self._keep_place(self.tape.extend_down)
+        if self.cur < NEAR and not self.source.at_top():
+            self._keep_place(self.source.extend_up)
+        if len(self.source.lines) - self.cur < NEAR and not self.source.at_bottom():
+            self._keep_place(self.source.extend_down)
 
     def move(self, n):
-        self.cur = max(0, min(len(self.tape.lines) - 1, self.cur + n))
+        self.cur = max(0, min(len(self.source.lines) - 1, self.cur + n))
         self.tok = 0
         self._widen()
 
@@ -825,13 +1016,13 @@ class View:
         """The top of the LOG, which is a seek to its first chunk —
         never a walk back through the run. On a store of 400,000 chunks
         those are not the same operation."""
-        self.open(seq=self.tape.first_seq)
+        self.open(seq=self.source.first_seq)
         self.cur = self.top = 0
         self.tok = 0
 
     def end(self):
-        self.open(seq=self.tape.last_seq)
-        self.cur = max(0, len(self.tape.lines) - 1)
+        self.open(seq=self.source.last_seq)
+        self.cur = max(0, len(self.source.lines) - 1)
         self.tok = 0
 
     def scroll_h(self, n):
@@ -903,7 +1094,7 @@ class View:
         it turned out to be."""
         store = hit.store
         if store and store.get("id") != self.store.get("id"):
-            self.tape = Tape(self.backend, store)
+            self.source = Tape(self.backend, store)
         self.open(offset=hit.address.value)
         if self.term:
             for i, (_, _, t) in enumerate(self.line_terms()):
@@ -924,7 +1115,7 @@ class View:
     def rowcount(self, i, width):
         if not self.wrap:
             return 1
-        n = len(self.tape.lines[i].text)
+        n = len(self.source.lines[i].text)
         return max(1, -(-n // max(1, width)))
 
     def _top_for(self, cur, width, height):
@@ -941,7 +1132,7 @@ class View:
         spans to highlight. An edge row is the tape's own boundary, and
         it appears only at the real one — the top of what is LOADED gets
         no marker, because the two are different facts."""
-        lines = self.tape.lines
+        lines = self.source.lines
         if not lines:
             return [{"text": "  (this store holds no lines)", "line": None,
                      "spans": [], "edge": True}]
@@ -964,9 +1155,9 @@ class View:
         return rows
 
     def _build(self, width, height):
-        rows, lines = [], self.tape.lines
+        rows, lines = [], self.source.lines
         if self.top == 0:
-            for text in (self.top_notes() if self.tape.at_top()
+            for text in (self.source.top_notes() if self.source.at_top()
                          else self.stuck_note(above=True)):
                 rows.append({"text": text, "line": None, "spans": [],
                              "edge": True})
@@ -1003,8 +1194,8 @@ class View:
                     "edge": False, "cursor": i == self.cur})
             i += 1
         if i >= len(lines) and len(rows) < height:
-            if self.tape.at_bottom():
-                rows.append({"text": self.bottom_note(), "line": None,
+            if self.source.at_bottom():
+                rows.append({"text": self.source.bottom_note(), "line": None,
                              "spans": [], "edge": True})
             else:
                 for text in self.stuck_note(above=False):
@@ -1016,49 +1207,26 @@ class View:
         """There is more tape this way and it could not be read. Said
         where the boundary marker would go, because an edge that stops
         without saying why is the same screen as the end of the log."""
-        if not self.tape.trouble:
+        if not self.source.trouble:
             return []
-        seq, why = self.tape.trouble
-        run = self.tape.chunks
+        seq, why = self.source.trouble
+        run = self.source.chunks
         if not run or (seq < run[0].seq) != above:
             return []
         return [f"── chunk {seq} could not be read · {why}"]
 
-    # -- the boundaries, stated rather than discovered
-    def top_notes(self):
-        s = self.store
-        notes = [f"── top of the log · chunk {s.get('first_seq')}"]
-        if s.get("dropped_chunks"):
-            notes.append(
-                f"── {grouped(s['dropped_chunks'])} chunk(s) older were "
-                f"dropped ({human(s.get('dropped_uncompressed_bytes', 0))} "
-                f"off the tape)")
-        return notes
-
-    def bottom_note(self):
-        s = self.store
-        tail = (f"a writer holds it ({s['writer']}), so newer lines may not "
-                "be flushed yet" if s.get("writer")
-                else "nothing is appending")
-        return f"── end of chunk {s.get('last_seq')} · {tail}"
-
     def header(self):
-        s = self.store
-        ln = self.line()
-        off = ln.offset if ln else self.tape.tape_start
-        span = max(1, self.tape.tape_end - self.tape.tape_start)
-        pct = min(100, max(0, int(100 * (off - self.tape.tape_start) / span)))
-        where = f"{s.get('name')}"
-        if s.get("_host"):
-            where += f" @ {s['_host']}"
-        return (f"── {where} · chunk {self.tape.chunk_of(off)} · "
-                f"offset {grouped(off)} · {pct}%")
+        """What the source says it is showing, and where in it."""
+        return self.source.describe(self.line())
 
     def status(self):
         if self.message:
             return self.message
         sel = self.selected()
-        bits = ["q quit", "Tab term", "Enter search", "n/N hits",
+        bits = ["q quit", "Tab term",
+                "Enter open" if isinstance(self.source, Records)
+                else "Enter search",
+                "* search" if isinstance(self.source, Records) else "n/N hits",
                 "w wrap" if not self.wrap else "w nowrap", "S stores",
                 "? help"]
         if sel:
@@ -1229,6 +1397,13 @@ class Screen:
             v.pick(1)
         elif key in (c.KEY_BTAB, ord("p")):
             v.pick(-1)
+        elif key in (KEY_CR, KEY_LF, c.KEY_ENTER) \
+                and isinstance(v.source, Records):
+            # In an ANSWER, Enter means go to where this entry is — the
+            # same thing it means in the hit list. On the tape there is
+            # nowhere to go, so there it searches.
+            self.reach(stdscr, "the log around this entry",
+                       v.leave_for_the_log)
         elif key in (KEY_CR, KEY_LF, c.KEY_ENTER, ord("*")):
             self.do_search(stdscr, v.selected())
         elif key == ord("/"):
@@ -1445,6 +1620,19 @@ class Screen:
 
 
 
+def watch_source(backend, source, what=None):
+    """Open the viewer on a source that is already read — a result set.
+
+    Nothing is fetched here, so there is no first read to explain and
+    the screen is up immediately."""
+    import curses
+    view = View(backend, source=source)
+    view.cur = view.top = 0
+    screen = Screen(view)
+    return curses.wrapper(lambda stdscr: (screen.setup(stdscr),
+                                          screen.loop(stdscr))[1])
+
+
 def watch(backend, store, seq=None, at=None, offset=None):
     """Open the viewer and return the address it was left at.
 
@@ -1579,6 +1767,30 @@ def main(argv=None):
                 else p.stdout.decode("utf-8", "replace")), err, p.returncode
 
     backend = QueryBackend(ask, fleet.names)
+
+    # A `records` stream on stdin is an ANSWER to page, not a store.
+    if not sys.stdin.isatty():
+        stream = sys.stdin.buffer.read()
+        # The keyboard has to come from somewhere else: stdin is the
+        # answer, so curses would read the log as keystrokes. Every
+        # pager does this, and a session with no controlling terminal
+        # is told rather than left with a screen it cannot drive.
+        try:
+            tty = open("/dev/tty", "rb")
+        except OSError as e:
+            sys.exit(f"timberview: reading an answer from a pipe needs a "
+                     f"terminal to take keys from, and /dev/tty is not "
+                     f"open to this session ({e})")
+        os.dup2(tty.fileno(), 0)
+        answer = Records(stream, stores=backend.stores() if a.hosts or a.cmd
+                         or a.resolver or a.targets else [],
+                         what=a.target or "an answer on stdin")
+        if not answer.entries:
+            sys.exit("timberview: that stream carried no entry — `--records` "
+                     "is the form that does")
+        print(watch_source(backend, answer) or "")
+        return 0
+
     try:
         store = resolve(backend, a.target)
         addr = watch(backend, store,

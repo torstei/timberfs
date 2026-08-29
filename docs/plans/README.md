@@ -37,7 +37,7 @@ messages and pull requests are for.
   clock an entry CARRIES: the frontier merge that makes it streamable, and the
   per-chunk logline range it needs.
 - [view.md](view.md) — reading a store as a tape rather than a result set.
-  A first version has shipped, and so has the fleet resolver the address was
-  shaped for, so what is left here is the second front end, the "who has
-  this store" half of resolution, and the questions those versions answered
-  one way.
+  A first version has shipped, along with the fleet resolver the address was
+  shaped for and the result-set screen an answer is read on, so what is left
+  here is the "who has this store" half of resolution, the drill-down from a
+  timestamp, and the questions those versions answered one way.

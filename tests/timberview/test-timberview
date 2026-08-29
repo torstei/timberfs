@@ -179,12 +179,12 @@ def landing_at_the_top_of_a_chunk_shows_its_first_line():
     f = Fake(["a\nb\nc\n", "d\ne\nf\n", "g\nh\n"])
     v = opened(f, seq=1)
     assert v.line().text == "d", (v.line().text, lines_of(v))
-    assert v.address().value == v.tape.chunks[0].start + 6, v.address()
+    assert v.address().value == v.source.chunks[0].start + 6, v.address()
     # Landing at the END needs no such read: the held line is a screen
     # away, and the read-ahead has it by the time anyone scrolls there.
     quiet = Fake(["a\n" * 9, "b\n" * 9])
     w = opened(quiet)
-    assert len(w.tape.chunks) == 1, w.tape.chunks
+    assert len(w.source.chunks) == 1, w.source.chunks
 
 
 @test
@@ -196,9 +196,9 @@ def a_line_across_a_chunk_boundary_is_one_line():
     v = opened(f, seq=0)
     # Opening reads ONE chunk, so the straddling line is still held back.
     assert lines_of(v) == ["alpha"], lines_of(v)
-    v.tape.extend_down()
+    v.source.extend_down()
     assert lines_of(v) == ["alpha", "bravo", "charlie"], lines_of(v)
-    assert [ln.offset for ln in v.tape.lines] == [0, 6, 12]
+    assert [ln.offset for ln in v.source.lines] == [0, 6, 12]
 
 
 @test
@@ -223,8 +223,8 @@ def an_offset_is_absolute_on_the_tape():
     the run that happens to be loaded."""
     f = Fake(["a\nb\n", "c\nd\n"], dropped=1000)
     v = opened(f, seq=1)
-    assert [ln.offset for ln in v.tape.lines] == [1000, 1002, 1004, 1006]
-    assert v.tape.index_of(1005) == 2
+    assert [ln.offset for ln in v.source.lines] == [1000, 1002, 1004, 1006]
+    assert v.source.index_of(1005) == 2
 
 
 @test
@@ -261,7 +261,7 @@ def the_top_of_the_log_is_a_seek_not_a_walk():
     f.fetches = 0
     v.home()
     assert f.fetches <= 4, f.fetches
-    assert v.tape.at_top() and v.cur == 0
+    assert v.source.at_top() and v.cur == 0
 
 
 # --------------------------------------------------- stated boundaries
@@ -452,20 +452,20 @@ def a_chunk_that_could_not_be_read_is_not_the_end_of_the_tape():
         f = Fake(["a\n" * 4, "b\n" * 4, "c\n" * 4])
         v = opened(f, seq=1)
         f.fail_at = {0, 2}
-        v.tape.chunks = [c for c in v.tape.chunks if c.seq == 1]
-        v.tape._rebuild()
+        v.source.chunks = [c for c in v.source.chunks if c.seq == 1]
+        v.source._rebuild()
         return f, v
 
     f, v = only_chunk_one()
     v.top = v.cur = 0
-    assert v.tape.extend_up() is False
+    assert v.source.extend_up() is False
     edges = edges_of(v)
     assert any("chunk 0 could not be read" in e for e in edges), edges
     assert not any("top of the log" in e for e in edges), edges
 
     f, v = only_chunk_one()
-    v.cur = len(v.tape.lines) - 1
-    assert v.tape.extend_down() is False
+    v.cur = len(v.source.lines) - 1
+    assert v.source.extend_down() is False
     edges = edges_of(v)
     assert any("chunk 2 could not be read" in e for e in edges), edges
     assert not any("end of chunk" in e for e in edges), edges
@@ -661,7 +661,7 @@ def the_neighbours_are_read_ahead_so_the_scroll_is_local():
     asked = []
     f.prefetch = lambda store, *seqs: asked.extend(seqs)
     v = opened(f)                       # the live end, where a pager opens
-    assert len(v.tape.chunks) == 1, v.tape.chunks
+    assert len(v.source.chunks) == 1, v.source.chunks
     assert asked == [1], asked
 
 
@@ -761,6 +761,66 @@ def a_hit_list_is_itself_searchable():
     # And a list that is not searchable has none of it.
     assert screen.choose(Screenish([ord("*"), ord("q")]), "t", rows) \
         == (None, None)
+
+
+def answer(*entries, source_id=ID_A, path="/l/app.log"):
+    """A `records` stream, as timberfs writes one."""
+    recs = [("source", {"path": path, "id": source_id}, None)]
+    for text, fields in entries:
+        body = text.encode()
+        recs.append(("entry", {"len": len(body), **fields}, body))
+    return wire(*recs)
+
+
+@test
+def a_multi_line_entry_is_one_entry():
+    """A stack trace belongs to the entry that raised it. Splitting it
+    would be the same lie as splitting a line across a chunk boundary —
+    and every one of its lines names the place the ENTRY came from."""
+    r = tv.Records(answer(("boom\n  at A\n  at B", {"offset": 40, "ts": 1})))
+    assert r.entries == 1 and len(r.lines) == 3, (r.entries, len(r.lines))
+    assert [ln.text for ln in r.lines] == ["boom", "  at A", "  at B"]
+    assert [ln.first for ln in r.lines] == [True, False, False]
+    assert {str(r.address_of(ln)) for ln in r.lines} \
+        == {f"timber:{ID_A}#offset=40"}
+
+
+@test
+def an_answer_is_a_closed_set():
+    """Both ends are ends: nothing extends, and the boundary says "the
+    answer" rather than naming a chunk that is not what you are in."""
+    r = tv.Records(answer(("one", {"offset": 0})))
+    assert r.at_top() and r.at_bottom()
+    assert r.extend_up() is False and r.extend_down() is False
+    assert "end of the answer" in r.bottom_note()
+    assert "chunk" not in r.bottom_note()
+    assert "1 entry matched" in r.top_notes()[0], r.top_notes()
+
+
+@test
+def an_entry_at_the_live_edge_is_shown_but_cannot_be_opened():
+    """It is real and it matched, so it is in the answer. It is in no
+    chunk yet, so there is no place to open — said, not guessed at."""
+    r = tv.Records(answer(("fresh", {"ts": 9})))       # no offset
+    assert r.entries == 1 and r.unplaced == 1
+    assert r.address_of(r.lines[0]) is None
+    assert "live edge" in r.top_notes()[0], r.top_notes()
+    v = tv.View(Fake(["x\n"]), source=r)
+    assert v.leave_for_the_log() is False
+    assert "no chunk yet" in v.message, v.message
+
+
+@test
+def two_streams_do_not_borrow_each_others_attribution():
+    """Each host's answer names its own sources, and a one-source stream
+    leaves the id off its entries. Read together without resetting, the
+    second host's entries would inherit the first host's store."""
+    a = answer(("from a", {"offset": 1}), source_id=ID_A, path="/l/a.log")
+    b = answer(("from b", {"offset": 2}), source_id=ID_B, path="/l/b.log")
+    r = tv.Records([a, b])
+    assert [str(r.address_of(ln)) for ln in r.lines] == \
+        [f"timber:{ID_A}#offset=1", f"timber:{ID_B}#offset=2"], \
+        [str(r.address_of(ln)) for ln in r.lines]
 
 
 def main():

@@ -127,6 +127,37 @@ opens another store.
 lists the keys.
 .B q
 quits, printing the address you stopped at.
+.SH AN ANSWER INSTEAD OF A STORE
+A
+.BR timberfs\-records (5)
+stream on standard input is paged as an ANSWER rather than a store:
+.PP
+.RS
+.EX
+timberfs query --records --from 13:00 --has ERROR app.log | timberview
+.EE
+.RE
+.PP
+timbersh reaches the same screen with
+.BR "select ... into view" .
+An entry record carries the chunk and offset it came from, so every line
+in an answer knows its place:
+.B Tab
+and the search work as they do anywhere, and
+.B Enter
+leaves the answer for the LOG around that entry \(em what you usually
+want next is what was happening either side of a match.
+.PP
+A multi-line entry is ONE entry: the lines of a stack trace belong to
+the entry that raised it. An answer is a closed set, so both ends are
+ends and the boundary says so rather than naming a chunk. An entry still
+at the live edge is shown and cannot be opened, because it is in no
+chunk yet \(em counted and said, never dropped.
+.PP
+⚠ Reading from a pipe needs a keyboard from somewhere other than stdin,
+which is the answer:
+.I /dev/tty
+is reopened for keys, as every pager does.
 .SH THE ADDRESS
 A coordinate is passed from a search to a viewer and back to a shell, so
 it has a written form:

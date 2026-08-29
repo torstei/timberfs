@@ -314,8 +314,10 @@ here.
   is one module reached two ways, `view` in timbersh and `timberview(1)`
   beside it, over four operations and nothing else, and a coordinate now
   has a written form (`timber://host/id#offset=N`) that names a store by
-  IDENTITY. What remains: the second backend (an entry-aware pager for a
-  piped `records` stream); "what happened in $FOO around here", the
+  IDENTITY. An ANSWER is read on the same screen — `select ... into view`
+  in timbersh, or a piped `records` stream — because an entry record
+  carries the offset it came from, so `Enter` leaves the answer for the
+  log around a match. What remains: "what happened in $FOO around here", the
   drill-down that starts from where you ARE and collides with the
   viewer's no-parsing rule; taking a line selection away as bytes or as
   the document that reproduces it; and getting the address into a

@@ -29,6 +29,15 @@ motion, and the difference is the point.
   runs `--has` matches — so the two candidate designs turned out to be
   one mechanism, and a 200-character log line does not need a character
   cursor to get across.
+- **An answer fits on the log's screen, and that is the second
+  backend.** `select ... into view` and a piped `records` stream are the
+  same source read two ways. It works because an entry record carries
+  `chunk` and `offset`: every line in an answer knows the place it came
+  from, which is the same coordinate the tape is addressed by. `Enter`
+  there leaves the answer for the log AROUND that entry — the one motion
+  an answer cannot make for itself. A multi-line entry is one entry; an
+  answer is a closed set; an entry at the live edge is shown and cannot
+  be opened.
 - **A fleet search returns to a list**, with `n`/`N` cycling from
   wherever you land. An identifier on six hosts is six answers, and
   jumping straight to one would pick for you.
@@ -37,23 +46,6 @@ motion, and the difference is the point.
   to be uniform. A target is a name and an argv, and the argv is a list
   because a command line written as one string has to be split again at
   the far end under rules we would have had to invent.
-
-## Not built: the records-stream front end
-
-```sh
-timberfs query --records --from 13:00 --has ERROR app.log | timberview
-```
-
-An entry-aware pager for a `records` stream — multi-line entries as
-units, `ts`/`wf`/`offset` per entry — is useful to anyone piping timberfs
-output, and it is a second implementation of the same four operations
-over a buffered stream rather than a store. The seam is there; the
-backend is not.
-
-⚠ It is the one that makes the viewer a *tool* rather than a mode: the
-store backend it ships with is the same one either front end uses, so
-today's `timberview app.log` proves the seam holds but not that a second
-kind of source fits behind it.
 
 ## Not built: "what happened in $FOO around here"
 

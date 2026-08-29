@@ -8,7 +8,7 @@ bug that actually happened.
     tests/timbersh/test-timbersh          # all
     tests/timbersh/test-timbersh short_id # one, by substring
 """
-import fcntl, json, os, pty, select, shutil, struct, subprocess, sys
+import fcntl, json, os, pty, re, select, shutil, struct, subprocess, sys
 import tempfile, termios, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -99,12 +99,19 @@ class Pty(Session):
         self.seen = ""
         return self
 
+    @property
+    def plain(self):
+        """What the screen SAYS. curses splits a line into styled runs
+        wherever a term is highlighted, so the text of a rendered line
+        is never contiguous in the raw stream."""
+        return re.sub(r"\x1b[\[(][0-9;?]*[A-Za-z]", "", self.seen)
+
     def expect(self, marker, timeout=20):
         end = time.time() + timeout
-        while marker not in self.seen:
+        while marker not in self.plain:
             if time.time() > end:
                 raise AssertionError(
-                    f"waited {timeout}s for {marker!r}; saw:\n{self.seen[-800:]}")
+                    f"waited {timeout}s for {marker!r}; saw:\n{self.plain[-800:]}")
             r, _, _ = select.select([self.fd], [], [], 0.2)
             if r:
                 try:
@@ -393,7 +400,7 @@ def view_seeks_to_a_chunk_and_asks_for_exactly_one():
     # reaches for the one before it, so the line held back as a possible
     # fragment is resolved rather than skipped over.
     at = sum(len(c["text"]) for c in chunks[:7])
-    assert f"timber:{ID_A}#offset={at}" in s.seen, s.seen[-400:]
+    assert f"timber:{ID_A}#offset={at}" in s.plain, s.plain[-400:]
     s.cleanup()
 
 
@@ -513,6 +520,39 @@ def one_target_being_down_does_not_stop_the_others():
     assert "hit on alpha" in s.out and "hit on beta" in s.out, s.out
     assert "No route to host" in s.out, s.out
     assert "gone" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def only_records_can_go_into_a_view():
+    """The other kinds carry no offset, so nothing in such an answer
+    could say where it came from or be opened. Judged as a statement,
+    wherever it is run — not as a terminal problem."""
+    s = Session({"": {"stores": [store("app", ID_A)]}}).run(
+        "select loglines from [] where entry has 'X' into view;")
+    assert "only `records`" in s.out, s.out
+    assert "terminal" not in s.out, s.out
+    s.cleanup()
+
+
+@test
+def select_into_view_asks_for_records_and_pages_the_answer():
+    """`select` walks an answer and `view` walks the log; this puts the
+    first on the second's screen, which works because an entry record
+    carries the offset it came from."""
+    st, chunks = tape("app", ID_A)
+    s = Pty({"": {"stores": [st], "chunks": chunks,
+                  "records": [{"id": ID_A, "text": "boom at 12:00"}]}}).start()
+    s.expect("timberfs=#")
+    s.send("select records from [] where entry has 'boom' into view;\n")
+    s.expect("Enter open")
+    assert "1 entry matched" in s.plain, s.plain[-400:]
+    assert "boom at 12:00" in s.plain, s.plain[-400:]
+    s.send("q").expect("timberfs=#")
+    s.finish()
+    docs = s.docs("records")
+    assert docs, [r["doc"] for r in s.requests]
+    assert docs[-1]["match"]["all"] == [{"has": "boom"}], docs[-1]
     s.cleanup()
 
 
