@@ -183,6 +183,18 @@ class Refused(Exception):
     """The far end said no, in its own words."""
 
 
+# The refusal a timberfs from before the bounded seek gives. It is the
+# FIRST wall anyone meets, and on its own it reads as the caller's
+# mistake — a chunk number with `max: {chunks: 1}` is exactly the legal
+# thing. Read from the refusal because a version cannot say it: the
+# builds either side of that change both report 0.25.0.
+NO_SEEK = "a chunk number is a resume position"
+NO_SEEK_WHY = (
+    "\n      — that timberfs predates the bounded seek a pager is made of "
+    "(the `from_chunk` change after 0.25.0). Its version cannot tell you: "
+    "the builds either side of it report the same one.")
+
+
 class QueryBackend:
     """The four operations over `timberfs-query-document(5)`.
 
@@ -270,7 +282,11 @@ class QueryBackend:
                                       "value": store["id"]}]},
                "window": win, "max": {"chunks": 1},
                "response_format": {"kind": "chunks"}}
-        out = self._run(doc, store.get("_host"), raw=True)
+        try:
+            out = self._run(doc, store.get("_host"), raw=True)
+        except Refused as e:
+            raise Refused(str(e) + NO_SEEK_WHY
+                          if NO_SEEK in str(e) else str(e)) from None
         for kind, f, payload in frames(out):
             if kind == "chunk":
                 return Chunk(int(f["chunk"]), int(f["uncomp_start"]),

@@ -485,6 +485,28 @@ def one_target_being_down_does_not_stop_the_others():
         v.message
 
 
+@test
+def a_timberfs_from_before_the_seek_is_diagnosed_not_relayed():
+    """The first wall anyone meets. On its own the refusal reads as the
+    caller's mistake — a chunk number with `max: {chunks: 1}` is exactly
+    the legal thing — and no version check can catch it, because the
+    builds either side of that change report the same version."""
+    def ask(doc, host=None, raw=False):
+        if (doc.get("response_format") or {}).get("kind") == "chunks":
+            return b"", ("Error: a chunk number is a resume position, and "
+                         "only a FOLLOWING read moves forward from one"), 1
+        return json.dumps({"server_version": "timberfs, 0.25.0",
+                           "stores": []}), "", 0
+    b = tv.QueryBackend(ask, [None])
+    try:
+        b.chunk({"id": ID_A}, seq=7)
+        raise AssertionError("a refusal became an answer")
+    except tv.Refused as e:
+        assert "predates the bounded seek" in str(e), str(e)
+        assert "resume position" in str(e), str(e)
+        assert "report the same one" in str(e), str(e)
+
+
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else ""
     chosen = [t for t in TESTS if want in t.__name__]
