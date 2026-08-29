@@ -143,16 +143,21 @@ timbersh reaches the same screen with
 An entry record carries the chunk and offset it came from, so every line
 in an answer knows its place:
 .B Tab
-and the search work as they do anywhere, and
+and the search work as they do anywhere \(em
 .B Enter
-leaves the answer for the LOG around that entry \(em what you usually
-want next is what was happening either side of a match.
+searches the picked term on an answer exactly as it does on the tape \(em
+and
+.B o
+leaves the answer for the LOG around that entry, which is what you
+usually want next.
 .PP
 A multi-line entry is ONE entry: the lines of a stack trace belong to
 the entry that raised it. An answer is a closed set, so both ends are
 ends and the boundary says so rather than naming a chunk. An entry still
 at the live edge is shown and cannot be opened, because it is in no
-chunk yet \(em counted and said, never dropped.
+chunk yet \(em counted and said, never dropped. On a store being written
+that is ordinary: the newest matches are still in the write-ahead
+sidecar.
 .PP
 ⚠ Reading from a pipe needs a keyboard from somewhere other than stdin,
 which is the answer:

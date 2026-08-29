@@ -33,9 +33,10 @@ motion, and the difference is the point.
   backend.** `select ... into view` and a piped `records` stream are the
   same source read two ways. It works because an entry record carries
   `chunk` and `offset`: every line in an answer knows the place it came
-  from, which is the same coordinate the tape is addressed by. `Enter`
-  there leaves the answer for the log AROUND that entry — the one motion
-  an answer cannot make for itself. A multi-line entry is one entry; an
+  from, which is the same coordinate the tape is addressed by. `o` leaves
+  the answer for the log AROUND that entry — the one motion an answer
+  cannot make for itself. `Enter` searches wherever you are: a key that
+  changes meaning with the screen is the surprise a mode is. A multi-line entry is one entry; an
   answer is a closed set; an entry at the live edge is shown and cannot
   be opened.
 - **A fleet search returns to a list**, with `n`/`N` cycling from

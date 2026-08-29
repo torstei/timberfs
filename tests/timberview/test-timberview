@@ -811,6 +811,27 @@ def an_entry_at_the_live_edge_is_shown_but_cannot_be_opened():
 
 
 @test
+def enter_searches_on_every_pager_screen():
+    """It used to mean "open the log" in an ANSWER and "search this
+    term" on the tape — so picking an identifier in an answer and
+    pressing Enter did something else entirely, and could fail with a
+    message about opening, which was never what was asked for. Leaving
+    an answer for the log is its own key."""
+    f = Fake(["one\ntwo\n"])
+    r = tv.Records(answer(("boom REQ3999", {"offset": 0})))
+    for source, where in ((r, "an answer"), (None, "the tape")):
+        v = (tv.View(f, source=source) if source is not None
+             else opened(f))
+        screen = Screen_for_test()
+        screen.view = v
+        asked = []
+        screen.do_search = lambda _s, token: asked.append(token)
+        v.tok = 1 if source is not None else 0
+        screen.step(Screenish(), KEY_CR)
+        assert asked and asked[0] == v.selected(), (where, asked)
+
+
+@test
 def two_streams_do_not_borrow_each_others_attribution():
     """Each host's answer names its own sources, and a one-source stream
     leaves the id off its entries. Read together without resetting, the

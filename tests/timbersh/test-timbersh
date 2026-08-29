@@ -545,7 +545,9 @@ def select_into_view_asks_for_records_and_pages_the_answer():
                   "records": [{"id": ID_A, "text": "boom at 12:00"}]}}).start()
     s.expect("timberfs=#")
     s.send("select records from [] where entry has 'boom' into view;\n")
-    s.expect("Enter open")
+    # `o log around` is the footer only an ANSWER has; Enter searches
+    # here exactly as it does on the tape.
+    s.expect("o log around")
     assert "1 entry matched" in s.plain, s.plain[-400:]
     assert "boom at 12:00" in s.plain, s.plain[-400:]
     s.send("q").expect("timberfs=#")

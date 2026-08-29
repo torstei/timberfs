@@ -142,10 +142,10 @@ HELP = """
   tail   <kind> from <source> [where ...];
 
     `into view` puts the ANSWER on the pager's screen instead of on the
-    terminal: multi-line entries stay whole, Tab and the search work as
-    they do anywhere, and Enter leaves the answer for the LOG around
-    that entry. Only `records` can -- it is the kind that carries the
-    offset a line needs to say where it came from.
+    terminal: multi-line entries stay whole, Tab and Enter search as
+    they do anywhere, and `o` leaves the answer for the LOG around that
+    entry. Only `records` can -- it is the kind that carries the offset
+    a line needs to say where it came from.
 
     <kind>    records | loglines | stores | chunks
     <source>  a view name, or a predicate literal like [type=console].

@@ -590,6 +590,9 @@ class Tape:
         The one motion a result set cannot do for itself: an answer is
         the entries that matched, and what you usually want next is what
         was happening around one of them."""
+        if not isinstance(self.source, Records):
+            self.message = "this is the log — you are already in it"
+            return False
         at = self.source.address_of(self.line())
         if at is None:
             self.message = ("that entry is still at the live edge — it is in "
@@ -902,7 +905,7 @@ class Records:
                    f" · {self.unplaced} at a live edge, with no place to open")]
 
     def bottom_note(self):
-        return ("── end of the answer · Enter opens the log around an entry"
+        return ("── end of the answer · `o` opens the log around an entry"
                 if self.entries else "── nothing matched")
 
 
@@ -934,6 +937,9 @@ class View:
         The one motion a result set cannot do for itself: an answer is
         the entries that matched, and what you usually want next is what
         was happening around one of them."""
+        if not isinstance(self.source, Records):
+            self.message = "this is the log — you are already in it"
+            return False
         at = self.source.address_of(self.line())
         if at is None:
             self.message = ("that entry is still at the live edge — it is in "
@@ -1223,10 +1229,9 @@ class View:
         if self.message:
             return self.message
         sel = self.selected()
-        bits = ["q quit", "Tab term",
-                "Enter open" if isinstance(self.source, Records)
-                else "Enter search",
-                "* search" if isinstance(self.source, Records) else "n/N hits",
+        bits = ["q quit", "Tab term", "Enter search",
+                "o log around" if isinstance(self.source, Records)
+                else "n/N hits",
                 "w wrap" if not self.wrap else "w nowrap", "S stores",
                 "? help"]
         if sel:
@@ -1397,15 +1402,14 @@ class Screen:
             v.pick(1)
         elif key in (c.KEY_BTAB, ord("p")):
             v.pick(-1)
-        elif key in (KEY_CR, KEY_LF, c.KEY_ENTER) \
-                and isinstance(v.source, Records):
-            # In an ANSWER, Enter means go to where this entry is — the
-            # same thing it means in the hit list. On the tape there is
-            # nowhere to go, so there it searches.
+        elif key in (KEY_CR, KEY_LF, c.KEY_ENTER, ord("*")):
+            # The same thing on every pager screen, answer or tape:
+            # picking a term and pressing Enter searches it. Making it
+            # depend on the source is exactly the surprise a mode is.
+            self.do_search(stdscr, v.selected())
+        elif key == ord("o"):
             self.reach(stdscr, "the log around this entry",
                        v.leave_for_the_log)
-        elif key in (KEY_CR, KEY_LF, c.KEY_ENTER, ord("*")):
-            self.do_search(stdscr, v.selected())
         elif key == ord("/"):
             self.do_search(stdscr, self.prompt(stdscr, "search token: "))
         elif key == ord("n"):
