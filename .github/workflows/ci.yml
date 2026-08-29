@@ -24,6 +24,23 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
+  # The clients' own suites — seconds, and they need no VM, no timberfs and
+  # no network: `--cmd` points at a fake that answers from a script. Local
+  # `scripts/check.sh` runs them, which leaves them ungated on a push that
+  # skipped the hook.
+  clients:
+    name: clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 -m py_compile tools/timbersh tools/timberview.py \
+            tools/timberview tools/timberfs_client.py
+      - run: tests/timberfs-client/test-timberfs-client
+      - run: tests/timbersh/test-timbersh
+      - run: tests/timberview/test-timberview
+
   vm-tests-matrix:
     name: vm-tests (${{ matrix.image }})
     runs-on: ubuntu-latest
