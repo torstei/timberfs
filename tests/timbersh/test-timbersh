@@ -359,6 +359,43 @@ def stores_that_matched_but_held_nothing_are_not_the_same_answer():
     s.cleanup()
 
 
+@test
+def a_probe_that_did_not_answer_is_not_an_empty_predicate():
+    """The third case, and the one that misreads a WORKING selector: the
+    read answered with nothing, and the probe behind "was anything
+    searched" then failed. Only the hosts that answered were counted, so
+    0 answers became 0 stores and a fleet that refused was reported as a
+    predicate matching nothing on all of them."""
+    s = Session({h: {"stores": [store(f"{h}1", ID_A)], "records": [],
+                     "refuse": {"stores": {"fail": "az: token expired",
+                                           "code": 1}}}
+                 for h in ("a", "b")}, hosts=["a", "b"]).run(
+        "select records from [host=a] where entry has 'X';")
+    assert "NO STORE" not in s.out, s.out
+    assert "never tried" in s.out, s.out
+    assert "az: token expired" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_read_every_host_refused_is_not_an_answer_with_nothing_in_it():
+    """`into view` returned before it reported anything, so a records
+    read every host refused reached the screen as "nothing matched, in 2
+    store(s)" — the stores were listed, so the count was true and the
+    sentence was false."""
+    s = Pty({h: {"stores": [store("app", ID_A)],
+                 "refuse": {"records": {
+                     "fail": "The query document was refused:\n  no",
+                     "code": 3}}}
+             for h in ("a", "b")}, hosts=["a", "b"]).start()
+    s.expect("timberfs=#")
+    s.send("select records from [] where entry has 'X' into view;\n")
+    s.expect("The query document was refused")
+    s.finish()
+    assert "nothing matched" not in s.plain, s.plain[-600:]
+    s.cleanup()
+
+
 def tape(name, sid, n=9):
     """A store with several chunks, and the chunks themselves — what a
     pager needs and a one-chunk fixture cannot exercise.
@@ -431,6 +468,21 @@ def view_refuses_a_predicate_that_selects_no_store():
     s.send("view [name=nope];\n").expect("NO STORE")
     s.finish()
     assert not s.docs("chunks"), s.docs("chunks")
+    s.cleanup()
+
+
+@test
+def view_does_not_blame_the_predicate_for_a_fleet_that_is_down():
+    """`view` reads the store list to find what to open, and a host that
+    did not answer contributes no stores. "that predicate selects NO
+    STORE" then sends someone to fix a selector that is correct."""
+    s = Pty({h: {"fail": "ssh: connect to host: No route to host",
+                 "code": 255} for h in ("a", "b")},
+            hosts=["a", "b"]).start()
+    s.expect("timberfs=#")
+    s.send("view [name=app];\n").expect("No route to host")
+    s.finish()
+    assert "NO STORE" not in s.plain, s.plain[-600:]
     s.cleanup()
 
 
@@ -555,6 +607,25 @@ def select_into_view_asks_for_records_and_pages_the_answer():
     docs = s.docs("records")
     assert docs, [r["doc"] for r in s.requests]
     assert docs[-1]["match"]["all"] == [{"has": "boom"}], docs[-1]
+    s.cleanup()
+
+
+@test
+def a_limit_after_into_view_still_bounds_the_read():
+    """`into view limit 1` parsed as `into view` and DROPPED the bound,
+    which turns one entry into a read of the whole store — a gigabyte
+    per host, across the fan-out. The two clauses come in either order,
+    and anything else ends the statement rather than being ignored."""
+    st, chunks = tape("app", ID_A)
+    s = Pty({"": {"stores": [st], "chunks": chunks,
+                  "records": [{"id": ID_A, "text": "boom at 12:00"}]}}).start()
+    s.expect("timberfs=#")
+    s.send("select records from [] where entry has 'boom' into view limit 1;\n")
+    s.expect("o log around")
+    s.send("q").expect("timberfs=#")
+    s.send("select records from [] into view banana;\n").expect("banana")
+    s.finish()
+    assert s.docs("records")[-1].get("max") == {"entries": 1}, s.docs("records")
     s.cleanup()
 
 

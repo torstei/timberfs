@@ -1173,19 +1173,33 @@ class Shell:
             if kind not in KINDS: raise ValueError(f"`{kind}`? one of {KINDS}")
             if toks[2][1].lower() != "from": raise ValueError("expected `from`")
             terms = self.source(toks[3])
-            conds, i, limit = [], 4, None
+            conds, i = [], 4
             if i < len(toks) and toks[i][1].lower() == "where":
                 conds, i = parse_where(toks, i + 1)
-            if i < len(toks) and toks[i][1].lower() == "limit":
-                n = int(toks[i + 1][1])
-                unit = (toks[i + 2][1].lower() if i + 2 < len(toks) else "entries")
-                limit = {"chunks" if unit.startswith("chunk") else "entries": n}
-                i += 3 if i + 2 < len(toks) and not unit.startswith("into") else 2
-            into = False
-            if i < len(toks) and toks[i][1].lower() == "into":
-                if i + 1 >= len(toks) or toks[i + 1][1].lower() != "view":
-                    raise ValueError("`into` what? `into view` is the one there is")
-                into = True
+            # `limit` and `into view` in either order, and NOTHING else
+            # after them. `into view limit 1` used to parse as `into view`
+            # and drop the bound without a word, which turns one entry
+            # into a read of the whole store on every host.
+            limit, into = None, False
+            while i < len(toks):
+                w = toks[i][1].lower()
+                if w == "limit" and limit is None:
+                    if i + 1 >= len(toks) or not toks[i + 1][1].isdigit():
+                        raise ValueError("`limit` wants a number")
+                    n, i = int(toks[i + 1][1]), i + 2
+                    unit = toks[i][1].lower() if i < len(toks) else "entries"
+                    if unit.startswith(("entr", "chunk")):
+                        i += 1
+                    limit = {"chunks" if unit.startswith("chunk")
+                             else "entries": n}
+                elif w == "into" and not into:
+                    if i + 1 >= len(toks) or toks[i + 1][1].lower() != "view":
+                        raise ValueError("`into` what? `into view` is the one there is")
+                    into, i = True, i + 2
+                else:
+                    raise ValueError(
+                        f"`{toks[i][1]}`? after the source come `where ...`, "
+                        f"`limit N [chunks]` and `into view`, each once")
             doc = build(kind, terms, conds, limit)
             if into:
                 if head != "select":
@@ -1221,13 +1235,19 @@ class Shell:
         what = re.sub(r"\s+into\s+view\s*;?\s*$", "", line.strip(),
                       flags=re.I).rstrip(";")
         streams = backend.records(doc)
+        # Which hosts refused THE READ. `unreachable` follows the last
+        # question asked, and the store listing on the next line asks
+        # another one — a host that answers that would erase the refusal
+        # which is the whole reason the answer is short.
+        refused = dict(backend.unreachable)
         answer = timberview.Records(streams, stores=backend.stores(), what=what)
         if not answer.entries:
-            note = self.why_empty(doc)
-            print(note if note else "  -- nothing matched")
+            # What the hosts SAID goes with the empty answer, not after a
+            # viewer that is never opened.
+            print(self.why_empty(doc, refused))
             return
         end = timberview.watch_source(backend, answer)
-        report_errors(backend.unreachable)
+        report_errors({**refused, **backend.unreachable})
         print(f"  {end}" if end else "  -- left the answer")
 
     def view(self, toks):
@@ -1254,9 +1274,16 @@ class Shell:
             raise ValueError(f"`{toks[rest][1]}`? nothing follows a position")
         stores = backend.select_stores(terms)
         if not stores:
+            # A host that did not answer contributes no stores, so an
+            # empty list is not evidence that the predicate is wrong.
+            report_errors(backend.unreachable)
+            answered = len(TARGETS) - len(backend.unreachable)
+            if not answered:
+                raise ValueError("nothing answered, so there is nothing to open")
             raise ValueError(
                 "that predicate selects NO STORE"
-                + (f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1
+                + (f" on the {answered} that answered" if backend.unreachable
+                   else f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1
                    else "") + ", so there is nothing to open")
         try:
             end = timberview.watch(backend, stores[0], **pos)
@@ -1350,24 +1377,40 @@ class Shell:
             print("  -- nothing more (for now)")
         cur["at"] = list(at.values())
 
-    def why_empty(self, doc):
+    def why_empty(self, doc, bad=None):
         """Nothing came back — was anything even SEARCHED?
 
         "no store matched the predicate" and "the stores held no matching
         entry" are opposite problems and look identical from an empty
         answer. Only asked when the answer IS empty, so the extra request
-        is paid on the confusing case and nowhere else."""
+        is paid on the confusing case and nowhere else.
+
+        A host that did not ANSWER is the third case, and counting it as
+        the first repeats the mistake one layer down: it holds an unknown
+        number of matching stores, so a fleet that refused cannot be
+        evidence about the predicate. `bad` is what already failed — those
+        hosts are named, not asked a second time."""
+        bad = dict(bad or {})
         probe = {k: v for k, v in doc.items() if k in ("v", "stores")}
         probe["response_format"] = {"kind": "stores"}
         n = 0
         for host in TARGETS:
+            if host in bad:
+                continue
             out, err, rc = self.ask(probe, host)
-            if rc == 0:
+            if rc != 0:
+                bad[host] = err or f"exit {rc}"
+            else:
                 n += len(unwrap(out)[0])
+        report_errors(bad)
         if n:
             return f"  -- nothing matched, in {n} store(s)"
+        if len(bad) == len(TARGETS):
+            return "  -- nothing answered, so the predicate was never tried"
         return ("  -- that predicate selects NO STORE"
-                + (f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1 else "")
+                + (f" on the {len(TARGETS) - len(bad)} that answered" if bad
+                   else f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1
+                   else "")
                 + ", so nothing was searched")
 
     def once(self, doc, kind):
