@@ -1660,6 +1660,26 @@ mod cli_tests {
         assert!(e.contains("FILES"), "a real read must still name one: {e}");
     }
 
+    /// `import /logs/*` with the `--into` forgotten: the shell expands the
+    /// glob, the last path becomes the destination, and a real log is
+    /// overwritten by a store. It is an argument error whatever the glob
+    /// expanded to — including a single file, where the mistake looks
+    /// exactly like a correct one-file import.
+    #[test]
+    fn a_forgotten_destination_is_an_argument_error() {
+        for args in [
+            vec!["timberfs", "import", "a.log", "b.log"],
+            vec!["timberfs", "import", "a.log"],
+        ] {
+            let e = match Cli::try_parse_from(&args) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{args:?} was accepted with no destination"),
+            };
+            assert!(e.contains("--into"), "{args:?}: {e}");
+        }
+        assert!(Cli::try_parse_from(["timberfs", "import", "a.log", "--into", "s/s.log"]).is_ok());
+    }
+
     /// Every subcommand must appear in the man page. Documentation drift
     /// is invisible to every other check: `forward-intake` and
     /// `otlp-intake` were each shipped before this existed, and only an

@@ -719,15 +719,13 @@ run_test "collapse-head retention survives repeated kill -9" collapse_crash_kill
 run_test "info/query: read-only, work for a non-root reader" info_readonly_nonroot
 run_test "records sink flushes by age, before EOF" records_sink_age_flush
 
-query_max_and_tail() {
-    # --max is an exact hard cap; --tail is chunk-granular last-N entries.
-    # A small chunk size spreads 40 lines over several chunks so --tail
-    # selects a proper suffix, not the whole store.
+query_tail_and_filter_caps() {
+    # --tail is chunk-granular last-N entries, and it runs the follow path,
+    # which is not reachable from a unit test yet. The exact --max cap is
+    # `query::paging_tests::a_max_is_an_exact_cap_on_entries`; what is left
+    # here is the tail, and timber-filter's own cap.
     seq 1 40 | sed 's/^/2026-06-08T08:00:00 INFO line /' > /tmp/hl.src
     timberfs import /tmp/hl.src --into "$PIPE_BACKING/hl.log" --chunk-size 512 --quiet
-    [ "$(timberfs query "$PIPE_BACKING/hl.log" | wc -l)" = 40 ] || return 1
-    # exact cap
-    [ "$(timberfs query "$PIPE_BACKING/hl.log" --max 5 | wc -l)" = 5 ] || return 1
     [ "$(timber-filter "$PIPE_BACKING/hl.log" --max 7 | wc -l)" = 7 ] || return 1
     # --tail: at least N, fewer than all (multi-chunk), includes the last entry
     local n
@@ -760,7 +758,7 @@ query_follow_live() {
     [ "$got" = yes ] && grep -q live-a /tmp/fl.out && ! grep -q seed-line /tmp/fl.out
 }
 
-run_test "query --max caps exactly; --tail is entry-granular" query_max_and_tail
+run_test "query --tail is entry-granular; timber-filter --max caps" query_tail_and_filter_caps
 run_test "query --follow streams new entries live" query_follow_live
 
 query_follow_idle_flush() {
@@ -4459,16 +4457,14 @@ grep_entry_aware() {
 
 run_test "grain: reindex + --has finds a needle, skipping chunks" grain_needle_search
 multi_file_fleet_view() {
+    # timber-filter counting across several stores. The timberfs half —
+    # interleaved by time, one prefix per line — is
+    # `query::paging_tests::the_text_fleet_view_interleaves_and_attributes_every_line`.
     printf '2026-06-06T10:00:00 INFO alpha one\n2026-06-06T10:00:02 INFO alpha two\n' > /tmp/hA.log
     printf '2026-06-06T10:00:01 INFO beta one\n2026-06-06T10:00:03 ERROR beta boom\n' > /tmp/hB.log
     timberfs import /tmp/hA.log --into "$PIPE_BACKING/hA.log" --chunk-size 1 2>/dev/null
     timberfs import /tmp/hB.log --into "$PIPE_BACKING/hB.log" --chunk-size 1 2>/dev/null
-    # interleaved and attributed
-    OUT=$(timberfs query "$PIPE_BACKING/hA.log" "$PIPE_BACKING/hB.log" 2>/dev/null)
-    [ "$(echo "$OUT" | head -2 | grep -c 'one')" = 2 ] \
-        && echo "$OUT" | head -1 | grep -q "hA.log:" \
-        && echo "$OUT" | sed -n 2p | grep -q "hB.log:" \
-        && [ "$(timber-filter --has ERROR -c "$PIPE_BACKING/hA.log" "$PIPE_BACKING/hB.log" 2>/dev/null)" = 1 ]
+    [ "$(timber-filter --has ERROR -c "$PIPE_BACKING/hA.log" "$PIPE_BACKING/hB.log" 2>/dev/null)" = 1 ]
 }
 
 run_test "timber-filter: entry-aware matching, stdin and grain-accelerated source" grep_entry_aware
@@ -4477,16 +4473,19 @@ forgotten_destination_refused() {
     # what the glob expanded to; and a plain-file --into is refused too
     printf '2026-06-07T08:00:00 a\n' > /tmp/fg1.log
     printf '2026-06-07T08:00:01 b\n' > /tmp/fg2.log
+    # That the ARGUMENTS are refused is
+    # `cli_tests::a_forgotten_destination_is_an_argument_error`; what needs
+    # the binary is that nothing was written where the glob pointed, and
+    # that a plain file is refused as a destination at run time.
     if timberfs import /tmp/fg1.log /tmp/fg2.log 2>/tmp/fg.err; then
         return 1
     fi
-    grep -q "\-\-into" /tmp/fg.err \
-        && [ ! -e /tmp/fg2.log.trunk ] \
+    [ ! -e /tmp/fg2.log.trunk ] \
         && ! timberfs import /tmp/fg1.log --into /tmp/fg2.log 2>/dev/null \
         && ! echo x | timberfs append --into /tmp/fg1.log 2>/dev/null
 }
 
-run_test "multi-file: interleaved attributed query, per-file grep counts" multi_file_fleet_view
+run_test "multi-file: timber-filter counts across stores" multi_file_fleet_view
 sticky_declared_index() {
     # create --index declares; imports maintain the grain with no flag
     printf '2026-06-08T09:00:00 INFO alpha STICKYNEEDLE42
