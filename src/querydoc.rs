@@ -497,14 +497,25 @@ pub struct Answer {
     /// extra punctuation.
     #[cfg_attr(test, schemars(with = "Vec<crate::store_json::Store>"))]
     pub stores: serde_json::Value,
+    /// What this machine will let one request ask for. Absent where it
+    /// declares nothing, which is the default install.
+    ///
+    /// Here because a store listing is the FIRST thing a client asks —
+    /// it has to know which stores exist before it reads any — so the
+    /// ceilings arrive in time to size a page, rather than as the reason
+    /// an answer came back short.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<crate::limits::Limits>,
 }
 
 impl Answer {
-    pub fn with_stores(stores: serde_json::Value) -> Self {
-        Answer {
+    pub fn with_stores(stores: serde_json::Value) -> anyhow::Result<Self> {
+        let limits = crate::limits::configured()?;
+        Ok(Answer {
             server_version: server_version(),
             stores,
-        }
+            limits: (!limits.is_empty()).then_some(limits),
+        })
     }
 }
 
@@ -654,6 +665,13 @@ impl Document {
 
     /// The `Query` this document describes.
     pub fn to_query(&self) -> anyhow::Result<Query> {
+        self.to_query_under(crate::limits::configured()?)
+    }
+
+    /// The same, against ceilings handed in rather than read from this
+    /// machine — the seam a query server sits on, and what lets the
+    /// ceilings be tested without a process-wide environment.
+    pub fn to_query_under(&self, ceilings: crate::limits::Limits) -> anyhow::Result<Query> {
         if self.v != VERSION {
             // Whether a compatible build exists at all is the thing a
             // generator's author most needs to know here, and while the
@@ -790,7 +808,7 @@ impl Document {
                 );
             }
         }
-        let q = Query {
+        let mut q = Query {
             sources: resolve_stores(&self.stores)?,
             cursor: self
                 .cursor
@@ -817,6 +835,7 @@ impl Document {
                 tail_chunks: self.tail.as_ref().and_then(|b| b.chunks),
                 tail: self.tail.as_ref().and_then(|b| b.entries),
                 deadline_ms: self.deadline.as_ref().map(|d| d.ms),
+                imposed: Default::default(),
             },
             output: Output {
                 no_filename: fmt.options.no_filename,
@@ -836,6 +855,19 @@ impl Document {
         // following read). Checking here means `to_query` yields a query
         // that RUNS, rather than one that fails later somewhere else.
         q.validate()?;
+        // This machine's ceilings, last: they lower what the request
+        // asked for, and lowering a bound the document itself would have
+        // been refused for would hide the refusal.
+        //
+        // The DOCUMENT only. A document is a request from somewhere else;
+        // the flags beside it are the operator at a shell, and an
+        // operator does not need protecting from their own `--max`.
+        //
+        // A store listing reads no entries — `window`, `match`, `max` and
+        // `tail` are refused with it — so there is no bound to put one on.
+        if !self.lists_stores() {
+            ceilings.impose(fmt.kind == Kind::Chunks, &mut q.limit)?;
+        }
         Ok(q)
     }
 }
@@ -898,6 +930,7 @@ mod tests {
                 max_chunks: None,
                 tail_chunks: None,
                 deadline_ms: Some(5_000),
+                imposed: Default::default(),
             },
             output: Output {
                 no_filename: true,
@@ -1073,7 +1106,7 @@ mod tests {
         assert!(v.starts_with("timberfs, "), "{v}");
         assert!(v.ends_with(env!("CARGO_PKG_VERSION")), "{v}");
 
-        let a = Answer::with_stores(serde_json::json!([]));
+        let a = Answer::with_stores(serde_json::json!([])).unwrap();
         let rendered = serde_json::to_value(&a).unwrap();
         assert_eq!(rendered["server_version"], v);
         assert!(rendered["stores"].is_array());
@@ -1353,6 +1386,61 @@ mod tests {
         .is_err());
     }
 
+    /// The ceilings bound the DOCUMENT, and every case has to be told
+    /// apart in the answer: a bound the request asked for, one this
+    /// machine lowered onto it, and one it supplied where the request
+    /// named none.
+    #[test]
+    fn this_machines_ceilings_bound_a_request_that_asked_for_more() {
+        let ceilings = crate::limits::Limits {
+            max_entries: Some(100),
+            deadline_ms: Some(5_000),
+            ..Default::default()
+        };
+        let of = |doc: &str| -> Query {
+            serde_json::from_str::<Document>(doc)
+                .unwrap()
+                .to_query_under(ceilings)
+                .unwrap()
+        };
+        let bare = of(r#"{"v":"1.0-EXPERIMENTAL","stores":{}}"#);
+        assert_eq!(
+            (bare.limit.max, bare.limit.deadline_ms),
+            (Some(100), Some(5_000))
+        );
+        assert!(bare.limit.imposed.max && bare.limit.imposed.deadline);
+
+        let over = of(r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":{"entries":900}}"#);
+        assert_eq!(over.limit.max, Some(100));
+        assert!(over.limit.imposed.max);
+
+        let under = of(r#"{"v":"1.0-EXPERIMENTAL","stores":{},"max":{"entries":9}}"#);
+        assert_eq!(under.limit.max, Some(9));
+        assert!(!under.limit.imposed.max);
+
+        // Declared on the read, so the answer carries them whether or not
+        // one of them bit.
+        assert_eq!(under.limit.imposed.declared, ceilings);
+    }
+
+    /// A store listing reads no entries — `max` and `tail` are refused
+    /// with it — so there is no bound for a ceiling to sit on. Putting
+    /// one there would contradict the refusal one line above it.
+    #[test]
+    fn a_store_listing_gets_no_ceiling_because_it_has_no_bound() {
+        let q = serde_json::from_str::<Document>(
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"response_format":{"kind":"stores"}}"#,
+        )
+        .unwrap()
+        .to_query_under(crate::limits::Limits {
+            max_entries: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(q.limit.max, None);
+        assert!(!q.limit.imposed.max);
+    }
+
     #[test]
     fn a_member_the_code_would_ignore_is_not_in_the_contract() {
         // A contract that names a member the code ignores is the failure
@@ -1462,7 +1550,7 @@ mod tests {
         let schema = schemars::schema_for!(Answer);
         let compiled = jsonschema::validator_for(&serde_json::to_value(&schema).unwrap())
             .expect("the generated schema must itself be valid");
-        let a = Answer::with_stores(serde_json::json!([]));
+        let a = Answer::with_stores(serde_json::json!([])).unwrap();
         let v = serde_json::to_value(&a).unwrap();
         assert!(
             compiled.is_valid(&v),

@@ -1,10 +1,10 @@
 # Paging: a cursor beside the search, not inside it
 
-**Status: the position, the cursor and the deadline are BUILT; the
-service-imposed limits are not.** A `position` record per examined
-store says where each got to, and handing those back as the request's
-`cursor` resumes exactly there. What follows is the reasoning, and what
-remains. The pieces it rested on were already there: a store carries an id,
+**Status: BUILT — the position, the cursor, the deadline, and the
+service-imposed limits.** A `position` record per examined store says
+where each got to, and handing those back as the request's `cursor`
+resumes exactly there. What follows is the reasoning. The pieces it
+rested on were already there: a store carries an id,
 `Cursor { seq, n }` means "chunk, and entries delivered from it" and resolves
 against retention, the records stream emits one `source` record per examined
 store, and `stream-end` says whether a bound stopped the read.
@@ -27,9 +27,27 @@ the one it stopped inside carries a position, a store selected but never
 opened has `chunks_read=0`, and one it never reached at all has no `source`
 record while `stream-start` still counts it.
 
-What is still missing are the **service-imposed limits** a query server
-will want to declare — its own ceilings on what a request may ask for,
-announced rather than discovered by having a request refused.
+Read under this machine's **ceilings** (`/etc/timberfs/limits.conf`:
+`MAX_ENTRIES`, `MAX_CHUNKS`, `DEADLINE_MS`), which bound the DOCUMENT and
+not the flags beside it — a document is a request from somewhere else,
+where the flags are the operator at a shell.
+
+They are announced, not discovered: a `stores` answer carries a `limits`
+object and a records or chunks `stream-start` carries the same values as
+fields, so a caller sizes its pages before it asks.
+
+A `max` or `deadline` over the ceiling is LOWERED, and `stream-end` says
+`limit=limits.max.entries` where the request's own bound would have said
+`limit=max.entries` — "you asked for this much" and "this is all one
+answer may carry" are different facts, and only the second says to page.
+A `tail` over it is REFUSED: a tail answer carries no `position`, so a
+shorter tail is a different answer rather than the start of the one asked
+for. That asymmetry is the whole reason the two are treated differently,
+and it is the same one this note opens with.
+
+⚠ It bounds **accidents, not adversaries**. Whoever controls the argv or
+the environment controls the ceilings too; what it protects is the machine
+from one document that asks for everything.
 
 ## What a client could do before that (kept, because it is the argument)
 

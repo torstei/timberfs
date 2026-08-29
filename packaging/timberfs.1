@@ -2420,6 +2420,69 @@ does not show it.
 moves where the declarations are read from and written to, for a test or
 an install that is not rooted at
 .IR / .
+.SH QUERY CEILINGS
+What this machine will let ONE REQUEST ask for:
+.I /etc/timberfs/limits.conf
+\(em the same
+.B KEY=VALUE
+idiom as a forest or an instance
+.IR .conf .
+Three keys, each optional and each unset by default:
+.BR MAX_ENTRIES ,
+.B MAX_CHUNKS
+and
+.BR DEADLINE_MS .
+Blank lines and
+.B #
+comments are ignored;
+.B TIMBERFS_LIMITS
+holds the same text and replaces the file, for a one-off.
+.PP
+⚠ An unknown key is REFUSED, where
+.I forests.d
+ignores one. The directions of failure are opposite: a forest nobody
+reads is a store not found, and a ceiling nobody reads is the unbounded
+read the file exists to prevent \(em so a typo, and an older timberfs
+meeting a newer policy, both fail closed.
+.PP
+They bound a
+.BR timberfs\-query\-document (5)
+and NOT the flags beside it. A document is a request from somewhere else
+\(em a relay hands one to
+.B "timberfs query \-\-query \-"
+for a caller who does not own this machine \(em where the flags are the
+operator at a shell, who does not need protecting from their own
+.BR \-\-max .
+.PP
+A
+.B max
+or
+.B deadline
+over a ceiling is LOWERED and the answer is the first PAGE of the one
+that was asked for:
+.B stream-end
+says
+.B status=limited
+naming
+.BR limit=limits.max.entries ,
+and the
+.B position
+records resume it. A
+.B tail
+over one is REFUSED \(em a tail answer carries no position, so a shorter
+tail is a different answer rather than the start of the one asked for.
+The ceilings are declared in every answer that has somewhere to put them
+(a
+.B limits
+object in a
+.B stores
+answer, fields on a
+.BR stream-start ),
+so a caller sizes its pages before it asks.
+.PP
+⚠ This bounds ACCIDENTS, not adversaries: whoever controls the argv or
+the environment controls the ceilings too. What it protects is the
+machine from one document that asks for everything.
 .SH WHERE AN INTAKE WRITES
 The four intakes \(em
 .BR forward\-intake ", " otlp\-intake ", " incus\-intake " and " frames\-intake

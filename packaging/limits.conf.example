@@ -1,0 +1,31 @@
+# Copy to /etc/timberfs/limits.conf.
+#
+# What this machine will let ONE REQUEST ask for. Each key is optional and
+# unset by default, which is no ceiling at all.
+#
+# They bound a timberfs-query-document(5) and not the flags beside it: a
+# document is a request from somewhere else, where the flags are the
+# operator at a shell.
+#
+# A `max` or `deadline` over a ceiling is LOWERED, and the answer is then
+# the first page of the one that was asked for — stream-end says which
+# ceiling stopped it and the position records resume it. A `tail` over one
+# is refused, because a tail answer carries no position to continue from.
+#
+# The ceilings are declared in every answer that has somewhere to put them,
+# so a caller sizes its pages before it asks rather than after an answer
+# came back short.
+#
+# ⚠ This bounds accidents, not adversaries: whoever controls the argv or
+# the environment controls these too.
+
+# Most entries one answer may deliver.
+#MAX_ENTRIES=100000
+
+# The same in chunks — the unit a `chunks` answer is bounded in, since an
+# entry count there caps entries nobody asked about.
+#MAX_CHUNKS=5000
+
+# Longest one search may run. It bounds what the other two cannot: a read
+# is slow because it READS a lot, not because it matches a lot.
+#DEADLINE_MS=30000

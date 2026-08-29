@@ -1285,7 +1285,7 @@ fn main() -> anyhow::Result<()> {
                     let stores = list::stores_json(&[], Some(&doc.store_selector()))?;
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&querydoc::Answer::with_stores(stores))?
+                        serde_json::to_string_pretty(&querydoc::Answer::with_stores(stores)?)?
                     );
                     return Ok(());
                 }
@@ -1321,6 +1321,9 @@ fn main() -> anyhow::Result<()> {
                     max_chunks: None,
                     tail_chunks: None,
                     deadline_ms: deadline.map(|s| (s * 1000.0).max(0.0) as u64),
+                    // The flags are the operator at a shell, and this
+                    // machine's ceilings bound a request from elsewhere.
+                    imposed: Default::default(),
                 },
                 output: query::Output {
                     no_filename,

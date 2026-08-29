@@ -554,6 +554,42 @@ pub struct Limit {
     /// Answered with whatever was gathered, which is what a client-side
     /// timeout cannot do — it drops the connection and everything on it.
     pub deadline_ms: Option<u64>,
+    /// Which of these came from this machine's ceiling rather than from
+    /// the request.
+    pub imposed: Imposed,
+}
+
+/// This machine's ceilings as they bear on ONE read: what it declares,
+/// and which of them it had to put on this request.
+///
+/// A bound the SERVICE put there is named apart when it stops a read,
+/// because "you asked for this much" and "this is all one answer may
+/// carry" are different facts and only the second says to page.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Imposed {
+    /// Declared to the caller in `stream-start`, so a page can be sized
+    /// before it is asked for rather than after an answer came back
+    /// short. Empty on the flag path — the ceilings bound a request from
+    /// elsewhere, and an answer the operator asked for by hand must not
+    /// claim a bound it was not given.
+    pub declared: crate::limits::Limits,
+    pub max: bool,
+    pub max_chunks: bool,
+    pub deadline: bool,
+}
+
+impl Imposed {
+    /// What `stream-end`'s `limit=` calls a bound.
+    fn name(imposed: bool, member: &'static str) -> &'static str {
+        if !imposed {
+            return member;
+        }
+        match member {
+            "max.entries" => "limits.max.entries",
+            "max.chunks" => "limits.max.chunks",
+            _ => "limits.deadline",
+        }
+    }
 }
 
 /// The read's remaining time, ASKED rather than computed at each site.
@@ -777,6 +813,7 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             max,
             poll,
             entry_preds,
+            q.limit.imposed,
         );
     }
     let windowed = from.is_some() || to.is_some();
@@ -814,12 +851,21 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             null_sep,
             records,
             max,
+            q.limit.imposed,
             &budget,
         );
     }
     if chunk_records {
         return query_chunks_framed(
-            files, from_ms, to_ms, from_chunk, has, any, max_chunks, &budget,
+            files,
+            from_ms,
+            to_ms,
+            from_chunk,
+            has,
+            any,
+            max_chunks,
+            q.limit.imposed,
+            &budget,
         );
     }
     if files.len() == 1 {
@@ -863,6 +909,7 @@ fn query_entries<W: Write>(
     null_sep: bool,
     records: bool,
     max: Option<u64>,
+    imposed: Imposed,
     budget: &Budget,
 ) -> anyhow::Result<()> {
     struct Src {
@@ -1012,8 +1059,9 @@ fn query_entries<W: Write>(
     if records {
         write!(
             out,
-            "\x1estream-start\x1fv=1\x1fserver_version={}",
-            crate::querydoc::server_version()
+            "\x1estream-start\x1fv=1\x1fserver_version={}{}",
+            crate::querydoc::server_version(),
+            imposed.declared.record_fields()
         )?;
         if from_ms > 0 {
             write!(out, "\x1ffrom={from_ms}")?;
@@ -1087,7 +1135,7 @@ fn query_entries<W: Write>(
     let mut chunks_out = 0u64;
     while let Some(i) = (0..srcs.len()).find(|&i| srcs[i].pos < srcs[i].chunks.len()) {
         if budget.expired() {
-            stopped_by = Some("deadline");
+            stopped_by = Some(Imposed::name(imposed.deadline, "deadline"));
             break;
         }
         let s = &mut srcs[i];
@@ -1120,7 +1168,7 @@ fn query_entries<W: Write>(
         // --max reached: stop decompressing further chunks.
         if let Some((count, m)) = &limit {
             if count.get() >= *m {
-                stopped_by = Some("max.entries");
+                stopped_by = Some(Imposed::name(imposed.max, "max.entries"));
                 break;
             }
         }
@@ -1129,7 +1177,7 @@ fn query_entries<W: Write>(
         // fifteen.
         chunks_out += 1;
         if max_chunks.is_some_and(|m| chunks_out >= m) {
-            stopped_by = Some("max.chunks");
+            stopped_by = Some(Imposed::name(imposed.max_chunks, "max.chunks"));
             break;
         }
         // Read to its end: release the entry this store was holding open
@@ -1176,7 +1224,7 @@ fn query_entries<W: Write>(
         // the loop's own check does not.
         if s.sink.suppressed > 0 {
             limited = true;
-            stopped_by = stopped_by.or(Some("max.entries"));
+            stopped_by = stopped_by.or(Some(Imposed::name(imposed.max, "max.entries")));
         }
         // What was actually READ, which is how far each source advanced —
         // not how many chunks were selected for it. They differ exactly
@@ -1392,6 +1440,7 @@ fn query_follow(
     max: Option<u64>,
     poll: Option<f64>,
     entry_preds: Option<crate::grep::Preds>,
+    imposed: Imposed,
 ) -> anyhow::Result<()> {
     let multi = files.len() > 1 && !no_filename;
     // Framing needs entries; plain text streams raw bytes (no one-entry lag).
@@ -1501,8 +1550,9 @@ fn query_follow(
         // need not be a timberfs.
         write!(
             out,
-            "\x1estream-start\x1fv=1\x1fserver_version={}",
-            crate::querydoc::server_version()
+            "\x1estream-start\x1fv=1\x1fserver_version={}{}",
+            crate::querydoc::server_version(),
+            imposed.declared.record_fields()
         )?;
         if let Some(fr) = from {
             write!(out, "\x1ffrom={fr}")?;
@@ -1815,12 +1865,13 @@ fn query_chunks_framed(
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
+    imposed: Imposed,
     budget: &Budget,
 ) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     write_chunks_framed(
-        &mut out, files, from_ms, to_ms, from_chunk, has, any, max_chunks, budget,
+        &mut out, files, from_ms, to_ms, from_chunk, has, any, max_chunks, imposed, budget,
     )?;
     out.flush()?;
     Ok(())
@@ -1838,12 +1889,14 @@ fn write_chunks_framed<W: Write>(
     has: &[String],
     any: &[String],
     max_chunks: Option<u64>,
+    imposed: Imposed,
     budget: &Budget,
 ) -> anyhow::Result<()> {
     write!(
         out,
-        "\x1estream-start\x1fv=1\x1fserver_version={}\x1forder=sequential\x1fsources={}",
+        "\x1estream-start\x1fv=1\x1fserver_version={}{}\x1forder=sequential\x1fsources={}",
         crate::querydoc::server_version(),
+        imposed.declared.record_fields(),
         files.len()
     )?;
     out.write_all(b"\0")?;
@@ -1886,11 +1939,11 @@ fn write_chunks_framed<W: Write>(
 
         for (_, c) in &selected {
             if max_chunks.is_some_and(|m| sent >= m) {
-                stopped = Some("max.chunks");
+                stopped = Some(Imposed::name(imposed.max_chunks, "max.chunks"));
                 break;
             }
             if budget.expired() {
-                stopped = Some("deadline");
+                stopped = Some(Imposed::name(imposed.deadline, "deadline"));
                 break;
             }
             // The COMPRESSED frame. `read_chunk` decompresses; this is the
@@ -3620,6 +3673,7 @@ mod chunk_stream_tests {
             &[],
             &[],
             None,
+            Default::default(),
             &Budget::Unbounded,
         )
         .unwrap();
@@ -3699,6 +3753,7 @@ mod chunk_stream_tests {
             &[],
             &[],
             None,
+            Default::default(),
             &Budget::Unbounded,
         )
         .unwrap();
@@ -3720,6 +3775,7 @@ mod chunk_stream_tests {
             &[],
             &[],
             Some(1),
+            Default::default(),
             &Budget::Unbounded,
         )
         .unwrap();
@@ -3762,6 +3818,7 @@ mod chunk_stream_tests {
             &[],
             &[],
             Some(2),
+            Default::default(),
             &Budget::Unbounded,
         )
         .unwrap();
@@ -3833,6 +3890,7 @@ mod paging_tests {
             false,
             true, // records
             max,
+            Default::default(),
             &Budget::Unbounded,
         )
         .unwrap();
@@ -4073,6 +4131,7 @@ mod deadline_tests {
             false, // null_sep
             true,  // records
             None,
+            Default::default(),
             budget,
         )
         .unwrap();
@@ -4259,6 +4318,7 @@ mod served_bytes_tests {
                 false, // null_sep
                 true,  // records
                 None,
+                Default::default(),
                 &Budget::Unbounded,
             )
             .unwrap();
@@ -4322,6 +4382,7 @@ mod served_bytes_tests {
             false, // null_sep
             true,  // records
             None,
+            Default::default(),
             &Budget::Unbounded,
         )
         .unwrap();
