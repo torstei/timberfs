@@ -313,7 +313,12 @@ here.
   supply, carrying `offset` beside `chunk`. Lines rather than entries, so
   it needs no index and no parseable timestamps: the two cases where
   `select` helps least. The whole timberfs side is relaxing one refusal —
-  `from_chunk` on a bounded read is a seek, not a resume. Design note:
+  `from_chunk` on a bounded read is a seek, not a resume. Its own front
+  end too (an entry-aware pager for a `records` stream needs no fleet),
+  which makes the coordinate a value worth writing down — and the note
+  carries that thread: an address that names a store by IDENTITY, so that
+  `TIMBERFS_HOSTS` can stop being /etc/hosts for timberfs and become
+  something resolved. Design note:
   [docs/plans/view.md](docs/plans/view.md).
 - **Ordering by the clock an entry CARRIES**: a bounded answer reads stores
   one after another and claims no order between them, because a streaming

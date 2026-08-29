@@ -51,6 +51,12 @@ name the store that contained an identifier, and locate it no better than
 carries `offset` beside `chunk`, so a hit is a **coordinate**, and
 jumping to it is an ordinary seek.
 
+A coordinate that gets passed between components wants a written form.
+That is [the address](#the-address) below, and it is the same value
+throughout: a search returns addresses, opening one is opening an
+address, and handing a place back to the shell is handing it an address.
+Being pasteable into a ticket is the free consequence, not the reason.
+
 This is why `view` should not be `less`. Handing a temp file to a pager
 gets scrolling and search for free, and gives up every part of the loop:
 there is nowhere to put a fleet search, no way to show a position that
@@ -78,6 +84,129 @@ chunk covering that instant:
 
 Aligning several hosts on one moment is what an incident actually needs,
 and it falls out of the viewer knowing where it is.
+
+## Two front ends, one seam
+
+The viewer is not a mode of the shell. It has a second use with no fleet
+and no shell in it:
+
+```sh
+timberfs query --records --from 13:00 --has ERROR app.log | timberview
+timberview /var/log/timberfs/app/app.log
+```
+
+An entry-aware pager for a `records` stream — multi-line entries as
+units, `ts`/`wf`/`offset` per entry, indexable tokens highlighted — is
+useful to anyone piping timberfs output. That, rather than "usable on the
+box", is what makes it a tool: on a fleet nobody has a shell on, the
+viewer runs on a workstation and needs exactly the shell's transport
+config anyway.
+
+So: a module with its own entry point, in `timberfs-sh`, and timbersh
+calls it **in process**.
+
+⚠ Not a separate process the shell execs. The loop is the whole point and
+it would cross the boundary badly: the viewer would exit carrying "the
+user asked to search F8854…", the shell would search, print, and
+re-invoke at a coordinate — a leave-alt-screen, flicker, re-enter per
+hop, which is the opposite of what a viewer is for.
+
+⚠ And it does not get its own selector, document builder or records
+parser. `tools/README.md` already says the selector is never
+reimplemented; a second copy living in a second command is exactly the
+drift this repo has spent several releases removing. Shared module, or it
+is not worth doing.
+
+The viewer needs four things from whoever hosts it, and nothing else:
+
+```
+chunk(store, seq)   -> lines + ring
+bounds(store)       -> first_seq, last_seq, dropped bytes
+search(token)       -> addresses
+stores()            -> the list, for :n
+```
+
+Written against those from the first line, two things follow: it is
+testable against a fake, the way `tests/timbersh/` already tests timbersh
+against a scripted server; and the standalone entry point is a second
+implementation of the same four — a local store, or a buffered `records`
+stream on stdin. Cheap to decide now, expensive to retrofit.
+
+⚠ The fleet search stays the shell's. Fan-out is not timberfs's job and
+it is not a pager's: the viewer asks for `search(token)` and does not
+know there are ten hosts.
+
+## The address
+
+A coordinate is passed from a search to a viewer, from one viewer to
+another, and back to the shell. Give it a written form and all three are
+the same operation:
+
+```
+timber://imap01/79d7f23a-b044-4a72-8be3-d26e0481d202#offset=33724753900
+timber://imap01/79d7f23a-…#chunk=498248
+timber:79d7f23a-…                       -- the store, no position, no host
+```
+
+Three rules decide the shape.
+
+**Identity, not location.** The store id is the name; the host is a HINT
+a resolver may confirm, override, or not need. Bake the host into the
+address and every pasted link breaks when a store moves, and there is
+nothing left for a resolver to resolve — which is the whole point of the
+next section. Same rule the query document already follows: a document
+names stores by identity, never by path.
+
+**A position says which coordinate it is.** `#offset=` and `#chunk=` are
+different numbers, and `#at=<time>` is a third thing again. A bare number
+would be ambiguous, and an address that resolves to the wrong place
+silently is worse than one that will not parse.
+
+**The full id, in a written address.** timbersh expands a short id
+git-style when you type one and refuses an ambiguous one — right for a
+prompt, wrong for a link, where the ambiguity would be discovered by
+whoever pasted it somewhere else.
+
+An address that has rotted says which way it rotted, which is the reason
+to prefer an offset over a timestamp: the offset is absolute on the tape,
+so it stays valid until retention drops the data and then `first_seq` and
+`dropped_bytes` say it was dropped rather than "not found".
+
+⚠ An address is a PLACE, not a search. The document stays the way a
+search is written down (`--dump-json` already emits one); growing query
+syntax into the address would be a second query language, in the address
+bar. Whether a narrow `timber:?has=<token>` — the one search the viewer
+itself generates — is worth the exception is open.
+
+## /etc/hosts, and the DNS that would replace it
+
+`TIMBERFS_CMD` plus `TIMBERFS_HOSTS` is **/etc/hosts for timberfs**: a
+hand-maintained map from a name to how to reach it, which works, does not
+scale, and has to be right before anything runs. Resolving a store today
+means asking every configured host for its store list and matching the
+id — a broadcast, which is exactly what /etc/hosts leaves you with.
+
+Something more like **DNS** already exists in one place. At Visena,
+`visena-timberfs hosts` derives the queryable set from service discovery
+— the ZooKeeper app registrations, each probed for whether the janitor2
+actually running there serves the query endpoint — and `visena-timberfs
+sh` execs timbersh with `TIMBERFS_HOSTS` already filled in. One command
+gets a fleet-wide shell with no list to maintain. That is a resolver, and
+it is derived rather than configured.
+
+The generalisation is a hook, not a feature: a `TIMBERFS_RESOLVER`
+command, the same shape as `TIMBERFS_CMD`, asked "who has this store" or
+"what is the fleet" and answering with hosts. It keeps discovery out of
+timberfs, where it does not belong — timberfs is a single-node tool and
+the fan-out has always lived in the client.
+
+⚠ Deliberately NOT now. Broadcast resolution is fine at 30 hosts and the
+measured fleet is 8 queryable of 30; the hook earns itself when a
+pasted address names a store the local configuration has never heard of,
+which is the case the viewer will eventually create and does not yet.
+What matters today is only that the address carries **identity**, so that
+adding a resolver later changes how a name is looked up and not what the
+name is.
 
 ## The protocol change: one refusal
 
@@ -161,3 +290,9 @@ project keeps removing from its answers.
 - **Follow.** Not in scope: the live edge is not in a chunk, and `select
   … --follow` already tails it. The viewer only has to *say* it is not
   showing it.
+- **Whether an address may carry a search.** `timber:?has=<token>` is the
+  one query the viewer generates on its own, and pasting "this identifier,
+  fleet-wide" is the thing an incident wants to share. It is also the
+  first millimetre of a query language in an address.
+- **Scheme name.** `timber:` beside `timber-filter`/`timber-otlp`, or
+  `timberfs:` for the product. Cheap now, a compatibility problem later.

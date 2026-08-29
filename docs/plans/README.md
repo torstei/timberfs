@@ -37,4 +37,6 @@ messages and pull requests are for.
   clock an entry CARRIES: the frontier merge that makes it streamable, and the
   per-chunk logline range it needs.
 - [view.md](view.md) — reading a store as a tape rather than a result set: a
-  pager over chunks, and the identifier-to-coordinate loop it exists for.
+  pager over chunks, the identifier-to-coordinate loop it exists for, the
+  address that coordinate is written as, and the resolver that address
+  eventually wants.
