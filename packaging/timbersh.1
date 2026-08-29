@@ -1,4 +1,4 @@
-.TH TIMBERSH 1 "2026-08-28" "timberfs" "User Commands"
+.TH TIMBERSH 1 "2026-08-30" "timberfs" "User Commands"
 .SH NAME
 timbersh \- an interactive shell for timberfs
 .SH SYNOPSIS
@@ -7,6 +7,7 @@ timbersh \- an interactive shell for timberfs
 .RI [ --hosts " H,H" ]
 .RI [ --rc " FILE" ]
 .RI [ --ttl " SECS" ]
+.RI [ --page " N" ]
 .RB [ \-q ]
 .SH DESCRIPTION
 A console for reading timberfs stores, in a grammar borrowed from SQL. It
@@ -189,6 +190,35 @@ it \(em
 .B refresh
 re-reads it and says what changed.
 .RB ( $TIMBERSH_STORE_TTL )
+.TP
+.BI \-\-page " N"
+Entries per CALL on an unbounded read, default 10000. Not the
+statement's
+.BR limit :
+that says how much of the ANSWER you want, this says how much of it may
+be in memory at once. Nothing streams, so an unbounded read otherwise
+buffers the whole answer \(em times the hosts asked in parallel.
+.RB ( $TIMBERSH_PAGE )
+.RS
+.PP
+An unbounded
+.B records
+read is walked a page at a time, handing the
+.B position
+records back as the next page's
+.BR cursor .
+A read with a
+.B limit
+is ONE call: that bound is a total enforced here, so a later host's
+entries are read and dropped, and a page built from its positions would
+resume past exactly what nobody saw.
+.B loglines
+and
+.B chunks
+carry no
+.B position
+record, so they are left unpaged rather than truncated.
+.RE
 .TP
 .B \-q
 Start without printing the help.

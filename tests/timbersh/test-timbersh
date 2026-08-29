@@ -256,6 +256,78 @@ def a_limit_is_a_total_across_hosts():
 
 
 @test
+def an_unbounded_read_is_walked_a_page_at_a_time():
+    """Nothing streams: a call is one `subprocess.run`, so an unbounded
+    read held the WHOLE answer in memory, times the hosts asked in
+    parallel. Measured at 3.4x the answer on the terminal path, and a
+    1.1 GiB store on thirteen hosts is not a query. Every call now
+    carries a page bound, and the positions come back as the next
+    page's cursor."""
+    recs = lambda a, b: [{"id": ID_A, "text": f"line {i}"} for i in range(a, b)]
+    s = Session({"": {"stores": [store("app", ID_A)],
+                      "sequence": [
+                          {"records": recs(0, 3), "status": "limited",
+                           "positions": [{"id": ID_A, "offset": 300}]},
+                          {"records": recs(3, 5), "status": "exhausted",
+                           "positions": [{"id": ID_A, "offset": 500}]}]}},
+                extra=["--page", "3"]).run("select records from [];")
+    assert len([l for l in s.out.splitlines() if "line " in l]) == 5, s.out
+    docs = s.docs("records")
+    assert len(docs) == 2, docs
+    assert docs[0]["max"] == {"entries": 3}, docs[0]
+    assert "cursor" not in docs[0], docs[0]
+    assert docs[1]["cursor"] == [{"id": ID_A, "offset": 300}], docs[1]
+    # OUR bound stopped page one, not a truncation of the answer.
+    assert "STOPPED" not in s.out, s.out
+    assert "5 entries, in 2 pages of 3" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_store_that_went_quiet_on_a_page_keeps_its_place_in_the_cursor():
+    """A store that delivered nothing reports the position it was
+    RESUMED from, and one never consumed reports none at all. Both must
+    ride along: an offsetless entry means the start of the window, and
+    dropping it re-reads that store from the beginning on every page."""
+    s = Session({"": {"stores": [store("app", ID_A), store("quiet", ID_B)],
+                      "sequence": [
+                          {"records": [{"id": ID_A, "text": "line 0"}],
+                           "status": "limited",
+                           "positions": [{"id": ID_A, "offset": 300},
+                                         {"id": ID_B}]},
+                          {"records": [], "status": "exhausted"}]}},
+                extra=["--page", "1"]).run("select records from [];")
+    sent = s.docs("records")[1]["cursor"]
+    assert {"id": ID_A, "offset": 300} in sent, sent
+    assert {"id": ID_B} in sent, sent
+    s.cleanup()
+
+
+@test
+def a_limit_is_one_call_because_a_page_would_resume_past_the_dropped():
+    """A `limit` is a total across hosts, enforced in the client, so a
+    later host is asked for the whole bound and its entries are read and
+    then dropped. Its `position` records cover what it DELIVERED — so a
+    cursor built from that page resumes past exactly the entries nobody
+    saw. A bounded read is therefore one call, never paged."""
+    recs = lambda sid: [{"id": sid, "text": f"line {i}"} for i in range(3)]
+    s = Session({h: {"stores": [store(f"{h}1", ID_A if h == "a" else ID_B)],
+                     "records": recs(ID_A if h == "a" else ID_B),
+                     "status": "limited",
+                     "positions": [{"id": ID_A if h == "a" else ID_B,
+                                    "offset": 300}]}
+                 for h in ("a", "b")},
+                hosts=["a", "b"], extra=["--page", "2"]).run(
+        "select records from [] limit 4;")
+    docs = s.docs("records")
+    assert len(docs) == 2, docs            # one per host, one round
+    assert all(d["max"] == {"entries": 4} for d in docs), docs
+    assert all("cursor" not in d for d in docs), docs
+    assert len([l for l in s.out.splitlines() if "line " in l]) == 4, s.out
+    s.cleanup()
+
+
+@test
 def a_quiet_store_keeps_its_place_across_pages():
     """A position with no offset means the START OF THE WINDOW, so handing
     the answer back verbatim re-read every store that had gone quiet.
@@ -626,6 +698,28 @@ def a_limit_after_into_view_still_bounds_the_read():
     s.send("select records from [] into view banana;\n").expect("banana")
     s.finish()
     assert s.docs("records")[-1].get("max") == {"entries": 1}, s.docs("records")
+    s.cleanup()
+
+
+@test
+def an_answer_screen_takes_one_page_and_says_the_answer_continues():
+    """`Records` materialises every entry it is handed — 2.5x the
+    answer, held for the life of the screen — so paging a gigabyte
+    into it would only move where the memory goes. It takes one page,
+    and the bottom of the screen must not claim to be the end of the
+    answer."""
+    st, chunks = tape("app", ID_A)
+    s = Pty({"": {"stores": [st], "chunks": chunks, "status": "limited",
+                  "records": [{"id": ID_A, "text": f"boom {i}"}
+                              for i in range(3)]}},
+            extra=["--page", "3"]).start()
+    s.expect("timberfs=#")
+    s.send("select records from [] where entry has 'boom' into view;\n")
+    s.expect("the answer continues")
+    assert "end of the answer" not in s.plain, s.plain[-600:]
+    s.send("q").expect("timberfs=#")
+    s.finish()
+    assert s.docs("records")[-1]["max"] == {"entries": 3}, s.docs("records")
     s.cleanup()
 
 

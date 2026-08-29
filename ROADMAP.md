@@ -320,8 +320,10 @@ here.
   log around a match. What remains: "what happened in $FOO around here", the
   drill-down that starts from where you ARE and collides with the
   viewer's no-parsing rule; taking a line selection away as bytes or as
-  the document that reproduces it; and getting the address into a
-  clipboard, over ssh, without failing silently. Design note:
+  the document that reproduces it; getting the address into a clipboard,
+  over ssh, without failing silently; and an answer screen that EXTENDS —
+  it is a closed set today, so it takes one page and says the answer
+  continues, where the tape fetches the next chunk as you reach it. Design note:
   [docs/plans/view.md](docs/plans/view.md).
 - **A fleet is a list of TARGETS, and a resolver derives it** — SHIPPED.
   `TIMBERFS_CMD` with `_TIMBERHOST_` in it made the transport a property of

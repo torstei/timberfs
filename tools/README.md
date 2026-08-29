@@ -97,6 +97,21 @@ whose output falls past the limit did work that is never shown — bounded by
 the limit itself, and the price of not paying the latency serially. Hosts
 with nothing are reported as a count rather than as a row of empty headers.
 
+⚠ **Nothing streams.** One call is one process whose whole output is buffered,
+times the hosts asked at once — measured at 3.4× the answer on the terminal
+path and 2.5× held for the life of an answer screen. So an unbounded `records`
+read is walked a page at a time (`--page`, default 10000 entries), handing the
+`position` records back as the next page's `cursor`: same answer, 215 MB → 33 MB
+on a 400k-entry read. A `limit` is a total enforced in the client, so a later
+host's entries are read and dropped and a page built from its positions would
+resume past exactly what nobody saw — a bounded read is therefore ONE call.
+`loglines` and `chunks` carry no `position` record and cannot be continued, so
+they are left unpaged rather than truncated.
+
+`select ... into view` takes one page: an answer screen materialises every
+entry it is handed, so paging a gigabyte into it would only move where the
+memory goes. The bottom of the screen says the answer continues.
+
 ### What it is for
 
 Dogfooding `timberfs-query-document(5)`. A protocol nobody writes a

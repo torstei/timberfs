@@ -678,10 +678,10 @@ different query than the one it printed.
 Use
 .B \-\-follow
 on the machine that holds the store. A document's equivalent is to ask
-again from where the last answer stopped \(em which is paging, and paging
-is not built yet (see
-.B ⚠ There is no paging yet
-above).
+again from where the last answer stopped, which is what
+.B cursor
+is for \(em the subscription is then the caller's loop rather than the
+document's.
 .SH SEE ALSO
 .BR timberfs (1),
 .BR timberfs\-records (5)
