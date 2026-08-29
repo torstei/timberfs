@@ -159,6 +159,15 @@ chunk yet \(em counted and said, never dropped. On a store being written
 that is ordinary: the newest matches are still in the write-ahead
 sidecar.
 .PP
+⚠ A target too old to place an entry is a DIFFERENT fact.
+.B offset
+on an entry record landed in 0.26.0, so a target still on 0.25.0 answers
+with entries that have no place at all. Calling that a live edge would
+be a claim about the data where the truth is about the server, so the
+stream's own
+.B server_version
+decides, and the note names the target and what to upgrade past.
+.PP
 ⚠ Reading from a pipe needs a keyboard from somewhere other than stdin,
 which is the answer:
 .I /dev/tty

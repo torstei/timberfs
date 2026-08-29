@@ -763,9 +763,11 @@ def a_hit_list_is_itself_searchable():
         == (None, None)
 
 
-def answer(*entries, source_id=ID_A, path="/l/app.log"):
+def answer(*entries, source_id=ID_A, path="/l/app.log", version="0.26.0"):
     """A `records` stream, as timberfs writes one."""
-    recs = [("source", {"path": path, "id": source_id}, None)]
+    recs = [("stream-start", {"v": 1, "server_version": f"timberfs, {version}"},
+             None),
+            ("source", {"path": path, "id": source_id}, None)]
     for text, fields in entries:
         body = text.encode()
         recs.append(("entry", {"len": len(body), **fields}, body))
@@ -842,6 +844,51 @@ def two_streams_do_not_borrow_each_others_attribution():
     assert [str(r.address_of(ln)) for ln in r.lines] == \
         [f"timber:{ID_A}#offset=1", f"timber:{ID_B}#offset=2"], \
         [str(r.address_of(ln)) for ln in r.lines]
+
+
+@test
+def a_target_too_old_to_place_an_entry_is_not_a_live_edge():
+    """`offset` on an entry record landed in 0.26.0. A target still on
+    0.25.0 answers with entries that have no place — and calling that
+    "at the live edge" states a fact about the DATA where the truth is a
+    fact about the server, so it sends you looking at the wrong thing.
+    The stream says what produced it, which settles it."""
+    old = tv.Records(answer(("boom", {"ts": 1}), version="0.25.0"))
+    assert old.stale == 1 and old.unplaced == 0, (old.stale, old.unplaced)
+    assert "0.25.0" in old.top_notes()[0], old.top_notes()
+    assert "live edge" not in old.top_notes()[0], old.top_notes()
+
+    v = tv.View(Fake(["x\n"]), source=old)
+    assert v.leave_for_the_log() is False
+    assert "predates the coordinate" in v.message, v.message
+    assert "Upgrade" in v.message, v.message
+
+    # A current target with an unflushed entry is still the live edge.
+    fresh = tv.Records(answer(("boom", {"ts": 1}), version="0.26.0"))
+    assert fresh.unplaced == 1 and fresh.stale == 0
+    assert "live edge" in fresh.top_notes()[0], fresh.top_notes()
+
+
+@test
+def a_search_says_which_target_could_not_place_its_hits():
+    """The same mistake one level up: every hit unplaced reads as "no
+    hit, all at a live edge" when it means one target is too old."""
+    def ask(doc, host=None, raw=False):
+        if (doc.get("response_format") or {}).get("kind") == "stores":
+            return json.dumps({"server_version": "t", "stores": []}), "", 0
+        body = b"boom"
+        return wire(("stream-start", {"server_version": "timberfs, 0.25.0"}, None),
+                    ("source", {"path": "/l/a.log", "id": ID_A}, None),
+                    ("entry", {"len": len(body), "ts": 1}, body)), "", 0
+
+    b = tv.QueryBackend(ask, ["old01"])
+    hits, unplaced, capped = b.search("boom")
+    assert hits == [] and unplaced == 0, (hits, unplaced)
+    assert b.stale == {"old01": (0, 25, 0)}, b.stale
+    v = tv.View(b, source=tv.Records(answer(("x", {"offset": 0}))))
+    v.search("boom")
+    assert "old01 answered on 0.25.0" in v.message, v.message
+    assert "live edge" not in v.message, v.message
 
 
 def main():

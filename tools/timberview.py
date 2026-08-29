@@ -207,6 +207,26 @@ class Refused(Exception):
 # it: the builds either side of that change both report 0.25.0.
 NO_SEEK = "a chunk number is a resume position"
 
+# The release that put `chunk` and `offset` ON AN ENTRY RECORD. Before
+# it an answer cannot say where its entries are — and that reads exactly
+# like an entry still at the live edge, which is a claim about the DATA
+# where the truth is a fact about the server.
+PLACED_FROM = (0, 26, 0)
+
+
+def server_of(text):
+    """`(0, 26, 0)` from `timberfs, 0.26.0` — the answer's own account
+    of what produced it, which is authoritative for this stream in a way
+    no registration or installed version is."""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def too_old_to_place(where):
+    return ("that timberfs predates the coordinate an answer needs — "
+            f"`offset` on an entry record landed in {'.'.join(map(str, PLACED_FROM))}"
+            f". Upgrade {where}, and its answers can be opened.")
+
 
 def too_old(host, said):
     """What to DO first, what it is second, and the far end's own words
@@ -244,6 +264,9 @@ class QueryBackend:
     def __init__(self, ask, hosts=(None,)):
         self.ask, self.hosts = ask, list(hosts)
         self._stores = None
+        # host -> the version it reported, for a target too old to say
+        # where its entries are.
+        self.stale = {}
         # A chunk's bytes never change once written, so a cached one
         # cannot go stale — which is what makes reading ahead safe.
         self._chunks, self._inflight = {}, set()
@@ -433,8 +456,11 @@ class QueryBackend:
             # An entry names its store only where the read spanned
             # several, so with one source the `source` record is the
             # attribution and the entries inherit it.
-            sources = []
+            sources, version = [], None
             for kind, f, payload in frames(out):
+                if kind == "stream-start":
+                    version = server_of(f.get("server_version"))
+                    continue
                 if kind == "source":
                     sources.append(f.get("id"))
                     continue
@@ -444,9 +470,12 @@ class QueryBackend:
                 if kind != "entry":
                     continue
                 if "chunk" not in f or "offset" not in f:
-                    # The live edge: real, and not in a chunk yet, so
-                    # there is no coordinate to hand back.
-                    unplaced += 1
+                    if version and version < PLACED_FROM:
+                        # Not the live edge: this timberfs cannot say
+                        # where ANY of its entries are.
+                        self.stale[host] = version
+                    else:
+                        unplaced += 1
                     continue
                 sid = f.get("id") or (sources[0] if len(sources) == 1 else None)
                 store = by_id.get(sid)
@@ -595,8 +624,11 @@ class Tape:
             return False
         at = self.source.address_of(self.line())
         if at is None:
-            self.message = ("that entry is still at the live edge — it is in "
-                            "no chunk yet, so there is no place to open")
+            old = getattr(self.source, "old", None)
+            self.message = (
+                too_old_to_place("the target that answered") if old
+                else "that entry is still at the live edge — it is in no "
+                     "chunk yet, so there is no place to open")
             return False
         store = (getattr(self.line(), "store", None) or {})
         if not store.get("id"):
@@ -821,6 +853,9 @@ class Records:
         self.by_id = {s.get("id"): s for s in stores}
         self.lines, self.entries = [], 0
         self.unplaced, self.trouble = 0, None
+        # Entries from a timberfs too old to say where they are, which
+        # is not the same fact as an entry at the live edge.
+        self.stale, self.old = 0, None
         self.chunks = []
         for stream in ([streams] if isinstance(streams, bytes) else streams):
             self._read(stream)
@@ -829,8 +864,11 @@ class Records:
     def _read(self, stream):
         # Per stream: each host's answer names its own sources, and a
         # one-source stream's entries carry no id of their own.
-        names, seen = {}, []
+        names, seen, version = {}, [], None
         for kind, f, payload in frames(stream):
+            if kind == "stream-start":
+                version = server_of(f.get("server_version"))
+                continue
             if kind == "source":
                 names[f.get("id")] = os.path.basename(f.get("path", "?"))
                 seen.append(f.get("id"))
@@ -844,7 +882,11 @@ class Records:
             where = (Address(sid, store.get("_host"), "offset",
                              int(f["offset"])) if "offset" in f else None)
             if where is None:
-                self.unplaced += 1
+                if version and version < PLACED_FROM:
+                    self.stale += 1
+                    self.old = version
+                else:
+                    self.unplaced += 1
             body = (payload or b"").rstrip(b"\n").split(b"\n")
             for n, raw in enumerate(body):
                 line = Line(int(f.get("offset", 0)), raw)
@@ -899,10 +941,15 @@ class Records:
                 + f" · {self.what}")
 
     def top_notes(self):
-        return [f"── {self.entries} entr"
-                f"{'y' if self.entries == 1 else 'ies'} matched · {self.what}"
-                + ("" if not self.unplaced else
-                   f" · {self.unplaced} at a live edge, with no place to open")]
+        note = (f"── {self.entries} entr"
+                f"{'y' if self.entries == 1 else 'ies'} matched · {self.what}")
+        if self.unplaced:
+            note += f" · {self.unplaced} at a live edge, with no place to open"
+        if self.stale:
+            note += (f" · {self.stale} answered on "
+                     f"{'.'.join(map(str, self.old))}, which cannot say where "
+                     f"an entry is")
+        return [note]
 
     def bottom_note(self):
         return ("── end of the answer · `o` opens the log around an entry"
@@ -942,8 +989,11 @@ class View:
             return False
         at = self.source.address_of(self.line())
         if at is None:
-            self.message = ("that entry is still at the live edge — it is in "
-                            "no chunk yet, so there is no place to open")
+            old = getattr(self.source, "old", None)
+            self.message = (
+                too_old_to_place("the target that answered") if old
+                else "that entry is still at the live edge — it is in no "
+                     "chunk yet, so there is no place to open")
             return False
         store = (getattr(self.line(), "store", None) or {})
         if not store.get("id"):
@@ -1087,6 +1137,15 @@ class View:
             notes.append("stopped at a bound, so there may be more")
         if unplaced:
             notes.append(f"{unplaced} at a live edge, not yet placed")
+        stale = getattr(self.backend, "stale", {})
+        if stale:
+            notes.append(
+                "and " + ", ".join(f"{h or '(local)'} answered on "
+                                   f"{'.'.join(map(str, v))}"
+                                   for h, v in sorted(stale.items(),
+                                                      key=lambda x: x[0] or ""))
+                + f", which cannot say where an entry is — "
+                  f"{'.'.join(map(str, PLACED_FROM))} can")
         bad = getattr(self.backend, "unreachable", {})
         if bad:
             notes.append("not searched: "
