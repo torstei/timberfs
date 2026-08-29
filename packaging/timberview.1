@@ -129,6 +129,15 @@ absolute on the tape, so it stays valid until retention drops the data
 and then the store's own
 .B first_seq
 says it was dropped rather than "not found".
+.SH WHEN SOMETHING IS DOWN
+A target that does not answer is NAMED and the rest are still asked \(em
+one machine being down must not stop you reading the logs that are
+available. It is said in each of the three places the failure would
+otherwise be invisible: an unreachable fleet reports that nothing was
+LISTED rather than that there is no store, a store that was not found
+names who was not asked (it may be on exactly that host), and a chunk
+that could not be read says so where the boundary marker goes, so a
+scroll that stopped is not the same screen as the end of the log.
 .SH BOUNDARIES
 Retention moves the floor while you read, and the newest lines are in no
 chunk yet. Both are stated: the top says whether it is the top of the

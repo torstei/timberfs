@@ -9,6 +9,7 @@ what the boundaries say) testable at all.
     tests/timberview/test-timberview           # all
     tests/timberview/test-timberview boundary  # one, by substring
 """
+import json
 import os
 import sys
 
@@ -32,6 +33,8 @@ class Fake:
         self.hits = hits or []
         self.unplaced = 0
         self.capped = False
+        self.unreachable = {}
+        self.fail_at = set()
         start = dropped
         self.chunks = []
         for i, t in enumerate(self.texts):
@@ -61,6 +64,8 @@ class Fake:
 
     def chunk(self, store, seq=None, at=None):
         self.fetches += 1
+        if seq in self.fail_at:
+            raise tv.Refused(f"mail01 did not answer: no route to host")
         if at is not None:
             return next((c for c in self.chunks if c.wf <= at <= c.wl), None)
         return next((c for c in self.chunks if c.seq == seq), None)
@@ -361,6 +366,123 @@ def an_answer_that_stopped_at_a_bound_says_so():
     v.search("one")
     assert "stopped at a bound" in v.message, v.message
     assert "2 at a live edge" in v.message, v.message
+
+
+@test
+def a_target_that_did_not_answer_is_not_an_empty_fleet():
+    """One machine being down must not stop you reading the logs that
+    ARE there — and when it stops everything, "nothing was listed" and
+    "there is nothing" are opposite problems that read the same."""
+    f = Fake(["a\n"])
+    f.all = []
+    f.unreachable = {"gone1": "gone1 did not answer: no route to host"}
+    try:
+        tv.resolve(f, None)
+        raise AssertionError("an unreachable fleet read as an empty one")
+    except tv.Refused as e:
+        assert "did not answer" in str(e) and "gone1" in str(e), str(e)
+        assert "nothing was listed" in str(e), str(e)
+
+
+@test
+def a_store_that_is_missing_says_who_was_not_asked():
+    """The store you are looking for may be on the host that did not
+    answer, so "no store matches" alone would send you looking in the
+    wrong place."""
+    f = Fake(["a\n"])
+    f.unreachable = {"gone1": "gone1 did not answer: no route to host"}
+    try:
+        tv.resolve(f, "mystery")
+        raise AssertionError("accepted a missing store with no note")
+    except tv.Refused as e:
+        assert "no store matches" in str(e) and "gone1" in str(e), str(e)
+
+
+@test
+def a_chunk_that_could_not_be_read_is_not_the_end_of_the_tape():
+    """A host that goes away mid-scroll leaves the run unable to grow.
+    Saying nothing makes that screen identical to the end of the log,
+    which is the boundary this viewer exists to state."""
+    def only_chunk_one():
+        f = Fake(["a\n" * 4, "b\n" * 4, "c\n" * 4])
+        v = opened(f, seq=1)
+        f.fail_at = {0, 2}
+        v.tape.chunks = [c for c in v.tape.chunks if c.seq == 1]
+        v.tape._rebuild()
+        return f, v
+
+    f, v = only_chunk_one()
+    v.top = v.cur = 0
+    assert v.tape.extend_up() is False
+    edges = edges_of(v)
+    assert any("chunk 0 could not be read" in e for e in edges), edges
+    assert not any("top of the log" in e for e in edges), edges
+
+    f, v = only_chunk_one()
+    v.cur = len(v.tape.lines) - 1
+    assert v.tape.extend_down() is False
+    edges = edges_of(v)
+    assert any("chunk 2 could not be read" in e for e in edges), edges
+    assert not any("end of chunk" in e for e in edges), edges
+
+
+# The tests above fake the BACKEND. These fake the TRANSPORT instead, so
+# they exercise the four operations themselves — which is where "one
+# target being down does not stop the others" actually lives.
+def wire(*records):
+    out = b"\x1estream-start\x1fv=1\x1fsources=1\0"
+    for kind, fields, payload in records:
+        head = kind + "".join(f"\x1f{k}={v}" for k, v in fields.items())
+        out += b"\x1e" + head.encode() + b"\0"
+        if payload is not None:
+            out += payload + b"\0"
+    return out + b"\x1estream-end\x1fstatus=exhausted\0"
+
+
+def transport(live, dead):
+    """`ask` for a fleet where `dead` refuses and `live` answers."""
+    def ask(doc, host=None, raw=False):
+        if host in dead:
+            return (b"" if raw else ""), "ssh: no route to host", 255
+        kind = (doc.get("response_format") or {}).get("kind")
+        if kind == "stores":
+            return json.dumps({"server_version": "timberfs, 0.25.0",
+                               "stores": [live[host]]}), "", 0
+        if kind == "records":
+            body = f"found on {host}".encode()
+            return wire(("source", {"path": f"/l/{host}.log",
+                                    "id": live[host]["id"]}, None),
+                        ("entry", {"len": len(body), "ts": 1,
+                                   "chunk": 0, "offset": 7}, body)), "", 0
+        return b"", "", 0
+    return ask
+
+
+@test
+def one_target_being_down_does_not_stop_the_others():
+    """Something in the system being down must not prevent reading the
+    logs that ARE available. The dead target is named — in the listing,
+    in the search, and in the store picker's title — and never dropped,
+    because a host that was not asked must not read as one that had
+    nothing."""
+    live = {"web01": {"name": "access", "id": ID_A, "chunks": 1,
+                      "first_seq": 0, "last_seq": 0, "logical_bytes": 10,
+                      "dropped_chunks": 0, "dropped_uncompressed_bytes": 0,
+                      "path": "/l/access.log", "labels": {}}}
+    b = tv.QueryBackend(transport(live, {"gone99"}), ["web01", "gone99"])
+    stores = b.stores()
+    assert [s["name"] for s in stores] == ["access"], stores
+    assert list(b.unreachable) == ["gone99"], b.unreachable
+    assert "no route to host" in b.unreachable["gone99"], b.unreachable
+
+    hits, unplaced, capped = b.search("found")
+    assert [h.address.host for h in hits] == ["web01"], hits
+    assert list(b.unreachable) == ["gone99"], b.unreachable
+
+    v = tv.View(b, stores[0])
+    v.search("found")
+    assert "1 hit(s)" in v.message and "not searched: gone99" in v.message, \
+        v.message
 
 
 def main():

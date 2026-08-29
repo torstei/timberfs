@@ -213,6 +213,22 @@ Falling back would answer a question about one fleet with a different one,
 and the empty case is worse: a session that quietly asks the local machine
 instead looks exactly like a fleet that held nothing.
 
+⚠ **A TARGET that failed is not.** Something in the system being down must
+not stop you reading the logs that are available, so a target that does not
+answer is named and the rest are still asked — in a listing, in a search,
+and in the viewer's store picker. The two are different failures: the
+resolver is how you know what the fleet IS, and being wrong about that
+makes every later answer describe the wrong thing; one machine refusing a
+connection only means that machine's logs are missing from this answer,
+which is worth saying and not worth stopping for.
+
+The three ways that has to hold, because they read the same when it does
+not: an unreachable fleet must say **"nothing was listed"** rather than
+"no store" · a store that was not found must name **who was not asked**,
+since it may be on exactly that host · and a chunk that could not be read
+must say so **where the boundary marker would go**, or a scroll that
+stopped is the same screen as the end of the log.
+
 ⚠ **A target this build cannot reach is NAMED, never dropped.** A future
 `{"name": …, "url": …}` leaves that one target unreachable-with-a-reason
 and the rest of the fleet working — refusing all of it over one would be

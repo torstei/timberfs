@@ -104,6 +104,18 @@ the reason to define it early, and they are not the same programs:
 comes next all ask "where is this store", and none of them should grow its
 own answer — the same rule the selector already has, one layer down.
 
+⚠ **Failing to resolve and failing to reach are different failures.** The
+resolver is how you know what the fleet IS, so being wrong about that makes
+every later answer describe the wrong thing: it is fatal, and an empty
+answer from it is refused rather than replaced by a local default. One
+target refusing a connection only means that machine's logs are missing
+from this answer — it is named, the rest are still asked, and nothing
+stops. The three places that distinction is invisible unless stated are an
+unreachable fleet ("nothing was listed", not "no store"), a store that was
+not found (name who was not asked — it may be there), and a chunk that
+could not be read (say so where the boundary marker goes, or a stopped
+scroll is the end of the log).
+
 ### What is still DNS, and is not built
 
 The resolver is asked **one** question: what is the fleet. Broadcast

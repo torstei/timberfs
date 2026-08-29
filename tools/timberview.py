@@ -202,7 +202,8 @@ class QueryBackend:
     def _run(self, doc, host, raw=False):
         out, err, rc = self.ask(doc, host, raw)
         if rc != 0:
-            raise Refused(err or f"exit {rc}")
+            raise Refused(f"{host or '(local)'} did not answer: "
+                          + (err or f"exit {rc}"))
         return out
 
     def stores(self, fresh=False):
@@ -415,6 +416,9 @@ class Tape:
     def __init__(self, backend, store):
         self.backend, self.store = backend, store
         self.chunks, self.lines = [], []
+        # (seq, why) for a chunk that could not be read. Scrolling into
+        # a host that went away must not look like the end of the tape.
+        self.trouble = None
 
     # -- the store's own numbers, which retention moves under us
     @property
@@ -515,9 +519,15 @@ class Tape:
 
     def _load(self, seq):
         try:
-            return self.backend.chunk(self.store, seq=seq)
-        except Refused:
+            c = self.backend.chunk(self.store, seq=seq)
+        except Refused as e:
+            self.trouble = (seq, str(e))
             return None
+        if c is None:
+            self.trouble = (seq, "the store no longer holds it")
+        else:
+            self.trouble = None
+        return c
 
     def extend_up(self):
         if not self.chunks or self.at_top():
@@ -788,8 +798,9 @@ class View:
 
     def _build(self, width, height):
         rows, lines = [], self.tape.lines
-        if self.top == 0 and self.tape.at_top():
-            for text in self.top_notes():
+        if self.top == 0:
+            for text in (self.top_notes() if self.tape.at_top()
+                         else self.stuck_note(above=True)):
                 rows.append({"text": text, "line": None, "spans": [],
                              "edge": True})
         i = self.top
@@ -824,10 +835,27 @@ class View:
                               if e > self.col and s < self.col + width],
                     "edge": False, "cursor": i == self.cur})
             i += 1
-        if i >= len(lines) and self.tape.at_bottom() and len(rows) < height:
-            rows.append({"text": self.bottom_note(), "line": None,
-                         "spans": [], "edge": True})
+        if i >= len(lines) and len(rows) < height:
+            if self.tape.at_bottom():
+                rows.append({"text": self.bottom_note(), "line": None,
+                             "spans": [], "edge": True})
+            else:
+                for text in self.stuck_note(above=False):
+                    rows.append({"text": text, "line": None, "spans": [],
+                                 "edge": True})
         return rows
+
+    def stuck_note(self, above):
+        """There is more tape this way and it could not be read. Said
+        where the boundary marker would go, because an edge that stops
+        without saying why is the same screen as the end of the log."""
+        if not self.tape.trouble:
+            return []
+        seq, why = self.tape.trouble
+        run = self.tape.chunks
+        if not run or (seq < run[0].seq) != above:
+            return []
+        return [f"── chunk {seq} could not be read · {why}"]
 
     # -- the boundaries, stated rather than discovered
     def top_notes(self):
@@ -1114,8 +1142,18 @@ def resolve(backend, target):
     """A store, from whatever was typed: an address, a name, a short id,
     or a path. Ambiguity is refused rather than picked from."""
     stores = backend.stores()
+    bad = getattr(backend, "unreachable", {})
     if not stores:
+        if bad:
+            raise Refused(
+                f"{len(bad)} target(s) did not answer, so nothing was "
+                "listed:\n      "
+                + "\n      ".join(w for _, w in
+                                   sorted(bad.items(), key=lambda x: x[0] or "")))
         raise Refused("no store to view")
+    missed = ("" if not bad else
+              f" ({len(bad)} target(s) did not answer: "
+              + ", ".join(sorted(h or "(local)" for h in bad)) + ")")
     if target is None:
         return stores[0]
     if target.startswith(f"{SCHEME}:"):
@@ -1124,7 +1162,7 @@ def resolve(backend, target):
         if not hit:
             raise Refused(f"no store here has id {addr.store}"
                           + (f" (the address says {addr.host})"
-                             if addr.host else ""))
+                             if addr.host else "") + missed)
         return hit[0]
     t = target.lower()
     for pick in (lambda s: (s.get("name") or "").lower() == t,
@@ -1139,7 +1177,7 @@ def resolve(backend, target):
             raise Refused(
                 f"{target!r} matches {len(hit)} stores: "
                 + ", ".join(sorted(s.get("name", "?") for s in hit)))
-    raise Refused(f"no store matches {target!r} — {len(stores)} here")
+    raise Refused(f"no store matches {target!r} — {len(stores)} here{missed}")
 
 
 def position(target=None, at=None, chunk=None):

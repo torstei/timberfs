@@ -492,6 +492,27 @@ def a_resolver_that_failed_stops_the_session():
     shutil.rmtree(d, ignore_errors=True)
 
 
+@test
+def one_target_being_down_does_not_stop_the_others():
+    """Something in the system being down must not prevent inspecting
+    the logs that ARE available. The failure is named — once, in full —
+    and every other target still answers."""
+    hosts = ["alpha", "beta", "gone"]
+    s = Session({"alpha": {"stores": [store("a1", ID_A)],
+                           "records": [{"id": ID_A, "text": "hit on alpha"}]},
+                 "beta": {"stores": [store("b1", ID_B)],
+                          "records": [{"id": ID_B, "text": "hit on beta"}]},
+                 "gone": {"fail": "ssh: connect to host gone: No route to host",
+                          "code": 255}},
+                hosts=hosts, resolver=True).run(
+        "\\d", "select records from [] where entry has 'hit' limit 9;")
+    assert "a1" in s.out and "b1" in s.out, s.out
+    assert "hit on alpha" in s.out and "hit on beta" in s.out, s.out
+    assert "No route to host" in s.out, s.out
+    assert "gone" in s.out, s.out
+    s.cleanup()
+
+
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else ""
     chosen = [t for t in TESTS if want in t.__name__]
