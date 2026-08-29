@@ -180,22 +180,37 @@ class Hit:
 
 
 class Refused(Exception):
-    """The far end said no, in its own words."""
+    """The far end said no, in its own words, and which end said it."""
+
+    def __init__(self, message, said=None, host=None):
+        super().__init__(message)
+        self.said, self.host = said, host
 
 
 # The refusal a timberfs from before the bounded seek gives. It is the
-# FIRST wall anyone meets, and on its own it reads as the caller's
+# FIRST wall anyone meets, and relayed as-is it reads as the caller's
 # mistake — a chunk number with `max: {chunks: 1}` is exactly the legal
-# thing. Read from the refusal because a version cannot say it: the
-# builds either side of that change both report 0.25.0.
+# thing to have sent. Read from the refusal because a version cannot say
+# it: the builds either side of that change both report 0.25.0.
 NO_SEEK = "a chunk number is a resume position"
-NO_SEEK_WHY = (
-    "\n      — that timberfs predates the bounded seek a pager is made of "
-    "(the `from_chunk` change after 0.25.0)."
-    "\n      Reach a newer one: put it earlier on PATH, or name it in "
-    "TIMBERFS_CMD or the target's `cmd`."
-    "\n      Its version cannot tell you which you have — the builds "
-    "either side of that change report the same one.")
+
+
+def too_old(host, said):
+    """What to DO first, what it is second, and the far end's own words
+    last. Someone meeting this wants a fix, not a protocol lesson — and
+    the remedy is not the same at both ends, since nothing on this
+    machine upgrades a timberfs on another one."""
+    who = f"{host}: " if host else ""
+    fix = (f"upgrade it there" if host else
+           "upgrade it, or put a newer build earlier on PATH")
+    other = ("Or reach a different build by changing that target's `cmd`."
+             if host else "TIMBERFS_CMD names one without installing it.")
+    return (f"{who}timberfs is too old — {fix}."
+            f"\n      A pager seeks to a chunk by number and this build "
+            f"refuses that; the change landed after 0.25.0. {other}"
+            f"\n      ⚠ Its version will not tell you which you have: the "
+            f"builds either side of that change report the same one."
+            f"\n      It said: {said}")
 
 
 class QueryBackend:
@@ -218,7 +233,7 @@ class QueryBackend:
         out, err, rc = self.ask(doc, host, raw)
         if rc != 0:
             raise Refused(f"{host or '(local)'} did not answer: "
-                          + (err or f"exit {rc}"))
+                          + (err or f"exit {rc}"), said=err, host=host)
         return out
 
     def stores(self, fresh=False):
@@ -288,8 +303,9 @@ class QueryBackend:
         try:
             out = self._run(doc, store.get("_host"), raw=True)
         except Refused as e:
-            raise Refused(str(e) + NO_SEEK_WHY
-                          if NO_SEEK in str(e) else str(e)) from None
+            if e.said and NO_SEEK in e.said:
+                raise Refused(too_old(e.host, e.said.strip())) from None
+            raise
         for kind, f, payload in frames(out):
             if kind == "chunk":
                 return Chunk(int(f["chunk"]), int(f["uncomp_start"]),

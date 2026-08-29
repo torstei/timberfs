@@ -502,12 +502,26 @@ def a_timberfs_from_before_the_seek_is_diagnosed_not_relayed():
         b.chunk({"id": ID_A}, seq=7)
         raise AssertionError("a refusal became an answer")
     except tv.Refused as e:
-        assert "predates the bounded seek" in str(e), str(e)
-        assert "resume position" in str(e), str(e)
-        # The remedy, not just the cause: a diagnosis you have to act on
-        # from first principles has done half its job.
+        # What to DO, on the first line. Someone meeting this wants a fix
+        # rather than a protocol lesson, and the mechanism read first is
+        # what made the original message sound like their own mistake.
+        first = str(e).splitlines()[0]
+        assert first.startswith("timberfs is too old — upgrade it"), first
         assert "PATH" in str(e) and "TIMBERFS_CMD" in str(e), str(e)
         assert "report the same one" in str(e), str(e)
+        # timberfs's own words are kept, and kept LAST.
+        assert str(e).splitlines()[-1].startswith("      It said:"), str(e)
+        assert "resume position" in str(e), str(e)
+
+
+@test
+def upgrading_the_other_end_is_not_something_this_machine_can_do():
+    """Nothing on PATH here fixes a timberfs on another host, so the
+    remedy names the target instead."""
+    named = tv.too_old("mail01", "a chunk number is a resume position")
+    assert named.startswith("mail01: timberfs is too old — upgrade it there")
+    assert "PATH" not in named, named
+    assert "`cmd`" in named, named
 
 
 def main():
