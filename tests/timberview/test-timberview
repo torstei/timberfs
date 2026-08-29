@@ -128,15 +128,28 @@ def an_address_is_identity_with_the_host_as_a_hint():
 
 # -------------------------------------------------------------- tokens
 @test
-def the_selectable_tokens_are_exactly_the_searchable_ones():
-    """`--has` matches maximal ASCII-alphanumeric runs of 3..64. Offering
-    anything else would offer a search that cannot be run — and offering
-    a 64-character PREFIX of a longer run would offer one that finds
-    something else."""
-    assert [t[2] for t in tv.tokens("GET /api req-8f3a x2")] \
-        == ["GET", "api", "req", "8f3a"], tv.tokens("GET /api req-8f3a x2")
-    assert tv.tokens("a" * 65) == []
-    assert [t[2] for t in tv.tokens("a" * 64)] == ["a" * 64]
+def an_identifier_is_one_term_not_its_pieces():
+    """The distinction that made a UUID unsearchable. The INDEX holds
+    alphanumeric runs, so `9da3dcf1-5a4b-…` is five of them — but a
+    `has` TERM may carry the separators an identifier is written with,
+    and timberfs ANDs the runs inside it. Offering the pieces offered
+    the wrong search: in one store `5a4b` matched every entry where the
+    whole id matched one."""
+    uuid = "9da3dcf1-5a4b-4d36-b907-917daa60bd90"
+    assert [t[2] for t in tv.terms(f"req={uuid} handled")] \
+        == ["req", uuid, "handled"]
+    assert [t[2] for t in tv.terms("at com.example.Thing.method(Thing.java:42)")] \
+        == ["com.example.Thing.method", "Thing.java:42"]
+    # `=` and `/` separate FIELDS, so they do not join a term.
+    assert [t[2] for t in tv.terms("GET /api/v1/x ref=REQ3999")] \
+        == ["GET", "api", "ref", "REQ3999"], tv.terms("GET /api/v1/x ref=REQ3999")
+    # `v1` and `x` are dropped for the reason they always were: the index
+    # cannot hold a run of under three characters.
+    # A term still has to be findable: the index must hold one of its
+    # runs, and a 65-character run is not one of them.
+    assert tv.terms("a" * 65) == []
+    assert [t[2] for t in tv.terms("a" * 64)] == ["a" * 64]
+    assert tv.terms("26.1.18") == []
 
 
 @test
@@ -149,6 +162,10 @@ def a_version_number_is_refused_with_the_reason():
     v.search("26.1.18")
     assert "under 3" in v.message and "26" in v.message, v.message
     assert v.hits == []
+    # But the id it was mistaken for IS one term, and is accepted.
+    f.hits = [tv.Hit(tv.Address(ID_A, None, "offset", 0), f.store, "x")]
+    v.search("9da3dcf1-5a4b-4d36-b907-917daa60bd90")
+    assert v.hits, v.message
 
 
 # ---------------------------------------------------------------- tape

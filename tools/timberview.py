@@ -37,11 +37,22 @@ from timberfs_client import when                              # noqa: F401
 
 DOC_V = "1.0-EXPERIMENTAL"
 
-# What `--has` matches, and therefore what can be selected: the index
-# holds maximal ASCII-alphanumeric runs of 3..=64 bytes, exact case.
-# Highlighting anything else would offer a search that cannot be run.
+# Two different things, and conflating them made a UUID unselectable.
+#
+# The INDEX holds maximal ASCII-alphanumeric runs of 3..=64 bytes, exact
+# case — so `9da3dcf1-5a4b-…` is five of them, none of which is the id.
 MIN_TOKEN, MAX_TOKEN = 3, 64
 RUN = re.compile(r"[A-Za-z0-9]+")
+# A `has` TERM is wider: it may carry the separators an identifier is
+# written with, and timberfs ANDs the runs inside it on the index and
+# then matches the whole thing word-anchored. So the UUID is one term,
+# and it is the one worth offering — `5a4b` on its own matched every
+# entry in a store where the whole id matched one.
+#
+# The joiners are the characters that appear INSIDE an identifier. `=`,
+# `/` and the rest separate fields, so `path=/api/v1/x` stays four
+# terms rather than becoming one.
+TERM = re.compile(r"[A-Za-z0-9]+(?:[-._:][A-Za-z0-9]+)*")
 
 SCHEME = "timber"
 
@@ -462,33 +473,41 @@ def sanitise(s):
     return "".join(out)
 
 
-def tokens(text):
-    """The searchable runs, as (start, end, text). Maximal runs, so a
-    65-character one yields nothing rather than its first 64 — that is
-    what the index does, and offering the prefix would offer a search
-    that finds a different thing."""
-    found = []
-    for m in RUN.finditer(text):
-        if MIN_TOKEN <= m.end() - m.start() <= MAX_TOKEN:
-            found.append((m.start(), m.end(), m.group()))
-    return found
+def indexable(text):
+    """The runs of `text` the index can actually hold. Maximal runs, so
+    a 65-character one yields nothing rather than its first 64 — that is
+    what the index does, and a prefix would find a different thing."""
+    return [m.group() for m in RUN.finditer(text)
+            if MIN_TOKEN <= len(m.group()) <= MAX_TOKEN]
 
 
-def why_not_a_token(word):
-    """Why the index cannot hold this one. `26.1.18` is the case: it is
-    three runs of one and two characters, so it is refused where you
-    point at it rather than discovered later as an empty answer."""
+def terms(text):
+    """The searchable spans of a line, as (start, end, text).
+
+    A term is offered only where the index can hold at least ONE of its
+    runs: that run is what lets a search skip chunks, and without one
+    nothing could find it. That is the same test timberfs applies, so
+    what can be picked is still exactly what can be searched."""
+    return [(m.start(), m.end(), m.group()) for m in TERM.finditer(text)
+            if indexable(m.group())]
+
+
+def why_not_a_term(word):
+    """Why nothing could find this one. `26.1.18` is the case: three
+    runs of one and two characters, so the index holds none of them and
+    it is refused where you point at it rather than discovered later as
+    an empty answer."""
     runs = [m.group() for m in RUN.finditer(word)]
     if not runs:
         return (f"{word!r} has no letters or digits in it — the index "
                 f"holds runs of {MIN_TOKEN}-{MAX_TOKEN} of them")
-    if all(len(r) < MIN_TOKEN for r in runs):
+    short = [r for r in runs if len(r) < MIN_TOKEN]
+    if len(short) == len(runs):
         return (f"{word!r} is {len(runs)} run(s) of under {MIN_TOKEN} "
                 f"characters ({', '.join(runs)}) — the index holds none "
                 f"of them, so no search can find it")
-    return (f"{word!r} is not one token: search "
-            + " or ".join(repr(r) for r in runs
-                          if MIN_TOKEN <= len(r) <= MAX_TOKEN))
+    return (f"{word!r} has no run the index can hold: every one is under "
+            f"{MIN_TOKEN} characters or over {MAX_TOKEN}")
 
 
 def human(n):
@@ -503,18 +522,18 @@ def grouped(n):
 
 
 class Line:
-    __slots__ = ("offset", "text", "_tokens")
+    __slots__ = ("offset", "text", "_terms")
 
     def __init__(self, offset, raw):
         self.offset = offset
         self.text = sanitise(raw.decode("utf-8", "replace"))
-        self._tokens = None
+        self._terms = None
 
     @property
-    def tokens(self):
-        if self._tokens is None:
-            self._tokens = tokens(self.text)
-        return self._tokens
+    def terms(self):
+        if self._terms is None:
+            self._terms = terms(self.text)
+        return self._terms
 
 
 # ---------------------------------------------------------------- tape
@@ -822,16 +841,16 @@ class View:
         self.wrap = not self.wrap
         self.col = 0
 
-    # -- tokens
-    def line_tokens(self):
+    # -- terms
+    def line_terms(self):
         ln = self.line()
-        return ln.tokens if ln else []
+        return ln.terms if ln else []
 
     def pick(self, step):
-        """Tab between the selectable tokens, and on past the end of the
+        """Tab between the selectable terms, and on past the end of the
         line: what can be picked is exactly what can be searched, so the
         motion never lands anywhere a search cannot follow."""
-        toks = self.line_tokens()
+        toks = self.line_terms()
         if not toks:
             self.message = self.nothing_pickable()
             return None
@@ -839,7 +858,7 @@ class View:
         return toks[self.tok][2]
 
     def selected(self):
-        toks = self.line_tokens()
+        toks = self.line_terms()
         return toks[self.tok][2] if toks and self.tok < len(toks) else None
 
     def nothing_pickable(self):
@@ -847,16 +866,16 @@ class View:
         if not ln or not ln.text.strip():
             return "nothing on this line"
         longest = max(ln.text.split(), key=len)
-        return "no searchable token on this line — " + why_not_a_token(longest)
+        return "no searchable term on this line — " + why_not_a_term(longest)
 
     # -- search
     def search(self, token):
         if not token:
             return
-        runs = [m.group() for m in RUN.finditer(token)]
-        if len(runs) != 1 or not (MIN_TOKEN <= len(runs[0]) <= MAX_TOKEN) \
-                or runs[0] != token:
-            self.message = why_not_a_token(token)
+        # A term rides the index on the runs INSIDE it, so ONE indexable
+        # run is enough — which is what makes a UUID searchable whole.
+        if not indexable(token):
+            self.message = why_not_a_term(token)
             self.hits, self.hit = [], -1
             return
         try:
@@ -887,7 +906,7 @@ class View:
             self.tape = Tape(self.backend, store)
         self.open(offset=hit.address.value)
         if self.term:
-            for i, (_, _, t) in enumerate(self.line_tokens()):
+            for i, (_, _, t) in enumerate(self.line_terms()):
                 if t == self.term:
                     self.tok = i
                     break
@@ -957,7 +976,7 @@ class View:
             ln = lines[i]
             spans = []
             if i == self.cur:
-                for n, (s, e, t) in enumerate(ln.tokens):
+                for n, (s, e, t) in enumerate(ln.terms):
                     spans.append((s, e, "sel" if (n == self.tok and t == sel)
                                   else "tok"))
             if self.wrap:
@@ -1039,7 +1058,7 @@ class View:
         if self.message:
             return self.message
         sel = self.selected()
-        bits = ["q quit", "Tab token", "Enter search", "n/N hits",
+        bits = ["q quit", "Tab term", "Enter search", "n/N hits",
                 "w wrap" if not self.wrap else "w nowrap", "S stores",
                 "? help"]
         if sel:
@@ -1056,8 +1075,8 @@ HELP_KEYS = """
   space b        a page              h l  ← →      sideways (no wrap)
   w              wrap / no wrap      y             this line's address
 
-  Tab  ⇧Tab      the searchable tokens on this line — the runs of 3-64
-                 letters or digits the index holds, and nothing else
+  Tab  ⇧Tab      the searchable terms on this line — an identifier is
+                 ONE of them, separators and all
   Enter  *       search the picked one, everywhere
   /              search a token you type
   n  N           the next / previous hit

@@ -263,10 +263,22 @@ want to look at.
 
 **The loop it exists for**: see an identifier, search it across every host,
 jump to the coordinate a hit comes back with. `Tab` moves between the
-searchable tokens on a line — exactly the runs `--has` matches, so what can
-be picked is what can be searched — and `Enter` finds one everywhere.
-A word the index cannot hold (`26.1.18`) is refused where you point at it,
-with the reason, rather than discovered later as an empty answer.
+searchable **terms** on a line and `Enter` finds one everywhere.
+
+⚠ A term is not an index token, and conflating them is what made a UUID
+unselectable. The *index* holds alphanumeric runs of 3–64, so
+`9da3dcf1-5a4b-4d36-b907-917daa60bd90` is five of them and none is the id.
+A **`has` term** is wider: timberfs ANDs the runs inside it on the index
+and then matches the whole thing word-anchored — so the UUID is ONE term,
+and it is the one worth offering. Measured on a store where the whole id
+matched one entry, its piece `5a4b` matched every entry in the chunk.
+
+So `Tab` offers the widest identifier at each position — separators and
+all, joined on `-` `.` `_` `:` but never across `=` or `/`, which separate
+fields rather than sit inside a name. A term the index cannot hold at all
+(`26.1.18`, three runs of under three characters) is refused where you
+point at it, with the reason, rather than discovered later as an empty
+answer.
 
 **One module, two front ends.** timbersh calls it in process, because a
 separate program would have to leave the alt screen carrying "search this

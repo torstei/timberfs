@@ -81,14 +81,29 @@ toggles wrapping. Neither is a default that can be argued into being
 correct, so it changes at runtime.
 .TP
 .BR Tab " " Shift\-Tab
-Move between the searchable tokens on the line. Those are exactly what
-.B --has
-matches \(em maximal ASCII-alphanumeric runs of 3 to 64 characters \(em so
-what can be picked is what can be searched, by construction. A word the
-index cannot hold, like
+Move between the searchable TERMS on the line \(em the widest identifier
+at each position, separators and all.
+.PP
+.RS
+A term is not an index token. The index holds alphanumeric runs of 3 to
+64 characters, so a UUID is five of them and none of them is the id; a
+.B has
+term may carry the separators an identifier is written with, and
+timberfs ANDs the runs inside it before matching the whole thing
+word-anchored. So the UUID is ONE term, and the one worth offering: its
+pieces are far less selective. Runs are joined on
+.BR - " " . " " _ " " :
+but never across
+.B =
+or
+.BR / ,
+which separate fields rather than sit inside a name.
+.PP
+A term the index cannot hold at all \(em
 .BR 26.1.18 ,
-is refused where you point at it rather than discovered later as an
-empty answer.
+three runs of under three characters \(em is refused where you point at
+it rather than discovered later as an empty answer.
+.RE
 .TP
 .BR Enter " " *
 Search the picked token everywhere: every store, on every host.
