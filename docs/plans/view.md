@@ -1,11 +1,12 @@
 # view: reading a store as a tape, not as a result set
 
-**Status: a first version SHIPPED.** The viewer is `tools/timberview.py`,
-reached two ways — `view` inside timbersh, and `timberview(1)` beside it —
-and [tools/README.md](../../tools/README.md) describes what it does. What
-stays here is what is still open: the second front end, the resolver the
-address is shaped for, and the questions the first version answered one
-way and could answer another.
+**Status: a first version SHIPPED, and the fleet resolver with it.** The
+viewer is `tools/timberview.py`, reached two ways — `view` inside timbersh,
+and `timberview(1)` beside it — and a fleet is a list of targets from
+`tools/timberfs_client.py`. [tools/README.md](../../tools/README.md)
+describes both. What stays here is what is still open: the second front
+end, the "who has this store" half of resolution, and the questions those
+versions answered one way and could answer another.
 
 See [paging.md](paging.md) for walking a result set — this is the other
 motion, and the difference is the point.
@@ -31,6 +32,11 @@ motion, and the difference is the point.
 - **A fleet search returns to a list**, with `n`/`N` cycling from
   wherever you land. An identifier on six hosts is six answers, and
   jumping straight to one would pick for you.
+- **How a target is reached belongs to the TARGET.** One command with
+  `_TIMBERHOST_` in it made it a property of the session, so a fleet had
+  to be uniform. A target is a name and an argv, and the argv is a list
+  because a command line written as one string has to be split again at
+  the far end under rules we would have had to invent.
 
 ## Not built: the records-stream front end
 
@@ -66,49 +72,61 @@ before it is a protocol one, and nothing in the wire has to change.
 
 ## /etc/hosts, and the DNS that would replace it
 
-`TIMBERFS_CMD` plus `TIMBERFS_HOSTS` is **/etc/hosts for timberfs**: a
-hand-maintained map from a name to how to reach it, which works, does not
-scale, and has to be right before anything runs. Resolving a store today
-means asking every configured host for its store list and matching the
-id — a broadcast, which is exactly what /etc/hosts leaves you with.
+**The hosts file half is BUILT.** `TIMBERFS_CMD` plus `TIMBERFS_HOSTS` was
+/etc/hosts for timberfs — a hand-maintained map from a name to how to reach
+it, which works, does not scale, and has to be right before anything runs.
+Worse, it made the transport a property of the SESSION: one command with a
+placeholder meant every host had to be reached the same way, so an `ssh`
+and a site wrapper taking the host as an argument could not be one fleet.
 
-Something more like **DNS** already exists in one place: a site-specific
-wrapper around timbersh, in use on one fleet. It derives the queryable
-set from service discovery — the ZooKeeper registrations, each probed for
-whether the agent actually running there serves the query endpoint — and
-execs timbersh with `TIMBERFS_HOSTS` already filled in. One command gets
-a fleet-wide shell with no list to maintain. That is a resolver, and it
-is derived rather than configured.
+A **target** is now a name and the argv that reaches it, and a **resolver**
+is any command that prints the list. `tools/README.md` has the document and
+the order the sources are tried in. `TIMBERFS_CMD`/`TIMBERFS_HOSTS` survive
+as one producer of a target list rather than as the only way to describe a
+fleet.
 
-The generalisation is a hook, not a feature: a `TIMBERFS_RESOLVER`
-command, the same shape as `TIMBERFS_CMD`, asked "who has this store" or
-"what is the fleet" and answering with hosts and how to reach them. It
-keeps discovery out of timberfs, where it does not belong — timberfs is a
-single-node tool and the fan-out has always lived in the client.
+The generalisation is a hook rather than a feature, so discovery stays out
+of timberfs where it does not belong — timberfs is a single-node tool and
+the fan-out has always lived in the client. The cheap implementations were
+the reason to define it early, and they are not the same programs:
 
-The reason to define the hook early is that the cheap implementations are
-useful the day it exists, and they are not the same programs:
+- `ssh <host> timberfs list --json` over a list of hosts — the honest floor.
+- **A static directory**: the same document as a FILE that can be generated,
+  reviewed, checked in and shared, rather than an environment variable each
+  person assembles. That is what `~/.config/timberfs/targets.json` is, and
+  it covers most of what a small fleet needs.
+- **Service discovery**, which one site-specific wrapper already does: it
+  derives the queryable set from the service registry, each candidate probed
+  for whether the agent actually running there serves the query endpoint.
+  That wrapper becomes a resolver by printing what it already computes.
 
-- `ssh <host> timberfs list --json` over a list of hosts — a resolver in
-  one line, and the honest floor.
-- **A static directory**: a file of stores, the hosts holding them, and
-  the command that reaches each. Which is /etc/hosts again, except as a
-  FILE that can be generated, reviewed, checked in and shared, rather
-  than an environment variable each person assembles. That alone covers
-  most of what a small fleet needs.
-- Service discovery, as the wrapper above already does.
-- Anything else: a registry, an inventory, a hosts file per environment.
+⚠ It is queried by more than one tool. The shell, the viewer, and whatever
+comes next all ask "where is this store", and none of them should grow its
+own answer — the same rule the selector already has, one layer down.
 
-⚠ And it is queried by more than one tool. The shell, the viewer, and
-whatever comes next all ask the same question — "where is this store" —
-and none of them should each grow their own answer. That is the same rule
-the selector already has, one layer down.
+### What is still DNS, and is not built
 
-⚠ What stays deferred is timberfs knowing any of this. Broadcast
-resolution is fine at the measured fleet (8 queryable of 30) and needs no
-hook at all, so nothing has to wait. What matters is only that the
-address carries **identity**, which it now does: adding a resolver later
-changes how a name is looked up and not what the name is.
+The resolver is asked **one** question: what is the fleet. Broadcast
+resolution — ask everyone, match the id — is what happens next, and it is
+fine at the measured fleet (8 queryable of 30).
+
+**"Who has this store" has deliberately not been designed.** Not even an
+argument is reserved for it, because reserving one would design it by
+accident. The questions it opens and does not answer:
+
+- What is a negative answer worth? A resolver that says "nobody has it" is
+  either authoritative or merely uninformed, and a client cannot tell —
+  which is the difference between "that store is gone" and "ask the others".
+- Caching, and therefore staleness. A lookup that is worth doing is worth
+  not repeating, and then a store that moved is at an address that resolves
+  to the wrong host until something expires.
+- Whether it composes with the fleet question at all, or is a second
+  program. A resolver that must answer both is a bigger contract than most
+  sites want to implement.
+
+What matters today is only that the address carries **identity**, which it
+does: adding a lookup later changes how a name is resolved and not what the
+name is.
 
 ## Open questions
 
@@ -118,10 +136,10 @@ changes how a name is looked up and not what the name is.
   first millimetre of a query language in an address, which is why the
   first version has no such form: an address is a PLACE, and the document
   is how a search is written down.
-- **What an unresolvable address should do.** Today an id no host holds is
-  refused with the count of stores that were asked. With a resolver it
-  becomes a lookup failure, which is a different sentence and possibly a
-  different exit code.
+- **What an unresolvable address should do.** Today an id no target holds
+  is refused with the count of stores that were asked, which is honest for
+  a broadcast. A lookup would make it a resolution failure — a different
+  sentence, and possibly a different exit code.
 - **Whether `search` should be bounded by where you are looking.** It is
   deliberately not: the loop starts with an identifier and no idea which
   log holds it, so the predicate you opened with must not narrow it. But

@@ -58,14 +58,16 @@ export for one session and nothing else:
 
 | flag | variable | |
 |---|---|---|
-| `--cmd` | `TIMBERFS_CMD` | how to reach a timberfs; it gets the document on stdin |
-| `--hosts` | `TIMBERFS_HOSTS` | fan out, substituting each host for `_TIMBERHOST_` in `--cmd` |
+| `--resolver` | `TIMBERFS_RESOLVER` | a command that prints the fleet — see below |
+| `--targets` | `TIMBERFS_TARGETS` | the same document, from a file |
+| `--cmd` | `TIMBERFS_CMD` | one command reaching every host, with `_TIMBERHOST_` substituted |
+| `--hosts` | `TIMBERFS_HOSTS` | the hosts that command reaches |
 | `--rc` | `TIMBERSH_RC` | statements run at startup |
 | `--histfile` | `TIMBERSH_HISTFILE` | line history, `~/.timbersh-history`, mode 0600 |
 | `--histsize` | `TIMBERSH_HISTSIZE` | how many lines to keep (2000) |
 | `--ttl` | `TIMBERSH_STORE_TTL` | expire the cached store list after N seconds; 0 (default) never expires it |
 
-`--cmd` is only ever handed a document on stdin, so anything that reaches a
+A target is only ever handed a document on stdin, so anything that reaches a
 timberfs works — a wrapper, `ssh`, a container exec.
 
 With several hosts the stores present as one set with a `HOST` column, and
@@ -161,6 +163,67 @@ search the server reads as a different question.
   `.psqlrc` is. `save` therefore refuses to default to it — writing the
   logviews back would delete whatever else it does.
 
+## Where the fleet is
+
+A **target** is a name and the command that reaches it. The command belongs
+to the target, not to the session — which is the whole point: an
+`ssh mail01 timberfs …` and a site wrapper taking the host as an argument
+are one fleet, and neither has to be expressible as the other with a
+placeholder swapped into it. `TIMBERFS_CMD` + `_TIMBERHOST_` could not do
+that, and it is still there as one *producer* of a target list rather than
+as the only way to describe a fleet.
+
+The document a resolver prints, and the file that holds the same thing:
+
+```json
+{"v": "1.0-EXPERIMENTAL",
+ "targets": [
+   {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
+   {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
+   {"cmd": ["timberfs", "query", "--query", "-"]}
+ ]}
+```
+
+`cmd` is a **list** because a command line written as one string has to be
+split again at this end, under rules we would have had to invent and get
+wrong — the same call the query document makes for `stores.select`. A
+`name` is what the `HOST` column and a `timber://<host>/…` address say; it
+is a **hint and not identity**, so renaming a target, or changing how it is
+reached, leaves every written address valid.
+
+**Where it comes from**, most explicit first — `show hosts;` says which won:
+
+```
+--resolver | --targets | --cmd/--hosts        one of them, not two
+$TIMBERFS_RESOLVER
+$TIMBERFS_TARGETS
+$TIMBERFS_CMD / $TIMBERFS_HOSTS
+~/.config/timberfs/targets.json, /etc/timberfs/targets.json
+one local `timberfs query --query -`          found on PATH
+```
+
+A flag beats an export as everywhere else here. Two *flags* is a usage
+error — they are three ways to answer one question, typed together, and
+preferring one silently is the mistake this replaced. Two *exports* is not:
+a stale one in a profile is ordinary, so the order decides and the
+provenance is reported rather than assumed.
+
+⚠ **A resolver that failed is fatal, and an empty fleet is refused.**
+Falling back would answer a question about one fleet with a different one,
+and the empty case is worse: a session that quietly asks the local machine
+instead looks exactly like a fleet that held nothing.
+
+⚠ **A target this build cannot reach is NAMED, never dropped.** A future
+`{"name": …, "url": …}` leaves that one target unreachable-with-a-reason
+and the rest of the fleet working — refusing all of it over one would be
+the wrong blast radius, and dropping it silently would make a host that was
+never asked read as a host that had nothing.
+
+The resolver is asked **one** question — what is the fleet — and gets no
+arguments. "Who has this store" is a different question that has not been
+thought through, and reserving an argument for it now would design it by
+accident. `refresh` re-runs it, because a resolver derives its answer.
+
 ## `timberview` — a pager over one store
 
 ⚠ **EXPERIMENTAL**, like everything else here.
@@ -223,10 +286,11 @@ hint: bake the host in and a pasted link breaks the day a store moves.
 tests/timbersh/test-timbersh              # all
 tests/timbersh/test-timbersh short_id     # one, by substring
 tests/timberview/test-timberview          # the viewer's model
+tests/timberfs-client/test-timberfs-client   # the fleet resolver
 ```
 
-No VM, no timberfs, no network. `scripts/check.sh` runs both, so they gate
-a push like everything else.
+No VM, no timberfs, no network. `scripts/check.sh` runs all three, so they
+gate a push like everything else.
 
 For timbersh, `--cmd` points at a fake that answers from a script. For the
 viewer, the fake is one level up: it implements the four operations, which

@@ -225,6 +225,18 @@ where they sit:
 ```sh
 timbersh --hosts web01,web02,db01 --cmd "ssh _TIMBERHOST_ timberfs query --query -"
 ```
+
+How a fleet is reached is a property of each **target**, not of the session,
+so a `ssh mail01 timberfs …` and a site wrapper taking the host as an
+argument can be in one set. A resolver — any command that prints the list —
+derives it, and `~/.config/timberfs/targets.json` holds the same document
+where there is nothing to derive it from:
+
+```json
+{"v": "1.0-EXPERIMENTAL",
+ "targets": [{"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
+             {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]}]}
+```
 ```sql
 select loglines from [type=apache] where logline since '00:00' and entry has 'error' limit 20;
 ```

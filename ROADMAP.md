@@ -315,9 +315,21 @@ here.
   beside it, over four operations and nothing else, and a coordinate now
   has a written form (`timber://host/id#offset=N`) that names a store by
   IDENTITY. What remains: the second backend (an entry-aware pager for a
-  piped `records` stream), holding several hosts open on one instant, and
-  the resolver the address is shaped for — so that `TIMBERFS_HOSTS` can
-  stop being /etc/hosts for timberfs. Design note:
+  piped `records` stream) and holding several hosts open on one instant.
+  Design note: [docs/plans/view.md](docs/plans/view.md).
+- **A fleet is a list of TARGETS, and a resolver derives it** — SHIPPED.
+  `TIMBERFS_CMD` with `_TIMBERHOST_` in it made the transport a property of
+  the SESSION, so every host had to be reached the same way and an `ssh`
+  could not sit beside a site wrapper taking the host as an argument. A
+  target is now a name and the argv that reaches it; `$TIMBERFS_RESOLVER`
+  is any command printing that list, `~/.config/timberfs/targets.json` holds
+  the same document, and the old variables are one producer of it rather
+  than the only way to describe a fleet. A resolver that failed is fatal and
+  an empty fleet refused, because a session that quietly asks the local
+  machine looks exactly like a fleet that held nothing; a target this build
+  cannot reach is named rather than dropped. What remains is the other half
+  of DNS — "who has this store", deliberately not designed yet, since
+  broadcast is fine at the measured fleet. Design note:
   [docs/plans/view.md](docs/plans/view.md).
 - **Ordering by the clock an entry CARRIES**: a bounded answer reads stores
   one after another and claims no order between them, because a streaming

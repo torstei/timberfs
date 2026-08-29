@@ -44,7 +44,8 @@ jobs:
 
       - name: It has to run
         run: |
-          python3 -m py_compile tools/timbersh tools/timberview.py tools/timberview
+          python3 -m py_compile tools/timbersh tools/timberview.py \
+            tools/timberview tools/timberfs_client.py
           python3 tools/timbersh --help > /dev/null
           python3 tools/timberview --help > /dev/null
 
@@ -75,6 +76,7 @@ jobs:
           # The module both front ends import: timbersh calls the viewer in
           # process, and /usr/bin/timberview is the entry point beside it.
           install -m 644 tools/timberview.py "$root/usr/share/timberfs-sh/timberview.py"
+          install -m 644 tools/timberfs_client.py "$root/usr/share/timberfs-sh/timberfs_client.py"
           gzip -9c packaging/timbersh.1 > "$root/usr/share/man/man1/timbersh.1.gz"
           gzip -9c packaging/timberview.1 > "$root/usr/share/man/man1/timberview.1.gz"
           install -m 644 tools/README.md "$root/usr/share/doc/timberfs-sh/README.md"

@@ -61,22 +61,25 @@ something else again at the far end.
   TIMBERSH_HISTSIZE
                  how many lines to keep, default 2000
 """
-import argparse, json, os, re, readline, shlex, subprocess, sys, threading, time
+import argparse, json, os, re, readline, subprocess, sys, threading, time
 
-# The viewer, and the pieces both front ends share. A checkout finds it
-# beside this script; the package installs it where both do.
+# The viewer, and the pieces both front ends share. A checkout finds
+# them beside this script; the package installs them where both do.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [p for p in (_HERE, "/usr/share/timberfs-sh")
                 if os.path.exists(os.path.join(p, "timberview.py"))]
+import timberfs_client
 import timberview
-from timberview import when
+from timberfs_client import HOST_TOKEN, when
 
-CMD = shlex.split(os.environ.get("TIMBERFS_CMD", "timberfs query --query -"))
-HOST_TOKEN = "_TIMBERHOST_"
-HOSTS = [h.strip() for h in os.environ.get("TIMBERFS_HOSTS", "").split(",") if h.strip()]
-# `None` is the one unnamed host: no fan-out, no substitution, and every
-# host-aware path below collapses to what it did before.
-TARGETS = HOSTS or [None]
+# The fleet, as TARGETS (names) and FLEET (the targets themselves). A
+# name is the currency everywhere below — the HOST column, a store's
+# `_host`, the host in an address — and only the transport looks up the
+# command behind it.
+FLEET = timberfs_client.Fleet([timberfs_client.Target(None,
+                                                      timberfs_client.DEFAULT_CMD)],
+                              "the default")
+TARGETS = [None]
 # How long the store list is reused for completion and `\d`. ZERO is
 # never: the list is read once and kept, because a store appearing
 # mid-session is rare and paying a round trip for it on a schedule is not.
@@ -228,7 +231,13 @@ def parse_pred(text):
 
 # ------------------------------------------------------------- timberfs
 def argv_for(host):
-    return CMD if host is None else [a.replace(HOST_TOKEN, host) for a in CMD]
+    """The argv that reaches one target. A LOOKUP, not a substitution:
+    two hosts may be reached in completely different ways, which is why
+    the command belongs to the target."""
+    t = FLEET.by_name(host)
+    if t is None:
+        raise ValueError(f"no target named {host!r} — `show hosts;` lists them")
+    return t.cmd
 
 
 def run(doc, host=None, raw=False):
@@ -486,26 +495,6 @@ def show_records(out, names, header=None, limit=None):
 
 def label(host):
     return host or "(local)"
-
-
-def check_hosts(targets, cmd):
-    """What a host set and a command must agree about, or None.
-
-    Both directions are wrong in the same silent way. Several hosts with
-    nowhere to put them sends the SAME command to each, so one forest is
-    read N times and every entry comes back N times under a different
-    host's name. A placeholder with no host to fill it runs the command
-    with `_TIMBERHOST_` in it literally — which reaches something, or
-    nothing, and reports whatever that was."""
-    named = [h for h in targets if h]
-    token = any(HOST_TOKEN in x for x in cmd)
-    if named and not token:
-        return (f"the command has no {HOST_TOKEN} to put a host in:\n"
-                f"      {' '.join(cmd)}")
-    if token and not named:
-        return (f"the command has a {HOST_TOKEN} and no host to put in it, so it "
-                f"would run with the placeholder still in it:\n      {' '.join(cmd)}")
-    return None
 
 
 def unwrap(text):
@@ -980,6 +969,7 @@ class Shell:
                            unreachable=self.unreachable)
 
     def do(self, line):
+        global FLEET, TARGETS
         if line.lstrip().startswith("\\"):
             return self.backslash(line.lstrip())
         toks = [t for t in lex(line) if t[1] != ";"]
@@ -994,25 +984,34 @@ class Shell:
             if len(toks) < 3:
                 raise ValueError(f"{head} host <name> [name ...]")
             names = [t[1] for t in toks[2:] if t[1] != ","]
-            global TARGETS
-            now = [h for h in TARGETS if h]  # the unnamed host is not a host
+            now = [t for t in FLEET.targets if t.name]
             for n in names:
                 if head == "add":
-                    if n in now:
+                    if any(t.name == n for t in now):
                         raise ValueError(f"`{n}` is already there")
-                    now.append(n)
+                    # A host needs a command to be reached BY, and only
+                    # the `--cmd` shape carries one that generalises. A
+                    # resolver derives its answer, so the way to add a
+                    # host there is to add it there and `refresh`.
+                    if not FLEET.template:
+                        raise ValueError(
+                            f"the fleet comes from {FLEET.source}, which says "
+                            f"how to reach each target — there is no command "
+                            f"to reach `{n}` with. Add it there and `refresh`")
+                    now.append(timberfs_client.Target(
+                        n, [a.replace(timberfs_client.HOST_TOKEN, n)
+                            for a in FLEET.template]))
                 else:
-                    if n not in now:
+                    if not any(t.name == n for t in now):
                         raise ValueError(
                             f"no host `{n}` — `show hosts;` lists them")
-                    now.remove(n)
+                    now = [t for t in now if t.name != n]
             if not now:
                 raise ValueError(
                     "that is the last host; a shell with none has nothing to ask")
-            problem = check_hosts(now, CMD)
-            if problem:
-                raise ValueError(problem)
-            TARGETS = now
+            FLEET = timberfs_client.Fleet(now, FLEET.source, FLEET.unusable,
+                                          FLEET.template, FLEET._how)
+            TARGETS = FLEET.names
             # The cached stores are tagged with the host they came from, so
             # a changed set makes the cache answer for a fleet that is no
             # longer the one being asked.
@@ -1024,6 +1023,23 @@ class Shell:
             show_unreachable(self.unreachable)
             return
         if head == "refresh":
+            was = set(FLEET.names)
+            try:
+                FLEET = FLEET.again()
+            except ValueError as e:
+                raise ValueError(f"the fleet could not be re-resolved: {e}")
+            TARGETS = FLEET.names
+            gained, lost = set(FLEET.names) - was, was - set(FLEET.names)
+            if gained or lost:
+                bits = [f"{len(TARGETS)} target(s) from {FLEET.source}"]
+                if gained:
+                    bits.append("new: " + ", ".join(sorted(map(label, gained))))
+                if lost:
+                    bits.append("gone: " + ", ".join(sorted(map(label, lost))))
+                print("  " + "   ".join(bits))
+            for h in list(self.hosts):
+                if h not in TARGETS:
+                    del self.hosts[h]
             before = {st.get("id") or st["name"]: st["name"]
                       for st in self.universe()}
             after = {st.get("id") or st["name"]: st["name"]
@@ -1042,6 +1058,9 @@ class Shell:
             return
         if head == "show" and len(toks) > 1 and toks[1][1].lower().startswith("host"):
             self.universe()  # cheap: cached, and it is what fills this in
+            print(f"  {len(TARGETS)} target(s), from {FLEET.source}")
+            for name, why in FLEET.unusable:
+                print(f"  ⚠ {label(name)} was not asked: {why}")
             w = max([len(label(h)) for h in TARGETS] + [4])
             print(f"  {'HOST':{w}}  {'VERSION':20}  STORES  STATUS")
             for host in TARGETS:
@@ -1066,6 +1085,12 @@ class Shell:
                 # The note timberfs printed and still exited 0 on. Kept
                 # because it is the sentence that explains an answer which
                 # looks wrong, and it used to be discarded.
+                # What actually runs. It is per target now, so a fleet
+                # reached several different ways says so here rather
+                # than being assumed uniform.
+                t = FLEET.by_name(host)
+                if t:
+                    print(f"  {'':{w}}  via: {' '.join(t.cmd)}")
                 if st.get("note"):
                     for line in st["note"].splitlines():
                         if line.strip():
@@ -1487,15 +1512,27 @@ def parse_args(argv):
                     "EXPERIMENTAL: the grammar is not promised.",
         epilog="Every option defaults to the environment variable beside it, so\n"
                "a flag overrides an export for one session and nothing else.\n"
+               "\n"
+               "WHERE THE FLEET IS, most explicit first: --resolver, --targets\n"
+               "or --cmd/--hosts (one of them, not two); then $TIMBERFS_RESOLVER,\n"
+               "$TIMBERFS_TARGETS, $TIMBERFS_CMD/$TIMBERFS_HOSTS; then\n"
+               "~/.config/timberfs/targets.json, /etc/timberfs/targets.json; then\n"
+               "one local `timberfs query --query -`. `show hosts;` says which won.\n"
+               "\n"
                "Inside the shell, `\\?` prints the statement syntax.")
+    ap.add_argument("--resolver", metavar="CMD",
+                    help="a command that prints the fleet as a target "
+                         "document. $TIMBERFS_RESOLVER")
+    ap.add_argument("--targets", metavar="FILE",
+                    help="the same document, from a file. $TIMBERFS_TARGETS; "
+                         "else ~/.config/timberfs/targets.json, else "
+                         "/etc/timberfs/targets.json")
     ap.add_argument("--cmd", metavar="ARGV",
-                    default=os.environ.get("TIMBERFS_CMD", "timberfs query --query -"),
-                    help="how to reach a timberfs; it is handed the query document "
-                         "on stdin. $TIMBERFS_CMD")
+                    help="one command reaching every host, with "
+                         f"{HOST_TOKEN} substituted per --hosts. Default "
+                         "`timberfs query --query -`. $TIMBERFS_CMD")
     ap.add_argument("--hosts", metavar="H,H",
-                    default=os.environ.get("TIMBERFS_HOSTS", ""),
-                    help="fan out to these hosts, substituting each for "
-                         f"{HOST_TOKEN} in --cmd. $TIMBERFS_HOSTS")
+                    help="the hosts that command reaches. $TIMBERFS_HOSTS")
     ap.add_argument("--rc", metavar="FILE", default=RC,
                     help="statements run at startup. $TIMBERSH_RC")
     ap.add_argument("--ttl", metavar="SECS", type=float,
@@ -1514,19 +1551,14 @@ def parse_args(argv):
 
 
 def main(argv=None):
-    global CMD, HOSTS, TARGETS, RC, STORE_TTL
+    global FLEET, TARGETS, RC, STORE_TTL
     a = parse_args(argv)
-    CMD = shlex.split(a.cmd)
-    HOSTS = [h.strip() for h in a.hosts.split(",") if h.strip()]
-    TARGETS = HOSTS or [None]
     RC, STORE_TTL = a.rc, a.ttl
-    # Several hosts and nowhere to put them: every one would get the SAME
-    # command, so the same forest would be read N times and every entry
-    # come back N times, labelled with a different host each time. A wrong
-    # answer that looks like a busy fleet.
-    problem = check_hosts(TARGETS, CMD)
-    if problem:
-        sys.exit(f"timbersh: {problem}")
+    try:
+        FLEET = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts)
+    except ValueError as e:
+        sys.exit(f"timbersh: {e}")
+    TARGETS = FLEET.names
     sh = Shell()
     # A space is the only delimiter: `[type=console` is ONE word to the
     # completer, which is what lets a predicate literal complete its own
@@ -1538,7 +1570,11 @@ def main(argv=None):
     if not a.quiet:
         print(HELP)
         if len(TARGETS) > 1:
-            print(f"  {len(TARGETS)} hosts: {', '.join(TARGETS)}\n")
+            print(f"  {len(TARGETS)} hosts from {FLEET.source}: "
+                  f"{', '.join(label(h) for h in TARGETS)}\n")
+    # Named on the way in, not discovered as a gap in an answer.
+    for name, why in FLEET.unusable:
+        print(f"  ⚠ {label(name)} was not asked: {why}")
     if sh.views:
         print(f"  {len(sh.views)} logview(s) from {RC}: {', '.join(sorted(sh.views))}")
     # Whatever ends the session — `\\q`, EOF, an interrupt, a statement

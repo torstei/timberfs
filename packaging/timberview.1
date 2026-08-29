@@ -3,6 +3,8 @@
 timberview \- read a timberfs store as a tape
 .SH SYNOPSIS
 .B timberview
+.RI [ --resolver " CMD" ]
+.RI [ --targets " FILE" ]
 .RI [ --cmd " ARGV" ]
 .RI [ --hosts " H,H" ]
 .RI [ --at " TIME" ]
@@ -28,19 +30,31 @@ address. With none, the first store is opened and
 switches between the rest.
 .SH OPTIONS
 .TP
+.BI \-\-resolver " CMD"
+A command that prints the fleet as a target document \(em a name and the
+argv that reaches it, per target. See
+.BR timbersh (1),
+WHERE THE FLEET IS, for the document and the order the sources are tried
+in.
+.RB ( $TIMBERFS_RESOLVER )
+.TP
+.BI \-\-targets " FILE"
+The same document, from a file.
+.RB ( $TIMBERFS_TARGETS )
+.TP
 .BI \-\-cmd " ARGV"
-How to reach a timberfs; it is handed a
+One command reaching every host, with
+.B _TIMBERHOST_
+substituted per
+.BR \-\-hosts .
+It is handed a
 .BR timberfs\-query\-document (5)
 on stdin. Default
 .BR "timberfs query --query -" .
 .RB ( $TIMBERFS_CMD )
 .TP
 .BI \-\-hosts " H,H"
-Ask these hosts, substituting each for
-.B _TIMBERHOST_
-in
-.BR \-\-cmd .
-A search covers all of them.
+The hosts that command reaches. A search covers all of them.
 .RB ( $TIMBERFS_HOSTS )
 .TP
 .BI \-\-at " TIME"

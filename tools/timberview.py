@@ -30,6 +30,9 @@ import re
 import subprocess
 import sys
 
+import timberfs_client
+from timberfs_client import when                              # noqa: F401
+
 DOC_V = "1.0-EXPERIMENTAL"
 
 # What `--has` matches, and therefore what can be selected: the index
@@ -1106,47 +1109,6 @@ def watch(backend, store, seq=None, at=None, offset=None):
     return curses.wrapper(Screen(view).run)
 
 
-# ------------------------------------------------------- typed times
-# What `timberfs query --from` accepts, in its order. Zoneless forms are
-# LOCAL time, and a bare time is today.
-TIME_FORMATS = [
-    ("%Y-%m-%d %H:%M:%S", "d"), ("%Y-%m-%dT%H:%M:%S", "d"),
-    ("%Y-%m-%d %H:%M", "d"),    ("%Y-%m-%dT%H:%M", "d"),
-    ("%Y.%m.%d %H:%M:%S", "d"), ("%Y.%m.%d %H:%M", "d"),
-    ("%Y-%m-%d", "d"),          ("%Y.%m.%d", "d"),
-    ("%H:%M:%S.%f", "t"),       ("%H:%M:%S", "t"), ("%H:%M", "t"),
-]
-
-
-def when(text):
-    """A typed time, in milliseconds — resolved at the EDGE.
-
-    A query document is self-contained, so building one must not need a
-    timberfs on this machine to interpret a string. And `11:10` means
-    today, where the reader is: carried as text it would mean a
-    different instant tomorrow and another one at the far end."""
-    import datetime
-    text = text.strip()
-    try:
-        return int(datetime.datetime.fromisoformat(text).timestamp() * 1000)
-    except ValueError:
-        pass
-    for fmt, kind in TIME_FORMATS:
-        try:
-            t = datetime.datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-        if kind == "t":
-            t = datetime.datetime.combine(datetime.date.today(), t.time())
-        return int(t.astimezone().timestamp() * 1000)
-    if text.isdigit():
-        n = int(text)
-        return n if n > 100_000_000_000 else n * 1000
-    raise ValueError(
-        f"{text!r} is not a time I read — try RFC3339, "
-        f"'YYYY-MM-DD [HH:MM[:SS]]', 'HH:MM[:SS]' for today, or unix seconds")
-
-
 # ------------------------------------------------------------ opening
 def resolve(backend, target):
     """A store, from whatever was typed: an address, a name, a short id,
@@ -1200,7 +1162,6 @@ def position(target=None, at=None, chunk=None):
 
 def main(argv=None):
     import argparse
-    import shlex
     ap = argparse.ArgumentParser(
         prog="timberview", add_help=True,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1209,28 +1170,38 @@ def main(argv=None):
                f"{SCHEME}: address.\nWith none, the first store is opened "
                "at its last chunk; S switches.")
     ap.add_argument("target", metavar="TARGET", nargs="?")
+    ap.add_argument("--resolver", metavar="CMD",
+                    help="a command that prints the fleet as a target "
+                         "document. $TIMBERFS_RESOLVER")
+    ap.add_argument("--targets", metavar="FILE",
+                    help="the same document, from a file. $TIMBERFS_TARGETS; "
+                         "else ~/.config/timberfs/targets.json, else "
+                         "/etc/timberfs/targets.json")
     ap.add_argument("--cmd", metavar="ARGV",
-                    default=os.environ.get("TIMBERFS_CMD",
-                                           "timberfs query --query -"),
-                    help="how to reach a timberfs; it is handed the query "
-                         "document on stdin. $TIMBERFS_CMD")
+                    help="one command reaching every host, with "
+                         "_TIMBERHOST_ substituted per --hosts. Default "
+                         "`timberfs query --query -`. $TIMBERFS_CMD")
     ap.add_argument("--hosts", metavar="H,H",
-                    default=os.environ.get("TIMBERFS_HOSTS", ""),
-                    help="ask these hosts, substituting each for "
-                         "_TIMBERHOST_ in --cmd. $TIMBERFS_HOSTS")
+                    help="the hosts that command reaches. $TIMBERFS_HOSTS")
     ap.add_argument("--at", metavar="TIME",
                     help="open at the chunk covering this instant")
     ap.add_argument("--chunk", metavar="N", help="open at this chunk number")
     a = ap.parse_args(argv)
 
-    cmd = shlex.split(a.cmd)
-    hosts = [h.strip() for h in a.hosts.split(",") if h.strip()] or [None]
+    try:
+        fleet = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts)
+    except ValueError as e:
+        sys.exit(f"timberview: {e}")
+    for name, why in fleet.unusable:
+        print(f"timberview: {name or '(local)'} was not asked: {why}",
+              file=sys.stderr)
 
     def ask(doc, host=None, raw=False):
-        line = cmd if host is None else [x.replace("_TIMBERHOST_", host)
-                                         for x in cmd]
+        t = fleet.by_name(host)
+        if t is None:
+            return (b"" if raw else ""), f"no target named {host!r}", 127
         try:
-            p = subprocess.run(line, input=json.dumps(doc).encode(),
+            p = subprocess.run(t.cmd, input=json.dumps(doc).encode(),
                                capture_output=True)
         except OSError as e:
             return (b"" if raw else ""), str(e), 127
@@ -1238,7 +1209,7 @@ def main(argv=None):
         return (p.stdout if raw
                 else p.stdout.decode("utf-8", "replace")), err, p.returncode
 
-    backend = QueryBackend(ask, hosts)
+    backend = QueryBackend(ask, fleet.names)
     try:
         store = resolve(backend, a.target)
         addr = watch(backend, store,

@@ -25,20 +25,37 @@ ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
 class Session:
     """One timbersh run against a scripted server."""
 
-    def __init__(self, scenario, hosts=None, extra=()):
+    def __init__(self, scenario, hosts=None, extra=(), resolver=False):
         self.dir = tempfile.mkdtemp(prefix="timbersh-test-")
         json.dump(scenario, open(os.path.join(self.dir, "scenario.json"), "w"))
         self.hosts = hosts
         self.extra = list(extra)
+        self.resolver = self.write_resolver(hosts) if resolver else None
+
+    def write_resolver(self, hosts):
+        """A resolver is a program that prints the fleet. Each target
+        gets its OWN argv here, which is the shape a placeholder could
+        not express."""
+        doc = {"v": "1.0-EXPERIMENTAL",
+               "targets": [{"name": h, "cmd": [FAKE, h]} for h in hosts]}
+        path = os.path.join(self.dir, "resolver")
+        open(path, "w").write(
+            "#!/bin/sh\ncat <<'EOF'\n" + json.dumps(doc)
+            + "\nEOF\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def where(self):
+        if self.resolver:
+            return ["--resolver", self.resolver]
+        return ["--cmd", f"{FAKE} _TIMBERHOST_" if self.hosts else FAKE] + (
+            ["--hosts", ",".join(self.hosts)] if self.hosts else [])
 
     def run(self, *statements):
         cmd = [sys.executable, TIMBERSH, "-q",
                "--histfile", os.path.join(self.dir, "history"),
-               "--rc", os.path.join(self.dir, "nonexistent-rc"),
-               "--cmd", f"{FAKE} _TIMBERHOST_" if self.hosts else FAKE]
-        if self.hosts:
-            cmd += ["--hosts", ",".join(self.hosts)]
-        cmd += self.extra
+               "--rc", os.path.join(self.dir, "nonexistent-rc")]
+        cmd += self.where() + self.extra
         p = subprocess.run(cmd, input="\n".join(statements) + "\n\\q\n",
                            capture_output=True, text=True,
                            env={**os.environ, "FAKE_DIR": self.dir})
@@ -71,10 +88,8 @@ class Pty(Session):
     def start(self, rows=24, cols=110):
         cmd = [sys.executable, TIMBERSH, "-q",
                "--histfile", os.path.join(self.dir, "history"),
-               "--rc", os.path.join(self.dir, "nonexistent-rc"),
-               "--cmd", f"{FAKE} _TIMBERHOST_" if self.hosts else FAKE]
-        if self.hosts:
-            cmd += ["--hosts", ",".join(self.hosts)]
+               "--rc", os.path.join(self.dir, "nonexistent-rc")]
+        cmd += self.where() + self.extra
         env = {**os.environ, "FAKE_DIR": self.dir, "TERM": "xterm"}
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
@@ -407,6 +422,74 @@ def view_refuses_a_predicate_that_selects_no_store():
     s.finish()
     assert not s.docs("chunks"), s.docs("chunks")
     s.cleanup()
+
+
+@test
+def a_fleet_can_be_reached_several_different_ways_at_once():
+    """The defect this replaced: one command with `_TIMBERHOST_` in it
+    made the transport a property of the SESSION, so an ssh-shaped host
+    and a wrapper taking the host as an argument could not be in one
+    fleet. Each target carries its own argv, and both are asked."""
+    hosts = ["alpha", "beta"]
+    s = Session({h: {"stores": [store(f"{h}1", ID_A if h == "alpha" else ID_B)]}
+                 for h in hosts}, hosts=hosts, resolver=True)
+    s.run("\\d")
+    assert "alpha1" in s.out and "beta1" in s.out, s.out
+    assert {r["host"] for r in s.requests} == {"alpha", "beta"}, s.requests
+    s.cleanup()
+
+
+@test
+def show_hosts_says_where_the_fleet_came_from_and_what_runs():
+    """"What am I talking to" now includes which of several sources won
+    — so an export that is no longer in charge cannot be mistaken for
+    one that is — and the command, which is per target rather than one
+    shape assumed for all of them."""
+    s = Session({"alpha": {"stores": []}}, hosts=["alpha"], resolver=True)
+    s.run("show hosts;")
+    assert "--resolver" in s.out, s.out
+    assert "via:" in s.out and "fake-timberfs alpha" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def add_host_under_a_resolver_says_where_to_add_it():
+    """`add host` needs a command to reach the new host WITH, and only
+    the `--cmd` shape carries one that generalises. Inventing one would
+    reach the wrong thing, or nothing, and report whatever that was."""
+    s = Session({"alpha": {"stores": []}}, hosts=["alpha"], resolver=True)
+    s.run("add host web03;")
+    assert "no command to reach" in s.out, s.out
+    assert "refresh" in s.out, s.out
+    s.cleanup()
+    # With a template there IS one, so it still works.
+    t = Session({h: {"stores": []} for h in ("alpha", "web03")},
+                hosts=["alpha"]).run("add host web03;", "show hosts;")
+    assert "2 host(s): alpha, web03" in t.out, t.out
+    t.cleanup()
+
+
+@test
+def a_resolver_that_failed_stops_the_session():
+    """Falling back to a default would answer a question about one fleet
+    with a different one — and an empty fleet used to mean "ask this
+    machine", which reads exactly like a fleet that held nothing."""
+    d = tempfile.mkdtemp(prefix="timbersh-test-")
+    bad = os.path.join(d, "bad")
+    open(bad, "w").write("#!/bin/sh\necho 'discovery is down' >&2\nexit 4\n")
+    os.chmod(bad, 0o755)
+    p = subprocess.run([sys.executable, TIMBERSH, "-q", "--resolver", bad],
+                       input="\\q\n", capture_output=True, text=True)
+    assert p.returncode != 0, p
+    assert "exit 4" in p.stderr and "discovery is down" in p.stderr, p.stderr
+    empty = os.path.join(d, "empty")
+    open(empty, "w").write(
+        '#!/bin/sh\necho \'{"v": "1.0-EXPERIMENTAL", "targets": []}\'\n')
+    os.chmod(empty, 0o755)
+    q = subprocess.run([sys.executable, TIMBERSH, "-q", "--resolver", empty],
+                       input="\\q\n", capture_output=True, text=True)
+    assert q.returncode != 0 and "nothing to ask" in q.stderr, q.stderr
+    shutil.rmtree(d, ignore_errors=True)
 
 
 def main():
