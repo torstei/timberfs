@@ -775,12 +775,51 @@ def parse_where(toks, i):
 
 # ----------------------------------------------------------- completion
 BACKSLASH = ["\\d", "\\d+", "\\dv", "\\?", "\\q"]
-VERBS = ["select", "tail", "view", "declare", "fetch", "close", "create",
-         "drop", "refresh", "add",
-         "show", "save", "load", "help", "quit"]
 AFTER_ENTRY = ["has", "not", "substring", "regex"]
 AFTER_TIME = ["since", "until", "between"]
 SUBJECTS = ["entry", "chunk", "logline", "written"]
+
+
+# ---------------------------------------------------------------- grammar
+#
+# THE statement shapes, once. The completer is generated from this and
+# knows nothing else, so a statement that is added here is completable and
+# one that is not, is not — where the two used to be written separately
+# and `create session` arrived in the parser alone.
+#
+# A `<placeholder>` is a value: `OFFERS` says what may be typed there, and
+# an empty answer means "anything, so offer nothing". One ending in `...`
+# is a sub-grammar that consumes the rest of the line — a clause list, a
+# coordinate, a nested statement — and has a handler below, because those
+# repeat or nest and a flat shape cannot say so.
+#
+# ⚠ The parser in `do()` is still hand-written and this does not drive it
+# yet. It is the index of what exists, which is the half that was drifting.
+FORMS = """
+    select <kind> from <source> <clauses...>
+    tail   <kind> from <source> <tailclauses...>
+    view   <source> <at...>
+    declare <name> cursor for <statement...>
+    fetch  <n> from <cursor>
+    close  <cursor>
+    create logview <name> <pred>
+    create logview <pred> <name>
+    create session <ends...>
+    drop   logview <view>
+    drop   host <host>
+    drop   session
+    show   hosts
+    show   logviews
+    show   cursors
+    show   session
+    add    host <newhost>
+    refresh
+    save   <file>
+    load   <file>
+    help
+    quit
+    exit
+"""
 
 
 class Complete:
@@ -793,32 +832,92 @@ class Complete:
     def __init__(self, sh):
         self.sh = sh
 
-    def options(self, line, word):
-        toks = line.split()
-        prev = toks[-2] if len(toks) >= 2 and not line.endswith(" ") else (
-            toks[-1] if toks and line.endswith(" ") else None)
-        n = len(toks) + (1 if line.endswith(" ") else 0)
+    def offers(self, slot):
+        """What may be typed at one `<placeholder>`. An empty answer is
+        "anything" — a name, a time, a count — where offering a guess
+        would be worse than offering nothing."""
+        return {
+            "<kind>": list(KINDS),
+            "<source>": sorted(self.sh.views) + ["["],
+            "<view>": sorted(self.sh.views),
+            "<cursor>": sorted(self.sh.cursors),
+            "<host>": [label(h) for h in TARGETS if h],
+            "<pred>": ["["],
+        }.get(slot, [])
 
-        # A backslash command takes a store NAME, so once past the command
-        # itself the names are the only thing that can follow.
+    def after(self, form, toks):
+        """What this FORM allows after `toks`, or None where it does not
+        match them at all. One walk of one shape; `options` unions it over
+        every shape, which is the whole completer now."""
+        slots, i = form.split(), 0
+        for j, slot in enumerate(slots):
+            if slot.endswith("...>"):
+                return self.sub(slot, toks[i:])
+            if i >= len(toks):
+                return [slot] if not slot.startswith("<") else self.offers(slot)
+            if not slot.startswith("<") and toks[i].lower() != slot:
+                return None                       # a different statement
+            i += 1
+        return [] if i >= len(toks) else None
+
+    def sub(self, slot, rest):
+        """The parts that repeat or nest, which a flat shape cannot say."""
+        prev = rest[-1].lower() if rest else None
+        if slot in ("<clauses...>", "<tailclauses...>"):
+            # `where ... [limit N [chunks]] [into view]`, in any order the
+            # parser takes them, and each of them once.
+            if prev in ("where", "and"):
+                return SUBJECTS
+            if prev == "entry":
+                return AFTER_ENTRY
+            if prev == "chunk":
+                return ["may"]
+            if prev == "may":
+                return ["have"]
+            if prev == "not":
+                return ["has", "substring", "regex"]
+            if prev in ("logline", "written", "write"):
+                return AFTER_TIME
+            if prev in ("limit", "into"):
+                return ["view"] if prev == "into" else []
+            low = [t.lower() for t in rest]
+            # `into view` is a SELECT's. A tail does not end, so it has no
+            # answer to put in a view — and the completer must not offer
+            # what the parser refuses.
+            clauses = ("where", "limit") if slot == "<tailclauses...>" \
+                else ("where", "limit", "into")
+            return [w for w in clauses if w not in low] \
+                + (["and"] if "where" in low else [])
+        if slot == "<at...>":
+            if prev in ("chunk", "offset"):
+                return []
+            return ["at"] if not rest else (
+                ["chunk", "offset"] if prev == "at" else [])
+        if slot == "<ends...>":
+            given = {t.lower() for t in rest}
+            return [e for e in ("from", "to") if e not in given]
+        if slot == "<statement...>":
+            # Past `for` it IS a statement, so it completes as one rather
+            # than teaching this a second copy of the grammar.
+            return self.options(" ".join(rest) + " ", "") if rest \
+                else ["select", "tail"]
+        return []
+
+    def options(self, line, word):
+        """Everything any statement shape allows at this point.
+
+        The grammar earns its keep here: at every point exactly one kind of
+        thing can come next, so the completer never has to guess. It reads
+        FORMS and nothing else — label keys and values come from the stores
+        that ARE there, so it cannot offer one nothing carries."""
+        # A backslash command and the inside of a predicate literal are
+        # not statement shapes: one is a different language, the other is
+        # the internals of a single token.
         if line.lstrip().startswith("\\"):
-            if n > 1:
+            toks = line.split()
+            if len(toks) + (1 if line.endswith(" ") else 0) > 1:
                 return sorted(x["name"] for x in self.sh.universe())
             return BACKSLASH
-        if n <= 1:
-            return VERBS
-        # `declare NAME cursor for <statement>`. Past `for` it IS an
-        # ordinary statement, so complete it as one rather than teaching
-        # this branch the whole grammar a second time — and `toks[0]` is
-        # `declare` there, which every rule below keys on.
-        if toks[0] == "declare":
-            low = line.lower()
-            if " for " in low:
-                rest = line[low.index(" for ") + 5:]
-                return ["select", "tail"] if not rest.strip() \
-                    else self.options(rest, word)
-            return {3: ["cursor"], 4: ["for"]}.get(n, [])
-        # inside a predicate literal: a key, then that key's values
         if word.startswith("["):
             body = word[1:]
             head, _, tail = body.rpartition(",")
@@ -829,52 +928,21 @@ class Complete:
                     return [pre + v for v in sorted(self.sh.values_of(k))]
             pre = f"[{head}," if head else "["
             return [pre + k + "=" for k in sorted(self.sh.keys_of())]
-        if toks[0] == "view":
-            if prev == "view":
-                return sorted(self.sh.views) + ["["]
-            if prev == "at":
-                return ["chunk", "offset"]
-            return ["at"] if n == 3 else []
-        if prev in ("select", "tail", "fetch"):
-            return KINDS if prev != "fetch" else []
-        if prev == "from":
-            return sorted(self.sh.views) + ["["] if toks[0] != "fetch" \
-                else sorted(self.sh.cursors)
-        if prev in KINDS and toks[0] in ("select", "tail"):
-            return ["from"]
-        if prev == "where" or prev == "and":
-            return SUBJECTS
-        if prev == "entry":
-            return AFTER_ENTRY
-        if prev == "chunk":
-            return ["may"]
-        if prev == "may":
-            return ["have"]
-        if prev == "not":
-            return ["has", "substring", "regex"]
-        if prev in ("logline", "written", "write"):
-            return AFTER_TIME
-        if prev == "add":
-            return ["host"]
-        if prev in ("create", "drop"):
-            return ["logview", "host"] if prev == "drop" else ["logview"]
-        # `drop host <TAB>` names one that is there.
-        if prev == "host" and toks[0] == "drop":
-            return [label(h) for h in TARGETS if h]
-        # What follows `logview` depends on the verb: `drop` names one that
-        # exists, `create` starts the predicate the new one will be.
-        if prev == "logview":
-            return sorted(self.sh.views) if toks[0] == "drop" else ["["]
-        # Still owed a predicate, whichever side the name went.
-        if toks[0] == "create" and not any(t.startswith("[") for t in toks[2:]):
-            return ["["]
-        if prev == "show":
-            return ["hosts", "logviews", "cursors"]
-        if prev == "close":
-            return sorted(self.sh.cursors)
-        if toks[0] in ("select", "tail") and prev not in ("where",):
-            return ["where", "limit"]
-        return []
+
+        toks = line.split()
+        # A partial last word is what is being completed, not something
+        # already typed.
+        if toks and not line.endswith(" "):
+            toks = toks[:-1]
+        out = []
+        for form in FORMS.split("\n"):
+            form = form.strip()
+            if not form:
+                continue
+            got = self.after(form, toks)
+            if got:
+                out += [o for o in got if o not in out]
+        return out
 
     def __call__(self, text, state):
         line = readline.get_line_buffer()[: readline.get_endidx()]
