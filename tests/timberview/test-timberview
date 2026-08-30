@@ -794,16 +794,21 @@ def an_entry_is_one_motion_however_many_lines_it_has():
     v.move_entry(-1)
     assert "first entry" in v.message, v.message
 
-    # The KEYS, not only the motion: J and K, one unit bigger than j and
-    # k and reachable on any layout — where `{`/`}` are AltGr gymnastics
-    # on half the keyboards in Europe.
+    # The KEYS, not only the motion. A shifted arrow keeps the hand where
+    # the line motion already is — one hand on shift, one on the arrows —
+    # where `{`/`}` are AltGr gymnastics on half the keyboards in Europe.
+    # J/K is the same motion for a terminal that sends no shifted arrow.
+    import curses
     screen = Screen_for_test()
     screen.view = v
-    v.cur = 0
-    screen.step(Screenish(), ord("J"))
-    assert v.source.lines[v.cur].text.endswith("ERROR boom"), v.source.lines[v.cur].text
-    screen.step(Screenish(), ord("K"))
-    assert v.source.lines[v.cur].text.endswith("INFO before"), v.source.lines[v.cur].text
+    for down, up in ((curses.KEY_SF, curses.KEY_SR), (ord("J"), ord("K"))):
+        v.cur = 0
+        screen.step(Screenish(), down)
+        assert v.source.lines[v.cur].text.endswith("ERROR boom"), \
+            (down, v.source.lines[v.cur].text)
+        screen.step(Screenish(), up)
+        assert v.source.lines[v.cur].text.endswith("INFO before"), \
+            (up, v.source.lines[v.cur].text)
 
 
 @test

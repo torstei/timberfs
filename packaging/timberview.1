@@ -72,14 +72,19 @@ A line.
 .BR g "/" G
 go to the log's top and end \(em a seek, not a walk back.
 .TP
-.BR J " " K
+.BR Shift\-\(da " " Shift\-\(ua " (or " J " " K )
 An ENTRY, over its continuation lines \(em a stack trace is one entry and
 forty lines, and stepping through them a line at a time is what this is
-for. The same motion as
-.BR j / k ,
-one unit bigger, which is why it is the same letters shifted. What it
-steps over is what the record stream said belongs together, never a guess
-at what a continuation line looks like.
+for. The shifted arrow keeps the hand where the line motion already is.
+What it steps over is what the record stream said belongs together, never
+a guess at what a continuation line looks like.
+.RB ( J / K
+is the same motion for a terminal that sends no shifted arrow: curses
+reads these as
+.B kri
+and
+.BR kind ,
+which xterm and its descendants define but not every terminal does.)
 .PP
 .RS
 ⚠ On the TAPE every line is its own entry, because the tape parses

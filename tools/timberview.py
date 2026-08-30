@@ -1493,10 +1493,11 @@ KEY_TAB, KEY_ESC, KEY_CR, KEY_LF = 9, 27, 13, 10
 HELP_KEYS = """
   j k  ↑ ↓        a line              g G           the log's top / end
   space b        a page              h l  ← →      sideways (no wrap)
-  J K            an ENTRY, over its continuation lines — a stack trace is
-                 one entry and forty lines. The same motion as j/k, one
-                 unit bigger. On the tape every line is its own, since it
-                 parses nothing
+  ⇧↓ ⇧↑          an ENTRY, over its continuation lines — a stack trace is
+   (J K)         one entry and forty lines. The arrow keeps the hand where
+                 the line motion already is; J/K is the same thing for a
+                 terminal that sends no shifted arrow. On the tape every
+                 line is its own, since it parses nothing
   w              wrap / no wrap      y             this line's address
 
   Tab  ⇧Tab      the searchable terms on this line — an identifier is
@@ -1639,9 +1640,9 @@ class Screen:
             self.scroll(stdscr, lambda: v.page(1, h - 2))
         elif key in (ord("b"), c.KEY_PPAGE):
             self.scroll(stdscr, lambda: v.page(-1, h - 2))
-        elif key == ord("J"):
+        elif key in (c.KEY_SF, ord("J")):
             self.scroll(stdscr, lambda: v.move_entry(1))
-        elif key == ord("K"):
+        elif key in (c.KEY_SR, ord("K")):
             self.scroll(stdscr, lambda: v.move_entry(-1))
         elif key == ord("g"):
             self.reach(stdscr, "the top of the log", v.home)
