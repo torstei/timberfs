@@ -794,6 +794,17 @@ def an_entry_is_one_motion_however_many_lines_it_has():
     v.move_entry(-1)
     assert "first entry" in v.message, v.message
 
+    # The KEYS, not only the motion: J and K, one unit bigger than j and
+    # k and reachable on any layout — where `{`/`}` are AltGr gymnastics
+    # on half the keyboards in Europe.
+    screen = Screen_for_test()
+    screen.view = v
+    v.cur = 0
+    screen.step(Screenish(), ord("J"))
+    assert v.source.lines[v.cur].text.endswith("ERROR boom"), v.source.lines[v.cur].text
+    screen.step(Screenish(), ord("K"))
+    assert v.source.lines[v.cur].text.endswith("INFO before"), v.source.lines[v.cur].text
+
 
 @test
 def tabbing_in_the_hit_list_brings_the_term_into_view():

@@ -72,13 +72,14 @@ A line.
 .BR g "/" G
 go to the log's top and end \(em a seek, not a walk back.
 .TP
-.BR } " " {
+.BR J " " K
 An ENTRY, over its continuation lines \(em a stack trace is one entry and
 forty lines, and stepping through them a line at a time is what this is
-for. What it steps over is what the record stream said belongs together,
-never a guess at what a continuation line looks like.
-.RB ( \(ua / \(da
-still move by line.)
+for. The same motion as
+.BR j / k ,
+one unit bigger, which is why it is the same letters shifted. What it
+steps over is what the record stream said belongs together, never a guess
+at what a continuation line looks like.
 .PP
 .RS
 ⚠ On the TAPE every line is its own entry, because the tape parses
