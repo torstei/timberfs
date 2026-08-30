@@ -16,6 +16,7 @@ unnamed one):
     {"alpha": {"stores": [ ... ], "loglines": "...", "records": [...]},
      "beta":  {"fail": "ssh: no route to host", "code": 255},
      "half":  {"stores": [...], "refuse": {"records": {"fail": "...", "code": 3}}},
+     "slow":  {"stores": [...], "records": [...], "delay_ms": 5000},
      "old":   {"stores": [...], "bare": true}}     <- pre-envelope server
 
 A `chunks` answer carries COMPRESSED frames, so the fake compresses too:
@@ -58,6 +59,13 @@ if "sequence" in me:
 # that can only fail every call cannot produce it.
 if kind in me.get("refuse", {}):
     me = {**me, **me["refuse"][kind]}
+
+# A host that takes its time. Not a timing bet in the test that uses it:
+# the sleep is explicit and long, and what is asserted is that another
+# host's output arrives while this one is still asleep.
+if me.get("delay_ms"):
+    import time
+    time.sleep(me["delay_ms"] / 1000.0)
 
 if "fail" in me:
     print(me["fail"], file=sys.stderr)

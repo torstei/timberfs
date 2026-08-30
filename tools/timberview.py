@@ -145,6 +145,39 @@ def unzstd(frame):
     return p.stdout
 
 
+def _record_at(buf, i):
+    """One record at or after `i` as `(kind, fields, payload, next_i)`, or
+    None where the buffer does not hold all of it.
+
+    The framing rules live here ONCE: `frames` walks a buffer that is
+    whole with it, `frames_from` one that is still arriving, and a stream
+    read as it comes must not be parsed by a second set of rules that can
+    drift from these."""
+    start = buf.find(b"\x1e", i)
+    if start < 0:
+        return None
+    j = buf.find(b"\0", start)
+    if j < 0:
+        return None                       # the head is not finished
+    head = buf[start + 1:j].split(b"\x1f")
+    fields = {}
+    for p in head[1:]:
+        k, _, v = p.partition(b"=")
+        fields[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    end = j + 1
+    payload = None
+    if "len" in fields:
+        n = int(fields["len"])
+        # ⚠ ALL of it, plus its NUL. A short buffer is not a short
+        # payload, it is a payload that has not arrived — and half an
+        # entry handed on as whole is the one thing this format refuses.
+        if end + n + 1 > len(buf):
+            return None
+        payload = buf[end:end + n]
+        end += n + 1
+    return head[0].decode("utf-8", "replace"), fields, payload, end
+
+
 def frames(buf):
     """`timberfs-records(5)` over BYTES. A record is RS, fields, NUL —
     and where a `len` field says so, that many payload bytes and a NUL.
@@ -152,24 +185,29 @@ def frames(buf):
     compressed frame contains every byte value including the separators."""
     i = 0
     while True:
-        i = buf.find(b"\x1e", i)
-        if i < 0:
+        got = _record_at(buf, i)
+        if got is None:
             return
-        j = buf.find(b"\0", i)
-        if j < 0:
-            return
-        head = buf[i + 1:j].split(b"\x1f")
-        fields = {}
-        for p in head[1:]:
-            k, _, v = p.partition(b"=")
-            fields[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
-        i = j + 1
-        payload = None
-        if "len" in fields:
-            n = int(fields["len"])
-            payload = buf[i:i + n]
-            i += n + 1
-        yield head[0].decode("utf-8", "replace"), fields, payload
+        kind, fields, payload, i = got
+        yield kind, fields, payload
+
+
+def frames_from(buf):
+    """The same records, plus WHAT IS LEFT — for a stream read as it
+    arrives rather than waited for.
+
+    A record is yielded only once every byte of it is here; the remainder
+    goes back to the reader to be added to. Returns `(records, leftover)`."""
+    out, i = [], 0
+    while True:
+        start = buf.find(b"\x1e", i)
+        if start < 0:
+            return out, b""               # nothing half-arrived
+        got = _record_at(buf, start)
+        if got is None:
+            return out, buf[start:]       # this one is still coming
+        kind, fields, payload, i = got
+        out.append((kind, fields, payload))
 
 
 class Chunk:
@@ -502,6 +540,24 @@ class QueryBackend:
 
 
 # ---------------------------------------------------------------- text
+def scrolled_to(span, col, width):
+    """The sideways offset that shows `span`, given the current one.
+
+    A little context either side, so the term does not sit against the
+    edge it just came from — a term flush against the right reads as the
+    end of the line.
+
+    Shared by the pager and the hit list because Tab means the same thing
+    on both screens, and a pick the window does not follow is a pick you
+    cannot see."""
+    margin = min(8, max(0, (width - (span[1] - span[0])) // 2))
+    if span[0] < col + margin:
+        return max(0, span[0] - margin)
+    if span[1] > col + width - margin:
+        return max(0, span[1] - width + margin)
+    return col
+
+
 def sanitise(s):
     """A raw-mode screen has to be told what to draw. Tabs become
     columns; every other control byte becomes one visible glyph, so an
@@ -993,6 +1049,84 @@ class Records:
                 if self.entries else "── nothing matched")
 
 
+class Joined:
+    """A source with each multi-line entry rendered as ONE line.
+
+    Ten stack traces in an answer is four hundred lines, and every one of
+    them pushes the next entry off the screen — so the thing you are
+    actually doing, deciding whether these ten are the same failure, has
+    no screen to do it on. Joined, each entry is a row: the message at the
+    left where the eye compares them, the frames trailing off to the
+    right where `h`/`l` can go and read them.
+
+    ⚠ The continuation lines are LSTRIPPED as they are joined. Their
+    indent is what puts the frames in a column under a message that is no
+    longer above them, and it is the difference between ten rows that
+    line up and ten that do not.
+
+    Nothing is hidden: every line of the entry is on the row. That is why
+    this is a rendering and not a fold — search, Tab, the hit list and
+    the entry motion all keep working, because every line on screen is a
+    real line with a real address.
+
+    A DECORATOR rather than a mode inside each source: `Tape` and
+    `Records` both have entries in this sense, the view swaps its source
+    at runtime (a hit in another store), and neither of them should learn
+    about a display option."""
+
+    SEP = " ↵ "
+
+    def __init__(self, source):
+        self.source = source
+        self._n = None
+        self._lines = []
+
+    def __getattr__(self, name):
+        # Everything not about lines is the source's, including the
+        # extends — which grow `source.lines` and so invalidate the cache
+        # by changing its length.
+        return getattr(self.source, name)
+
+    @property
+    def lines(self):
+        if self._n != len(self.source.lines):
+            self._rebuild()
+        return self._lines
+
+    def _rebuild(self):
+        out, run = [], []
+
+        def flush():
+            if not run:
+                return
+            head = run[0]
+            ln = Line(head.offset, b"")
+            ln.text = head.text + "".join(
+                self.SEP + x.text.lstrip() for x in run[1:])
+            ln.at, ln.store, ln.wf, ln.first = head.at, head.store, head.wf, True
+            out.append(ln)
+
+        for line in self.source.lines:
+            if getattr(line, "first", True) and run:
+                flush()
+                run = []
+            run.append(line)
+        flush()
+        self._lines, self._n = out, len(self.source.lines)
+
+    # An offset lands on the ENTRY holding it, which is the row it is now
+    # part of. The base implementations would scan the source's lines and
+    # answer with an index into the wrong list.
+    def index_of(self, offset):
+        for i, ln in enumerate(self.lines):
+            if ln.offset >= offset:
+                return i
+        return max(0, len(self.lines) - 1)
+
+    def chunk_of(self, offset):
+        return self.source.chunk_of(offset)
+
+
 # ---------------------------------------------------------------- view
 NEAR = 200          # lines from an edge at which the next chunk is fetched
 
@@ -1005,6 +1139,7 @@ class View:
 
     def __init__(self, backend, store=None, source=None):
         self.backend = backend
+        self.join = False
         self.source = source if source is not None else Tape(backend, store)
         self.wrap = False
         self.col = 0
@@ -1018,6 +1153,34 @@ class View:
         # the screen snap back would be the same fight from the other
         # side.
         self.follow_term = False
+
+    # `source` is a PROPERTY so the join survives the view swapping it —
+    # a hit in another store replaces the source outright, and a display
+    # option must not be something each of those sites remembers.
+    @property
+    def source(self):
+        return self._joined or self._source
+
+    @source.setter
+    def source(self, s):
+        self._source = s
+        self._joined = Joined(s) if self.join else None
+
+    def join_entries(self, on=None):
+        """Show each multi-line entry as one row, or stop.
+
+        The line under the cursor is kept: its offset addresses the ENTRY
+        either way, so the same entry is under you before and after, and
+        a toggle is not also a jump."""
+        where = self.line()
+        self.join = (not self.join) if on is None else on
+        self.source = self._source          # re-wrap, or unwrap
+        if where is not None:
+            self.cur = self.source.index_of(where.offset)
+            self.top = min(self.top, self.cur)
+        self.tok, self.col = 0, 0
+        self.message = ("multi-line entries as one row" if self.join
+                        else "entries as they are written")
 
     # -- opening
     def leave_for_the_log(self):
@@ -1120,6 +1283,29 @@ class View:
     def page(self, n, height):
         self.move(n * max(1, height - 2))
 
+    def move_entry(self, step):
+        """To the start of the next entry, over the continuation lines.
+
+        A stack trace is forty lines of one entry, and `j` walks every one
+        of them. What is stepped over is exactly what the record stream
+        said belongs together — `first` comes from the entry framing, not
+        from a guess at what a continuation line looks like.
+
+        ⚠ On the TAPE every line is its own start, because the tape parses
+        nothing and cannot know otherwise; there the motion is a line, and
+        the help says so. Better than a heuristic that would disagree with
+        timberfs about where an entry begins."""
+        lines = self.source.lines
+        rng = (range(self.cur + 1, len(lines)) if step > 0
+               else range(self.cur - 1, -1, -1))
+        for i in rng:
+            if getattr(lines[i], "first", True):
+                self.cur = i
+                self.tok = 0
+                self._widen()
+                return
+        self.message = ("the last entry" if step > 0 else "the first entry")
+
     def home(self):
         """The top of the LOG, which is a seek to its first chunk —
         never a walk back through the run. On a store of 400,000 chunks
@@ -1146,16 +1332,50 @@ class View:
         return ln.terms if ln else []
 
     def pick(self, step):
-        """Tab between the selectable terms, and on past the end of the
-        line: what can be picked is exactly what can be searched, so the
-        motion never lands anywhere a search cannot follow."""
+        """Tab between the selectable terms, and ON PAST the end of the
+        line to the next one that has any.
+
+        It used to wrap inside the line, which makes Tab a loop over four
+        tokens when what you are doing is reading down a screen. Off the
+        end of a line is the next line's first term; off the front is the
+        previous line's last.
+
+        Lines with nothing pickable are STEPPED OVER rather than landed
+        on. What can be picked is exactly what can be searched, so a stop
+        with nothing to search is a stop with nothing to do — and on the
+        tape the walk pulls more of it in as it nears an edge, so the end
+        is the source's end and not the buffer's."""
         toks = self.line_terms()
-        if not toks:
+        n = self.tok + step
+        if toks and 0 <= n < len(toks):
+            self.tok = n
+            self.follow_term = True
+            return toks[self.tok][2]
+        return self.pick_on(step)
+
+    def pick_on(self, step):
+        """The next line with a term on it, entered from the side Tab
+        arrived at: forwards lands on its first, backwards on its last."""
+        lines = self.source.lines
+        rng = (range(self.cur + 1, len(lines)) if step > 0
+               else range(self.cur - 1, -1, -1))
+        for i in rng:
+            toks = lines[i].terms
+            if not toks:
+                continue
+            self.cur = i
+            self.tok = 0 if step > 0 else len(toks) - 1
+            self.follow_term = True
+            self._widen()
+            return toks[self.tok][2]
+        # Nothing ahead has one. Say which way ran out, and stay put:
+        # wrapping to the far end is the loop this motion just stopped
+        # being, one size larger.
+        self.message = ("no searchable term below" if step > 0
+                        else "no searchable term above")
+        if not self.line_terms():
             self.message = self.nothing_pickable()
-            return None
-        self.tok = (self.tok + step) % len(toks)
-        self.follow_term = True
-        return toks[self.tok][2]
+        return None
 
     def selected(self):
         toks = self.line_terms()
@@ -1168,16 +1388,11 @@ class View:
     def bring_term_into_view(self, width):
         """Tab across a 200-character log line walks straight off the
         screen otherwise: the pick moves and the sideways scroll does
-        not follow it. A little context either side, so the term does
-        not sit against the edge it just came from."""
+        not follow it."""
         span = self.selected_span()
         if self.wrap or not span:
             return
-        margin = min(8, max(0, (width - (span[1] - span[0])) // 2))
-        if span[0] < self.col + margin:
-            self.col = max(0, span[0] - margin)
-        elif span[1] > self.col + width - margin:
-            self.col = max(0, span[1] - width + margin)
+        self.col = scrolled_to(span, self.col, width)
 
     def nothing_pickable(self):
         ln = self.line()
@@ -1419,10 +1634,19 @@ KEY_TAB, KEY_ESC, KEY_CR, KEY_LF = 9, 27, 13, 10
 HELP_KEYS = """
   j k  ↑ ↓        a line              g G           the log's top / end
   space b        a page              h l  ← →      sideways (no wrap)
+  ⇧↓ ⇧↑          an ENTRY, over its continuation lines — a stack trace is
+   (J K)         one entry and forty lines. The arrow keeps the hand where
+                 the line motion already is; J/K is the same thing for a
+                 terminal that sends no shifted arrow. On the tape every
+                 line is its own, since it parses nothing
+  z              a multi-line entry as ONE row — a stack trace beside the
+                 message that raised it, so ten of them can be compared
+                 at all. Nothing is hidden: h/l read along it
   w              wrap / no wrap      y             this line's address
 
-  Tab  ⇧Tab      the searchable terms on this line — an identifier is
-                 ONE of them, separators and all
+  Tab  ⇧Tab      the searchable terms, and on past the end of a line to
+                 the next one that has any — an identifier is ONE of
+                 them, separators and all
   Enter  *       search the picked one, everywhere
   /              search a term you type
   n  N           the next / previous hit
@@ -1561,6 +1785,10 @@ class Screen:
             self.scroll(stdscr, lambda: v.page(1, h - 2))
         elif key in (ord("b"), c.KEY_PPAGE):
             self.scroll(stdscr, lambda: v.page(-1, h - 2))
+        elif key in (c.KEY_SF, ord("J")):
+            self.scroll(stdscr, lambda: v.move_entry(1))
+        elif key in (c.KEY_SR, ord("K")):
+            self.scroll(stdscr, lambda: v.move_entry(-1))
         elif key == ord("g"):
             self.reach(stdscr, "the top of the log", v.home)
         elif key == ord("G"):
@@ -1569,6 +1797,8 @@ class Screen:
             v.scroll_h(-8)
         elif key in (ord("l"), c.KEY_RIGHT):
             v.scroll_h(8)
+        elif key == ord("z"):
+            v.join_entries()
         elif key == ord("w"):
             v.toggle_wrap()
         elif key == KEY_TAB:
@@ -1735,26 +1965,33 @@ class Screen:
         Answers `(what, value)`: `("open", index)`, `("term", text)`,
         or `(None, None)` for a cancel."""
         c = self.curses
-        sel, top, tok = 0, 0, 0
+        sel, top, tok, col = 0, 0, 0, 0
         while True:
-            h, _ = stdscr.getmaxyx()
+            h, w = stdscr.getmaxyx()
             body = max(1, h - 2)
             top = min(top, sel)
             if sel >= top + body:
                 top = sel - body + 1
             picked = (self.term_of(rows[sel][terms_from:], tok)
                       if searchable else None)
+            # The pick moves sideways and the window follows it, exactly
+            # as it does on the pager. A hit line is often long — a fleet
+            # path, a store name and the entry — so a term picked past the
+            # edge was highlighted nowhere and only named in the footer.
+            found = terms(rows[sel][terms_from:]) if searchable else []
+            if found:
+                a, b, _t = found[tok % len(found)]
+                col = scrolled_to((a + terms_from, b + terms_from), col, w - 1)
             stdscr.erase()
             self.put(stdscr, 0, f"── {title}", c.A_REVERSE)
             for y, i in enumerate(range(top, min(len(rows), top + body)),
                                   start=1):
                 base = c.A_REVERSE if i == sel else 0
-                self.put(stdscr, y, rows[i], base)
+                self.put(stdscr, y, rows[i][col:], base)
                 if searchable and i == sel:
-                    found = terms(rows[i][terms_from:])
                     for n, (a, b, _t) in enumerate(found):
-                        a, b = a + terms_from, b + terms_from
-                        if b <= stdscr.getmaxyx()[1] - 1:
+                        a, b = a + terms_from - col, b + terms_from - col
+                        if 0 <= a and b <= w - 1:
                             try:
                                 stdscr.chgat(y, a, b - a, base | (
                                     c.A_BOLD if n == tok % max(1, len(found))
@@ -1786,13 +2023,13 @@ class Screen:
                 if typed:
                     return "term", typed
             elif key in (ord("j"), c.KEY_DOWN):
-                sel, tok = min(len(rows) - 1, sel + 1), 0
+                sel, tok, col = min(len(rows) - 1, sel + 1), 0, 0
             elif key in (ord("k"), c.KEY_UP):
-                sel, tok = max(0, sel - 1), 0
+                sel, tok, col = max(0, sel - 1), 0, 0
             elif key in (ord(" "), c.KEY_NPAGE):
-                sel, tok = min(len(rows) - 1, sel + body), 0
+                sel, tok, col = min(len(rows) - 1, sel + body), 0, 0
             elif key == c.KEY_PPAGE:
-                sel, tok = max(0, sel - body), 0
+                sel, tok, col = max(0, sel - body), 0, 0
 
     @staticmethod
     def term_of(row, n):

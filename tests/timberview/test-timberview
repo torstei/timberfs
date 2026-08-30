@@ -581,6 +581,18 @@ def _z(data):
                               capture_output=True).stdout
 
 
+def tab_to(v, term, step, limit=50):
+    """Tab until `term` is picked. BOUNDED: an unbounded `while` here
+    turned a change in what Tab does into a suite that hangs, which is a
+    worse way to learn it than a failure."""
+    for _ in range(limit):
+        if v.selected() == term:
+            return
+        v.pick(step)
+    raise AssertionError(f"{term!r} never picked in {limit} tabs; "
+                         f"stopped at {v.selected()!r} ({v.message})")
+
+
 def Screen_for_test():
     """`busy` needs the curses MODULE for its attribute constants, and
     nothing else — no terminal."""
@@ -593,13 +605,14 @@ def Screen_for_test():
 class Screenish:
     """Enough of a curses window to draw on, and to type at."""
 
-    def __init__(self, keys=()):
+    def __init__(self, keys=(), width=200):
         self.painted = []
         self.keys = list(keys)
         self.exhausted = False
+        self.width = width
 
     def getmaxyx(self):
-        return (24, 200)
+        return (24, self.width)
 
     def addnstr(self, y, x, text, n, attr=0):
         self.painted.append(text)
@@ -761,6 +774,198 @@ def a_hit_list_is_itself_searchable():
     # And a list that is not searchable has none of it.
     assert screen.choose(Screenish([ord("*"), ord("q")]), "t", rows) \
         == (None, None)
+
+
+@test
+def tab_carries_on_to_the_next_line_rather_than_looping():
+    """It wrapped inside the line, so Tab was a loop over four tokens
+    while what you are doing is reading DOWN a screen. Off the end of a
+    line is the next line's first term; off the front is the previous
+    line's last."""
+    f = Fake(["alpha bravo\ncharlie\n"])
+    v = opened(f, seq=0)
+    v.cur, v.tok = 0, 0
+    assert v.selected() == "alpha"
+
+    v.pick(1)
+    assert v.selected() == "bravo" and v.cur == 0, (v.selected(), v.cur)
+    # Off the end of the line, not round to the start of it.
+    v.pick(1)
+    assert (v.selected(), v.cur) == ("charlie", 1), (v.selected(), v.cur)
+    # And backwards enters the previous line from ITS end.
+    v.pick(-1)
+    assert (v.selected(), v.cur) == ("bravo", 0), (v.selected(), v.cur)
+
+    # The end of the source stops and says which way ran out, rather than
+    # wrapping to the far end — that is the same loop one size larger.
+    tab_to(v, "charlie", 1)
+    v.pick(1)
+    assert v.selected() == "charlie", v.selected()
+    assert "below" in v.message, v.message
+
+
+@test
+def tab_steps_over_a_line_with_nothing_to_pick():
+    """What can be picked is exactly what can be searched, so a stop with
+    nothing to search is a stop with nothing to do. `26.1.18` is three
+    runs of under three characters and the index holds none of them."""
+    f = Fake(["alpha\n26.1.18\n\nomega9\n"])
+    v = opened(f, seq=0)
+    v.cur, v.tok = 0, 0
+    assert v.selected() == "alpha"
+    v.pick(1)
+    assert (v.selected(), v.cur) == ("omega9", 3), (v.selected(), v.cur)
+
+
+@test
+def a_multi_line_entry_can_be_shown_as_one_row():
+    """Ten stack traces is four hundred lines and each pushes the next
+    entry off the screen, so the thing you are doing — deciding whether
+    these ten are the same failure — has no screen to do it on. Joined,
+    the message is at the left where the eye compares them."""
+    r = tv.Records(answer(
+        ("10:00:01 ERROR boom\n\tat frame.0(F.java:1)\n\tat frame.1(F.java:1)",
+         {"offset": 0}),
+        ("10:00:02 INFO after", {"offset": 100})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    assert len(v.source.lines) == 4
+
+    v.join_entries()
+    assert len(v.source.lines) == 2, [ln.text for ln in v.source.lines]
+    # The indent goes: it is what stops ten rows lining up.
+    assert v.source.lines[0].text == (
+        "10:00:01 ERROR boom ↵ at frame.0(F.java:1) ↵ at frame.1(F.java:1)"), \
+        v.source.lines[0].text
+    # Nothing is hidden, so the row is still an entry with its address.
+    assert str(v.source.address_of(v.source.lines[0])).endswith("#offset=0")
+    # ...and the terms of the frames are pickable, because they are there.
+    assert any(t[2].startswith("frame.0") for t in v.source.lines[0].terms), \
+        v.source.lines[0].terms
+
+    v.join_entries()
+    assert len(v.source.lines) == 4, "and back again"
+
+
+@test
+def joining_keeps_the_entry_you_are_on():
+    """A display toggle must not also be a jump. The offset addresses the
+    ENTRY either way, so the same one is under the cursor before and
+    after — including from a continuation line, which has no row of its
+    own once they are joined."""
+    r = tv.Records(answer(
+        ("first", {"offset": 0}),
+        ("second\n  at a\n  at b", {"offset": 100}),
+        ("third", {"offset": 200})))
+    v = tv.View(Fake(["x\n"]), source=r)
+
+    v.cur = 3                                  # "  at b", inside the second
+    v.join_entries()
+    assert v.source.lines[v.cur].text.startswith("second"), \
+        (v.cur, v.source.lines[v.cur].text)
+    v.join_entries()
+    assert v.source.lines[v.cur].text == "second", \
+        (v.cur, v.source.lines[v.cur].text)
+
+
+@test
+def the_join_survives_the_view_changing_store():
+    """A hit in another store replaces the source outright. A display
+    option nobody re-applies there is one that turns itself off when you
+    follow a hit, which is when you were using it."""
+    r = tv.Records(answer(("boom\n  at a", {"offset": 0})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.join_entries()
+    assert len(v.source.lines) == 1
+
+    v.source = tv.Records(answer(("other\n  at b\n  at c", {"offset": 0})))
+    assert v.join is True
+    assert len(v.source.lines) == 1, [ln.text for ln in v.source.lines]
+
+
+@test
+def an_entry_is_one_motion_however_many_lines_it_has():
+    """A stack trace is forty lines of ONE entry, and `j` walks every one
+    of them. `}` and `{` step over the continuation lines to the next
+    entry's start, using what the record stream said belongs together
+    rather than guessing at what a continuation looks like."""
+    frames = "\n".join(f"\tat frame.{i}(F.java:1)" for i in range(40))
+    r = tv.Records(answer(
+        ("2026-08-30T10:00:00Z INFO before", {"offset": 0}),
+        (f"2026-08-30T10:00:01Z ERROR boom\n{frames}", {"offset": 100}),
+        ("2026-08-30T10:00:02Z INFO after", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    assert r.entries == 3 and len(r.lines) == 43, (r.entries, len(r.lines))
+
+    v.cur = 0
+    v.move_entry(1)
+    assert v.source.lines[v.cur].text.endswith("ERROR boom"), v.source.lines[v.cur].text
+    # ...and past all forty frames in one press, not forty.
+    v.move_entry(1)
+    assert v.source.lines[v.cur].text.endswith("INFO after"), v.source.lines[v.cur].text
+    # The end says so rather than moving nowhere in silence.
+    v.move_entry(1)
+    assert "last entry" in v.message, v.message
+
+    v.move_entry(-1)
+    assert v.source.lines[v.cur].text.endswith("ERROR boom"), v.source.lines[v.cur].text
+    v.move_entry(-1)
+    v.move_entry(-1)
+    assert "first entry" in v.message, v.message
+
+    # The KEYS, not only the motion. A shifted arrow keeps the hand where
+    # the line motion already is — one hand on shift, one on the arrows —
+    # where `{`/`}` are AltGr gymnastics on half the keyboards in Europe.
+    # J/K is the same motion for a terminal that sends no shifted arrow.
+    import curses
+    screen = Screen_for_test()
+    screen.view = v
+    for down, up in ((curses.KEY_SF, curses.KEY_SR), (ord("J"), ord("K"))):
+        v.cur = 0
+        screen.step(Screenish(), down)
+        assert v.source.lines[v.cur].text.endswith("ERROR boom"), \
+            (down, v.source.lines[v.cur].text)
+        screen.step(Screenish(), up)
+        assert v.source.lines[v.cur].text.endswith("INFO before"), \
+            (up, v.source.lines[v.cur].text)
+
+
+@test
+def tabbing_in_the_hit_list_brings_the_term_into_view():
+    """The pager's Tab follows the pick sideways and the hit list's did
+    not: a term picked past the right edge was highlighted nowhere and
+    named only in the footer, so the motion had nothing to show for
+    itself. A hit line is long by construction — a store, a host, a
+    timestamp, then the entry."""
+    uuid = "9da3dcf1-5a4b-4d36-b907-917daa60bd90"
+    row = (f"{'app @ mail01':28} 12:00:01 INFO handling "
+           + "padding " * 12 + f"req={uuid} done")
+    screen = Screen_for_test()
+
+    # How many Tabs reach the id is a property of the line, not something
+    # to hard-code: ask by searching what each pick offers.
+    taps = next(n for n in range(20)
+                if screen.choose(Screenish([KEY_TAB] * n + [ord("*")]),
+                                 "t", [row], searchable=True,
+                                 terms_from=29) == ("term", uuid))
+
+    # ⚠ The ROW, not the footer. The footer names the picked term too,
+    # and "named in the footer while highlighted nowhere" is precisely
+    # the state this is about — a check that accepts it passes before the
+    # fix and proves nothing. A painted row is a suffix of the whole row,
+    # because scrolling sideways is what slices it.
+    def seen(scr, w):
+        return [t[:w - 1] for t in scr.painted if row.endswith(t)]
+
+    wide = Screenish([KEY_TAB] * taps + [ord("q")], width=200)
+    screen.choose(wide, "t", [row], searchable=True, terms_from=29)
+    assert any(uuid in t for t in seen(wide, 200)), "wide enough anyway"
+
+    # 60 columns cannot hold the line, so the window has to move.
+    narrow = Screenish([KEY_TAB] * taps + [ord("q")], width=60)
+    screen.choose(narrow, "t", [row], searchable=True, terms_from=29)
+    visible = seen(narrow, 60)
+    assert any(uuid in t for t in visible), (
+        "the picked term is off-screen:\n  " + "\n  ".join(visible))
 
 
 def answer(*entries, source_id=ID_A, path="/l/app.log", version="0.26.0"):
@@ -955,8 +1160,7 @@ def tabbing_brings_the_term_into_view():
     assert v.col == 0
 
     # Tab to the term at the far right; the window follows it.
-    while v.selected() != "omega9":
-        v.pick(1)
+    tab_to(v, "omega9", 1)
     v.layout(80, 10)
     span = v.selected_span()
     assert v.col <= span[0] and span[1] <= v.col + 80, (v.col, span)
@@ -964,9 +1168,9 @@ def tabbing_brings_the_term_into_view():
     # context beside it reads as the end of the line.
     assert span[1] < v.col + 80, (v.col, span)
 
-    # And back to the first, which is off to the LEFT from there.
-    while v.selected() != "alpha":
-        v.pick(1)
+    # And BACK to the first, which is off to the left from there. Back,
+    # not round: Tab does not wrap inside a line any more.
+    tab_to(v, "alpha", -1)
     v.layout(80, 10)
     span = v.selected_span()
     assert v.col <= span[0] and span[1] <= v.col + 80, (v.col, span)

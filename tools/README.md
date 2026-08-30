@@ -79,18 +79,29 @@ A target is only ever handed a document on stdin, so anything that reaches a
 timberfs works — a wrapper, `ssh`, a container exec.
 
 With several hosts the stores present as one set with a `HOST` column, and
-each remembers where it lives. Listings go out in parallel; reads go host by
-host and claim no order between them, for the reason a bounded timberfs
-answer is `order=sequential`. `limit N` is N in total, so a later host may go
-unread — it says so when that happens, and a host it cannot reach is named
-rather than quietly missing.
+each remembers where it lives. A host it cannot reach is named rather than
+quietly missing.
 
-A read goes to every host **at once** and is rendered in the order the hosts
-were given. There is no point asking first which of them hold a matching
-store: a read whose predicate matches nothing resolves to nothing and returns
-immediately — the same 0.00 s as asking. The cost was never the search, it
-was N round trips taken one after another. Measured on seven hosts at a
-second of latency each: **7.0 s → 1.1 s**.
+A read goes to every host **at once** and is rendered **as it arrives**, each
+line naming the host it came from. There is no point asking first which of
+them hold a matching store: a read whose predicate matches nothing resolves to
+nothing and returns immediately — the same 0.00 s as asking. The cost was
+never the search, it was N round trips taken one after another. Measured on
+seven hosts at a second of latency each: **7.0 s → 1.1 s**.
+
+⚠ It used to collect every answer and then replay them host by host, so the
+fastest host's first line waited for the slowest host's last one. Measured
+against a server emitting an entry every 300 ms: **first line at 1.9 s, which
+was also when the last one arrived**. Now 0.4 s on one host, and on a fleet
+where one host is slow, 0.1 s for the fast one's first line.
+
+No ordering is lost by interleaving. Within a host a bounded answer is
+`order=sequential` — store after store, not time — and across hosts this shell
+never claimed one; the grouping was a rendering. Ordering by the clock an entry
+carries needs the whole answer in hand and is a separate thing
+(`docs/plans/logline-order.md`). `limit N` is N in total, so which entries a
+bounded fleet read returns is decided by arrival, and it says how many more had
+already come.
 
 ⚠ A `limit` is sent to every host and enforced across the answers, so a host
 whose output falls past the limit did work that is never shown — bounded by
