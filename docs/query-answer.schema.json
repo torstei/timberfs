@@ -48,7 +48,7 @@
       ]
     },
     "Limits": {
-      "description": "The ceilings, as declared. An absent one is no ceiling.",
+      "description": "The ceilings in force. `None` is no ceiling — which is what\n`Default` gives, because that is what a read the ceilings do not bound\ndeclares. What an unconfigured MACHINE has is `builtin`.",
       "type": "object",
       "properties": {
         "deadline_ms": {

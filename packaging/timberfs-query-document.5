@@ -489,9 +489,12 @@ hands those back. That is a page, and
 bounds how LONG it may take rather than how much it returns.
 .PP
 A document is a request from somewhere else, and the machine answering
-it declares its own CEILINGS on what one may ask for \(em
+it has CEILINGS on what one may ask for \(em ON by default and overridden
+in
 .BR /etc/timberfs/limits.conf ,
 .BR timberfs (1).
+So an unbounded document is answered with a PAGE rather than with
+everything, and the answer says so.
 They are announced rather than discovered: every answer with somewhere
 to put them carries them, so a caller sizes its pages before it asks.
 The

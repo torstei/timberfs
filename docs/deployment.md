@@ -181,6 +181,38 @@ timberfs query /var/log/timberfs/*/*.trunk --from 13:40
 An instance that needs more than one stream in one directory just sets a custom
 `--into` in a drop-in.
 
+## What a request may ask for
+
+A query document is a request from somewhere else — a relay hands one to
+`timberfs query --query -` for a caller who does not own this machine — so the
+machine has ceilings on what one may ask for. They are **on by default**
+(100 000 entries, 1 000 chunks, a 30 s deadline) and they bound a document, not
+the flags an operator types beside it.
+
+```sh
+timberfs limits                                  # what is in force, and from where
+```
+
+A bounded answer is not a truncation: `stream-end` says `status=limited` and
+names which ceiling stopped it, and the `position` records resume it, so an
+unbounded document is answered with a first page rather than with everything.
+The ceilings are declared in every answer that has somewhere to put them, so a
+caller can size its pages before it asks.
+
+Override them in `/etc/timberfs/limits.conf` — `MAX_ENTRIES`, `MAX_CHUNKS`,
+`DEADLINE_MS`, each a number or `none`:
+
+```sh
+printf 'MAX_ENTRIES=250000\nDEADLINE_MS=none\n' > /etc/timberfs/limits.conf
+timberfs limits                                  # exits non-zero on a line it could not use
+```
+
+That exit code is what a rollout gates on. A line this build cannot use is
+skipped and named on stderr rather than being fatal, and every ceiling it does
+know stays in force: `timberfs query` has no startup to validate the file at,
+so a policy file it refused would answer every caller with a config error the
+caller cannot fix. See `man timberfs` (QUERY CEILINGS).
+
 ## systemd units
 
 Seven independent families ship with the package: one mount, four intakes

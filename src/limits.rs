@@ -32,7 +32,9 @@ const FILE: &str = "/etc/timberfs/limits.conf";
 /// no clap plumbing. The same idiom as `TIMBERFS_FORESTS`.
 const ENV: &str = "TIMBERFS_LIMITS";
 
-/// The ceilings, as declared. An absent one is no ceiling.
+/// The ceilings in force. `None` is no ceiling — which is what
+/// `Default` gives, because that is what a read the ceilings do not bound
+/// declares. What an unconfigured MACHINE has is `builtin`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Limits {
@@ -52,6 +54,38 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// What an unconfigured timberfs answers under.
+    ///
+    /// ON by default, because the file exists to OVERRIDE these rather
+    /// than to switch protection on: a machine nobody configured is the
+    /// one most likely to be asked for everything, and a ceiling only the
+    /// careful operator gets is not a ceiling. It costs an unbounded
+    /// caller nothing it cannot take back — a bounded answer is a PAGE,
+    /// carrying the positions that resume it.
+    ///
+    /// The numbers are a judgement, not physics, and each is one line to
+    /// change:
+    ///
+    /// - **100_000 entries** — an answer a client can hold (measured at
+    ///   ~3.4x its own size in a reader, so ~13 MB of apache lines here),
+    ///   and far above any interactive search. "Give me everything" is
+    ///   what it bounds, and that is the request that should page.
+    /// - **1_000 chunks** — the same size class in the unit a chunk sweep
+    ///   is bounded in: frames move compressed and verbatim, so this is
+    ///   what a caller receives rather than what it decompresses to.
+    /// - **30_000 ms** — the only bound on the WAIT. A relay's own
+    ///   timeout drops the connection and everything already on it, where
+    ///   a deadline is ANSWERED: the stores read are complete and the one
+    ///   it stopped in carries a position. Under any relay timeout worth
+    ///   the name, so the answered partial arrives first.
+    pub fn builtin() -> Self {
+        Limits {
+            max_entries: Some(100_000),
+            max_chunks: Some(1_000),
+            deadline_ms: Some(30_000),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         *self == Limits::default()
     }
@@ -130,29 +164,64 @@ impl Limits {
     }
 }
 
-/// What this machine declares, from `TIMBERFS_LIMITS` if set, else
-/// `/etc/timberfs/limits.conf`, else nothing.
+/// What this machine declares, warning about any line it could not use.
+///
+/// ⚠ A line this build cannot apply is SKIPPED, not fatal, and the reason
+/// goes to stderr. That is the opposite disposition from the rest of this
+/// format, and the reason is that `timberfs query` has no STARTUP: a relay
+/// execs it once per request, so a policy file it refused would answer
+/// every caller with a config error the caller cannot fix, for a mistake
+/// the operator would never see. A server reads its policy once and
+/// refuses to start, which is the same strictness landing on the person
+/// who can act on it — see `describe` and `timberfs limits`, which is that
+/// check for a thing that has no startup.
+///
+/// Skipping is not silent either way: the ceilings actually in force are
+/// declared in every answer, so a ceiling that did not survive the file is
+/// visible to the caller as well as to the operator.
 pub fn configured() -> anyhow::Result<Limits> {
+    let (limits, problems, _) = describe()?;
+    for why in &problems {
+        eprintln!("timberfs: {why}");
+    }
+    Ok(limits)
+}
+
+/// The ceilings, everything unusable about the file, and where it came
+/// from — what `timberfs limits` prints and what `configured` warns with.
+pub fn describe() -> anyhow::Result<(Limits, Vec<String>, String)> {
     if let Some(env) = std::env::var_os(ENV) {
-        return parse(&env.to_string_lossy(), ENV);
+        let (l, p) = parse(&env.to_string_lossy(), ENV);
+        return Ok((l, p, format!("${ENV}")));
     }
     match std::fs::read_to_string(FILE) {
-        Ok(text) => parse(&text, FILE),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Limits::default()),
+        Ok(text) => {
+            let (l, p) = parse(&text, FILE);
+            Ok((l, p, FILE.to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((
+            Limits::builtin(),
+            Vec::new(),
+            "the built-in defaults".into(),
+        )),
+        // Present and unreadable is not "no ceilings": something is there
+        // and this build cannot see it, which is worth stopping for.
         Err(e) => Err(e).with_context(|| format!("reading {FILE}")),
     }
 }
 
 /// `KEY=VALUE`, one per line or space-separated; `#` comments and blank
-/// lines ignored.
+/// lines ignored. Returns what it understood and one sentence per line it
+/// did not — an unknown key (an older timberfs meeting a newer policy, or
+/// a typo) and a value that is not a number are both that.
 ///
-/// ⚠ An unknown key is an ERROR, where `forests.d` ignores one for
-/// forward compatibility. The directions of failure are opposite: a
-/// forest nobody reads is a store not found, and a CEILING nobody reads
-/// is the unbounded read this file exists to prevent. So a typo, and an
-/// older timberfs meeting a newer policy, both fail closed and say so.
-fn parse(text: &str, from: &str) -> anyhow::Result<Limits> {
-    let mut l = Limits::default();
+/// It starts from the BUILT-IN ceilings and overrides them, so a file
+/// naming one key changes that one and leaves the rest in force. `none`
+/// removes a ceiling; there is no other way to say it, and `0` is refused
+/// because a ceiling of zero entries would answer nothing while reading
+/// as "off".
+fn parse(text: &str, from: &str) -> (Limits, Vec<String>) {
+    let (mut l, mut bad) = (Limits::builtin(), Vec::new());
     // `#` runs to the end of the LINE, so a comment cannot be mistaken for
     // a field — the fields themselves are whitespace-separated, which is
     // what lets the env var carry the same text as the file.
@@ -161,26 +230,44 @@ fn parse(text: &str, from: &str) -> anyhow::Result<Limits> {
         .map(|line| line.split('#').next().unwrap_or(""))
         .flat_map(str::split_whitespace);
     for field in fields {
-        let (key, value) = field
-            .split_once('=')
-            .with_context(|| format!("{from}: {field:?} is not KEY=VALUE"))?;
-        let n = || -> anyhow::Result<u64> {
-            value
-                .parse::<u64>()
-                .with_context(|| format!("{from}: `{key}` wants a number, not {value:?}"))
+        let Some((key, value)) = field.split_once('=') else {
+            bad.push(format!(
+                "{from}: {field:?} is not KEY=VALUE, so it sets no ceiling"
+            ));
+            continue;
+        };
+        let n = if value.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            match value.parse::<u64>() {
+                Ok(0) => {
+                    bad.push(format!(
+                        "{from}: `{key}=0` would answer nothing at all — write `none` to \
+                         remove the ceiling. Left at the default"
+                    ));
+                    continue;
+                }
+                Ok(n) => Some(n),
+                Err(_) => {
+                    bad.push(format!(
+                        "{from}: `{key}` wants a number or `none`, not {value:?}. Left at \
+                         the default"
+                    ));
+                    continue;
+                }
+            }
         };
         match key {
-            "MAX_ENTRIES" => l.max_entries = Some(n()?),
-            "MAX_CHUNKS" => l.max_chunks = Some(n()?),
-            "DEADLINE_MS" => l.deadline_ms = Some(n()?),
-            _ => bail!(
-                "{from}: `{key}` is not a limit this timberfs knows — it has MAX_ENTRIES, \
-                 MAX_CHUNKS and DEADLINE_MS. A ceiling that is not understood is not \
-                 applied, so it is refused rather than ignored"
-            ),
+            "MAX_ENTRIES" => l.max_entries = n,
+            "MAX_CHUNKS" => l.max_chunks = n,
+            "DEADLINE_MS" => l.deadline_ms = n,
+            _ => bad.push(format!(
+                "{from}: `{key}` is not a limit this timberfs knows (MAX_ENTRIES, \
+                 MAX_CHUNKS, DEADLINE_MS). The ceilings it does know are unaffected"
+            )),
         }
     }
-    Ok(l)
+    (l, bad)
 }
 
 #[cfg(test)]
@@ -188,35 +275,79 @@ mod tests {
     use super::*;
     use crate::query::Limit;
 
+    /// A machine nobody configured is the one most likely to be asked for
+    /// everything, so the ceilings are ON and the file overrides them.
+    /// `Default` stays empty because that is what a read the ceilings do
+    /// not bound — one from the flags — declares.
     #[test]
-    fn nothing_declared_is_no_ceiling() {
-        let l = parse("", "test").unwrap();
-        assert!(l.is_empty());
-        assert_eq!(l.record_fields(), "");
+    fn an_empty_file_is_the_built_in_ceilings_not_none() {
+        let (l, bad) = parse("", "test");
+        assert_eq!(l, Limits::builtin());
+        assert!(bad.is_empty());
+        assert!(Limits::default().is_empty());
+        assert_eq!(Limits::default().record_fields(), "");
     }
 
     #[test]
     fn comments_and_blank_lines_are_skipped() {
-        let l = parse(
+        let (l, bad) = parse(
             "# a policy\n\nMAX_ENTRIES=100\n\nDEADLINE_MS=5000\n",
             "test",
-        )
-        .unwrap();
-        assert_eq!(l.max_entries, Some(100));
-        assert_eq!(l.deadline_ms, Some(5000));
-        assert_eq!(l.max_chunks, None);
+        );
+        assert_eq!(
+            (l.max_entries, l.deadline_ms, l.max_chunks),
+            (Some(100), Some(5000), Limits::builtin().max_chunks)
+        );
+        assert!(bad.is_empty(), "{bad:?}");
     }
 
-    /// A ceiling nobody understood is not applied, and an unapplied
-    /// ceiling is the unbounded read the file exists to prevent — the
-    /// opposite direction from `forests.d`, where an ignored key costs a
-    /// lookup rather than the machine.
+    /// The file OVERRIDES the built-in ceilings, so a line naming one key
+    /// changes that one and leaves the rest standing.
     #[test]
-    fn an_unknown_key_is_refused_rather_than_ignored() {
-        let e = parse("MAX_ENTRY=100", "test").unwrap_err().to_string();
-        assert!(e.contains("MAX_ENTRIES"), "{e}");
-        assert!(parse("MAX_ENTRIES=lots", "test").is_err());
-        assert!(parse("MAX_ENTRIES", "test").is_err());
+    fn the_file_overrides_the_built_in_ceilings_key_by_key() {
+        let (l, bad) = parse("MAX_ENTRIES=5", "test");
+        assert_eq!(l.max_entries, Some(5));
+        assert_eq!(l.max_chunks, Limits::builtin().max_chunks);
+        assert_eq!(l.deadline_ms, Limits::builtin().deadline_ms);
+        assert!(bad.is_empty(), "{bad:?}");
+
+        // `none` is the only way to remove one, because `0` would answer
+        // nothing while reading as "off".
+        let (l, bad) = parse("DEADLINE_MS=none", "test");
+        assert_eq!(l.deadline_ms, None);
+        assert!(bad.is_empty(), "{bad:?}");
+        let (l, bad) = parse("DEADLINE_MS=0", "test");
+        assert_eq!(l.deadline_ms, Limits::builtin().deadline_ms);
+        assert!(bad[0].contains("none"), "{bad:?}");
+    }
+
+    /// `timberfs query` has no startup: a relay execs it once per request,
+    /// so a policy file it REFUSED would answer every caller with a config
+    /// error the caller cannot fix, for a mistake the operator would never
+    /// see. An override naming something that does not exist is the
+    /// operator's mistake and must not make the logs unavailable — the
+    /// line is skipped, said out loud, and every ceiling this build DOES
+    /// know stays in force. `timberfs limits` is where the strictness
+    /// lives, and a server would move it to its own startup.
+    #[test]
+    fn a_line_it_cannot_use_is_skipped_and_named_not_fatal() {
+        // The realistic one: an older timberfs meeting a newer policy.
+        let (l, bad) = parse("MAX_ENTRIES=100\nMAX_BYTES=99\n", "test");
+        assert_eq!(l.max_entries, Some(100));
+        assert_eq!(l.max_chunks, Limits::builtin().max_chunks);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(
+            bad[0].contains("MAX_BYTES") && bad[0].contains("MAX_ENTRIES"),
+            "{bad:?}"
+        );
+
+        // A typo leaves the DEFAULT standing, which is the difference
+        // between this and a file that switched protection on.
+        for text in ["MAX_ENTRIES=lots", "MAX_ENTRIES"] {
+            let (l, bad) = parse(text, "test");
+            assert_eq!(l, Limits::builtin(), "{text}");
+            assert_eq!(bad.len(), 1, "{text} gave {bad:?}");
+        }
     }
 
     #[test]

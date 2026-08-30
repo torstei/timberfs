@@ -954,7 +954,12 @@ mod tests {
         // in the VM suite, against stores that exist.
         let before = q();
         let doc = Document::of(&before).unwrap();
-        let after = doc.to_query().unwrap();
+        // Under NO ceilings: a machine's policy is a layer OVER the
+        // document, so mixing it in here would test the policy rather
+        // than the round trip.
+        let after = doc
+            .to_query_under(crate::limits::Limits::default())
+            .unwrap();
         for (name, a, b) in [
             (
                 "window",
@@ -1136,7 +1141,12 @@ mod tests {
         // stores is "every entry of those stores".
         let doc: Document =
             serde_json::from_str(r#"{"v":"1.0-EXPERIMENTAL","stores":{}}"#).unwrap();
-        let q = doc.to_query().unwrap();
+        // Under NO ceilings: this is about what the DOCUMENT means, and a
+        // machine's ceilings are a layer over it that a bare `to_query`
+        // would mix in.
+        let q = doc
+            .to_query_under(crate::limits::Limits::default())
+            .unwrap();
         assert!(q.window.from.is_none() && q.window.to.is_none());
         assert!(q.matching.is_empty());
         assert!(q.limit.max.is_none() && q.limit.tail.is_none());
@@ -1439,6 +1449,35 @@ mod tests {
         .unwrap();
         assert_eq!(q.limit.max, None);
         assert!(!q.limit.imposed.max);
+        // ...including under the built-in ceilings, which is the path a
+        // machine nobody configured actually takes.
+        let q = serde_json::from_str::<Document>(
+            r#"{"v":"1.0-EXPERIMENTAL","stores":{},"response_format":{"kind":"stores"}}"#,
+        )
+        .unwrap()
+        .to_query_under(crate::limits::Limits::builtin())
+        .unwrap();
+        assert_eq!(q.limit.max, None);
+    }
+
+    /// A machine nobody configured still bounds a request, because the
+    /// ceilings are ON and the file overrides them rather than switching
+    /// them on. A bounded answer is a PAGE — it carries the positions
+    /// that resume it — so this costs a caller nothing it cannot take
+    /// back, which is what makes a default defensible.
+    #[test]
+    fn an_unconfigured_machine_still_bounds_a_document() {
+        let q = serde_json::from_str::<Document>(r#"{"v":"1.0-EXPERIMENTAL","stores":{}}"#)
+            .unwrap()
+            .to_query_under(crate::limits::Limits::builtin())
+            .unwrap();
+        assert_eq!(q.limit.max, crate::limits::Limits::builtin().max_entries);
+        assert!(q.limit.imposed.max);
+        assert_eq!(
+            q.limit.imposed.declared,
+            crate::limits::Limits::builtin(),
+            "and says so in the answer"
+        );
     }
 
     #[test]

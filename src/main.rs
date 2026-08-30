@@ -482,6 +482,16 @@ enum Command {
         #[arg(long)]
         full_id: bool,
     },
+    /// What this machine will let ONE REQUEST ask for, and where those
+    /// ceilings came from. `timberfs query` has no startup to validate
+    /// /etc/timberfs/limits.conf at, so this is that check: it exits
+    /// non-zero when a line could not be used, which is what config
+    /// management gates a rollout on
+    Limits {
+        /// The ceilings as JSON, exactly as an answer declares them
+        #[arg(long)]
+        json: bool,
+    },
     /// Declare where stores live. A forest is a directory timberfs
     /// searches, and it is the ONE thing a timberfs command names by
     /// path — every other argument names a store, and a store is found
@@ -1345,6 +1355,31 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             query::cmd_query(&q)?;
+        }
+        Command::Limits { json } => {
+            let (limits, problems, from) = timberfs::limits::describe()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&limits)?);
+            } else {
+                println!("ceilings on one request, from {from}:");
+                let say = |what: &str, v: Option<u64>, unit: &str| {
+                    println!(
+                        "  {what:12} {}",
+                        v.map_or("none".to_string(), |n| format!("{n} {unit}"))
+                    );
+                };
+                say("MAX_ENTRIES", limits.max_entries, "entries");
+                say("MAX_CHUNKS", limits.max_chunks, "chunks");
+                say("DEADLINE_MS", limits.deadline_ms, "ms");
+            }
+            // A line that set no ceiling is the whole reason this command
+            // exists, so it is the exit code and not a footnote.
+            for why in &problems {
+                eprintln!("timberfs: {why}");
+            }
+            if !problems.is_empty() {
+                std::process::exit(1);
+            }
         }
         Command::Forest { command } => match command {
             ForestCommand::Create { dir, name, dry_run } => {

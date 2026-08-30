@@ -1,7 +1,17 @@
 # Copy to /etc/timberfs/limits.conf.
 #
-# What this machine will let ONE REQUEST ask for. Each key is optional and
-# unset by default, which is no ceiling at all.
+# What this machine will let ONE REQUEST ask for. The ceilings are ON by
+# default and this file OVERRIDES them, key by key — a machine nobody
+# configured is the one most likely to be asked for everything.
+#
+# Each value is a number, or `none` to remove that ceiling. `0` is refused:
+# a ceiling of zero would answer nothing while reading as "off".
+#
+# `timberfs limits` prints what is in force and where it came from, and
+# exits non-zero on a line it could not use — a line this build cannot use
+# is skipped rather than fatal, because `timberfs query` has no startup and
+# a refused policy file would answer every caller with a config error they
+# cannot fix.
 #
 # They bound a timberfs-query-document(5) and not the flags beside it: a
 # document is a request from somewhere else, where the flags are the
@@ -19,13 +29,14 @@
 # ⚠ This bounds accidents, not adversaries: whoever controls the argv or
 # the environment controls these too.
 
-# Most entries one answer may deliver.
+# Most entries one answer may deliver. Default 100000.
 #MAX_ENTRIES=100000
 
 # The same in chunks — the unit a `chunks` answer is bounded in, since an
-# entry count there caps entries nobody asked about.
-#MAX_CHUNKS=5000
+# entry count there caps entries nobody asked about. Default 1000.
+#MAX_CHUNKS=1000
 
 # Longest one search may run. It bounds what the other two cannot: a read
-# is slow because it READS a lot, not because it matches a lot.
+# is slow because it READS a lot, not because it matches a lot. Default
+# 30000.
 #DEADLINE_MS=30000

@@ -2644,10 +2644,13 @@ JSON
     end() { timberfs query --query /tmp/vmceil.json 2>/dev/null \
         | tr '\036\037\0' '\n|\n' | grep "^$1"; }
 
-    # No ceiling: the whole store, and nothing claimed about a bound.
+    # A machine nobody configured still has ceilings, and declares them:
+    # the file OVERRIDES the built-in ones rather than switching them on.
     rm -f /etc/timberfs/limits.conf
+    timberfs limits | grep -q 'built-in defaults' || { timberfs limits >&2; return 1; }
+    end stream-start | grep -q 'limits.max.entries=' || { end stream-start >&2; return 1; }
+    # 40 entries is far under the built-in ceiling, so the answer is whole.
     end stream-end | grep -q 'status=exhausted' || { end stream-end >&2; return 1; }
-    end stream-start | grep -q 'limits[.]' && { echo "declared a ceiling it has not got" >&2; return 1; }
 
     printf '# a policy\nMAX_ENTRIES=5\nDEADLINE_MS=30000\n' > /etc/timberfs/limits.conf
     # Declared BEFORE any entry, so a caller sizes its next page rather
@@ -2664,7 +2667,20 @@ JSON
     # ...and a position to resume it from.
     end position | grep -q 'offset=' || { end position >&2; return 1; }
 
+    # An override the operator got wrong is THEIR mistake, and must not
+    # make the logs unavailable: the line is skipped and said out loud,
+    # every ceiling this build DOES know stays in force, and `timberfs
+    # limits` is where it is fatal — that being the startup check for a
+    # command which has no startup.
+    printf 'MAX_ENTRIES=5\nMAX_BYTES=99\n' > /etc/timberfs/limits.conf
+    timberfs limits >/dev/null 2>/tmp/vmceil.err && { echo "limits accepted MAX_BYTES" >&2; return 1; }
+    grep -q 'MAX_BYTES' /tmp/vmceil.err || { cat /tmp/vmceil.err >&2; return 1; }
+    end stream-end | grep -q 'limit=limits.max.entries' || { end stream-end >&2; return 1; }
+    [ "$(timberfs query --query /tmp/vmceil.json 2>/dev/null \
+        | tr '\036\0' '\n\n' | grep -c '^entry')" = 5 ] || return 1
+
     # A request under the ceiling keeps its own bound, and says so.
+    printf 'MAX_ENTRIES=5\n' > /etc/timberfs/limits.conf
     sed -i 's/"response_format"/"max":{"entries":3},"response_format"/' /tmp/vmceil.json
     end stream-end | grep -q 'limit=max.entries' || { end stream-end >&2; return 1; }
 
@@ -2677,11 +2693,6 @@ JSON
         | grep '^stream-start' | grep -q 'limits[.]' \
         && { echo "a flag read claimed a ceiling" >&2; return 1; }
 
-    # A ceiling nobody understood is not applied, so it is refused rather
-    # than ignored — the opposite direction from forests.d.
-    printf 'MAX_ENTRY=5\n' > /etc/timberfs/limits.conf
-    timberfs query --query /tmp/vmceil.json >/dev/null 2>/tmp/vmceil.err && { cat /tmp/vmceil.err >&2; return 1; }
-    grep -q 'MAX_ENTRIES' /tmp/vmceil.err || { cat /tmp/vmceil.err >&2; return 1; }
     rm -f /etc/timberfs/limits.conf
 }
 

@@ -302,13 +302,18 @@ here.
   handing them back as the request's `cursor` resumes exactly there. A
   `deadline` bounds how LONG rather than how much, and is answered with the
   work done rather than abandoned. The **service-imposed limits** followed:
-  `/etc/timberfs/limits.conf` declares this machine's ceilings, they bound
-  a DOCUMENT and not the flags beside it, and they are announced in every
-  answer that has somewhere to put them rather than discovered by having a
-  request refused. A `max` or `deadline` over one is lowered — the answer
-  is then the first page, and `stream-end` names the ceiling apart from the
-  request's own bound — where a `tail` is refused, because a tail carries
-  no position to continue from. Design note:
+  ceilings that are ON by default (100k entries, 1k chunks, 30 s) and
+  overridden in `/etc/timberfs/limits.conf`, bounding a DOCUMENT and not
+  the flags beside it, announced in every answer that has somewhere to put
+  them rather than discovered by having a request refused. Paging is what
+  makes a default defensible: a `max` or `deadline` over a ceiling is
+  lowered and the answer is then the first PAGE, with `stream-end` naming
+  the ceiling apart from the request's own bound; a `tail` is refused
+  instead, carrying no position to continue from. An unusable line is
+  skipped and named, never fatal — `timberfs query` has no startup, so a
+  refused policy file would answer every caller with an error they cannot
+  fix; `timberfs limits` is that check, and the read-only serve below is
+  where the strictness moves. Design note:
   [docs/plans/paging.md](docs/plans/paging.md).
 - **`view`: reading a store as a tape** — SHIPPED, a first version. A pager
   over chunks that opens at the last one and scrolls back, with no

@@ -50,9 +50,10 @@ timberfs-otlp.service).
 forests.d/*.conf lists the directories searched when a command is given a
 bare handle instead of a path (see FORESTS in man 1 timberfs).
 
-limits.conf declares what this machine will let ONE REQUEST ask for —
-MAX_ENTRIES, MAX_CHUNKS, DEADLINE_MS. Absent, as it is by default, there is
-no ceiling. It bounds a query DOCUMENT, not the flags beside it (see QUERY
+limits.conf OVERRIDES what this machine will let ONE REQUEST ask for —
+MAX_ENTRIES, MAX_CHUNKS, DEADLINE_MS. The ceilings are on by default and
+this file changes them, key by key; `timberfs limits` prints what is in
+force. It bounds a query DOCUMENT, not the flags beside it (see QUERY
 CEILINGS in man 1 timberfs).
 
 Commented examples: /usr/share/doc/timberfs/examples/

@@ -27,10 +27,15 @@ the one it stopped inside carries a position, a store selected but never
 opened has `chunks_read=0`, and one it never reached at all has no `source`
 record while `stream-start` still counts it.
 
-Read under this machine's **ceilings** (`/etc/timberfs/limits.conf`:
-`MAX_ENTRIES`, `MAX_CHUNKS`, `DEADLINE_MS`), which bound the DOCUMENT and
-not the flags beside it — a document is a request from somewhere else,
-where the flags are the operator at a shell.
+Read under this machine's **ceilings**, which are ON by default (100k
+entries, 1k chunks, a 30 s deadline) and overridden key by key in
+`/etc/timberfs/limits.conf`. A machine nobody configured is the one most
+likely to be asked for everything, and paging is what makes a default
+defensible: a bounded answer is not a truncation, it is the first page,
+carrying the positions that resume it.
+
+They bound the DOCUMENT and not the flags beside it — a document is a
+request from somewhere else, where the flags are the operator at a shell.
 
 They are announced, not discovered: a `stores` answer carries a `limits`
 object and a records or chunks `stream-start` carries the same values as
@@ -44,6 +49,17 @@ A `tail` over it is REFUSED: a tail answer carries no `position`, so a
 shorter tail is a different answer rather than the start of the one asked
 for. That asymmetry is the whole reason the two are treated differently,
 and it is the same one this note opens with.
+
+⚠ A line the build cannot use is **skipped and said out loud**, not fatal,
+and every ceiling it does know stays in force — an override naming a key
+that does not exist is the operator's mistake and must not make the logs
+unavailable. `timberfs query` has no STARTUP to validate the file at: a
+relay execs it once per request, so a refused policy file would answer
+every caller with a config error the caller cannot fix. `timberfs limits`
+is that check for a command which has no startup, and exits non-zero.
+**The read-only serve on the sawmill path is where this moves** — a server
+reads its policy once and refuses to start, which is the same strictness
+landing on the person who can act on it.
 
 ⚠ It bounds **accidents, not adversaries**. Whoever controls the argv or
 the environment controls the ceilings too; what it protects is the machine
