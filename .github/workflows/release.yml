@@ -1,9 +1,13 @@
 name: Release
 
 # Tag-driven releases: push a tag `vX.Y.Z` (matching the Cargo.toml
-# version) and this builds the .deb, re-runs the full VM package suite
-# against that exact artifact, attests its build provenance, creates the
-# GitHub release with generated notes, and publishes to crates.io.
+# version) and this builds the .deb, attests its build provenance, creates
+# the GitHub release with generated notes, and publishes to crates.io.
+#
+# It does NOT re-run the VM suite: it REQUIRES CI to have passed on the
+# exact commit instead (see the gate below). So a tag pushed before CI
+# finishes fails — and since a squash merge makes a new sha, the wait is
+# for MAIN's run, not the pull request's.
 #
 # crates.io publishing uses Trusted Publishing (OIDC) — no stored secret.
 # One-time setup on crates.io: the timberfs crate -> Settings -> Trusted
@@ -57,7 +61,17 @@ jobs:
           sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage
 
       - uses: dtolnay/rust-toolchain@stable
+      # RESTORE only. Saving runs a cleaning pass over `target/`, looking
+      # for the trybuild leftovers a test suite leaves behind — and by then
+      # `cargo publish` has made `target/package/timberfs-X.Y.Z/`, which it
+      # descends into and cannot find them in. That is four `##[error]`
+      # annotations on an otherwise green release, which is how you teach
+      # somebody to ignore errors on a release. Nothing wants this cache
+      # anyway: CI saved one for the same target minutes ago, and a tag
+      # builds once.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
 
       - name: Cache Debian cloud base image
         uses: actions/cache@v4
@@ -86,11 +100,14 @@ jobs:
           cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
           cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
 
-      # CI already ran the VM suite on this exact commit, on BOTH images,
-      # after building the compat .deb with the identical commands above.
-      # Re-running it here repeated a SUBSET of that — one image — for nine
-      # minutes; and "the exact artifact" was never literally the bytes CI
-      # tested either, since a Rust build is not bit-reproducible.
+      # CI already passed the VM suite for this commit's TREE, on BOTH
+      # images, after building the compat .deb with the identical commands
+      # above. (For the tree and not the commit: an identical tree is an
+      # identical checkout, and CI short-circuits a re-run on one — see
+      # `vm-seen` in ci.yml.) Re-running it here repeated a SUBSET of that —
+      # one image — for nine minutes; and "the exact artifact" was never
+      # literally the bytes CI tested either, since a Rust build is not
+      # bit-reproducible.
       #
       # ⚠ A commit CI never ran on FAILS here. That is the whole gate, and
       # why it requires a `success` rather than the absence of a failure: a

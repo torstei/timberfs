@@ -10,6 +10,10 @@ name: apt-repo
 #
 # Runs after every release (called from release.yml) and on manual
 # dispatch (e.g. to rebuild after deleting a release).
+#
+# ⚠ It ends by checking that the site SERVES the pool it just built. A
+# successful deployment is not the same fact, and the difference is not
+# theoretical — see the comment on that step.
 
 on:
   workflow_dispatch:
@@ -90,3 +94,38 @@ jobs:
           path: site
 
       - uses: actions/deploy-pages@v4
+        id: deploy
+
+      # ⚠ A deployment that reports success is not a site that serves it.
+      #
+      # On 2026-08-30 two releases minutes apart each deployed Pages: the
+      # first published a pool built before the second's release existed,
+      # the second deployed two minutes later and reported success — and
+      # the FIRST one's bytes stayed live. `timberfs 0.27.0` was on the
+      # GitHub release and on crates.io while `apt install timberfs` still
+      # got 0.26.0, and nothing anywhere was red. A re-dispatch fixed it in
+      # eleven seconds, so the deploy was never slow; it simply did not
+      # take.
+      #
+      # So the pool this run BUILT is compared against the index the site
+      # SERVES. Nothing is inferred from a version number or a tag: the
+      # question is whether these bytes are the ones being served, which is
+      # the only thing a release cares about.
+      - name: The published index must be the pool this run built
+        run: |
+          base="${{ steps.deploy.outputs.page_url }}"
+          want=$(ls site/pool/main | sort)
+          echo "$want" | sed 's/^/  built: /'
+          for i in $(seq 1 18); do
+            got=$(curl -sfL --max-time 20 \
+                    "${base%/}/dists/stable/main/binary-amd64/Packages" \
+                  | sed -n 's|^Filename: .*/||p' | sort) || got=""
+            if [ "$want" = "$got" ]; then
+              echo "the published index is this run's pool (after $((i * 10 - 10))s)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::the site serves an index that is not the pool this run built"
+          diff <(echo "$want") <(echo "$got") | sed 's/^/  /' || true
+          exit 1
