@@ -1395,13 +1395,16 @@ def a_copy_says_which_route_it_took():
         as_if([["cat"]], terminal=True)
         v.cur = 0
         v.copy()
-        assert v.message.endswith("on the clipboard (cat)"), v.message
+        assert "on the clipboard (cat)" in v.message, v.message
         assert "osc" not in got, got
+        # A copy that took no region names the key that would make one:
+        # that is where a reader stands when they wonder.
+        assert "m marks a region" in v.message, v.message
 
         # One that failed is not the answer: the next is tried.
         as_if([["false"], ["cat"]], terminal=True)
         v.copy()
-        assert v.message.endswith("on the clipboard (cat)"), v.message
+        assert "on the clipboard (cat)" in v.message, v.message
         assert "osc" not in got, got
 
         # None of them worked, so the terminal is asked — and that answer
@@ -1528,6 +1531,9 @@ def the_mark_and_the_copy_are_keys_on_the_screen():
         screen.step(Screenish(), ord("c"))
         assert took == ["b\nc\n"], took
         assert v.mark is None, "the copy left a region nobody chose"
+        # ...and a copy that WAS a region does not explain the mark to
+        # someone who has just used it.
+        assert "m marks a region" not in v.message, v.message
 
         screen.step(Screenish(), tv.KEY_NUL)        # ^Space
         assert v.mark == v.cur, (v.mark, v.cur)

@@ -394,6 +394,12 @@ text does reads as chrome next to a reversed header — and the entry a bare
 visible as a unit while the cursor is anywhere in them, and on the tape,
 where every line is its own entry, the bold is just the line you are on.
 
+⚠ **`c` copies AT ONCE; `m` is what begins a selection.** So both are
+named in the status line, a copy that took no region ends with `m marks a
+region`, and a live one says what its keys do — `c` alone reads as the
+whole feature, and someone who expects it to start a selection and then
+moves sees nothing happen.
+
 ⚠ **The route is said, because one of them cannot be confirmed.** A
 clipboard helper (`wl-copy`, `xclip`, `xsel`, `pbcopy`) where there is a
 display to use one on: it writes the clipboard of the machine the pager is

@@ -716,8 +716,9 @@ def to_clipboard(text):
     if len(data) <= OSC_LIMIT:
         try:
             osc52(text)
-            return ("handed to the terminal (OSC 52) — if nothing pastes, "
-                    "it dropped it without saying so")
+            # Short on purpose: this is a status LINE, and the hedge has
+            # to survive being read next to what was copied.
+            return "to the terminal (OSC 52) — if nothing pastes, it was dropped"
         except OSError:
             pass
     why = (f"{human(len(data))} is more than OSC 52 can be trusted with"
@@ -1741,9 +1742,15 @@ class View:
             self.message = "nothing here to copy"
             return
         text, what = got
+        # Whether this was a REGION is the one thing the message can teach:
+        # a reader who has just copied an entry and wanted several rows is
+        # standing exactly where the mark needs naming.
+        marked = self.mark is not None
         route = to_clipboard(text)
         self.mark = None
         self.message = f"{what}, {human(len(text.encode('utf-8')))} · {route}"
+        if not marked:
+            self.message += " · m marks a region"
 
     def copy_address(self):
         """The address, shown AND copied.
@@ -1988,7 +1995,7 @@ class View:
                 "o log around" if isinstance(self.source, Records)
                 else "n/N hits",
                 "w wrap" if not self.wrap else "w nowrap", "S stores",
-                "c copy", "? help"]
+                "m mark", "c copy", "? help"]
         if sel:
             bits.insert(0, f"[{sel}]")
         # A region can be longer than the screen, so its size is said
@@ -1996,7 +2003,8 @@ class View:
         span = self.region()
         if span:
             rows = span[1] - span[0] + 1
-            bits.insert(0, f"region {rows} row{'' if rows == 1 else 's'}")
+            bits.insert(0, f"region {rows} row{'' if rows == 1 else 's'} — "
+                           "c copies · x the other end · ^G drops it")
         return "  ".join(bits)
 
 
