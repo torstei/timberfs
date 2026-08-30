@@ -1,6 +1,12 @@
 [package]
 name = "timberfs"
-version = "0.27.0"
+# A PLACEHOLDER. `scripts/stamp-version.sh` writes the real version at
+# build time: the tag when building one, else the NEXT version, so every
+# build on main is already what tagging it would publish. Only a tagged
+# CI run publishes, so nothing built anywhere can claim to be a release
+# that was never released — which a committed number could not help
+# doing, every build between two releases reporting the earlier one's.
+version = "0.0.0"
 edition = "2021"
 description = "Append-only, transparently compressed, write-time-indexed filesystem for log files"
 license = "MIT OR Apache-2.0"
