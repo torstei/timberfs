@@ -49,6 +49,15 @@ jobs:
           python3 tools/timbersh --help > /dev/null
           python3 tools/timberview --help > /dev/null
 
+      # The suites gate the release, not only the PR: they take seconds and
+      # need no VM, no timberfs and no network, so a release that skipped
+      # them would be a package nothing had run.
+      - name: And it has to work
+        run: |
+          tests/timberfs-client/test-timberfs-client
+          tests/timbersh/test-timbersh
+          tests/timberview/test-timberview
+
       # Architecture: all — it is a script, and cargo-deb would have called
       # it amd64.
       #
