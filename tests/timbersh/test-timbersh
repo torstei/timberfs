@@ -18,6 +18,10 @@ FAKE = os.path.join(HERE, "fake-timberfs")
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
 from timberview import when                                  # noqa: E402
 
+KINDS_VERBS_FIRST = ["select", "tail", "view", "declare", "fetch", "close",
+                     "create", "drop", "refresh", "add", "show", "save",
+                     "load", "help", "quit"]
+
 ID_A = "aaaaaaaa-1111-2222-3333-444444444444"
 ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
 
@@ -569,6 +573,79 @@ def a_chunk_read_takes_the_session_on_the_clock_it_is_addressed_by():
     assert w["from"] == 1788091800000, w
     assert w["to"] == 1788094800000 + 60_000, w
     s.cleanup()
+
+
+def completer(views=("console",), cursors=(), hosts=()):
+    """The completer, with a shell that has some of everything. It is
+    pure logic over the line typed, so it needs no terminal and no host —
+    which is why there is no excuse for the gap this closes."""
+    import importlib.machinery, importlib.util
+    ld = importlib.machinery.SourceFileLoader("tsh", TIMBERSH)
+    sp = importlib.util.spec_from_loader("tsh", ld)
+    m = importlib.util.module_from_spec(sp)
+    sys.modules["tsh"] = m
+    ld.exec_module(m)
+    m.TARGETS = list(hosts) or [None]
+
+    class Sh:
+        def __init__(self):
+            self.views = {v: [] for v in views}
+            self.cursors = {c: {} for c in cursors}
+
+        def universe(self, fresh=False):
+            return [{"name": "app"}]
+
+        def keys_of(self):
+            return {"host", "type"}
+
+        def values_of(self, key):
+            return {"web01"} if key == "host" else {"console"}
+
+    return m.Complete(Sh())
+
+
+@test
+def the_completer_knows_every_statement_there_is():
+    """It was never tested, so `create session` arrived and Tab went on
+    offering only `logview` — the grammar earning its keep everywhere
+    except where it is typed."""
+    c = completer()
+    assert c.options("create ", "") == ["logview", "session"]
+    assert c.options("drop ", "") == ["logview", "host", "session"]
+    assert "session" in c.options("show ", "")
+
+    # The ends a session takes, and only the one still owed.
+    assert c.options("create session ", "") == ["from", "to"]
+    assert c.options("create session from '13:00' ", "") == ["to"]
+    # ...and never the predicate a logview owes.
+    assert c.options("create session ", "") != ["["]
+    assert c.options("create logview x ", "") == ["["]
+
+
+@test
+def the_completer_still_knows_the_rest_of_the_grammar():
+    """The half a change to it could quietly break. Every point where
+    exactly one kind of thing can come next, checked once."""
+    c = completer(views=("console",), cursors=("errs",), hosts=("web01",))
+    assert c.options("", "") == KINDS_VERBS_FIRST
+    # KINDS is the tuple the parser validates against — one list of the
+    # kinds, not a second copy for the completer to drift from.
+    assert list(c.options("select ", "")) == ["records", "loglines", "stores",
+                                              "chunks"]
+    assert c.options("select records ", "") == ["from"]
+    assert "console" in c.options("select records from ", "")
+    assert c.options("select records from [] ", "") == ["where", "limit"]
+    assert c.options("select records from [] where ", "") \
+        == ["entry", "chunk", "logline", "written"]
+    assert c.options("select records from [] where entry ", "") \
+        == ["has", "not", "substring", "regex"]
+    assert c.options("select records from [] where logline ", "") \
+        == ["since", "until", "between"]
+    assert c.options("close ", "") == ["errs"]
+    assert c.options("drop host ", "") == ["web01"]
+    # A predicate literal completes its own keys, then that key's values.
+    assert c.options("select records from [", "[") == ["[host=", "[type="]
+    assert c.options("select records from [host=", "[host=") == ["[host=web01"]
 
 
 def tape(name, sid, n=9):

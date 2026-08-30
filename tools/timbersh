@@ -856,8 +856,14 @@ class Complete:
             return AFTER_TIME
         if prev == "add":
             return ["host"]
+        # `create session from T to T` — the ends not yet given, so the
+        # second Tab offers only the one still owed.
+        if toks[0] == "create" and len(toks) > 1 and toks[1].lower() == "session":
+            given = {t.lower() for t in toks[2:]}
+            return [e for e in ("from", "to") if e not in given]
         if prev in ("create", "drop"):
-            return ["logview", "host"] if prev == "drop" else ["logview"]
+            return ["logview", "session"] if prev == "create" \
+                else ["logview", "host", "session"]
         # `drop host <TAB>` names one that is there.
         if prev == "host" and toks[0] == "drop":
             return [label(h) for h in TARGETS if h]
@@ -866,10 +872,11 @@ class Complete:
         if prev == "logview":
             return sorted(self.sh.views) if toks[0] == "drop" else ["["]
         # Still owed a predicate, whichever side the name went.
-        if toks[0] == "create" and not any(t.startswith("[") for t in toks[2:]):
+        if toks[0] == "create" and toks[1:2] != ["session"] \
+                and not any(t.startswith("[") for t in toks[2:]):
             return ["["]
         if prev == "show":
-            return ["hosts", "logviews", "cursors"]
+            return ["hosts", "logviews", "cursors", "session"]
         if prev == "close":
             return sorted(self.sh.cursors)
         if toks[0] in ("select", "tail") and prev not in ("where",):
