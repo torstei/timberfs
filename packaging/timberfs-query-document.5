@@ -310,7 +310,17 @@ Neither unit nor both is refused rather than guessed at. A
 .B bytes
 unit belongs here and is absent until something produces one; a
 .B scope
-(total versus per\-store) likewise. Counts are totals across stores, so a
+(total versus per\-store) likewise.
+.PP
+⚠ Either may be LOWERED by the answering machine, and one is SUPPLIED where
+the document names none \(em in the unit that member would have used. A
+.B tail
+over the ceiling is refused instead, having no position to continue from.
+See
+.B "Paging, and the ceilings it pages under"
+below.
+.PP
+Counts are totals across stores, so a
 fleet view capped at 5 chunks reads five, not five per store \(em and
 because stores are read one after another, those five come from the
 first store(s) reached. The
@@ -329,6 +339,9 @@ rather than conflicting with it, because they bound different things \(em
 a fleet read is slow because it READS a lot, not because it matches a
 lot, so no count bounds the wait.
 .RS
+.PP
+⚠ Absent does not mean unbounded: the answering machine supplies its own
+where a document names none, and lowers one asked for over its ceiling.
 .PP
 The point is that it is answered rather than abandoned. A timeout in the
 caller drops the connection and everything that had already arrived on
@@ -594,9 +607,21 @@ A member left out
 .B widens
 the search rather than emptying it. A document naming only
 .B stores
-is "every entry of those stores". This is the single rule a generator must
-get right: invert it and a member somebody forgot returns nothing, which
-looks exactly like a correct empty result.
+SELECTS every entry of those stores. This is the single rule a generator
+must get right: invert it and a member somebody forgot returns nothing,
+which looks exactly like a correct empty result.
+.PP
+⚠ It widens the SELECTION, not the delivery. What comes back is bounded by
+the answering machine's ceilings whether or not the document named a bound
+(see
+.B "Paging, and the ceilings it pages under"
+above), so "every entry of those stores" is the first PAGE of them \(em
+said in
+.BR stream-end ,
+and resumed from the
+.B position
+records. Widening a document is how you select more; it is not how you
+receive more in one answer.
 .SH STRICTNESS
 An unknown member is an
 .BR error .
