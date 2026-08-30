@@ -93,9 +93,20 @@ an answer and a superset of one),
 below),
 .B stage
 (repeated; each pipeline stage that transformed the stream appends its
-own command line \(em provenance accumulates across the pipe). The
-selection echo and the stage list let a downstream tool record the
-full lineage of what it consumed.
+own command line \(em provenance accumulates across the pipe),
+.B limits.max.entries
+/
+.B limits.max.chunks
+/
+.B limits.deadline_ms
+(what the machine answering will let ONE REQUEST ask for \(em see
+.BR timberfs\-query\-document (5).
+Absent means no ceiling, which is every answer to the flags: a ceiling
+bounds a document, so an answer that was never bounded by one does not
+claim to be. A caller reads these to size its next page instead of
+learning the ceiling from an answer that came back short). The selection
+echo and the stage list let a downstream tool record the full lineage of
+what it consumed.
 .TP
 .B source
 One per input, in argument order, before any entries. Fields:
@@ -278,7 +289,7 @@ counting; present when known),
 .B exhausted
 when everything in the selection was read, or
 .B limited
-when a bound the CALLER set stopped it short, in which case
+when a bound stopped it short, in which case
 .B limit
 names WHICH one \(em
 .BR max.entries ,
@@ -287,7 +298,15 @@ or
 .BR deadline .
 It names the bound that actually fired; it once said
 .B max.entries
-whatever had. A
+whatever had.
+.BR limits.max.entries ,
+.B limits.max.chunks
+and
+.B limits.deadline
+are the same three where the bound was the machine's CEILING rather than
+the request's own \(em \(lqyou asked for this much\(rq and \(lqthis is
+all one answer may carry\(rq are different facts, and only the second
+says to ask again from the position records. A
 .B deadline
 is the one bound whose effect is not reproducible: the same request run
 twice can stop in different places, so a consumer must read the per-store

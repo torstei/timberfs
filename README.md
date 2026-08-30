@@ -277,6 +277,14 @@ path), over what window, for what — `has`, `substring`, `regex`, caseless, and
 demonstrates; the contract is `man timberfs-query-document` plus a JSON Schema
 at `/usr/share/doc/timberfs/query-document.schema.json`.
 
+Because a document comes from somewhere else, the machine answering it has
+ceilings on what one may ask for — on by default, overridden in
+`/etc/timberfs/limits.conf`, and shown by `timberfs limits`. They bound a
+document rather than the flags an operator types, and a bounded answer is a
+page: it names which ceiling stopped it and carries the positions that resume
+it, so an unbounded document is answered with a first page rather than with
+everything.
+
 When a term wants a definition rather than a tour — chunk, entry, follower,
 forest, the two clocks — **[Concepts](docs/concepts.md)** indexes the
 vocabulary, one line each, with a pointer to wherever it is explained.

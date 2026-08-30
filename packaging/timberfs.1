@@ -1273,6 +1273,24 @@ Show what would move without changing anything.
 .TP
 .B \-\-fail\-on\-empty
 Error when nothing rotates instead of attesting the empty result.
+.SS limits
+What this machine will let ONE REQUEST ask for, and where those ceilings
+came from. See
+.B QUERY CEILINGS
+below.
+.TP
+.B timberfs limits [\-\-json]
+Print the ceilings in force and the source they came from \(em the
+built-in defaults, or
+.I /etc/timberfs/limits.conf
+overriding them.
+.B \-\-json
+prints them exactly as an answer declares them.
+.PP
+It EXITS NON-ZERO on a line it could not use, which is what config
+management gates a rollout on:
+.B timberfs query
+has no startup to validate that file at, so this is that check.
 .SS forest
 Declare where stores live. A
 .I forest
@@ -2420,6 +2438,112 @@ does not show it.
 moves where the declarations are read from and written to, for a test or
 an install that is not rooted at
 .IR / .
+.SH QUERY CEILINGS
+What this machine will let ONE REQUEST ask for. They are ON by default \(em
+.B 100000
+entries,
+.B 1000
+chunks, a
+.B 30000
+ms deadline \(em because a machine nobody configured is the one most
+likely to be asked for everything, and a ceiling only the careful operator
+gets is not a ceiling. It costs an unbounded caller nothing it cannot take
+back: a bounded answer is a PAGE, carrying the
+.B position
+records that resume it.
+.PP
+.I /etc/timberfs/limits.conf
+OVERRIDES them, key by key \(em the same
+.B KEY=VALUE
+idiom as a forest or an instance
+.IR .conf .
+.B MAX_ENTRIES ,
+.B MAX_CHUNKS
+and
+.BR DEADLINE_MS ,
+each a number or
+.B none
+to remove that ceiling.
+.B 0
+is refused, because a ceiling of zero would answer nothing while reading
+as \(lqoff\(rq. Blank lines and
+.B #
+comments are ignored;
+.B TIMBERFS_LIMITS
+holds the same text and replaces the file, for a one-off.
+.B "timberfs limits"
+prints what is in force and where it came from.
+.PP
+⚠ A line this build cannot use is SKIPPED, said on stderr, and every
+ceiling it does know stays in force \(em an override naming a key that
+does not exist is the operator's mistake, and it must not make the logs
+unavailable.
+.B "timberfs query"
+has no STARTUP: a relay execs it once per request, so a policy file it
+refused would answer every caller with a config error the caller cannot
+fix, for a mistake the operator would never see.
+.B "timberfs limits"
+is that check for a command which has no startup \(em it exits non-zero on
+a line it could not use, which is what config management gates a rollout
+on. A server reads its policy once and refuses to start, which is the same
+strictness landing on the person who can act on it.
+.PP
+They bound a
+.BR timberfs\-query\-document (5)
+and NOT the flags beside it, because the DOCUMENT is the trust boundary
+and the flags are not: the CLI runs ON the host, where whoever can type it
+can already read the files, and a document is the one shape a caller who
+is not here can hand you \(em a relay execs
+.B "timberfs query \-\-query \-"
+on their behalf. So
+.B "timberfs query \-\-query FILE"
+is bounded even when you type it yourself, and the flags are not. That is
+not two dialects of one question: the SEARCH is identical either way, and
+what differs is what this machine will spend on it for someone who is not
+here. A read the ceilings did not bound declares none.
+.PP
+A ceiling meets a request in the unit the REQUEST chose:
+.B max
+in entries is held to
+.BR MAX_ENTRIES ,
+.B max
+in chunks to
+.BR MAX_CHUNKS ,
+and a request that bounds itself in neither is given the ceiling for the
+unit its answer is counted in. It is not given the other one as well \(em
+setting an entry cap engages the entry pipeline, which discards an entry a
+chunk boundary cut in half where the raw path emits it, so a ceiling that
+never fired would still change the answer.
+.PP
+A
+.B max
+or
+.B deadline
+over its ceiling is LOWERED and the answer is the first PAGE of the one
+that was asked for:
+.B stream-end
+says
+.B status=limited
+naming
+.BR limit=limits.max.entries ,
+and the
+.B position
+records resume it. A
+.B tail
+over one is REFUSED \(em a tail answer carries no position, so a shorter
+tail is a different answer rather than the start of the one asked for.
+The ceilings are declared in every answer that has somewhere to put them
+(a
+.B limits
+object in a
+.B stores
+answer, fields on a
+.BR stream-start ),
+so a caller sizes its pages before it asks.
+.PP
+⚠ This bounds ACCIDENTS, not adversaries: whoever controls the argv or
+the environment controls the ceilings too. What it protects is the
+machine from one document that asks for everything.
 .SH WHERE AN INTAKE WRITES
 The four intakes \(em
 .BR forward\-intake ", " otlp\-intake ", " incus\-intake " and " frames\-intake

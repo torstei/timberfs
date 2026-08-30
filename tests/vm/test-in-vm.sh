@@ -2628,6 +2628,74 @@ forward_intake_restart_survives() {
         && systemctl --quiet is-active timberfs-forward.service
 }
 
+the_machines_ceilings_bound_a_document_and_are_declared() {
+    # Needs a VM twice over: the config path is /etc, and the example is a
+    # packaged file. A ceiling nobody can write is a ceiling nobody has.
+    test -f /usr/share/doc/timberfs/examples/limits.conf.example || return 1
+    local d=/var/log/timberfs/vmceil
+    rm -rf "$d"
+    timberfs create "$d/vmceil.log" >/dev/null 2>&1 || return 1
+    for i in $(seq 1 40); do printf '2026-08-30T10:00:%02dZ INFO ceil %d\n' "$i" "$i"; done \
+        | timberfs append --into "$d/vmceil.log" --quiet 2>/dev/null || return 1
+    cat > /tmp/vmceil.json <<'JSON'
+{ "v":"1.0-EXPERIMENTAL","stores":{"select":[{"key":"name","op":"=","value":"vmceil"}]},
+  "window":{"axis":"logline"}, "response_format":{"kind":"records"} }
+JSON
+    end() { timberfs query --query /tmp/vmceil.json 2>/dev/null \
+        | tr '\036\037\0' '\n|\n' | grep "^$1"; }
+
+    # A machine nobody configured still has ceilings, and declares them:
+    # the file OVERRIDES the built-in ones rather than switching them on.
+    rm -f /etc/timberfs/limits.conf
+    timberfs limits | grep -q 'built-in defaults' || { timberfs limits >&2; return 1; }
+    end stream-start | grep -q 'limits.max.entries=' || { end stream-start >&2; return 1; }
+    # 40 entries is far under the built-in ceiling, so the answer is whole.
+    end stream-end | grep -q 'status=exhausted' || { end stream-end >&2; return 1; }
+
+    printf '# a policy\nMAX_ENTRIES=5\nDEADLINE_MS=30000\n' > /etc/timberfs/limits.conf
+    # Declared BEFORE any entry, so a caller sizes its next page rather
+    # than learning the ceiling from an answer that came back short.
+    local start
+    start=$(end stream-start)
+    echo "$start" | grep -q 'limits.max.entries=5' || { echo "$start" >&2; return 1; }
+    echo "$start" | grep -q 'limits.deadline_ms=30000' || { echo "$start" >&2; return 1; }
+    # Lowered, not refused: the answer is the first PAGE, and the bound is
+    # named apart from one the request set itself.
+    [ "$(timberfs query --query /tmp/vmceil.json 2>/dev/null \
+        | tr '\036\0' '\n\n' | grep -c '^entry')" = 5 ] || return 1
+    end stream-end | grep -q 'limit=limits.max.entries' || { end stream-end >&2; return 1; }
+    # ...and a position to resume it from.
+    end position | grep -q 'offset=' || { end position >&2; return 1; }
+
+    # An override the operator got wrong is THEIR mistake, and must not
+    # make the logs unavailable: the line is skipped and said out loud,
+    # every ceiling this build DOES know stays in force, and `timberfs
+    # limits` is where it is fatal — that being the startup check for a
+    # command which has no startup.
+    printf 'MAX_ENTRIES=5\nMAX_BYTES=99\n' > /etc/timberfs/limits.conf
+    timberfs limits >/dev/null 2>/tmp/vmceil.err && { echo "limits accepted MAX_BYTES" >&2; return 1; }
+    grep -q 'MAX_BYTES' /tmp/vmceil.err || { cat /tmp/vmceil.err >&2; return 1; }
+    end stream-end | grep -q 'limit=limits.max.entries' || { end stream-end >&2; return 1; }
+    [ "$(timberfs query --query /tmp/vmceil.json 2>/dev/null \
+        | tr '\036\0' '\n\n' | grep -c '^entry')" = 5 ] || return 1
+
+    # A request under the ceiling keeps its own bound, and says so.
+    printf 'MAX_ENTRIES=5\n' > /etc/timberfs/limits.conf
+    sed -i 's/"response_format"/"max":{"entries":3},"response_format"/' /tmp/vmceil.json
+    end stream-end | grep -q 'limit=max.entries' || { end stream-end >&2; return 1; }
+
+    # The flags are the operator at a shell: a ceiling bounds a request
+    # from elsewhere, so the same read by hand is unbounded and does not
+    # claim otherwise.
+    [ "$(timberfs query --records "$d/vmceil.log" 2>/dev/null \
+        | tr '\036\0' '\n\n' | grep -c '^entry')" = 40 ] || return 1
+    timberfs query --records "$d/vmceil.log" 2>/dev/null | tr '\036\037\0' '\n|\n' \
+        | grep '^stream-start' | grep -q 'limits[.]' \
+        && { echo "a flag read claimed a ceiling" >&2; return 1; }
+
+    rm -f /etc/timberfs/limits.conf
+}
+
 run_test "forward-intake: enable socket, unit activates" forward_intake_setup
 run_test "forward-intake: unknown tag refused until operator creates it" forward_intake_unknown_tag_refused_until_created
 run_test "forward-intake: --auto-create drop-in (Docker-host mode)" forward_intake_enable_auto_create
@@ -2644,6 +2712,7 @@ run_test "selection: list --select matches on labels, not on the name" selection
 run_test "query document: selects by label, and can answer with stores" a_query_document_selects_stores_and_can_answer_with_them
 run_test "query document: match and bounds name their granularity" a_match_selects_what_it_says_it_selects
 run_test "bounded read: names the bound, counts what it read, invents no entry" a_bounded_read_says_what_stopped_it_and_invents_nothing
+run_test "ceilings: /etc/timberfs/limits.conf bounds a document, and is declared" the_machines_ceilings_bound_a_document_and_are_declared
 run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
 run_test "forest: an intake writes into a forest by name; --into-dir warns" an_intake_writes_into_a_forest_by_name

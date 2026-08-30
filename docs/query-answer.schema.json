@@ -4,6 +4,17 @@
   "description": "The envelope a JSON answer carries.\n\n`server_version` belongs to the ANSWER, not to any one kind of it. The\nrecords stream carries the same field in `stream-start`; this is where\nit goes when the answer is JSON. `loglines` and `chunks` have nowhere\nto put it, which is what makes them the raw kinds.",
   "type": "object",
   "properties": {
+    "limits": {
+      "description": "What this machine will let one request ask for. Absent where it\ndeclares nothing, which is the default install.\n\nHere because a store listing is the FIRST thing a client asks —\nit has to know which stores exist before it reads any — so the\nceilings arrive in time to size a page, rather than as the reason\nan answer came back short.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Limits"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "server_version": {
       "description": "What produced this: `\"timberfs, 0.24.0\"`.",
       "type": "string"
@@ -35,6 +46,39 @@
           "const": "bundle"
         }
       ]
+    },
+    "Limits": {
+      "description": "The ceilings in force. `None` is no ceiling — which is what\n`Default` gives, because that is what a read the ceilings do not bound\ndeclares. What an unconfigured MACHINE has is `builtin`.",
+      "type": "object",
+      "properties": {
+        "deadline_ms": {
+          "description": "Longest a search may run. It bounds what the other two cannot —\na read is slow because it READS a lot, not because it matches a\nlot — and it is answered rather than abandoned.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_chunks": {
+          "description": "The same in chunks, which is the unit a `chunks` answer is bounded\nin: an entry count there caps entries nobody asked about.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_entries": {
+          "description": "Most entries one answer may deliver. Supplied to a request that\nnamed no bound, and lowered onto one that asked for more.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
     },
     "Store": {
       "description": "A store, as JSON.",

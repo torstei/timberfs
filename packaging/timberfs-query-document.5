@@ -476,7 +476,7 @@ A store ABSENT from the cursor is read from the start of the window. For
 a tail that is right \(em it is new, and everything it holds is new. A
 bounded walk that wants otherwise pins its store set instead.
 .RE
-.SS Paging, and what it still does not do
+.SS Paging, and the ceilings it pages under
 .B stream\-end
 says whether a cap stopped the read
 .RB ( status=limited ,
@@ -488,9 +488,47 @@ hands those back. That is a page, and
 .B deadline
 bounds how LONG it may take rather than how much it returns.
 .PP
-What is NOT here yet are the service-imposed limits a query server will
-want to declare \(em its own ceilings on what a request may ask for,
-announced rather than discovered by having a request refused.
+A document is a request from somewhere else, and the machine answering
+it has CEILINGS on what one may ask for \(em ON by default and overridden
+in
+.BR /etc/timberfs/limits.conf ,
+.BR timberfs (1).
+So an unbounded document is answered with a PAGE rather than with
+everything, and the answer says so.
+They are announced rather than discovered: every answer with somewhere
+to put them carries them, so a caller sizes its pages before it asks.
+The
+.B stores
+answer has a
+.B limits
+object beside
+.BR server_version ,
+and a records or chunks
+.B stream-start
+has
+.BR limits.max.entries ,
+.B limits.max.chunks
+and
+.B limits.deadline_ms
+as fields. Absent means no ceiling.
+.PP
+A
+.B max
+or
+.B deadline
+over the ceiling is LOWERED, not refused: the answer is then the first
+page of the one that was asked for, and
+.B stream-end
+names which bound stopped it \(em
+.B limit=limits.max.entries
+where the request's own bound would have said
+.BR limit=max.entries .
+A
+.B tail
+over it is REFUSED, because a tail answer carries no
+.B position
+to continue from: a shorter tail is a different answer rather than the
+start of the one asked for.
 .PP
 A page is not the only way to move. A cursor is a place in an ANSWER,
 where
