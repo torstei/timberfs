@@ -1,10 +1,17 @@
 //! Service-imposed limits: what the machine ANSWERING will let one
 //! request ask for.
 //!
-//! A document is a request from somewhere else — a relay hands one to
-//! `timberfs query --query -` for a caller who does not own this machine,
-//! where the flags are the operator at a shell. So these bound the
-//! document and leave the flags alone.
+//! THE DOCUMENT IS THE TRUST BOUNDARY, and the flags are not. The CLI
+//! runs ON the host: whoever can type it can already read the files, so
+//! there is nothing for a ceiling to protect there. A document is the one
+//! shape a caller who is NOT on the host can hand you — a relay execs
+//! `timberfs query --query -` on their behalf — so that is where the
+//! ceilings apply.
+//!
+//! ⚠ Which is why the same search bounded two ways is not two dialects of
+//! one question, and must not be "fixed" into one: the SEARCH is identical
+//! either way, and what differs is what this machine will spend on it for
+//! someone who is not here.
 //!
 //! DECLARED, not discovered. Every answer with somewhere to put them
 //! carries the ceilings, so a caller sizes its pages before it asks

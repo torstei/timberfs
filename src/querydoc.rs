@@ -859,9 +859,10 @@ impl Document {
         // asked for, and lowering a bound the document itself would have
         // been refused for would hide the refusal.
         //
-        // The DOCUMENT only. A document is a request from somewhere else;
-        // the flags beside it are the operator at a shell, and an
-        // operator does not need protecting from their own `--max`.
+        // The DOCUMENT only, because the document is the TRUST BOUNDARY
+        // and the flags are not: the CLI runs on the host, where whoever
+        // can type it can already read the files. A document is the one
+        // shape a caller who is not here can hand you.
         //
         // A store listing reads no entries — `window`, `match`, `max` and
         // `tail` are refused with it — so there is no bound to put one on.

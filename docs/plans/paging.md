@@ -34,8 +34,14 @@ likely to be asked for everything, and paging is what makes a default
 defensible: a bounded answer is not a truncation, it is the first page,
 carrying the positions that resume it.
 
-They bound the DOCUMENT and not the flags beside it — a document is a
-request from somewhere else, where the flags are the operator at a shell.
+They bound the DOCUMENT and not the flags beside it, because **the
+document is the trust boundary and the flags are not**: the CLI runs on the
+host, where whoever can type it can already read the files, and a document
+is the one shape a caller who is not here can hand you. So
+`timberfs query --query FILE` is bounded even when an operator types it,
+and the flags are not — which is not two dialects of one question, since
+the search is identical either way and what differs is what this machine
+will spend on it for someone who is not here.
 
 They are announced, not discovered: a `stores` answer carries a `limits`
 object and a records or chunks `stream-start` carries the same values as

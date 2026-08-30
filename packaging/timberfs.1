@@ -2490,13 +2490,17 @@ strictness landing on the person who can act on it.
 .PP
 They bound a
 .BR timberfs\-query\-document (5)
-and NOT the flags beside it. A document is a request from somewhere else
-\(em a relay hands one to
+and NOT the flags beside it, because the DOCUMENT is the trust boundary
+and the flags are not: the CLI runs ON the host, where whoever can type it
+can already read the files, and a document is the one shape a caller who
+is not here can hand you \(em a relay execs
 .B "timberfs query \-\-query \-"
-for a caller who does not own this machine \(em where the flags are the
-operator at a shell, who does not need protecting from their own
-.BR \-\-max .
-A read the ceilings did not bound declares none.
+on their behalf. So
+.B "timberfs query \-\-query FILE"
+is bounded even when you type it yourself, and the flags are not. That is
+not two dialects of one question: the SEARCH is identical either way, and
+what differs is what this machine will spend on it for someone who is not
+here. A read the ceilings did not bound declares none.
 .PP
 A
 .B max

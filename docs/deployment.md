@@ -183,11 +183,13 @@ An instance that needs more than one stream in one directory just sets a custom
 
 ## What a request may ask for
 
-A query document is a request from somewhere else — a relay hands one to
-`timberfs query --query -` for a caller who does not own this machine — so the
-machine has ceilings on what one may ask for. They are **on by default**
-(100 000 entries, 1 000 chunks, a 30 s deadline) and they bound a document, not
-the flags an operator types beside it.
+The query **document is the trust boundary**, and the flags are not: the CLI
+runs on the host, where whoever can type it can already read the files, while a
+document is the one shape a caller who is not here can hand you — a relay execs
+`timberfs query --query -` on their behalf. So the machine has ceilings on what
+one document may ask for. They are **on by default** (100 000 entries, 1 000
+chunks, a 30 s deadline) and they bound a document, including one an operator
+types, never the flags beside it.
 
 ```sh
 timberfs limits                                  # what is in force, and from where
