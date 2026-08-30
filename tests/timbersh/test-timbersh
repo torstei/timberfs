@@ -521,6 +521,56 @@ def one_host_still_says_nothing_about_which_host():
     s.cleanup()
 
 
+@test
+def a_session_bounds_every_statement_and_narrows_but_never_widens():
+    """A drill-down has a time frame, and stating it on every statement
+    is how it gets forgotten on one. The session is stated once; a
+    statement may narrow inside it and never out of it."""
+    s = Session({"": {"stores": [store("app", ID_A)], "records": []}}).run(
+        "create session from '2026-08-30T12:00:00Z' to '2026-08-30T13:00:00Z';",
+        "select records from [];",
+        "select records from [] where logline since '2026-08-30T12:30:00Z';",
+        "select records from [] where logline since '2026-08-30T09:00:00Z';",
+        "select records from [] where logline between '2026-01-01T00:00:00Z'"
+        " and '2026-01-02T00:00:00Z';",
+        "drop session;",
+        "select records from [];")
+    w = [d.get("window") for d in s.docs("records")]
+    lo, hi = 1788091200000, 1788094800000
+
+    assert w[0] == {"axis": "logline", "from": lo, "to": hi}, w[0]
+    # Narrowing inside it is taken as typed, and says nothing.
+    assert w[1]["from"] == lo + 1_800_000 and w[1]["to"] == hi, w[1]
+    # Reaching past it is answered INSIDE it — and said, because a
+    # question quietly answered as a different one is what this refuses.
+    assert w[2] == {"axis": "logline", "from": lo, "to": hi}, w[2]
+    assert "read inside the session" in s.out, s.out
+    # A window with no overlap at all is refused rather than answered
+    # emptily: that and "nothing matched" look identical otherwise.
+    assert "lies outside the session" in s.out, s.out
+    # Dropped, and the last statement is unbounded again.
+    assert w[3] == {"axis": "logline"}, w[3]
+    s.cleanup()
+
+
+@test
+def a_chunk_read_takes_the_session_on_the_clock_it_is_addressed_by():
+    """`chunks` are selected on the WRITE axis and a session is stated in
+    logline time, so applying it exactly would be a clock confusion. It
+    is widened instead, which can only over-include — the direction that
+    never loses a line belonging to the window."""
+    s = Session({"": {"stores": [store("app", ID_A)]}}).run(
+        "create session from '2026-08-30T12:00:00Z' to '2026-08-30T13:00:00Z';",
+        "select chunks from [] where written since '2026-08-30T12:10:00Z';")
+    w = s.docs("chunks")[0]["window"]
+    assert w["axis"] == "write", w
+    # The statement's own start is inside the session, so it stands; the
+    # far end is the session's, widened by a minute.
+    assert w["from"] == 1788091800000, w
+    assert w["to"] == 1788094800000 + 60_000, w
+    s.cleanup()
+
+
 def tape(name, sid, n=9):
     """A store with several chunks, and the chunks themselves — what a
     pager needs and a one-chunk fixture cannot exercise.

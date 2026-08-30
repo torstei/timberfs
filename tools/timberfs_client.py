@@ -268,6 +268,16 @@ TIME_FORMATS = [
 ]
 
 
+def when_ms(ms):
+    """A millisecond stamp as a person reads it, in UTC.
+
+    Beside `when`, which goes the other way: both front ends and the
+    viewer need the pair, and a second copy of either is a second answer
+    to what a timestamp looks like."""
+    import time
+    return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(ms / 1000)) if ms else "-"
+
+
 def when(text):
     """A typed time, in milliseconds — resolved at the EDGE.
 

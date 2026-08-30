@@ -73,7 +73,7 @@ sys.path[:0] = [p for p in (_HERE, "/usr/share/timberfs-sh")
                 if os.path.exists(os.path.join(p, "timberview.py"))]
 import timberfs_client
 import timberview
-from timberfs_client import HOST_TOKEN, when
+from timberfs_client import HOST_TOKEN, when, when_ms
 
 # The fleet, as TARGETS (names) and FLEET (the targets themselves). A
 # name is the currency everywhere below — the HOST column, a store's
@@ -146,6 +146,16 @@ HELP = """
 
   create logview console [type=console];   name a predicate (either order)
   drop logview console;                    forget it
+
+  create session from '13:00' to '14:00';  the INVESTIGATION's window
+  show session;   drop session;
+
+    Stated once instead of on every statement, which is how it comes to
+    be forgotten on one. Every statement is then read INSIDE it -- a
+    `where logline since ...` may narrow within it and never out of it,
+    and one that reaches past is answered inside and says so. It bounds
+    the PAGER too, so `into view` and `o` cannot walk out of the period
+    you are investigating; `t` changes it from in there.
   show logviews;                           what is defined
   show hosts;                              what each one is, and whether
                                            anything it said went wrong
@@ -368,10 +378,6 @@ SHORT_ID = 8
 
 def short_id(s):
     return (s.get("id") or "-")[:SHORT_ID]
-
-
-def when_ms(ms):
-    return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(ms / 1000)) if ms else "-"
 
 
 def describe_store(s):
@@ -600,8 +606,17 @@ def unwrap(text):
     raise ValueError(f"expected an answer, got {type(payload).__name__}")
 
 
+# The tape is addressed on the WRITE axis and an investigation window is
+# stated on the LOGLINE one, so a chunk written at 14:05 can hold an entry
+# stamped 13:00. timberfs widens a logline selection by the same margin
+# for the same reason; the bound can then only over-INCLUDE, which is the
+# safe direction — a line belonging to the window is never lost, and a few
+# that do not may be seen.
+WIDEN_MS = 60_000
+
+
 # ---------------------------------------------------------------- build
-def build(kind, terms, conds, limit):
+def build(kind, terms, conds, limit, session=None, notes=None):
     doc = {"v": "1.0-EXPERIMENTAL", "stores": {"select": terms}}
     win, match = {}, {"all": [], "any": [], "none": []}
     gran = None
@@ -650,6 +665,8 @@ def build(kind, terms, conds, limit):
             "`select chunks` is the write axis — chunks carry no entry parsing, "
             "so a logline window has nothing to apply to.\n     Use `written "
             "since ...`, or ask for `records`/`loglines` instead.")
+    if session:
+        win = impose_session(win, session, notes)
     if win: doc["window"] = win
     if gran is not None:
         match = {k: v for k, v in match.items() if v}
@@ -658,6 +675,56 @@ def build(kind, terms, conds, limit):
     if limit: doc["max"] = limit
     doc["response_format"] = {"kind": kind}
     return doc
+
+
+def impose_session(win, session, notes=None):
+    """The session window, INTERSECTED with what the statement asked for.
+
+    A statement may narrow inside the session and never widen out of it:
+    the window is the investigation, and a query that quietly reached
+    outside it would be the thing this exists to stop. One that asks for a
+    range with no overlap at all is refused rather than answered emptily,
+    because an empty answer and a question that could not have one look
+    the same.
+
+    ⚠ On the WRITE axis — a `chunks` read, which is the tape — the
+    session is applied WIDENED, because the two clocks are not the same
+    one. It can then only over-include; see WIDEN_MS."""
+    wide = WIDEN_MS if win.get("axis") == "write" else 0
+    lo = session.get("from")
+    hi = session.get("to")
+    out = dict(win)
+    if lo is not None:
+        out["from"] = max(win["from"], lo - wide) if "from" in win else lo - wide
+    if hi is not None:
+        out["to"] = min(win["to"], hi + wide) if "to" in win else hi + wide
+    if "from" in out and "to" in out and out["from"] > out["to"]:
+        raise ValueError(
+            f"that window lies outside the session ({show_window(session)}) — "
+            f"a statement narrows inside it, never out of it. `drop session;` "
+            f"first, or ask for a range within it")
+    # ⚠ A statement that reached PAST the session is answered inside it,
+    # which is the rail doing its job — and said, because a question
+    # quietly answered as a different one is the thing this format
+    # refuses everywhere else.
+    # Only where an end the STATEMENT named was moved. The session
+    # supplying the end a statement left open is the ordinary case and
+    # says nothing; being pulled back from one it asked for is the case
+    # worth a word.
+    moved = any(e in win and out[e] != win[e] for e in ("from", "to"))
+    if notes is not None and moved:
+        notes.append(f"  -- read inside the session ({show_window(session)}); "
+                     f"the window asked for reaches outside it")
+    return out
+
+
+def show_window(session):
+    ends = []
+    if session.get("from") is not None:
+        ends.append("from " + when_ms(session["from"]))
+    if session.get("to") is not None:
+        ends.append("to " + when_ms(session["to"]))
+    return " ".join(ends) or "unbounded"
 
 
 def parse_where(toks, i):
@@ -821,6 +888,9 @@ class Complete:
 # ----------------------------------------------------------------- main
 class Shell:
     def __init__(self):
+        # The investigation's window: every statement is read inside it,
+        # and the pager will not scroll out of it. None until asked for.
+        self.session = None
         self.views = {}
         self.cursors = {}
         self.names = {}
@@ -990,6 +1060,39 @@ class Shell:
         return {str(v) for s in self.universe()
                 for k, v in (s.get("labels") or {}).items() if k == key}
 
+    def window(self):
+        """The session as the viewer takes it: `(from_ms, to_ms)`, or None.
+
+        The same window the statements are read inside, so the pager a hit
+        opens into cannot wander out of the investigation the query was
+        bounded by — which it could, being a tape with no predicate."""
+        if not self.session:
+            return None
+        return (self.session.get("from"), self.session.get("to"))
+
+    def parse_session(self, toks):
+        """`from T`, `to T`, or both — either end may be left open, which
+        is still a rail on the other."""
+        window, i = {}, 0
+        while i < len(toks):
+            w = toks[i][1].lower()
+            if w in ("from", "since", "after") and i + 1 < len(toks):
+                window["from"] = when(toks[i + 1][1]); i += 2
+            elif w in ("to", "until", "before") and i + 1 < len(toks):
+                window["to"] = when(toks[i + 1][1]); i += 2
+            elif w == "and":
+                i += 1
+            else:
+                raise ValueError(
+                    f"`{toks[i][1]}`? create session from <time> to <time> "
+                    f"— either end may be left out")
+        if not window:
+            raise ValueError("create session from <time> to <time>")
+        if "from" in window and "to" in window \
+                and window["from"] > window["to"]:
+            raise ValueError("that session starts after it ends")
+        return window
+
     def source(self, tok):
         # Every path that turns text into terms comes through here, so this
         # is the one place a short id has to be expanded — including the
@@ -1153,6 +1256,27 @@ class Shell:
             print("  " + "   ".join(bits))
             show_unreachable(self.unreachable)
             return
+        if head == "create" and len(toks) > 1 \
+                and toks[1][1].lower() == "session":
+            # `create session from '13:00' to '14:00'` — the investigation's
+            # own window, which every statement is then read inside and the
+            # pager will not scroll out of. Re-creating replaces it, the way
+            # a window you are adjusting should.
+            self.session = self.parse_session(toks[2:])
+            print(f"  session {show_window(self.session)}")
+            return
+        if head == "drop" and len(toks) > 1 \
+                and toks[1][1].lower() == "session":
+            if self.session is None:
+                raise ValueError("no session — `create session from ... to ...`")
+            self.session = None
+            print("  session dropped; statements are unbounded again")
+            return
+        if head == "show" and len(toks) > 1 \
+                and toks[1][1].lower() == "session":
+            print(f"  session {show_window(self.session)}" if self.session
+                  else "  no session — every statement is read unbounded")
+            return
         if head == "show" and len(toks) > 1 and toks[1][1].lower().startswith("host"):
             self.universe()  # cheap: cached, and it is what fills this in
             print(f"  {len(TARGETS)} target(s), from {FLEET.source}")
@@ -1288,7 +1412,10 @@ class Shell:
                     raise ValueError(
                         f"`{toks[i][1]}`? after the source come `where ...`, "
                         f"`limit N [chunks]` and `into view`, each once")
-            doc = build(kind, terms, conds, limit)
+            notes = []
+            doc = build(kind, terms, conds, limit, self.session, notes)
+            for note in notes:
+                print(note)
             if into:
                 if head != "select":
                     raise ValueError("`tail` does not end, so it has no answer "
@@ -1381,7 +1508,8 @@ class Shell:
                    else f" on any of {len(TARGETS)} hosts" if len(TARGETS) > 1
                    else "") + ", so there is nothing to open")
         try:
-            end = timberview.watch(backend, stores[0], **pos)
+            end = timberview.watch(backend, stores[0], window=self.window(),
+                                   **pos)
         except timberview.Refused as e:
             raise ValueError(str(e))
         if len(stores) > 1:
@@ -1420,7 +1548,7 @@ class Shell:
         conds, i = [], 4
         if i < len(toks) and toks[i][1].lower() == "where":
             conds, i = parse_where(toks, i + 1)
-        doc = build(kind, terms, conds, {"entries": n})
+        doc = build(kind, terms, conds, {"entries": n}, self.session)
         # The WHOLE cursor goes to every host. A position names a store by
         # id, ids are uuids, and a host simply never looks up one it does
         # not have — so nothing has to be routed and a page can straddle
