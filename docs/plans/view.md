@@ -99,6 +99,16 @@ made for it.
   trace is one entry and forty lines, and the line the cursor happens to
   be on is one frame of it. On the tape, which parses nothing, every line
   is its own, exactly as the entry motion is a line there.
+- **What a copy will take is on the screen before it is made.** Both of
+  them, because there are two: the region is the REVERSED block, padded
+  to the width — a bar that stops where the text does reads as chrome
+  next to a reversed header, which is how the first version of this was
+  missed — and the entry a bare `c` would take is the BOLD one, so the
+  forty lines of a stack trace are a visible unit while the cursor is
+  anywhere in them. Inside the block the picked term is punched OUT of
+  it rather than reversed again, which would be the same attribute and
+  so invisible. No colour: reverse video is the terminal's own, and a
+  background chosen here is a bet on somebody's theme.
 - **A joined row copies as the log's own lines.** `z` renders an entry as
   one row with `↵` between its lines; that is a thing to read, and the
   clipboard wants what the log holds. So `z` then a mark is how entry-wide

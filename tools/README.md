@@ -387,6 +387,13 @@ every line is its own, exactly as the entry motion is a line there. `z`
 first if you want entries as rows — a joined row copies as the log's own
 lines rather than with the `↵` in, because that rendering is for reading.
 
+The screen says which is which **before** the copy is made: the region is
+the reversed block — padded to the width, since a bar that stops where the
+text does reads as chrome next to a reversed header — and the entry a bare
+`c` would take is the bold one. So the forty lines of a stack trace are
+visible as a unit while the cursor is anywhere in them, and on the tape,
+where every line is its own entry, the bold is just the line you are on.
+
 ⚠ **The route is said, because one of them cannot be confirmed.** A
 clipboard helper (`wl-copy`, `xclip`, `xsel`, `pbcopy`) where there is a
 display to use one on: it writes the clipboard of the machine the pager is

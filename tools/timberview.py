@@ -1907,9 +1907,12 @@ class View:
 
     def _build(self, width, height):
         rows, lines = [], self.source.lines
-        # A selection you cannot see is not one: the rows are marked so
-        # the drawing can show which they are.
+        # A selection you cannot see is not one, so both of them are
+        # marked for the drawing: the region, and — since `c` with no
+        # mark takes the ENTRY — the entry the cursor is in. On the tape
+        # that is the cursor's own line and the screen is unchanged.
         span = self.region()
+        here = self.entry_span()
         if self.top == 0:
             for text in (self.source.top_notes() if self.source.at_top()
                          else self.stuck_note(above=True)):
@@ -1938,7 +1941,8 @@ class View:
                                   for s, e, a in spans
                                   if e > base and s < base + width],
                         "edge": False, "cursor": i == self.cur,
-                        "region": bool(span) and span[0] <= i <= span[1]})
+                        "region": bool(span) and span[0] <= i <= span[1],
+                        "entry": bool(here) and here[0] <= i <= here[1]})
             else:
                 text = ln.text[self.col:self.col + width]
                 rows.append({
@@ -1947,7 +1951,8 @@ class View:
                               for s, e, a in spans
                               if e > self.col and s < self.col + width],
                     "edge": False, "cursor": i == self.cur,
-                    "region": bool(span) and span[0] <= i <= span[1]})
+                    "region": bool(span) and span[0] <= i <= span[1],
+                    "entry": bool(here) and here[0] <= i <= here[1]})
             i += 1
         if i >= len(lines) and len(rows) < height:
             if self.source.at_bottom():
@@ -2026,6 +2031,12 @@ HELP_KEYS = """
                  under the cursor, which is the forty lines of a stack
                  trace and not the one frame the cursor is on. Joined
                  rows copy as the log's own lines, not with the ↵ in
+
+                 What is on the screen says which is which: the region is
+                 the REVERSED block, and the entry a bare c would take is
+                 the BOLD one — so what a copy will take is visible before
+                 it is made. On the tape every line is its own entry, so
+                 there the bold is the line you are on
   y              this line's address, shown AND copied
 
   Tab  ⇧Tab      the searchable terms, and on past the end of a line to
@@ -2143,14 +2154,25 @@ class Screen:
         self.put(stdscr, 0, v.header()[:w - 1], c.A_REVERSE)
         for y, row in enumerate(v.layout(w - 1, body), start=1):
             base = c.A_DIM if row["edge"] else (
-                c.A_BOLD if row.get("cursor") else 0)
+                c.A_BOLD if row.get("entry") or row.get("cursor") else 0)
+            text = row["text"][:w - 1]
             if row.get("region"):
                 base |= c.A_REVERSE
-            self.put(stdscr, y, row["text"][:w - 1], base)
+                # PADDED to the width: a bar that stops where the text
+                # does is a ragged edge that reads as chrome, and the
+                # header and status lines are already reverse. A solid
+                # block is what a selection looks like.
+                text = text.ljust(w - 1)
+            self.put(stdscr, y, text, base)
             for s, e, kind in row["spans"]:
                 if 0 <= s < e <= w - 1:
                     try:
-                        stdscr.chgat(y, s, e - s, self.attr(kind) | base)
+                        # Inside the block the picked term is punched OUT
+                        # of it rather than reversed again, which would
+                        # be the same attribute and so invisible.
+                        stdscr.chgat(y, s, e - s,
+                                     self.attr(kind) ^ base if base & c.A_REVERSE
+                                     else self.attr(kind) | base)
                     except c.error:
                         pass
         self.put(stdscr, h - 1, v.status()[:w - 1], c.A_REVERSE)

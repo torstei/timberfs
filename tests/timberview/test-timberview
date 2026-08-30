@@ -1447,6 +1447,32 @@ def the_region_is_on_the_screen_and_counted():
 
 
 @test
+def what_a_bare_copy_would_take_is_on_the_screen_too():
+    """`c` with no mark takes the whole ENTRY, so the rows of that entry
+    are marked as well: what a copy will take is visible BEFORE it is
+    made, whether or not a mark is set. On the tape every line is its
+    own entry, so there it is the line the cursor is on and the screen
+    is unchanged."""
+    frames = "\n".join(f"\tat frame.{i}(F.java:1)" for i in range(3))
+    r = tv.Records(answer(("before", {"offset": 0}),
+                          (f"boom\n{frames}", {"offset": 100}),
+                          ("after", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.cur = 3                                   # a frame, mid-trace
+    rows = [x for x in v.layout(80, 20) if not x["edge"]]
+    marked = [x["text"] for x in rows if x.get("entry")]
+    assert len(marked) == 4 and marked[0] == "boom", marked
+    assert [x["text"] for x in rows if x.get("region")] == [], "no mark, no region"
+    # And it is the same rows the copy takes, which is the point.
+    assert v.selection()[0] == "".join(t + "\n" for t in marked), v.selection()
+
+    t = opened(Fake(["a\nb\nc\n"]), seq=0)
+    t.cur = 1
+    rows = [x for x in t.layout(80, 20) if not x["edge"]]
+    assert [x["text"] for x in rows if x.get("entry")] == ["b"], rows
+
+
+@test
 def an_address_is_shown_as_well_as_copied():
     """The clipboard cannot always be confirmed, so selecting the address
     with the mouse has to stay possible — which needs it on the screen
