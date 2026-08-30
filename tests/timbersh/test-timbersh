@@ -18,9 +18,9 @@ FAKE = os.path.join(HERE, "fake-timberfs")
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
 from timberview import when                                  # noqa: E402
 
-KINDS_VERBS_FIRST = ["select", "tail", "view", "declare", "fetch", "close",
-                     "create", "drop", "refresh", "add", "show", "save",
-                     "load", "help", "quit"]
+VERBS_THE_PARSER_TAKES = ["select", "tail", "view", "declare", "fetch",
+                          "close", "create", "drop", "refresh", "add", "show",
+                          "save", "load", "help", "quit", "exit"]
 
 ID_A = "aaaaaaaa-1111-2222-3333-444444444444"
 ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
@@ -623,18 +623,53 @@ def the_completer_knows_every_statement_there_is():
 
 
 @test
+def every_verb_the_parser_takes_is_in_the_grammar_table():
+    """The bug this table exists to stop, caught mechanically rather than
+    by typing: a statement added to `do()` and not to FORMS completes to
+    nothing, and one in FORMS that the parser does not take is offered
+    and then refused.
+
+    Read off the source, so it cannot be kept up to date by hand either."""
+    import re
+    src = open(TIMBERSH).read()
+    dispatched = set(re.findall(r'head == "([a-z]+)"', src))
+    dispatched |= set(re.findall(r'head in \("([a-z]+)", "([a-z]+)"\)', src)[0]
+                      if re.findall(r'head in \("([a-z]+)", "([a-z]+)"\)', src)
+                      else [])
+    forms = {f.split()[0] for f in
+             re.search(r'FORMS = """(.*?)"""', src, re.S).group(1).split("\n")
+             if f.strip()}
+    # `select` and `tail` are dispatched together, and `help`/`save`/`load`
+    # by name — every one of them has to be offerable.
+    dispatched |= {"select", "tail"}
+    missing = dispatched - forms
+    assert not missing, f"in the parser, not in FORMS (so uncompletable): {missing}"
+    extra = forms - dispatched
+    assert not extra, f"in FORMS, not in the parser (offered then refused): {extra}"
+
+
+@test
 def the_completer_still_knows_the_rest_of_the_grammar():
     """The half a change to it could quietly break. Every point where
     exactly one kind of thing can come next, checked once."""
     c = completer(views=("console",), cursors=("errs",), hosts=("web01",))
-    assert c.options("", "") == KINDS_VERBS_FIRST
+    # The SET of verbs, not their order: the order is now FORMS' order,
+    # and pinning it would make reordering the table a test failure for
+    # no reason. `exit` is offered because the parser takes it.
+    assert set(c.options("", "")) == set(VERBS_THE_PARSER_TAKES)
     # KINDS is the tuple the parser validates against — one list of the
     # kinds, not a second copy for the completer to drift from.
     assert list(c.options("select ", "")) == ["records", "loglines", "stores",
                                               "chunks"]
     assert c.options("select records ", "") == ["from"]
     assert "console" in c.options("select records from ", "")
-    assert c.options("select records from [] ", "") == ["where", "limit"]
+    # `into view` too, which the hand-written completer never offered —
+    # it is a clause the parser has taken for as long as the pager has.
+    assert c.options("select records from [] ", "") == ["where", "limit", "into"]
+    assert c.options("select records from [] into ", "") == ["view"]
+    assert c.options("select records from [] limit ", "") == [], "a number comes next"
+    # A tail does not end, so it has no answer to put in a view.
+    assert c.options("tail records from [] ", "") == ["where", "limit"]
     assert c.options("select records from [] where ", "") \
         == ["entry", "chunk", "logline", "written"]
     assert c.options("select records from [] where entry ", "") \
