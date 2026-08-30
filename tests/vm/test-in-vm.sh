@@ -2654,8 +2654,8 @@ JSON
     # than learning the ceiling from an answer that came back short.
     local start
     start=$(end stream-start)
-    echo "$start" | grep -q 'limits.max.entries|5' || { echo "$start" >&2; return 1; }
-    echo "$start" | grep -q 'limits.deadline_ms|30000' || { echo "$start" >&2; return 1; }
+    echo "$start" | grep -q 'limits.max.entries=5' || { echo "$start" >&2; return 1; }
+    echo "$start" | grep -q 'limits.deadline_ms=30000' || { echo "$start" >&2; return 1; }
     # Lowered, not refused: the answer is the first PAGE, and the bound is
     # named apart from one the request set itself.
     [ "$(timberfs query --query /tmp/vmceil.json 2>/dev/null \
