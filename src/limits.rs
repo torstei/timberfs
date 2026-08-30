@@ -168,22 +168,31 @@ impl Limits {
                 }
             }
         }
-        // ...and SUPPLIED where the request named no bound, in the unit
-        // this answer is counted in. A `chunks` answer moves frames
-        // verbatim, so nothing decompresses to count an entry there; and
-        // an entries answer is not given a chunk bound it did not ask for,
-        // which would stop a search that reads a lot and matches little —
-        // the case the deadline is for, in the unit that fits it.
-        let (asked, ceiling, flag) = if chunk_answer {
-            (
-                &mut l.max_chunks,
-                self.max_chunks,
-                &mut l.imposed.max_chunks,
-            )
-        } else {
-            (&mut l.max, self.max_entries, &mut l.imposed.max)
-        };
-        if asked.is_none() {
+        // ...and SUPPLIED only where the request named NO bound at all,
+        // in the unit this answer is counted in. A `chunks` answer moves
+        // frames verbatim, so nothing decompresses to count an entry
+        // there.
+        //
+        // ⛔ Not in the other unit as well, however bypassable the entries
+        // ceiling looks beside a chunk bound: setting `max` ENGAGES THE
+        // ENTRY PIPELINE, which discards an entry the chunk boundary cut
+        // in half where the raw path emits it. A ceiling that never fires
+        // would change the answer by one line, silently — measured, as
+        // `max: {chunks: 2}` on a `loglines` read going 100 -> 99.
+        //
+        // A caller bounding itself in chunks has chosen the unit its cost
+        // is counted in, and MAX_CHUNKS is the ceiling over that: the
+        // machine is bounded either way, in the unit the request picked.
+        if l.max.is_none() && l.max_chunks.is_none() {
+            let (asked, ceiling, flag) = if chunk_answer {
+                (
+                    &mut l.max_chunks,
+                    self.max_chunks,
+                    &mut l.imposed.max_chunks,
+                )
+            } else {
+                (&mut l.max, self.max_entries, &mut l.imposed.max)
+            };
             if let Some(c) = ceiling {
                 (*asked, *flag) = (Some(c), true);
             }
@@ -412,13 +421,20 @@ mod tests {
         assert!(l.imposed.max_chunks && !l.imposed.max);
     }
 
-    /// The hole this closes: `max` names ONE unit, so a request could
-    /// bound itself in chunks and meet no entries ceiling at all — 200
-    /// entries came back where the ceiling said 5. The two bound
-    /// different things and the engine stops at whichever comes first,
-    /// so both are put on a request that named either.
+    /// A request that bounds itself in chunks is judged in CHUNKS, and
+    /// gets no entry cap beside it.
+    ///
+    /// Tempting to add one — the entries ceiling looks bypassed — and
+    /// wrong: setting `max` engages the entry pipeline, which discards an
+    /// entry the chunk boundary cut in half where the raw path emits it.
+    /// A ceiling that never fires would then change the answer by one
+    /// line, silently. `max: {chunks: 2}` on a `loglines` read went
+    /// 100 -> 99, which is how this was caught.
+    ///
+    /// The machine is bounded either way: MAX_CHUNKS is the ceiling over
+    /// the unit such a request chose.
     #[test]
-    fn a_request_cannot_escape_a_ceiling_by_changing_units() {
+    fn a_request_bounded_in_chunks_is_judged_in_chunks() {
         let c = Limits {
             max_entries: Some(5),
             max_chunks: Some(1000),
@@ -429,17 +445,22 @@ mod tests {
             ..Default::default()
         };
         c.impose(false, &mut l).unwrap();
-        assert_eq!((l.max_chunks, l.max), (Some(9), Some(5)));
-        assert!(l.imposed.max && !l.imposed.max_chunks);
+        assert_eq!((l.max_chunks, l.max), (Some(9), None));
 
-        // ...but an entries answer is not GIVEN a chunk bound it did not
-        // ask for: that would stop a search which reads a lot and matches
-        // little, and the deadline is the bound for that.
+        // Over the chunk ceiling, that is the one which lowers it.
+        let mut over = Limit {
+            max_chunks: Some(9_000),
+            ..Default::default()
+        };
+        c.impose(false, &mut over).unwrap();
+        assert_eq!((over.max_chunks, over.max), (Some(1000), None));
+        assert!(over.imposed.max_chunks && !over.imposed.max);
+
+        // A request that named nothing gets the ceiling in the unit its
+        // answer is counted in, and only that one.
         let mut plain = Limit::default();
         c.impose(false, &mut plain).unwrap();
         assert_eq!((plain.max, plain.max_chunks), (Some(5), None));
-
-        // A chunks answer counts no entries, so it gets only its own.
         let mut chunks = Limit::default();
         c.impose(true, &mut chunks).unwrap();
         assert_eq!((chunks.max, chunks.max_chunks), (None, Some(1000)));

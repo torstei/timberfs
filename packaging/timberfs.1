@@ -2502,12 +2502,25 @@ not two dialects of one question: the SEARCH is identical either way, and
 what differs is what this machine will spend on it for someone who is not
 here. A read the ceilings did not bound declares none.
 .PP
+A ceiling meets a request in the unit the REQUEST chose:
+.B max
+in entries is held to
+.BR MAX_ENTRIES ,
+.B max
+in chunks to
+.BR MAX_CHUNKS ,
+and a request that bounds itself in neither is given the ceiling for the
+unit its answer is counted in. It is not given the other one as well \(em
+setting an entry cap engages the entry pipeline, which discards an entry a
+chunk boundary cut in half where the raw path emits it, so a ceiling that
+never fired would still change the answer.
+.PP
 A
 .B max
 or
 .B deadline
-over a ceiling is LOWERED and the answer is the first PAGE of the one that
-was asked for:
+over its ceiling is LOWERED and the answer is the first PAGE of the one
+that was asked for:
 .B stream-end
 says
 .B status=limited
