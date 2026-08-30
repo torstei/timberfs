@@ -1176,6 +1176,29 @@ class View:
     def page(self, n, height):
         self.move(n * max(1, height - 2))
 
+    def move_entry(self, step):
+        """To the start of the next entry, over the continuation lines.
+
+        A stack trace is forty lines of one entry, and `j` walks every one
+        of them. What is stepped over is exactly what the record stream
+        said belongs together — `first` comes from the entry framing, not
+        from a guess at what a continuation line looks like.
+
+        ⚠ On the TAPE every line is its own start, because the tape parses
+        nothing and cannot know otherwise; there the motion is a line, and
+        the help says so. Better than a heuristic that would disagree with
+        timberfs about where an entry begins."""
+        lines = self.source.lines
+        rng = (range(self.cur + 1, len(lines)) if step > 0
+               else range(self.cur - 1, -1, -1))
+        for i in rng:
+            if getattr(lines[i], "first", True):
+                self.cur = i
+                self.tok = 0
+                self._widen()
+                return
+        self.message = ("the last entry" if step > 0 else "the first entry")
+
     def home(self):
         """The top of the LOG, which is a seek to its first chunk —
         never a walk back through the run. On a store of 400,000 chunks
@@ -1470,6 +1493,9 @@ KEY_TAB, KEY_ESC, KEY_CR, KEY_LF = 9, 27, 13, 10
 HELP_KEYS = """
   j k  ↑ ↓        a line              g G           the log's top / end
   space b        a page              h l  ← →      sideways (no wrap)
+  } {            an ENTRY, over its continuation lines — a stack trace is
+                 one entry and forty lines. On the tape every line is its
+                 own, since it parses nothing
   w              wrap / no wrap      y             this line's address
 
   Tab  ⇧Tab      the searchable terms on this line — an identifier is
@@ -1612,6 +1638,10 @@ class Screen:
             self.scroll(stdscr, lambda: v.page(1, h - 2))
         elif key in (ord("b"), c.KEY_PPAGE):
             self.scroll(stdscr, lambda: v.page(-1, h - 2))
+        elif key == ord("}"):
+            self.scroll(stdscr, lambda: v.move_entry(1))
+        elif key == ord("{"):
+            self.scroll(stdscr, lambda: v.move_entry(-1))
         elif key == ord("g"):
             self.reach(stdscr, "the top of the log", v.home)
         elif key == ord("G"):

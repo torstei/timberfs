@@ -72,6 +72,21 @@ A line.
 .BR g "/" G
 go to the log's top and end \(em a seek, not a walk back.
 .TP
+.BR } " " {
+An ENTRY, over its continuation lines \(em a stack trace is one entry and
+forty lines, and stepping through them a line at a time is what this is
+for. What it steps over is what the record stream said belongs together,
+never a guess at what a continuation line looks like.
+.RB ( \(ua / \(da
+still move by line.)
+.PP
+.RS
+⚠ On the TAPE every line is its own entry, because the tape parses
+nothing and cannot know otherwise \(em there the motion is a line. Better
+than a heuristic that would disagree with timberfs about where an entry
+begins.
+.RE
+.TP
 .BR space " " b
 A page.
 .BR h " " l " " \(<- " " \(->

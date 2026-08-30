@@ -765,6 +765,37 @@ def a_hit_list_is_itself_searchable():
 
 
 @test
+def an_entry_is_one_motion_however_many_lines_it_has():
+    """A stack trace is forty lines of ONE entry, and `j` walks every one
+    of them. `}` and `{` step over the continuation lines to the next
+    entry's start, using what the record stream said belongs together
+    rather than guessing at what a continuation looks like."""
+    frames = "\n".join(f"\tat frame.{i}(F.java:1)" for i in range(40))
+    r = tv.Records(answer(
+        ("2026-08-30T10:00:00Z INFO before", {"offset": 0}),
+        (f"2026-08-30T10:00:01Z ERROR boom\n{frames}", {"offset": 100}),
+        ("2026-08-30T10:00:02Z INFO after", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    assert r.entries == 3 and len(r.lines) == 43, (r.entries, len(r.lines))
+
+    v.cur = 0
+    v.move_entry(1)
+    assert v.source.lines[v.cur].text.endswith("ERROR boom"), v.source.lines[v.cur].text
+    # ...and past all forty frames in one press, not forty.
+    v.move_entry(1)
+    assert v.source.lines[v.cur].text.endswith("INFO after"), v.source.lines[v.cur].text
+    # The end says so rather than moving nowhere in silence.
+    v.move_entry(1)
+    assert "last entry" in v.message, v.message
+
+    v.move_entry(-1)
+    assert v.source.lines[v.cur].text.endswith("ERROR boom"), v.source.lines[v.cur].text
+    v.move_entry(-1)
+    v.move_entry(-1)
+    assert "first entry" in v.message, v.message
+
+
+@test
 def tabbing_in_the_hit_list_brings_the_term_into_view():
     """The pager's Tab follows the pick sideways and the hit list's did
     not: a term picked past the right edge was highlighted nowhere and
