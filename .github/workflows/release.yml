@@ -85,7 +85,9 @@ jobs:
 
       - name: Install zig (cargo-zigbuild's cross linker)
         # Extract OUTSIDE the checkout: unpacking into the repo leaves thousands
-        # of untracked files, and `cargo publish` refuses to run on a dirty tree.
+        # of untracked files. The publish below passes --allow-dirty for the
+        # version stamp, and that must stay a licence for one known change,
+        # not cover for a working tree nobody looked at.
         run: |
           curl -fL --retry 3 \
             https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
@@ -136,8 +138,9 @@ jobs:
             esac
           done
 
-      # Assets are staged OUTSIDE the checkout: cargo publish refuses to
-      # run from a dirty working tree, and rightly so.
+      # Assets are staged OUTSIDE the checkout, the same rule as the zig
+      # unpack above: --allow-dirty is a licence for the version stamp and
+      # nothing else, so nothing else may dirty the tree.
       - name: Stage release assets
         run: |
           mkdir -p "$RUNNER_TEMP/dist"
@@ -163,7 +166,10 @@ jobs:
         if: steps.crates_auth.outcome == 'success'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
-        run: cargo publish
+        # --allow-dirty: the dirt IS the stamp. The tree differs from the
+        # tag by exactly the version this release is named after, which is
+        # the one difference a publish is entitled to.
+        run: cargo publish --allow-dirty
 
   # Rebuild and redeploy the apt repository on GitHub Pages with the new
   # release included. (A separate `on: release` workflow would never fire:

@@ -10,7 +10,7 @@ name: timbersh
 # needs belong in one commit series — that is where this tool's value comes
 # from — and only the RELEASE is separate.
 #
-# The version comes from tools/VERSION and must match the tag.
+# The version is STAMPED from the tag; tools/VERSION holds a placeholder.
 # apt-repo.yml rebuilds the pool from every release, so it picks this up
 # with no change of its own.
 
@@ -30,17 +30,22 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        # ⚠ Depth 0: the stamp is `git describe`, which needs the tags and
+        # the history to count from.
+        with:
+          fetch-depth: 0
 
-      # A tag that disagrees with the file would publish a package whose
-      # version is not the one anybody tagged, and nothing downstream could
-      # tell.
-      - name: The tag must be the version
+      # tools/VERSION holds a placeholder; the tag is the version. Stamping
+      # rather than checking is what makes only a CI run able to mint a
+      # release — see scripts/stamp-version.sh.
+      - name: Stamp the version from the tag
         run: |
+          scripts/stamp-version.sh
           file=$(tr -d '[:space:]' < tools/VERSION)
           tag="${GITHUB_REF_NAME#timbersh-v}"
           echo "tools/VERSION=$file  tag=$tag"
           [ "$file" = "$tag" ] || {
-            echo "::error::tools/VERSION says $file, tag says $tag"; exit 1; }
+            echo "::error::stamped $file from the ref, but the tag is $tag"; exit 1; }
 
       - name: It has to run
         run: |

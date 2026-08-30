@@ -1,6 +1,11 @@
 [package]
 name = "timberfs"
-version = "0.27.0"
+# A PLACEHOLDER. The version is stamped at build time from the git ref by
+# `scripts/stamp-version.sh`, and only a tagged CI run publishes — so
+# nothing built anywhere can claim to be a release that was never
+# released. A committed number could not help doing that: every build
+# between two releases reported the earlier one's, indistinguishably.
+version = "0.0.0"
 edition = "2021"
 description = "Append-only, transparently compressed, write-time-indexed filesystem for log files"
 license = "MIT OR Apache-2.0"

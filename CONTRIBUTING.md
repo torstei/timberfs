@@ -31,6 +31,18 @@ cargo deb && tests/vm/run-vm-test.sh
 
 ## Before cutting a release
 
+**There is nothing to bump.** The manifests hold a placeholder and the tag is
+the version: `scripts/stamp-version.sh` writes what `git describe` says, CI
+runs it on every build, and only a tagged run publishes. So a release is the
+tip of main, tagged — the tree that was tested is the tree that ships, and no
+commit exists whose only content is a version number.
+
+⚠ It also means a local build cannot claim to be a release, which the old
+scheme could not help doing: between two releases every build reported the
+earlier one's number and was indistinguishable from it, including in the
+`server_version` every query answer carries. A build three commits past a tag
+now says `0.27.0-3.gcee4152`.
+
 Read the documentation against the diff. `git log vX.Y.Z..HEAD` is the
 work-list, which makes this a bounded pass rather than an audit.
 

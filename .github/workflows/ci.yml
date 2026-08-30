@@ -89,6 +89,9 @@ jobs:
         image: [trixie, focal]
     steps:
       - uses: actions/checkout@v4
+        # Depth 0: the build stamps from `git describe`.
+        with:
+          fetch-depth: 0
       # /dev/kvm exists on GitHub's standard runners but isn't accessible
       # to the runner user by default
       - name: Enable KVM for the runner user
@@ -119,8 +122,13 @@ jobs:
             | tar -xJ -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
       # Build and test exactly what we ship: the old-glibc compat .deb.
+      #
+      # Stamped like a release is, so the artifact under test says which
+      # commit it came from — `0.27.0-3.gcee4152` — rather than carrying a
+      # placeholder or, worse, a released version it is not.
       - name: Build the compat .deb
         run: |
+          scripts/stamp-version.sh
           cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
           cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
       - name: Run the VM package test suite
