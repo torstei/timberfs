@@ -115,6 +115,7 @@ impl Limits {
     /// nobody asked about, which is the trap `max`'s own units exist to
     /// keep a caller out of.
     pub fn impose(&self, chunk_answer: bool, l: &mut crate::query::Limit) -> anyhow::Result<()> {
+        l.imposed.declared = *self;
         // A tail is REFUSED rather than lowered: its answer carries no
         // position, so "the last 10000" in place of "the last 10000000"
         // is a different question answered silently. Named with the
@@ -134,24 +135,50 @@ impl Limits {
                 }
             }
         }
-        // `max` is lowered, and supplied where nothing was asked. Either
-        // way the answer is a PAGE: `stream-end` says `limited`, names
-        // this ceiling, and the `position` records resume it.
-        let bounded = l.max.is_some()
-            || l.max_chunks.is_some()
-            || l.tail.is_some()
-            || l.tail_chunks.is_some();
-        l.imposed.declared = *self;
-        if let Some(c) = self.max_chunks {
-            if l.max_chunks.is_some_and(|m| m > c) || (chunk_answer && !bounded) {
-                l.max_chunks = Some(c);
-                l.imposed.max_chunks = true;
+        if l.tail.is_some() || l.tail_chunks.is_some() {
+            // A tail says how much itself and the check above held it to
+            // the ceiling. Nothing further is put on one: `max` beside a
+            // tail is two starts, and the tail path reads no deadline at
+            // all — a ceiling that does nothing is worse than none.
+            return Ok(());
+        }
+        // LOWERED in whichever unit the request named — both, if it
+        // somehow named both. The two bound different things (how much is
+        // delivered, how much is read) and the engine stops at whichever
+        // comes first, so a request bounded in chunks does not escape the
+        // entries ceiling by changing units.
+        for (asked, ceiling, flag) in [
+            (
+                &mut l.max_chunks,
+                self.max_chunks,
+                &mut l.imposed.max_chunks,
+            ),
+            (&mut l.max, self.max_entries, &mut l.imposed.max),
+        ] {
+            if let (Some(n), Some(c)) = (*asked, ceiling) {
+                if n > c {
+                    (*asked, *flag) = (Some(c), true);
+                }
             }
         }
-        if let Some(c) = self.max_entries {
-            if l.max.is_some_and(|m| m > c) || (!chunk_answer && !bounded) {
-                l.max = Some(c);
-                l.imposed.max = true;
+        // ...and SUPPLIED where the request named no bound, in the unit
+        // this answer is counted in. A `chunks` answer moves frames
+        // verbatim, so nothing decompresses to count an entry there; and
+        // an entries answer is not given a chunk bound it did not ask for,
+        // which would stop a search that reads a lot and matches little —
+        // the case the deadline is for, in the unit that fits it.
+        let (asked, ceiling, flag) = if chunk_answer {
+            (
+                &mut l.max_chunks,
+                self.max_chunks,
+                &mut l.imposed.max_chunks,
+            )
+        } else {
+            (&mut l.max, self.max_entries, &mut l.imposed.max)
+        };
+        if asked.is_none() {
+            if let Some(c) = ceiling {
+                (*asked, *flag) = (Some(c), true);
             }
         }
         if let Some(c) = self.deadline_ms {
@@ -376,6 +403,39 @@ mod tests {
         c.impose(true, &mut l).unwrap();
         assert_eq!((l.max, l.max_chunks), (None, Some(7)));
         assert!(l.imposed.max_chunks && !l.imposed.max);
+    }
+
+    /// The hole this closes: `max` names ONE unit, so a request could
+    /// bound itself in chunks and meet no entries ceiling at all — 200
+    /// entries came back where the ceiling said 5. The two bound
+    /// different things and the engine stops at whichever comes first,
+    /// so both are put on a request that named either.
+    #[test]
+    fn a_request_cannot_escape_a_ceiling_by_changing_units() {
+        let c = Limits {
+            max_entries: Some(5),
+            max_chunks: Some(1000),
+            ..Default::default()
+        };
+        let mut l = Limit {
+            max_chunks: Some(9),
+            ..Default::default()
+        };
+        c.impose(false, &mut l).unwrap();
+        assert_eq!((l.max_chunks, l.max), (Some(9), Some(5)));
+        assert!(l.imposed.max && !l.imposed.max_chunks);
+
+        // ...but an entries answer is not GIVEN a chunk bound it did not
+        // ask for: that would stop a search which reads a lot and matches
+        // little, and the deadline is the bound for that.
+        let mut plain = Limit::default();
+        c.impose(false, &mut plain).unwrap();
+        assert_eq!((plain.max, plain.max_chunks), (Some(5), None));
+
+        // A chunks answer counts no entries, so it gets only its own.
+        let mut chunks = Limit::default();
+        c.impose(true, &mut chunks).unwrap();
+        assert_eq!((chunks.max, chunks.max_chunks), (None, Some(1000)));
     }
 
     #[test]

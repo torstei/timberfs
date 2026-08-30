@@ -1298,7 +1298,16 @@ fn query_entries<W: Write>(
     // a count alone reads as the whole answer, and this one is not.
     if limited {
         if let Some(m) = max {
-            crate::note!("timberfs: stopped at --max {m}; more entries matched than were shown");
+            if imposed.max {
+                crate::note!(
+                    "timberfs: stopped at this machine's ceiling of {m} entries; ask again \
+                     from the position records for the next page"
+                );
+            } else {
+                crate::note!(
+                    "timberfs: stopped at --max {m}; more entries matched than were shown"
+                );
+            }
         }
     }
     if windowed {
