@@ -1316,6 +1316,53 @@ def a_joined_row_copies_as_the_logs_own_lines():
 
 
 @test
+def the_join_toggle_keeps_what_was_selected():
+    """`z` is a display toggle, and the row-to-line mapping changes
+    underneath it: a joined row IS an entry, so unjoining one is several
+    lines and an offset resolves to the FIRST of them. Keeping the row
+    numbers collapsed a selection of two records to their two first
+    lines — a highlight that looked lost, and a copy that then took two
+    lines of the fourteen that were selected."""
+    r = tv.Records(answer(("one", {"offset": 0}),
+                          ("boom\n  at A\n  at B", {"offset": 100}),
+                          ("three", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.join_entries()
+    v.cur = 0
+    v.set_mark()
+    v.move(1)                                   # "one", then the trace
+    whole = "one\nboom\n  at A\n  at B\n"
+    assert v.region() == (0, 1) and v.selection()[0] == whole, v.selection()
+
+    v.join_entries()                            # ...and back
+    assert v.region() == (0, 3), v.region()
+    assert v.selection()[0] == whole, v.selection()
+    v.join_entries()                            # round trip
+    assert v.region() == (0, 1) and v.selection()[0] == whole, v.selection()
+
+    # The mark BELOW the cursor: the ends keep their identity, so `x`
+    # still swaps to the one you were not on.
+    v.mark = None
+    v.cur = 1
+    v.set_mark()
+    v.move(-1)
+    assert (v.mark, v.cur) == (1, 0), (v.mark, v.cur)
+    v.join_entries()
+    assert (v.mark, v.cur) == (3, 0), (v.mark, v.cur)
+    assert v.selection()[0] == whole, v.selection()
+
+    # On the tape every line is its own entry, so nothing widens.
+    w = opened(Fake(["a\nb\nc\nd\n"]), seq=0)
+    w.cur = 1
+    w.set_mark()
+    w.move(1)
+    w.join_entries()
+    assert w.selection()[0] == "b\nc\n", w.selection()
+    w.join_entries()
+    assert w.selection()[0] == "b\nc\n", w.selection()
+
+
+@test
 def the_mark_travels_when_the_run_renumbers():
     """Scrolling up PREPENDS lines, so every index shifts. A mark left as
     a number would silently be on a different line than the one it was

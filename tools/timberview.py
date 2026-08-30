@@ -1385,19 +1385,28 @@ class View:
         a toggle is not also a jump."""
         where = self.line()
         lines = self.source.lines
-        mark_off = (lines[self.mark].offset
-                    if self.mark is not None and self.mark < len(lines)
-                    else None)
+        # Both ends of the region travel as OFFSETS, for the reason the
+        # cursor does: a display toggle must not change what is selected.
+        span = self.region()
+        ends = (lines[span[0]].offset, lines[span[1]].offset) if span else None
+        mark_low = span is not None and self.mark <= self.cur
         self.join = (not self.join) if on is None else on
         self.source = self._source          # re-wrap, or unwrap
         if where is not None:
             self.cur = self.source.index_of(where.offset)
             self.top = min(self.top, self.cur)
-        # Both ends of the region are kept for the same reason the cursor
-        # is: an offset addresses the entry either way, so a display
-        # toggle is not also a change of what you selected.
-        if mark_off is not None:
-            self.mark = self.source.index_of(mark_off)
+        if ends:
+            # ⚠ The UPPER end is taken to the END of the entry it lands
+            # in. A joined row IS an entry, so unjoining it is several
+            # lines, and an offset resolves to the FIRST of them: keeping
+            # the row numbers collapsed a selection of two records to
+            # their two first lines — a highlight that looked lost, and a
+            # copy that quietly took two lines of the fourteen selected.
+            # Joined, every row is a first, so this widens nothing and the
+            # rule needs no direction.
+            lo = self.source.index_of(ends[0])
+            hi = self.entry_span(at=self.source.index_of(ends[1]))[1]
+            self.mark, self.cur = (lo, hi) if mark_low else (hi, lo)
         self.tok, self.col = 0, 0
         self.message = ("multi-line entries as one row" if self.join
                         else "entries as they are written")
@@ -1679,8 +1688,9 @@ class View:
         lo, hi = sorted((self.mark, self.cur))
         return max(0, lo), min(last, hi)
 
-    def entry_span(self):
-        """The rows of the ENTRY under the cursor, as `(lo, hi)`.
+    def entry_span(self, at=None):
+        """The rows of the ENTRY at `at`, or under the cursor, as
+        `(lo, hi)`.
 
         A stack trace is one entry and forty lines, so the line the
         cursor happens to be on is one frame of what you are looking at.
@@ -1691,7 +1701,7 @@ class View:
         lines = self.source.lines
         if not lines:
             return None
-        lo = hi = min(self.cur, len(lines) - 1)
+        lo = hi = min(self.cur if at is None else at, len(lines) - 1)
         while lo > 0 and not getattr(lines[lo], "first", True):
             lo -= 1
         while hi + 1 < len(lines) and not getattr(lines[hi + 1], "first", True):

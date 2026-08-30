@@ -224,7 +224,12 @@ with the
 .B ↵
 in \(em that rendering is for reading. So
 .B z
-and then a mark is how a run of whole entries is selected.
+and then a mark is how a run of whole entries is selected. Toggling
+.B z
+with a region live keeps what was selected rather than the row numbers:
+both ends travel as offsets, and the upper one is taken to the END of the
+entry it lands in, since a row unjoins into several lines and an offset
+resolves to the first of them.
 .PP
 The screen says which is which, so what a copy will take is visible
 before it is made: the region is the REVERSED block \(em padded to the

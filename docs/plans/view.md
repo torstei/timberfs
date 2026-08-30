@@ -114,6 +114,17 @@ made for it.
   picked term, so nothing is lost. No colour: reverse video is the
   terminal's own, and a background chosen here is a bet on somebody's
   theme.
+- ⚠ **Toggling `z` keeps what was SELECTED, not the row numbers.** Both
+  ends travel as offsets, and the upper one is taken to the END of the
+  entry it lands in: a joined row is an entry, so unjoining it is several
+  lines and an offset resolves to the first of them. Keeping the numbers
+  collapsed a selection of two records to their two first lines — a
+  highlight that read as lost, and a copy that then took two lines of the
+  fourteen selected. Joined, every row is a first, so the rule widens
+  nothing in that direction and needs no test of which way the toggle
+  went. The cursor is one of those ends, so where it was the upper one
+  the view follows it to the entry's end; a selection longer than the
+  screen cannot show both ends anyway.
 - **A joined row copies as the log's own lines.** `z` renders an entry as
   one row with `↵` between its lines; that is a thing to read, and the
   clipboard wants what the log holds. So `z` then a mark is how entry-wide
