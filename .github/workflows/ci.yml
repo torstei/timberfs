@@ -123,9 +123,9 @@ jobs:
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
       # Build and test exactly what we ship: the old-glibc compat .deb.
       #
-      # Stamped like a release is, so the artifact under test says which
-      # commit it came from — `0.27.0-3.gcee4152` — rather than carrying a
-      # placeholder or, worse, a released version it is not.
+      # Stamped like a release is — on main that is the NEXT version, so
+      # what the suite tests here is what tagging this commit would
+      # publish, rather than a placeholder or a version it is not.
       - name: Build the compat .deb
         run: |
           scripts/stamp-version.sh

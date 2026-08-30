@@ -10,30 +10,44 @@
 # number and was indistinguishable from it, including in the
 # `server_version` a query answer carries.
 #
-# The stamp is a pure function of the git ref, so a build of a tag stamps
-# exactly that tag's version wherever it runs, and a build three commits
-# past it says so: 0.27.0+3.gcee4152.
+# On a TAG the stamp is that tag. Anywhere else it is the NEXT version —
+# the last tag with its minor incremented — so every build on main is
+# already the version it would be released as, and any of them can be
+# tagged whenever. The artifact CI tested and the artifact a release
+# publishes are then the same thing, which is the point of the exercise.
 #
-# ⚠ `+` and not `-`. A build three commits AFTER 0.27.0 is newer than it,
-# and `0.27.0-3.g...` says the opposite in both systems that will read it:
-# semver makes it a PRERELEASE of 0.27.0, and dpkg sorts the `~` cargo-deb
-# renders it as BELOW 0.27.0-1. `+` is build metadata — semver ignores it
-# for precedence, dpkg sorts it above — so the string agrees with the
-# history it came from.
+# ⚠ Not `git describe`'s `0.27.0-3.gcee4152`. That names the release a
+# build came AFTER, which makes every build on main un-releasable without
+# rebuilding it under a different version — exactly the coupling this
+# removes. It also lies about ordering: semver reads it as a prerelease of
+# 0.27.0, which the code is newer than.
 #
 # ⚠ `--match` PER LINEAGE, never a bare `git describe`. Two release trains
-# share this repository and the newest tag is often the other one's — on
+# share this repository and the newest tag is usually the other one's — on
 # main today a bare describe answers `timbersh-v0.3.0`, which would stamp
 # a timberfs build with the console's version.
+#
+# The default increment is the MINOR. A release that should be a major or
+# a patch is tagged as one, and then the tag and the last main build
+# disagree — the release rebuilds, as it always did, and the next cycle
+# derives from the new tag. Deviating costs a rebuild, not correctness.
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # No argument on purpose: the git ref is the source of truth, and a
 # version passed by hand is the committed version back again under
 # another name.
-stamp() {
-    git describe --tags --match "$1*" --always 2>/dev/null \
-        | sed "s/^$1//; s/-\([0-9]*\)-g/+\1.g/"
+stamp() {  # $1 = the lineage's tag prefix
+    local exact last
+    # Building a tag? That tag is the version, exactly.
+    if exact=$(git describe --tags --match "$1*" --exact-match 2>/dev/null); then
+        printf '%s' "${exact#"$1"}"
+        return
+    fi
+    last=$(git describe --tags --match "$1*" --abbrev=0 2>/dev/null) || return 1
+    last=${last#"$1"}
+    awk -F. '{ print $1 "." ($2 + 1) ".0" }' <<<"$last"
 }
 
 ver=$(stamp v)
