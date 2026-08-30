@@ -132,16 +132,16 @@ column, each remembering where it lives.
 .RB ( $TIMBERFS_HOSTS )
 .RS
 .PP
-A read goes to every host at once and is rendered in the order they were
-given. There is no order claimed BETWEEN hosts, for the reason a bounded
-timberfs answer is
+A read goes to every host at once and is rendered AS IT ARRIVES, each line
+naming the host it came from \(em so a slow host does not hold up a fast
+one. Nothing is lost by that: within a host a bounded answer is
 .B order=sequential
-(see
-.BR timberfs\-records (5)).
-A
+(store after store, not time \(em see
+.BR timberfs\-records (5))
+and across hosts no order was ever claimed. A
 .B limit
-is a total, so a host whose output falls past it did work that is never
-shown \(em the price of not paying the latency serially.
+is a total, so which entries a bounded fleet read returns is decided by
+arrival; it says how many more had already come.
 .PP
 Several hosts with no
 .B _TIMBERHOST_

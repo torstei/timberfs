@@ -145,6 +145,39 @@ def unzstd(frame):
     return p.stdout
 
 
+def _record_at(buf, i):
+    """One record at or after `i` as `(kind, fields, payload, next_i)`, or
+    None where the buffer does not hold all of it.
+
+    The framing rules live here ONCE: `frames` walks a buffer that is
+    whole with it, `frames_from` one that is still arriving, and a stream
+    read as it comes must not be parsed by a second set of rules that can
+    drift from these."""
+    start = buf.find(b"\x1e", i)
+    if start < 0:
+        return None
+    j = buf.find(b"\0", start)
+    if j < 0:
+        return None                       # the head is not finished
+    head = buf[start + 1:j].split(b"\x1f")
+    fields = {}
+    for p in head[1:]:
+        k, _, v = p.partition(b"=")
+        fields[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    end = j + 1
+    payload = None
+    if "len" in fields:
+        n = int(fields["len"])
+        # ⚠ ALL of it, plus its NUL. A short buffer is not a short
+        # payload, it is a payload that has not arrived — and half an
+        # entry handed on as whole is the one thing this format refuses.
+        if end + n + 1 > len(buf):
+            return None
+        payload = buf[end:end + n]
+        end += n + 1
+    return head[0].decode("utf-8", "replace"), fields, payload, end
+
+
 def frames(buf):
     """`timberfs-records(5)` over BYTES. A record is RS, fields, NUL —
     and where a `len` field says so, that many payload bytes and a NUL.
@@ -152,24 +185,29 @@ def frames(buf):
     compressed frame contains every byte value including the separators."""
     i = 0
     while True:
-        i = buf.find(b"\x1e", i)
-        if i < 0:
+        got = _record_at(buf, i)
+        if got is None:
             return
-        j = buf.find(b"\0", i)
-        if j < 0:
-            return
-        head = buf[i + 1:j].split(b"\x1f")
-        fields = {}
-        for p in head[1:]:
-            k, _, v = p.partition(b"=")
-            fields[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
-        i = j + 1
-        payload = None
-        if "len" in fields:
-            n = int(fields["len"])
-            payload = buf[i:i + n]
-            i += n + 1
-        yield head[0].decode("utf-8", "replace"), fields, payload
+        kind, fields, payload, i = got
+        yield kind, fields, payload
+
+
+def frames_from(buf):
+    """The same records, plus WHAT IS LEFT — for a stream read as it
+    arrives rather than waited for.
+
+    A record is yielded only once every byte of it is here; the remainder
+    goes back to the reader to be added to. Returns `(records, leftover)`."""
+    out, i = [], 0
+    while True:
+        start = buf.find(b"\x1e", i)
+        if start < 0:
+            return out, b""               # nothing half-arrived
+        got = _record_at(buf, start)
+        if got is None:
+            return out, buf[start:]       # this one is still coming
+        kind, fields, payload, i = got
+        out.append((kind, fields, payload))
 
 
 class Chunk:

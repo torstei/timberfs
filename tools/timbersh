@@ -64,7 +64,7 @@ something else again at the far end.
                  not the statement's `limit`, which is how much of the
                  answer you want
 """
-import argparse, json, os, re, readline, subprocess, sys, threading, time
+import argparse, json, os, queue, re, readline, subprocess, sys, threading, time
 
 # The viewer, and the pieces both front ends share. A checkout finds
 # them beside this script; the package installs them where both do.
@@ -119,10 +119,17 @@ HELP = """
   ambiguous prefix is refused, never picked from.
 
   With TIMBERFS_HOSTS set, every host is asked and the stores show as one
-  set with a HOST column. Listings go out in parallel; reads go host by
-  host (no order is claimed between them) and `limit N` is N in total, so
-  a later host may go unread -- it says so when that happens. A host that
-  cannot be reached is named, never quietly missing.
+  set with a HOST column. A read goes to every host at once and is
+  rendered AS IT ARRIVES, so a slow host does not hold up a fast one --
+  each line names the host it came from. `limit N` is N in total, so
+  which entries a bounded fleet read returns is decided by arrival; it
+  says how many more had already come. A host that cannot be reached is
+  named, never quietly missing.
+
+  No ordering is lost by that. Within a host a bounded answer is
+  `order=sequential` -- store after store, not time -- and across hosts
+  none was ever claimed. Ordering by the clock an entry carries needs the
+  whole answer in hand; it is a separate thing.
 
   Nothing streams, so an UNBOUNDED `records` read is walked a page at a
   time (--page, default 10000 entries) rather than held whole. That is
@@ -276,6 +283,60 @@ def run(doc, host=None, raw=False):
         return (b"" if raw else ""), str(e), 127
     return ((p.stdout if raw else p.stdout.decode("utf-8", "replace")),
             p.stderr.decode("utf-8", "replace").strip(), p.returncode)
+
+
+def stream(doc, host, emit, framed=True):
+    """One document to one host, read AS IT ARRIVES.
+
+    `emit(record)` is called from this thread for every record — or every
+    complete line where the answer is not framed — and returns
+    `(stderr, rc)` when the process has finished. The buffering `run`
+    above waits for the whole answer first, which on a fleet means the
+    fastest host's first line waits for the slowest host's last one.
+
+    ⚠ `read1`, not `read`. A `BufferedReader.read(n)` blocks until it has
+    n bytes or EOF, which is the buffering this exists to avoid.
+
+    ⚠ stderr gets a thread of its own. Two pipes and one reader is a
+    process that stops when the one nobody drains fills up, and timberfs
+    writes its explanations there — the sentences that say why an answer
+    looks wrong."""
+    try:
+        p = subprocess.Popen(argv_for(host), stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        return str(e), 127
+    errbuf = []
+    drain = threading.Thread(target=lambda: errbuf.append(p.stderr.read()),
+                             daemon=True)
+    drain.start()
+    try:
+        p.stdin.write(json.dumps(doc).encode())
+        p.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass                      # it died before reading; rc says so
+    buf = b""
+    while True:
+        chunk = p.stdout.read1(65536)
+        if not chunk:
+            break
+        buf += chunk
+        if framed:
+            recs, buf = timberview.frames_from(buf)
+            for r in recs:
+                emit(r)
+        else:
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                emit(("line", {}, line))
+    # A last line with no newline is still a line.
+    if not framed and buf:
+        emit(("line", {}, buf))
+    p.stdout.close()
+    rc = p.wait()
+    drain.join()
+    err = errbuf[0].decode("utf-8", "replace").strip() if errbuf else ""
+    return err, rc
 
 
 # --------------------------------------------------------------- render
@@ -779,23 +840,35 @@ class Shell:
             self.load(RC, quiet=True)
 
     def ask(self, doc, host=None, raw=False):
-        """Every call to a host goes through here, so that what it said is
-        RECORDED rather than thrown away.
+        """One host, waited for. `ask_stream` is the same call read as it
+        arrives; both record what the host said."""
+        started = time.monotonic()
+        out, err, rc = run(doc, host, raw)
+        self.record(host, started, err, rc)
+        return out, err, rc
+
+    def ask_stream(self, doc, host, emit, framed=True):
+        """`stream`, with the same bookkeeping `ask` does."""
+        started = time.monotonic()
+        err, rc = stream(doc, host, emit, framed)
+        self.record(host, started, err, rc)
+        return err, rc
+
+    def record(self, host, started, err, rc):
+        """What a host said, kept rather than thrown away.
 
         timberfs writes its explanations to stderr and still exits 0 — `no
         store matches ...`, `retention overtook this follower`, a coverage
         warning. Those are exactly the sentences that answer "why did I get
         nothing", and they were being discarded on every successful call."""
+        st = self.hosts.setdefault(host, {})
         # Stamped BEFORE the call, and a later call never loses to an
         # earlier one that happened to finish after it. The prewarm thread
         # runs alongside whatever is typed first, so without this the
         # startup listing could land last and erase the note from the
         # command the person actually ran.
-        started = time.monotonic()
-        out, err, rc = run(doc, host, raw)
-        st = self.hosts.setdefault(host, {})
         if started < st.get("at", 0):
-            return out, err, rc
+            return
         st["at"] = started
         st["seen"] = True
         if rc != 0:
@@ -805,7 +878,6 @@ class Shell:
             # Kept, not printed: a note is context for an answer that looks
             # wrong, and printing every one would bury the answer.
             st["note"] = err or None
-        return out, err, rc
 
     def universe(self, fresh=False):
         """Every store on every host, cached for STORE_TTL seconds.
@@ -1488,14 +1560,19 @@ class Shell:
         # A `stores` answer is a SET, so the hosts merge into one listing.
         if kind == "stores":
             return self.list_stores(doc)
+        # `chunks` is compressed frames for a machine — written through
+        # untouched, so there is nothing to render and nothing an arrival
+        # order could help.
+        if kind == "chunks":
+            return self.once_raw(doc)
 
         want = doc.get("max", {}).get("entries")
         # ⚠ Paged only where every entry that comes back is SHOWN.
         #
-        # A `limit` is a total across hosts, enforced here, so a later host
-        # is asked for the whole bound and its entries are read and then
-        # dropped. Its `position` records cover what it DELIVERED, so a
-        # cursor built from that page resumes past exactly the entries
+        # A `limit` is a total across hosts, enforced here, so a host is
+        # asked for the whole bound and its surplus entries are read and
+        # then dropped. Its `position` records cover what it DELIVERED, so
+        # a cursor built from that page resumes past exactly the entries
         # nobody saw. An unbounded read shows all of it, and the positions
         # are then what they say they are.
         #
@@ -1503,64 +1580,38 @@ class Shell:
         # kinds cannot be continued and are left as one call rather than
         # bounded into a silent truncation.
         paged = want is None and kind == "records"
-        total, bad, stopped = 0, {}, None
-        shown_by, unshown, at, pages = {}, set(), {}, 0
+        total, bad, at, pages, dropped = 0, {}, {}, 0, 0
+        shown_by = {}
         while True:
             d = doc
             if paged:
                 d = dict(doc, max={"entries": PAGE})
                 if at:
                     d["cursor"] = list(at.values())
-            answers = self.fan_out(d)
-            # Rendered in the order the hosts were GIVEN, not the order
-            # they answered — the fan-out is a way to spend the latency
-            # once, not a licence to interleave machines.
-            more = False
-            for host in TARGETS:
-                out, err, rc = answers[host]
-                if rc != 0:
-                    bad[host] = err or f"exit {rc}"
-                    continue
-                if want is not None and total >= want:
-                    # ⚠ It has already been fetched. A bound sent to every
-                    # host in parallel is a bound each of them honours, so
-                    # the total is enforced here — which is why a later
-                    # host can do work that is never shown. Bounded by the
-                    # limit itself, and the price of not paying the
-                    # latency serially.
-                    stopped = stopped or host
-                    unshown.add(host)
-                    continue
-                head = f"  == {label(host)}" if len(TARGETS) > 1 else None
-                room = None if want is None else want - total
-                if kind == "records":
-                    n = show_records(out, self.names, header=head, limit=room,
-                                     note=not paged)
-                elif kind == "loglines":
-                    n = show_loglines(out, self.paths_on(host), header=head,
-                                      limit=room)
-                else:
-                    n = sys.stdout.write(out) and 0 or len(out.strip().splitlines())
-                shown_by[host] = shown_by.get(host, 0) + n
-                total += n
-                if paged:
-                    more = self.next_page(out, at) or more
+            room = None if want is None else want - total
+            n, more, page_dropped = self.render_page(d, kind, room, at, shown_by, bad)
+            total += n
+            dropped += page_dropped
             pages += 1
-            if not more:
+            # ⚠ `more` is the server saying a bound stopped it, which is
+            # true of the CALLER's `limit` too — so only a paged read may
+            # act on it. Without this an unpaged one re-sends the same
+            # document for ever.
+            if not (paged and more):
                 break
-        empty = [h for h in TARGETS
-                 if h not in bad and h not in unshown and not shown_by.get(h)]
-        # The per-call note was suppressed while paging — the server says
-        # `limited` on every page but the last, which is this shell's own
-        # bound and not a truncation of the answer — so the count is said
-        # once here instead, as a fleet total rather than per host.
+        empty = [h for h in TARGETS if h not in bad and not shown_by.get(h)]
+        # The count is said once, as a fleet total. Per host it would be
+        # the server's own `stream-end` line, which while paging says
+        # `limited` on every page but the last — this shell's own bound,
+        # not a truncation of the answer.
         if paged and total:
             print(f"  -- {total} entries"
                   + (f", in {pages} pages of {PAGE}" if pages > 1 else ""))
-
-        if stopped is not None:
-            print(f"  -- stopped at {want}; {label(stopped)} and any after it "
-                  f"were read but not shown")
+        if dropped:
+            # Which entries a bounded fleet read returns is now decided by
+            # ARRIVAL, so saying how many were read past the bound is
+            # saying that the answer is a sample of a larger one.
+            print(f"  -- stopped at {want}; {dropped} more had already arrived")
         # NOTHING came back, and nothing failed. Which host had nothing is
         # then the one thing that does not matter: every host has nothing,
         # and the tally reads identically whether the stores held no
@@ -1570,11 +1621,130 @@ class Shell:
             note = self.why_empty(doc)
             if note:
                 print(note)
-        # A host with nothing is counted, not given a header of its own:
-        # six empty headers is noise standing where an answer should be.
+        # A host with nothing is counted, not given a line of its own:
+        # six such lines is noise standing where an answer should be.
         elif empty and len(TARGETS) > 1:
             print(f"  -- nothing on {len(empty)}: "
                   + ", ".join(label(h) for h in TARGETS if h in empty))
+        report_errors(bad)
+
+    def render_page(self, doc, kind, room, at, shown_by, bad):
+        """One round to every host, rendered AS IT ARRIVES.
+
+        Interleaved, in arrival order, because the alternative is what the
+        buffering cost: with the answers collected first and replayed host
+        by host, the fastest host's first line waited for the slowest
+        host's last one — measured at 1.9 s for a line that was ready at
+        0.3 s. No ordering is lost by it. Within a host a bounded answer is
+        `order=sequential` — store after store, not time — and ACROSS hosts
+        this shell never claimed one; the grouping was a rendering, not a
+        promise. Sorting by the clock an entry carries is a different
+        thing, needs the whole answer in hand, and is
+        `docs/plans/logline-order.md`.
+
+        Attribution moves onto the LINE, where it has to be once the hosts
+        are mixed. With one host there is nothing to say and the output is
+        what it always was."""
+        q, ends = queue.Queue(), {}
+        framed = kind != "loglines"
+
+        def reader(host):
+            # ⚠ The sentinel goes out whatever happens. The drain below
+            # counts them to know when every host is finished, so a reader
+            # that raised without one would hang the shell for good.
+            try:
+                ends[host] = self.ask_stream(
+                    doc, host, lambda r: q.put((host, r)), framed=framed)
+            except Exception as e:                        # noqa: BLE001
+                ends[host] = (str(e), 127)
+            finally:
+                q.put((host, None))
+
+        for host in TARGETS:
+            threading.Thread(target=reader, args=(host,), daemon=True).start()
+
+        # The host goes in a column of its own, one width for all of them,
+        # so the store names still line up once the hosts are mixed.
+        hw = max(len(label(h)) for h in TARGETS) if len(TARGETS) > 1 else 0
+        pre = {h: f"  {label(h):{hw}}  " if hw else "  " for h in TARGETS}
+        paths = {h: self.paths_on(h) for h in TARGETS} if not framed else {}
+        left, shown, more, dropped = len(TARGETS), 0, False, 0
+        while left:
+            host, rec = q.get()
+            if rec is None:
+                left -= 1
+                err, rc = ends.get(host, ("", 0))
+                if rc != 0:
+                    bad[host] = err or f"exit {rc}"
+                continue
+            k, f, payload = rec
+            if k == "source":
+                self.names[f.get("id", "?")] = os.path.basename(f.get("path", "?"))
+            elif k == "position" and f.get("id"):
+                # Positions MERGE onto what is held: every store EXAMINED
+                # reports one, and a store that delivered nothing reports
+                # the offset it was RESUMED from.
+                if "offset" in f:
+                    at[f["id"]] = {"id": f["id"], "offset": int(f["offset"])}
+                else:
+                    at.setdefault(f["id"], {"id": f["id"]})
+            elif k == "stream-end":
+                more = more or f.get("status") == "limited"
+            elif k in ("entry", "line"):
+                if room is not None and shown >= room:
+                    dropped += 1          # read before the bound was reached
+                    continue
+                if k == "entry":
+                    self.show_entry(pre[host], f, payload)
+                else:
+                    self.show_line(pre[host], paths[host], payload)
+                shown += 1
+                shown_by[host] = shown_by.get(host, 0) + 1
+        return shown, more, dropped
+
+    def show_entry(self, pre, f, payload):
+        """One entry, its store named in the column every kind uses. A
+        multi-line entry is one entry: the continuation lines are indented
+        to sit under the first, never re-labelled."""
+        who = self.names.get(f.get("id", ""), "")
+        body = (payload or b"").decode("utf-8", "replace").rstrip("\n")
+        for i, line in enumerate(body.split("\n")):
+            print(f"{pre}{who:28} {line}" if i == 0 else f"{pre}{'':28} {line}")
+
+    def show_line(self, pre, by_path, payload):
+        """One `loglines` line. timberfs prefixes each with the store's
+        PATH, which on a fleet is most of the terminal and none of the
+        information — rewrite it to the store's name, in the column
+        `records` uses, so the two kinds read the same way.
+
+        Split on the FIRST colon and look the prefix up: a path that is not
+        a store we know about is left exactly as it came, because guessing
+        at the shape of a line is how a log line containing a colon becomes
+        a truncated one."""
+        line = payload.decode("utf-8", "replace")
+        head, sep, rest = line.partition(":")
+        if sep and head in by_path:
+            print(f"{pre}{by_path[head]:28} {rest}")
+        else:
+            print(f"{pre}{line}" if line else "")
+
+    def once_raw(self, doc):
+        """`chunks`: the answer is compressed frames, written through as
+        BYTES.
+
+        ⚠ Not decoded. This path used to go through the text transport,
+        which decodes utf-8 with replacement — so every frame reaching a
+        terminal had already been corrupted, silently, in the one kind
+        whose whole promise is that nothing is decompressed or altered at
+        either end."""
+        bad = {}
+        for host in TARGETS:
+            out, err, rc = self.ask(doc, host, raw=True)
+            if rc != 0:
+                bad[host] = err or f"exit {rc}"
+                continue
+            sys.stdout.buffer.write(out)
+        sys.stdout.buffer.flush()
         report_errors(bad)
 
     def list_stores(self, doc):

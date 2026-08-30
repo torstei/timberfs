@@ -468,6 +468,59 @@ def a_read_every_host_refused_is_not_an_answer_with_nothing_in_it():
     s.cleanup()
 
 
+@test
+def a_slow_host_does_not_hold_up_a_fast_one():
+    """The whole answer used to be waited for before any of it was
+    rendered, so on a fleet the fastest host's first line waited for the
+    slowest host's last one — measured at 1.9s for a line ready at 0.3s.
+
+    Not a timing bet: `slow` sleeps five seconds before its FIRST byte,
+    and what is asserted is that `fast`'s entries are on the screen well
+    inside that. The only way it fails is if nothing renders until every
+    host has finished, which is the defect."""
+    s = Pty({"fast": {"stores": [store("f1", ID_A)],
+                      "records": [{"id": ID_A, "text": "quick answer"}]},
+             "slow": {"stores": [store("s1", ID_B)], "delay_ms": 5000,
+                      "records": [{"id": ID_B, "text": "eventual answer"}]}},
+            hosts=["fast", "slow"]).start()
+    s.expect("timberfs=#")
+    s.send("select records from [];\n")
+    s.expect("quick answer", timeout=3)
+    assert "eventual answer" not in s.plain, "the slow host cannot have answered yet"
+    s.expect("eventual answer", timeout=15)
+    s.finish()
+    s.cleanup()
+
+
+@test
+def a_mixed_fleet_names_the_host_on_the_LINE():
+    """Once the hosts are interleaved the `== host` block header names
+    nothing — the next line may be another host's. Attribution moves onto
+    the line, in a column of its own so the store names still line up."""
+    s = Session({h: {"stores": [store(f"{h}1", ID_A if h == "a" else ID_B)],
+                     "records": [{"id": ID_A if h == "a" else ID_B,
+                                  "text": f"from {h}"}]}
+                 for h in ("alpha", "b")}, hosts=["alpha", "b"]).run(
+        "select records from [];")
+    assert "== alpha" not in s.out, s.out
+    # One column width for every host, so the store column is straight.
+    for want in ("  alpha  alpha1.log", "  b      b1.log"):
+        assert want in s.out, f"{want!r} not in\n{s.out}"
+    s.cleanup()
+
+
+@test
+def one_host_still_says_nothing_about_which_host():
+    """There is only one, so naming it on every line is noise. The
+    single-host rendering is what it always was."""
+    s = Session({"": {"stores": [store("app", ID_A)],
+                      "records": [{"id": ID_A, "text": "alone"}]}}).run(
+        "select records from [];")
+    assert "  app.log" in s.out, s.out
+    assert "(local)" not in s.out, s.out
+    s.cleanup()
+
+
 def tape(name, sid, n=9):
     """A store with several chunks, and the chunks themselves — what a
     pager needs and a one-chunk fixture cannot exercise.
