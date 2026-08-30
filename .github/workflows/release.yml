@@ -1,9 +1,13 @@
 name: Release
 
 # Tag-driven releases: push a tag `vX.Y.Z` (matching the Cargo.toml
-# version) and this builds the .deb, re-runs the full VM package suite
-# against that exact artifact, attests its build provenance, creates the
-# GitHub release with generated notes, and publishes to crates.io.
+# version) and this builds the .deb, attests its build provenance, creates
+# the GitHub release with generated notes, and publishes to crates.io.
+#
+# It does NOT re-run the VM suite: it REQUIRES CI to have passed on the
+# exact commit instead (see the gate below). So a tag pushed before CI
+# finishes fails — and since a squash merge makes a new sha, the wait is
+# for MAIN's run, not the pull request's.
 #
 # crates.io publishing uses Trusted Publishing (OIDC) — no stored secret.
 # One-time setup on crates.io: the timberfs crate -> Settings -> Trusted
@@ -57,7 +61,17 @@ jobs:
           sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage
 
       - uses: dtolnay/rust-toolchain@stable
+      # RESTORE only. Saving runs a cleaning pass over `target/`, looking
+      # for the trybuild leftovers a test suite leaves behind — and by then
+      # `cargo publish` has made `target/package/timberfs-X.Y.Z/`, which it
+      # descends into and cannot find them in. That is four `##[error]`
+      # annotations on an otherwise green release, which is how you teach
+      # somebody to ignore errors on a release. Nothing wants this cache
+      # anyway: CI saved one for the same target minutes ago, and a tag
+      # builds once.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
 
       - name: Cache Debian cloud base image
         uses: actions/cache@v4
