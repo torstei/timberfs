@@ -8,8 +8,8 @@ bug that actually happened.
     tests/timbersh/test-timbersh          # all
     tests/timbersh/test-timbersh short_id # one, by substring
 """
-import fcntl, json, os, pty, re, select, shutil, struct, subprocess, sys
-import tempfile, termios, time
+import fcntl, http.server, json, os, pty, re, select, shutil, socketserver
+import struct, subprocess, sys, tempfile, termios, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TIMBERSH = os.path.join(HERE, "..", "..", "tools", "timbersh")
@@ -35,6 +35,27 @@ class Session:
         self.hosts = hosts
         self.extra = list(extra)
         self.resolver = self.write_resolver(hosts) if resolver else None
+        self.targets = None
+        self.servers = []
+
+    def over_http(self, status=None):
+        """Serve the same fake over a unix socket per host and reach it
+        by `url`, so a whole session runs on the url transport rather
+        than on an assertion about how one would be built.
+
+        `status` scripts a non-2xx from every host: a url target has no
+        stderr, so that IS how a failure arrives."""
+        targets = []
+        for h in self.hosts or [""]:
+            sock = os.path.join(self.dir, f"{h or 'local'}.sock")
+            self.servers.append(serve_fake(sock, h, self.dir, status))
+            targets.append({"url": f"http://{h or 'local'}.timberfs/query",
+                            "socket": sock,
+                            **({"name": h} if h else {})})
+        self.targets = os.path.join(self.dir, "targets.json")
+        json.dump({"v": "1.0-EXPERIMENTAL", "targets": targets},
+                  open(self.targets, "w"))
+        return self
 
     def write_resolver(self, hosts):
         """A resolver is a program that prints the fleet. Each target
@@ -50,6 +71,8 @@ class Session:
         return path
 
     def where(self):
+        if self.targets:
+            return ["--targets", self.targets]
         if self.resolver:
             return ["--resolver", self.resolver]
         return ["--cmd", f"{FAKE} _TIMBERHOST_" if self.hosts else FAKE] + (
@@ -79,7 +102,42 @@ class Session:
                 or (r["doc"].get("response_format") or {}).get("kind") == kind]
 
     def cleanup(self):
+        for srv in self.servers:
+            srv.shutdown()
+            srv.server_close()
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def serve_fake(sock, host, fake_dir, status=None):
+    """One unix-socket HTTP server in front of `fake-timberfs`: the POST
+    body is the document on its stdin, its stdout is the response."""
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            p = subprocess.run([FAKE, host] if host else [FAKE], input=body,
+                               capture_output=True,
+                               env={**os.environ, "FAKE_DIR": fake_dir})
+            out = p.stderr if status else p.stdout
+            self.send_response(status or 200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+        def get_request(self):
+            s, _ = socketserver.UnixStreamServer.get_request(self)
+            return s, ("unix", 0)
+
+    srv = S(sock, H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 
 class Pty(Session):
@@ -859,6 +917,44 @@ def one_target_being_down_does_not_stop_the_others():
     assert "hit on alpha" in s.out and "hit on beta" in s.out, s.out
     assert "No route to host" in s.out, s.out
     assert "gone" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_url_target_runs_a_whole_session_over_a_unix_socket():
+    """Not an assertion about how a url target would be built — the
+    document goes out over the socket, the answer comes back, and the
+    store lands under the host it came from. `show hosts` says which
+    transport, since a fleet reached several ways is the point."""
+    hosts = ["alpha", "beta"]
+    s = Session({"alpha": {"stores": [store("a1", ID_A)],
+                           "records": [{"id": ID_A, "text": "hit on alpha"}]},
+                 "beta": {"stores": [store("b1", ID_B)],
+                          "records": [{"id": ID_B, "text": "hit on beta"}]}},
+                hosts=hosts).over_http().run(
+        "show hosts;", "select records from [] where entry has 'hit' limit 9;")
+    assert "hit on alpha" in s.out and "hit on beta" in s.out, s.out
+    assert "via: POST http://alpha.timberfs/query over " in s.out, s.out
+    # A set: hosts are asked at once, so which answer lands first is
+    # arrival and not order.
+    assert sorted(r["host"] for r in s.requests
+                  if r["doc"].get("response_format", {}).get("kind")
+                  == "records") == hosts, s.requests
+    s.cleanup()
+
+
+@test
+def a_url_target_that_answered_non_2xx_reports_the_body_as_the_reason():
+    """A url target has NO stderr — timberfs's explanations have no
+    second channel to arrive on — so a failed request's body is the
+    whole of what a host said, and it must not be parsed as an answer
+    that happens to be unreadable."""
+    s = Session({"alpha": {"fail": "the query document was refused: no such "
+                                   "member `qq`", "code": 3}},
+                hosts=["alpha"]).over_http(status=400).run(
+        "select stores from [];")
+    assert "HTTP 400" in s.out, s.out
+    assert "no such member" in s.out, s.out
     s.cleanup()
 
 

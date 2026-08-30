@@ -32,7 +32,11 @@ switches between the rest.
 .TP
 .BI \-\-resolver " CMD"
 A command that prints the fleet as a target document \(em a name and the
-argv that reaches it, per target. See
+way to reach it, per target: an argv to run, or a
+.B url
+to POST the document to, over TCP or a unix
+.BR socket .
+See
 .BR timbersh (1),
 WHERE THE FLEET IS, for the document and the order the sources are tried
 in.
@@ -41,6 +45,13 @@ in.
 .BI \-\-targets " FILE"
 The same document, from a file.
 .RB ( $TIMBERFS_TARGETS )
+.TP
+.BI \-\-refresh " CMD"
+The command that re-derives the fleet, where that is not the one that
+produced it.
+.RB ( $TIMBERFS_REFRESH ;
+then the document\(aqs
+.BR refresh )
 .TP
 .BI \-\-cmd " ARGV"
 One command reaching every host, with

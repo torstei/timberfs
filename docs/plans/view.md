@@ -184,11 +184,22 @@ Worse, it made the transport a property of the SESSION: one command with a
 placeholder meant every host had to be reached the same way, so an `ssh`
 and a site wrapper taking the host as an argument could not be one fleet.
 
-A **target** is now a name and the argv that reaches it, and a **resolver**
-is any command that prints the list. `tools/README.md` has the document and
-the order the sources are tried in. `TIMBERFS_CMD`/`TIMBERFS_HOSTS` survive
-as one producer of a target list rather than as the only way to describe a
-fleet.
+A **target** is now a name and the way to reach it — an argv to run, or a
+`url` to POST the document to, over TCP or a unix `socket` — and a
+**resolver** is any command that prints the list. `tools/README.md` has the
+document and the order the sources are tried in.
+`TIMBERFS_CMD`/`TIMBERFS_HOSTS` survive as one producer of a target list
+rather than as the only way to describe a fleet.
+
+⚠ **A url target has no stderr, and that is a gap this cannot close from
+here.** The two transports are the same shape in every other respect — a
+document up, a stream read as it arrives, a rc that says whether the host
+answered — but timberfs writes the sentences that explain an answer which
+looks wrong to fd 2 while still exiting 0, and HTTP has no second channel.
+Over a url those arrive only out of a failed response's body. Giving them
+one means saying what a timberfs server puts on the wire, which is the
+read-only-serve question and is deliberately still open; a header invented
+here would be a wire format decided by a client.
 
 The generalisation is a hook rather than a feature, so discovery stays out
 of timberfs where it does not belong — timberfs is a single-node tool and
@@ -204,6 +215,12 @@ the reason to define it early, and they are not the same programs:
   derives the queryable set from the service registry, each candidate probed
   for whether the agent actually running there serves the query endpoint.
   That wrapper becomes a resolver by printing what it already computes.
+  ⚠ Such a sweep is not cheap — probing every candidate is a round trip per
+  host — which is why re-deriving the fleet is allowed to be a DIFFERENT
+  command from the one that produced it (`--refresh`, `$TIMBERFS_REFRESH`,
+  the document's own `refresh`). A full sweep to open a session with and a
+  cached re-ask are the same question asked at two prices, and the session
+  should not have to pick one for both.
 
 ⚠ It is queried by more than one tool. The shell, the viewer, and whatever
 comes next all ask "where is this store", and none of them should grow its

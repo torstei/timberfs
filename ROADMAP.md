@@ -355,16 +355,30 @@ here.
   `TIMBERFS_CMD` with `_TIMBERHOST_` in it made the transport a property of
   the SESSION, so every host had to be reached the same way and an `ssh`
   could not sit beside a site wrapper taking the host as an argument. A
-  target is now a name and the argv that reaches it; `$TIMBERFS_RESOLVER`
+  target is now a name and the way to reach it; `$TIMBERFS_RESOLVER`
   is any command printing that list, `~/.config/timberfs/targets.json` holds
   the same document, and the old variables are one producer of it rather
   than the only way to describe a fleet. A resolver that failed is fatal and
   an empty fleet refused, because a session that quietly asks the local
   machine looks exactly like a fleet that held nothing; a target this build
-  cannot reach is named rather than dropped. What remains is the other half
-  of DNS — "who has this store", deliberately not designed yet, since
-  broadcast is fine at the measured fleet. Design note:
-  [docs/plans/view.md](docs/plans/view.md).
+  cannot reach is named rather than dropped.
+  A target reaches its timberfs by `cmd` or by **`url`** — POSTed the
+  document, streamed the answer, over TCP or a unix `socket`. `socket` is a
+  member of its own for the reason `cmd` is a list: a filesystem path folded
+  into a URL means percent-encoding it into the authority or inventing a
+  separator we then own, and a socket path containing that separator would
+  break silently. The gap it leaves is real and stated: a url target has no
+  stderr, so timberfs's explanations — the sentences that say why an answer
+  looks wrong — arrive only out of a failed response's body. Closing that
+  means deciding what a timberfs server puts on the wire, which is the
+  read-only-serve entry above and stays open. Nothing here serves such a
+  URL; these are clients for endpoints that already exist.
+  Re-deriving the fleet is its own command where it needs to be
+  (`--refresh`, `$TIMBERFS_REFRESH`, the document's `refresh`), since a full
+  sweep to open a session with and a cheap re-ask are not the same call.
+  What remains is the other half of DNS — "who has this store",
+  deliberately not designed yet, since broadcast is fine at the measured
+  fleet. Design note: [docs/plans/view.md](docs/plans/view.md).
 - **Ordering by the clock an entry CARRIES**: a bounded answer reads stores
   one after another and claims no order between them, because a streaming
   merge can only key on arrival — the one key a store is already sorted by.

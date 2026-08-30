@@ -30,20 +30,26 @@ so a predicate means here exactly what it means there.
 .SH WHERE THE FLEET IS
 A
 .B target
-is a name and the command that reaches it. The command belongs to the
-TARGET rather than to the session, so an
+is a name and the way to reach it: an argv to run, or a URL to POST the
+document to. The transport belongs to the TARGET rather than to the
+session, so an
 .BR ssh (1)
-to one host and a site wrapper taking the host as an argument are one
-fleet \(em which one command with a placeholder could not express.
+to one host, a site wrapper taking the host as an argument, and an HTTP
+endpoint on a unix socket are one fleet \(em which one command with a
+placeholder could not express.
 .PP
 The document a resolver prints, and the file that holds the same thing:
 .PP
 .RS
 .EX
 {"v": "1.0-EXPERIMENTAL",
+ "refresh": ["fleet-sweep", "--cached"],
  "targets": [
    {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
    {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
+   {"name": "db01",   "url": "http://db01:9099/query"},
+   {"name": "local",  "url": "http://localhost/query",
+                      "socket": "/run/timberfs.sock"},
    {"cmd": ["timberfs", "query", "--query", "-"]}
  ]}
 .EE
@@ -52,7 +58,35 @@ The document a resolver prints, and the file that holds the same thing:
 .B cmd
 is a LIST because a command line written as one string would have to be
 split again at this end, under rules that are ours to invent and get
-wrong. A
+wrong.
+.B socket
+is a member of its own for that same reason: a unix socket is a
+filesystem path and a URL has nowhere to put one, so folding it in means
+either percent-encoding it into the authority or inventing a separator we
+would then own \(em and a socket path containing that separator would
+break silently. The URL stays an ordinary URL, and
+.B socket
+says what to dial instead of resolving its host. That host is still the
+.B Host:
+header, which is what a server routing several names off one socket
+reads.
+.PP
+A target is reached ONE way: a
+.B cmd
+and a
+.B url
+on the same target is a mistake in the document and is named, not
+resolved by preferring one.
+.PP
+⚠ A url target has NO stderr. timberfs writes the sentences that explain
+an answer which looks wrong \(em
+.BR "no store matches \(rs..." ,
+.B "retention overtook this follower"
+\(em to fd 2 and still exits 0, and HTTP has no second channel to carry
+them on. A url target's notes therefore arrive only when the request
+FAILS, out of the response body. Closing that gap means deciding what a
+timberfs server puts on the wire, which is deliberately not decided yet.
+A
 .B name
 is what the
 .B HOST
@@ -91,17 +125,28 @@ differ: the resolver is how you know what the fleet IS, and being wrong
 about that makes every later answer describe the wrong thing; one machine
 refusing a connection only means its logs are missing from this answer.
 .PP
-⚠ A target this build cannot reach \(em a future
+⚠ A target this build cannot reach \(em a
 .B url
-in place of
-.B cmd
-\(em is NAMED, never dropped, for the same reason: a host that was never
-asked must not read as a host that had nothing.
+whose scheme it cannot dial, a future member in place of both \(em is
+NAMED, never dropped, for the same reason: a host that was never asked
+must not read as a host that had nothing.
 .PP
 The resolver is asked ONE question, what the fleet is, and gets no
 arguments.
 .B refresh
-re-runs it, because a resolver derives its answer.
+asks again, because a resolver derives its answer \(em by default with
+the command that produced the fleet, and otherwise with the one named by
+.BR \-\-refresh ,
+.BR $TIMBERFS_REFRESH ,
+or the document's own
+.BR refresh ,
+in that order. Getting the fleet and re-asking for it may cost different
+amounts \(em a full sweep to open a session with, a cheap one to re-ask
+\(em so they are allowed to be different commands. A document's
+.B refresh
+applies to the fleet it arrived with: a refresh whose document names none
+of its own leaves the next one re-running whatever produced the fleet
+originally.
 .SH OPTIONS
 .TP
 .BI \-\-resolver " CMD"
@@ -124,6 +169,17 @@ works \(em a wrapper,
 .BR ssh (1),
 a container exec.
 .RB ( $TIMBERFS_CMD )
+.TP
+.BI \-\-refresh " CMD"
+The command
+.B refresh
+re-derives the fleet with, where that is not the one that produced it. It
+is not a fourth way to say where the fleet is, so it does not join the
+one-of-three rule above.
+.RB ( $TIMBERFS_REFRESH ;
+then the document\(aqs
+.BR refresh ;
+then whatever produced the fleet)
 .TP
 .BI \-\-hosts " H,H"
 The hosts that command reaches. Their stores present as one set with a

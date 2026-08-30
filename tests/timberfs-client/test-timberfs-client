@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""The fleet resolver's tests. No timberfs, no network, no terminal.
+"""The fleet resolver's tests. No timberfs and no terminal; the servers
+are this process's own, on a loopback port and a unix socket in a
+temporary directory.
 
     tests/timberfs-client/test-timberfs-client          # all
     tests/timberfs-client/test-timberfs-client empty    # one, by substring
 """
 import contextlib
+import http.server
 import json
 import os
 import shutil
+import socketserver
 import stat
 import sys
 import tempfile
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
@@ -31,7 +36,7 @@ def env(**kw):
     of it — otherwise a developer's own export decides the answer."""
     keep = {k: os.environ.get(k) for k in
             ("TIMBERFS_RESOLVER", "TIMBERFS_TARGETS", "TIMBERFS_CMD",
-             "TIMBERFS_HOSTS")}
+             "TIMBERFS_HOSTS", "TIMBERFS_REFRESH")}
     try:
         for k in keep:
             os.environ.pop(k, None)
@@ -54,8 +59,85 @@ def tmp():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def doc(*targets):
-    return json.dumps({"v": V, "targets": list(targets)})
+def doc(*targets, refresh=None):
+    d = {"v": V, "targets": list(targets)}
+    if refresh is not None:
+        d["refresh"] = refresh
+    return json.dumps(d)
+
+
+# ------------------------------------------------------------- a server
+class Seen:
+    """What the last request carried, so a test can assert on the wire
+    rather than on the client's own idea of what it sent."""
+
+    def __init__(self):
+        self.method = self.path = self.host = None
+        self.body = b""
+        self.status = 200
+        self.reply = b"ok"
+        self.hold = None            # set to let a test stall mid-answer
+
+
+def handler_for(seen):
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            seen.method, seen.path = self.command, self.path
+            seen.host = self.headers.get("Host")
+            n = int(self.headers.get("Content-Length") or 0)
+            seen.body = self.rfile.read(n)
+            self.send_response(seen.status)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            first, rest = ((seen.reply, b"") if seen.hold is None
+                           else (seen.reply, b"-and-the-rest"))
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(first), first))
+            self.wfile.flush()
+            if seen.hold is not None:
+                # Deterministic, not timed: the test releases this only
+                # after its first read1 has already returned.
+                seen.hold.wait(10)
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(rest), rest))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+    return H
+
+
+@contextlib.contextmanager
+def tcp_server(seen):
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler_for(seen))
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@contextlib.contextmanager
+def unix_server(seen, path):
+    class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+        def get_request(self):
+            # BaseHTTPRequestHandler logs and formats a peer address; an
+            # AF_UNIX accept has none.
+            sock, _ = socketserver.UnixStreamServer.get_request(self)
+            return sock, ("unix", 0)
+
+    srv = S(path, handler_for(seen))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def script(d, name, body):
@@ -72,7 +154,7 @@ def a_command_belongs_to_the_target_not_the_session():
     host as an argument are one fleet, and neither has to be expressible
     as the other with a placeholder swapped in — which is what
     `TIMBERFS_CMD` + `_TIMBERHOST_` forced."""
-    targets, unusable = fc.parse(doc(
+    targets, unusable, _ = fc.parse(doc(
         {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query"]},
         {"name": "web01", "cmd": ["site-wrapper", "query", "web01"]}), "test")
     assert unusable == []
@@ -85,7 +167,7 @@ def a_cmd_is_a_list_so_nothing_is_split_again():
     """An argument containing a space survives whole. Written as one
     string it would have to be re-split at this end, under rules we
     would have had to invent."""
-    targets, _ = fc.parse(doc(
+    targets, _, _ = fc.parse(doc(
         {"name": "h", "cmd": ["ssh", "-o", "ProxyCommand=nc %h 22", "h",
                               "timberfs"]}), "test")
     assert targets[0].cmd[2] == "ProxyCommand=nc %h 22", targets[0].cmd
@@ -110,16 +192,21 @@ def an_envelope_that_is_not_ours_is_refused():
 
 @test
 def a_target_this_build_cannot_reach_is_named_not_dropped():
-    """A future reach method — a URL, say — must leave that ONE target
-    unreachable-with-a-reason, not refuse the whole fleet and not
+    """A reach method this build does not speak must leave that ONE
+    target unreachable-with-a-reason, not refuse the whole fleet and not
     vanish. A host that was never asked reads exactly like a host that
-    had nothing, and that is the difference this repo keeps removing."""
-    targets, unusable = fc.parse(doc(
+    had nothing, and that is the difference this repo keeps removing.
+
+    Both doors: a member that is no transport at all, and a `url` whose
+    SCHEME is one this build cannot dial."""
+    targets, unusable, _ = fc.parse(doc(
         {"name": "mail01", "cmd": ["ssh", "mail01"]},
-        {"name": "web01", "url": "https://web01/timberfs"}), "test")
+        {"name": "web01", "quic": "web01:9099"},
+        {"name": "db01", "url": "quic://db01:9099/query"}), "test")
     assert [t.name for t in targets] == ["mail01"]
-    assert len(unusable) == 1 and unusable[0][0] == "web01"
-    assert "url" in unusable[0][1] and "`cmd`" in unusable[0][1], unusable
+    assert [n for n, _ in unusable] == ["web01", "db01"], unusable
+    assert "quic" in unusable[0][1] and "`cmd` or `url`" in unusable[0][1]
+    assert "scheme `quic`" in unusable[1][1], unusable
 
 
 @test
@@ -267,6 +354,266 @@ def refresh_re_resolves_rather_than_remembering():
         open(f, "w").write(doc({"name": "one", "cmd": ["x"]},
                                {"name": "two", "cmd": ["y"]}))
         assert fleet.again().names == ["one", "two"]
+
+
+# ------------------------------------------------------- url as a target
+@test
+def a_url_target_and_a_cmd_target_are_one_fleet():
+    """The whole point again, one transport further out: an ssh, a site
+    wrapper and an HTTP endpoint sit in the same list and none has to be
+    expressible as the others."""
+    targets, unusable, _ = fc.parse(doc(
+        {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs"]},
+        {"name": "db01", "url": "http://db01:9099/query"},
+        {"name": "local", "url": "http://localhost/query",
+         "socket": "/run/timberfs.sock"}), "test")
+    assert unusable == []
+    assert [t.name for t in targets] == ["mail01", "db01", "local"]
+    assert targets[0].via == "ssh mail01 timberfs"
+    assert targets[1].via == "POST http://db01:9099/query"
+    assert targets[2].via == ("POST http://localhost/query over "
+                              "/run/timberfs.sock"), targets[2].via
+
+
+@test
+def the_socket_is_its_own_member_so_no_path_needs_escaping():
+    """A unix socket is a filesystem path and a URL has nowhere to put
+    one. Folded in, we would own a separator — and a socket path
+    containing it would break silently. Here `urlsplit` reads an ordinary
+    URL and the path is carried whole, colons and all."""
+    odd = "/run/odd:name/timberfs.sock"
+    t = fc.Target("h", url="http://localhost/query?a=1", socket=odd)
+    assert t.socket == odd
+    assert fc.split_url(t.url, odd) == ("localhost", "/query?a=1")
+
+
+@test
+def a_url_with_no_host_needs_a_socket_to_dial_instead():
+    """`http:///query` says where to send and not where to send it. With
+    a socket that is complete; without one it is a target with nothing
+    to connect to, named rather than dropped."""
+    assert fc.split_url("http:///query", "/run/s.sock") == (
+        "localhost", "/query")
+    targets, unusable, _ = fc.parse(doc(
+        {"name": "a", "cmd": ["x"]}, {"name": "b", "url": "http:///query"}),
+        "test")
+    assert [t.name for t in targets] == ["a"]
+    assert "names no host" in unusable[0][1], unusable
+
+
+@test
+def two_transports_on_one_target_is_a_mistake_in_the_document():
+    """Not a target this build cannot reach — a target that says two
+    things. Preferring one silently is exactly the error the target list
+    exists to remove, so it is named."""
+    for bad, want in (
+            ({"name": "h", "cmd": ["x"], "url": "http://h/q"},
+             "both `cmd` and `url`"),
+            ({"name": "h", "cmd": ["x"], "socket": "/s"},
+             "how to dial a `url`"),
+            ({"name": "h", "url": "http://h/q", "socket": 3},
+             "non-string `socket`"),
+            ({"name": "h", "url": ""}, "non-empty string")):
+        try:
+            fc.parse(doc(bad), "test")
+            raise AssertionError(f"accepted {bad!r}")
+        except ValueError as e:
+            assert want in str(e), f"{bad!r} -> {e}"
+
+
+# --------------------------------------------------------- over the wire
+@test
+def a_url_target_posts_the_document_and_streams_the_answer():
+    """The document goes up as the body, the answer comes back as the
+    body, and the URL's own host is the Host header — which is what a
+    server routing several names off one socket reads."""
+    seen = Seen()
+    seen.reply = b"the-answer"
+    with tcp_server(seen) as base:
+        t = fc.Target("h", url=base + "/query?deep=1")
+        out, err, rc = t.run(b'{"v":"x"}')
+        assert (out, err, rc) == (b"the-answer", "", 0), (out, err, rc)
+        assert seen.method == "POST" and seen.path == "/query?deep=1"
+        assert seen.body == b'{"v":"x"}', seen.body
+        assert seen.host == base[len("http://"):], seen.host
+
+
+@test
+def a_url_answer_is_read_as_it_arrives_not_when_it_ends():
+    """The same property the process transport has, and the reason one
+    loop serves both: the fastest host's first line must not wait for the
+    slowest host's last one."""
+    seen = Seen()
+    seen.reply, seen.hold = b"first-piece", threading.Event()
+    with tcp_server(seen) as base:
+        call = fc.Target("h", url=base + "/query").open(b"{}")
+        got = call.read1(65536)
+        assert got == b"first-piece", got   # arrived; the server is still in it
+        seen.hold.set()
+        rest = b""
+        while True:
+            chunk = call.read1(65536)
+            if not chunk:
+                break
+            rest += chunk
+        assert rest == b"-and-the-rest", rest
+        assert call.finish() == ("", 0)
+
+
+@test
+def a_unix_socket_is_dialled_instead_of_the_host():
+    """The case the separate member exists for. Everything else about the
+    request is ordinary HTTP."""
+    seen = Seen()
+    seen.reply = b"over-the-socket"
+    with tmp() as d:
+        sock = os.path.join(d, "timberfs.sock")
+        with unix_server(seen, sock):
+            t = fc.Target("h", url="http://timberfs.local/query", socket=sock)
+            out, err, rc = t.run(b"{}")
+            assert (out, err, rc) == (b"over-the-socket", "", 0), (out, err, rc)
+            assert seen.host == "timberfs.local", seen.host
+
+
+@test
+def a_failed_request_carries_the_reason_from_the_body():
+    """A url target has no stderr, so the body IS the explanation — and a
+    non-2xx must not be streamed as an answer, or a proxy's error page
+    parses as records that happen to be unreadable."""
+    seen = Seen()
+    seen.status, seen.reply = 400, b"the query document was refused: no such member `qq`"
+    with tcp_server(seen) as base:
+        out, err, rc = fc.Target("h", url=base + "/query").run(b"{}")
+        assert out == b"", out
+        assert rc == 1 and "HTTP 400" in err and "no such member" in err, (rc, err)
+
+
+@test
+def nothing_listening_is_that_target_failing_not_the_fleet():
+    """Something in the system being down must not stop the logs that
+    ARE available being read, so a transport that never started is a
+    non-zero rc with its own words — the same shape as ssh refusing."""
+    with tmp() as d:
+        out, err, rc = fc.Target(
+            "h", url="http://localhost/query",
+            socket=os.path.join(d, "not-there.sock")).run(b"{}")
+        assert (out, rc) == (b"", 127), (out, rc)
+        assert "not-there.sock" in err, err
+    out, err, rc = fc.Target("h", url="http://127.0.0.1:1/query").run(b"{}")
+    assert (out, rc) == (b"", 127), (out, rc)
+    assert err, err
+
+
+# --------------------------------------------------------------- refresh
+@test
+def refresh_may_be_a_different_command_from_the_one_that_resolved():
+    """Getting the fleet and re-asking for it are allowed to cost
+    different amounts — a full sweep to open a session with, a cheap one
+    to re-ask — so they are allowed to be different commands."""
+    with tmp() as d, env():
+        full = script(d, "full", f"cat {d}/full.json")
+        cheap = script(d, "cheap", f"cat {d}/cheap.json")
+        open(f"{d}/full.json", "w").write(doc({"name": "one", "cmd": ["x"]}))
+        open(f"{d}/cheap.json", "w").write(doc({"name": "one", "cmd": ["x"]},
+                                               {"name": "two", "cmd": ["y"]}))
+        fleet = fc.resolve(resolver=full, refresh=cheap)
+        assert fleet.names == ["one"]
+        assert fleet.refresh_source == "--refresh"
+        again = fleet.again()
+        assert again.names == ["one", "two"], again.names
+        # And it keeps asking the refresh command, not the resolver.
+        assert again.again().names == ["one", "two"]
+
+
+@test
+def a_document_can_name_the_command_that_re_derives_it():
+    """So a --targets file and /etc/timberfs/targets.json gain a refresh
+    too — the answer travels with the fleet it describes, rather than
+    having to be typed beside it."""
+    with tmp() as d, env():
+        open(f"{d}/next.json", "w").write(doc({"name": "two", "cmd": ["y"]}))
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]},
+                               refresh=["cat", f"{d}/next.json"]))
+        fleet = fc.resolve(targets=f)
+        assert fleet.names == ["one"]
+        assert "the `refresh` in --targets" == fleet.refresh_source
+        assert fleet.again().names == ["two"]
+
+
+@test
+def the_refresh_in_force_is_the_most_explicit_one():
+    """Same flag-beats-export precedence as everywhere else here, with the
+    document last — it is the fleet's own default and the least explicit
+    thing in the room."""
+    with tmp() as d, env():
+        for who in ("flag", "export", "in-doc"):
+            open(f"{d}/{who}.json", "w").write(
+                doc({"name": who, "cmd": ["x"]}))
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]},
+                               refresh=["cat", f"{d}/in-doc.json"]))
+        assert fc.resolve(targets=f).again().names == ["in-doc"]
+        os.environ["TIMBERFS_REFRESH"] = f"cat {d}/export.json"
+        assert fc.resolve(targets=f).again().names == ["export"]
+        assert fc.resolve(targets=f,
+                          refresh=f"cat {d}/flag.json").again().names == ["flag"]
+
+
+@test
+def with_no_refresh_named_it_re_runs_what_produced_the_fleet():
+    """The behaviour that was there before, unchanged — and what a
+    refreshed document naming no `refresh` of its own falls back to."""
+    with tmp() as d, env():
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]}))
+        r = script(d, "r", f"cat {f}")
+        fleet = fc.resolve(resolver=r)
+        assert fleet.refresh is None
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]},
+                               {"name": "two", "cmd": ["y"]}))
+        assert fleet.again().names == ["one", "two"]
+
+
+@test
+def a_refresh_named_with_no_command_in_it_is_a_mistake():
+    """Naming it says the two commands are not the same, so an empty one
+    silently falling back to the resolver would be the opposite of what
+    was asked for."""
+    with tmp() as d, env():
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]}))
+        try:
+            fc.resolve(targets=f, refresh="   ")
+            raise AssertionError("accepted an empty --refresh")
+        except ValueError as e:
+            assert "names no command" in str(e), str(e)
+
+
+@test
+def a_refresh_that_failed_is_fatal_like_a_resolver_that_failed():
+    """It answers the same question, so being wrong about it is wrong in
+    the same way: the fleet after it would not be the fleet."""
+    with tmp() as d, env():
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]}))
+        bad = script(d, "bad", "echo 'the sweep found nothing' >&2; exit 4")
+        fleet = fc.resolve(targets=f, refresh=bad)
+        try:
+            fleet.again()
+            raise AssertionError("survived a failing refresh")
+        except ValueError as e:
+            assert "exit 4" in str(e) and "found nothing" in str(e), str(e)
+
+
+@test
+def a_malformed_refresh_member_is_named_like_a_malformed_cmd():
+    for bad in ("fleet-sweep --cached", [], ["sweep", 3]):
+        try:
+            fc.parse(doc({"name": "h", "cmd": ["x"]}, refresh=bad), "test")
+            raise AssertionError(f"accepted refresh {bad!r}")
+        except ValueError as e:
+            assert "non-empty list of strings" in str(e), str(e)
 
 
 def main():

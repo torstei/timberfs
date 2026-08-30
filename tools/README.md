@@ -68,6 +68,7 @@ export for one session and nothing else:
 |---|---|---|
 | `--resolver` | `TIMBERFS_RESOLVER` | a command that prints the fleet — see below |
 | `--targets` | `TIMBERFS_TARGETS` | the same document, from a file |
+| `--refresh` | `TIMBERFS_REFRESH` | the command `refresh` re-derives the fleet with |
 | `--cmd` | `TIMBERFS_CMD` | one command reaching every host, with `_TIMBERHOST_` substituted |
 | `--hosts` | `TIMBERFS_HOSTS` | the hosts that command reaches |
 | `--rc` | `TIMBERSH_RC` | statements run at startup |
@@ -75,8 +76,9 @@ export for one session and nothing else:
 | `--histsize` | `TIMBERSH_HISTSIZE` | how many lines to keep (2000) |
 | `--ttl` | `TIMBERSH_STORE_TTL` | expire the cached store list after N seconds; 0 (default) never expires it |
 
-A target is only ever handed a document on stdin, so anything that reaches a
-timberfs works — a wrapper, `ssh`, a container exec.
+A target is either handed a document on stdin — so anything that reaches a
+timberfs works: a wrapper, `ssh`, a container exec — or POSTed one over
+HTTP, on a TCP port or a unix socket.
 
 With several hosts the stores present as one set with a `HOST` column, and
 each remembers where it lives. A host it cannot reach is named rather than
@@ -199,10 +201,11 @@ search the server reads as a different question.
 
 ## Where the fleet is
 
-A **target** is a name and the command that reaches it. The command belongs
-to the target, not to the session — which is the whole point: an
-`ssh mail01 timberfs …` and a site wrapper taking the host as an argument
-are one fleet, and neither has to be expressible as the other with a
+A **target** is a name and the way to reach it: an argv to run, or a URL to
+POST the document to. The transport belongs to the target, not to the
+session — which is the whole point: an `ssh mail01 timberfs …`, a site
+wrapper taking the host as an argument and an HTTP endpoint on a unix
+socket are one fleet, and none has to be expressible as the others with a
 placeholder swapped into it. `TIMBERFS_CMD` + `_TIMBERHOST_` could not do
 that, and it is still there as one *producer* of a target list rather than
 as the only way to describe a fleet.
@@ -211,9 +214,13 @@ The document a resolver prints, and the file that holds the same thing:
 
 ```json
 {"v": "1.0-EXPERIMENTAL",
+ "refresh": ["fleet-sweep", "--cached"],
  "targets": [
    {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
    {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
+   {"name": "db01",   "url": "http://db01:9099/query"},
+   {"name": "local",  "url": "http://localhost/query",
+                      "socket": "/run/timberfs.sock"},
    {"cmd": ["timberfs", "query", "--query", "-"]}
  ]}
 ```
@@ -225,7 +232,43 @@ wrong — the same call the query document makes for `stores.select`. A
 is a **hint and not identity**, so renaming a target, or changing how it is
 reached, leaves every written address valid.
 
-**Where it comes from**, most explicit first — `show hosts;` says which won:
+### A url instead of a command
+
+`url` is POSTed the query document and answers with the stream, read as it
+arrives exactly as a pipe is. `http` and `https`; the URL's query string is
+kept, since a `?` is part of the address the endpoint was named by.
+
+`socket` is a **member of its own** rather than something folded into the
+URL, for the reason `cmd` is a list. A unix socket is a filesystem path and
+a URL has nowhere to put one, so every scheme that tries either
+percent-encodes it into the authority (`http+unix://%2Frun%2F…`) or invents
+a separator we would then own — and a socket path containing that separator
+would break silently. Here the URL stays an ordinary URL that `urlsplit`
+reads, and `socket` says what to dial instead of resolving its host. That
+host is still the `Host:` header, which is what a server routing several
+names off one socket needs.
+
+A target is reached **one** way. A `cmd` and a `url` on the same target is a
+mistake in the document and is named as one, rather than resolved by
+preferring whichever came first.
+
+⚠ **A url target has no stderr.** timberfs writes the sentences that explain
+an answer which looks wrong — `no store matches …`, `retention overtook this
+follower` — to fd 2 and still exits 0, and `show hosts` keeps them as
+`note:`. HTTP has no second channel to carry them on, so a url target's
+notes arrive **only when the request fails**, out of the response body. That
+is a real gap and not an oversight: closing it means deciding what a timberfs
+server puts on the wire, which this repository has deliberately not decided
+(ROADMAP, *Read-only serve*). A non-2xx is never streamed as an answer — a
+proxy's error page must not parse as records that happen to be unreadable.
+
+⚠ **Nothing in this repository serves that URL yet.** These are clients; the
+endpoint is whatever already speaks `timberfs-query-document(5)` over HTTP at
+your site.
+
+### Where it comes from, and how it is asked again
+
+Most explicit first — `show hosts;` says which won:
 
 ```
 --resolver | --targets | --cmd/--hosts        one of them, not two
@@ -235,6 +278,24 @@ $TIMBERFS_CMD / $TIMBERFS_HOSTS
 ~/.config/timberfs/targets.json, /etc/timberfs/targets.json
 one local `timberfs query --query -`          found on PATH
 ```
+
+**And how it is asked AGAIN.** Getting the fleet and re-asking for it may
+cost different amounts — a full sweep to open a session with, a cheap one to
+re-ask — so they are allowed to be different commands:
+
+```
+--refresh CMD
+$TIMBERFS_REFRESH
+the document's `refresh`
+otherwise: whatever produced the fleet
+```
+
+`--refresh` is not a fourth way to say where the fleet is, so it does not
+join the one-of-three rule above: it answers a different question and may
+legitimately have a different answer. `show hosts;` prints the command and
+which of these named it. A document's `refresh` applies to the fleet it
+arrived with — a refresh whose own document names none leaves the next one
+re-running whatever produced the fleet originally.
 
 A flag beats an export as everywhere else here. Two *flags* is a usage
 error — they are three ways to answer one question, typed together, and
@@ -263,16 +324,17 @@ since it may be on exactly that host · and a chunk that could not be read
 must say so **where the boundary marker would go**, or a scroll that
 stopped is the same screen as the end of the log.
 
-⚠ **A target this build cannot reach is NAMED, never dropped.** A future
-`{"name": …, "url": …}` leaves that one target unreachable-with-a-reason
-and the rest of the fleet working — refusing all of it over one would be
-the wrong blast radius, and dropping it silently would make a host that was
-never asked read as a host that had nothing.
+⚠ **A target this build cannot reach is NAMED, never dropped.** A `url`
+whose scheme this build cannot dial, or a future member in place of both,
+leaves that one target unreachable-with-a-reason and the rest of the fleet
+working — refusing all of it over one would be the wrong blast radius, and
+dropping it silently would make a host that was never asked read as a host
+that had nothing.
 
 The resolver is asked **one** question — what is the fleet — and gets no
 arguments. "Who has this store" is a different question that has not been
 thought through, and reserving an argument for it now would design it by
-accident. `refresh` re-runs it, because a resolver derives its answer.
+accident.
 
 ## An answer on the pager's screen
 
@@ -474,8 +536,10 @@ tests/timberview/test-timberview          # the viewer's model
 tests/timberfs-client/test-timberfs-client   # the fleet resolver
 ```
 
-No VM, no timberfs, no network. `scripts/check.sh` runs all three, so they
-gate a push like everything else.
+No VM and no timberfs. The url transport's tests serve the same fake over
+a loopback port and a unix socket in the test process, which is as far out
+as they go. `scripts/check.sh` runs all three, so they gate a push like
+everything else.
 
 For timbersh, `--cmd` points at a fake that answers from a script. For the
 viewer, the fake is one level up: it implements the four operations, which

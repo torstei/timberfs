@@ -2650,6 +2650,10 @@ def main(argv=None):
     ap.add_argument("--resolver", metavar="CMD",
                     help="a command that prints the fleet as a target "
                          "document. $TIMBERFS_RESOLVER")
+    ap.add_argument("--refresh", metavar="CMD",
+                    help="the command that re-derives the fleet, where that "
+                         "is not the one that produced it. $TIMBERFS_REFRESH; "
+                         "else the document's `refresh`")
     ap.add_argument("--targets", metavar="FILE",
                     help="the same document, from a file. $TIMBERFS_TARGETS; "
                          "else ~/.config/timberfs/targets.json, else "
@@ -2666,7 +2670,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     try:
-        fleet = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts)
+        fleet = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts,
+                                        a.refresh)
     except ValueError as e:
         sys.exit(f"timberview: {e}")
     for name, why in fleet.unusable:
@@ -2677,14 +2682,8 @@ def main(argv=None):
         t = fleet.by_name(host)
         if t is None:
             return (b"" if raw else ""), f"no target named {host!r}", 127
-        try:
-            p = subprocess.run(t.cmd, input=json.dumps(doc).encode(),
-                               capture_output=True)
-        except OSError as e:
-            return (b"" if raw else ""), str(e), 127
-        err = p.stderr.decode("utf-8", "replace").strip()
-        return (p.stdout if raw
-                else p.stdout.decode("utf-8", "replace")), err, p.returncode
+        out, err, rc = t.run(json.dumps(doc).encode())
+        return (out if raw else out.decode("utf-8", "replace")), err, rc
 
     backend = QueryBackend(ask, fleet.names)
 
