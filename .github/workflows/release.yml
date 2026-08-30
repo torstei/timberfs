@@ -100,11 +100,14 @@ jobs:
           cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
           cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
 
-      # CI already ran the VM suite on this exact commit, on BOTH images,
-      # after building the compat .deb with the identical commands above.
-      # Re-running it here repeated a SUBSET of that — one image — for nine
-      # minutes; and "the exact artifact" was never literally the bytes CI
-      # tested either, since a Rust build is not bit-reproducible.
+      # CI already passed the VM suite for this commit's TREE, on BOTH
+      # images, after building the compat .deb with the identical commands
+      # above. (For the tree and not the commit: an identical tree is an
+      # identical checkout, and CI short-circuits a re-run on one — see
+      # `vm-seen` in ci.yml.) Re-running it here repeated a SUBSET of that —
+      # one image — for nine minutes; and "the exact artifact" was never
+      # literally the bytes CI tested either, since a Rust build is not
+      # bit-reproducible.
       #
       # ⚠ A commit CI never ran on FAILS here. That is the whole gate, and
       # why it requires a `success` rather than the absence of a failure: a

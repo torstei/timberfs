@@ -41,8 +41,43 @@ jobs:
       - run: tests/timbersh/test-timbersh
       - run: tests/timberview/test-timberview
 
+  # Has this exact TREE already passed the VM suite?
+  #
+  # A squash merge makes a new sha for a tree that was tested minutes ago on
+  # the pull request, so main re-ran eighteen minutes of VM for a byte-
+  # identical checkout. The key is the tree and not the branch, the PR or the
+  # sha: an identical tree has identical inputs, and the workflow files are
+  # IN the tree, so changing CI invalidates its own short-circuit.
+  #
+  # ⚠ A cache would be the obvious mechanism and cannot work: an Actions cache
+  # written on a feature branch is not visible to a run on main, which is
+  # exactly the direction needed. An artifact is visible across branches
+  # through the API, so the marker is one.
+  vm-seen:
+    name: vm-seen
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tree: ${{ steps.probe.outputs.tree }}
+      hit: ${{ steps.probe.outputs.hit }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tree=$(git rev-parse HEAD^{tree})
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=vm-pass-$tree" \
+                --jq '[.artifacts[] | select(.expired | not)] | length')
+          echo "tree $tree: ${n:-0} prior pass(es)"
+          if [ "${n:-0}" -gt 0 ]; then echo "hit=yes" >> "$GITHUB_OUTPUT"
+          else echo "hit=no" >> "$GITHUB_OUTPUT"; fi
+
   vm-tests-matrix:
     name: vm-tests (${{ matrix.image }})
+    needs: vm-seen
+    if: needs.vm-seen.outputs.hit != 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -98,13 +133,30 @@ jobs:
   # `vm-tests (trixie)` / `vm-tests (focal)`, so this aggregates them into that
   # one name without pinning the protection rule to specific matrix values.
   vm-tests:
-    needs: vm-tests-matrix
+    needs: [vm-seen, vm-tests-matrix]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Gate on the matrix result
         run: |
+          if [ "${{ needs.vm-seen.outputs.hit }}" = "yes" ]; then
+            echo "tree ${{ needs.vm-seen.outputs.tree }} already passed the VM suite"
+            exit 0
+          fi
           if [ "${{ needs.vm-tests-matrix.result }}" != "success" ]; then
             echo "a vm-tests matrix leg did not succeed: ${{ needs.vm-tests-matrix.result }}" >&2
             exit 1
           fi
+      # Written only where the suite actually RAN and passed, so a hit can
+      # never mint a marker from another hit. The file is a receipt, not
+      # data: what matters is that an artifact by this name exists.
+      - name: Record that this tree passed
+        if: needs.vm-seen.outputs.hit != 'yes'
+        run: echo "${{ github.sha }}" > vm-pass.txt
+      - uses: actions/upload-artifact@v4
+        if: needs.vm-seen.outputs.hit != 'yes'
+        with:
+          name: vm-pass-${{ needs.vm-seen.outputs.tree }}
+          path: vm-pass.txt
+          retention-days: 90
+          if-no-files-found: error
