@@ -818,6 +818,65 @@ def tab_steps_over_a_line_with_nothing_to_pick():
 
 
 @test
+def the_tape_stops_at_the_investigation_window():
+    """A drill-down has a time frame. `where logline since ... until ...`
+    bounds the query and then `o` opens the log around a hit, where there
+    is no bound at all — so the pager walks straight out of the
+    investigation the query was careful about."""
+    f = Fake([f"chunk {i}\n" for i in range(6)])
+    for i, c in enumerate(f.chunks):          # a minute of write time each
+        c.wf, c.wl = 1_000_000 + i * 60_000, 1_000_000 + (i + 1) * 60_000
+
+    v = tv.View(f, source=tv.Tape(f, f.store))
+    v.open(seq=3)
+    assert v.source.at_top() is False, "no window: the tape runs to the store"
+
+    # Now inside a window covering chunk 3 only. WIDENED, so it stops one
+    # chunk late rather than losing a line that belongs.
+    v.source.window = (f.chunks[3].wf, f.chunks[3].wl)
+    v.open(seq=3)
+    while v.source.extend_up():
+        pass
+    assert v.source.chunks[0].seq >= 1, v.source.chunks[0].seq
+    assert v.source.at_top(), "the window should have stopped it short of the store"
+    # ...and the edge says whose bound it was, on which clock.
+    note = v.source.top_notes()[0]
+    assert "session window" in note and "write clock" in note, note
+    assert "top of the log" not in note, note
+
+
+@test
+def the_window_is_carried_to_a_tape_the_view_switches_to():
+    """`o` into the log and following a hit into another store both
+    REPLACE the source, and they are exactly when the guard matters — a
+    tape has no predicate of its own to keep it near the incident."""
+    f = Fake(["a\n"])
+    v = tv.View(f, source=tv.Tape(f, f.store, window=(1000, 2000)))
+    v.source = tv.Tape(f, {"id": "elsewhere"})
+    assert v.source.window == (1000, 2000), v.source.window
+
+
+@test
+def the_window_is_changed_by_typing_it_not_by_scrolling():
+    """A bound you can drift out of is not one you can sort or count
+    against, so scrolling cannot cross it and changing it is one typed
+    act."""
+    f = Fake(["a\n"])
+    v = tv.View(f, source=tv.Tape(f, f.store))
+    v.set_window("from 2026-08-30T10:00:00Z to 2026-08-30T11:00:00Z")
+    lo, hi = v.source.window
+    assert hi - lo == 3_600_000, (lo, hi)
+    v.set_window("none")
+    assert v.source.window is None
+    for bad in ("from", "sideways", "from 2026-08-30T11:00:00Z to 2026-08-30T10:00:00Z"):
+        try:
+            v.set_window(bad)
+            raise AssertionError(f"{bad!r} was accepted")
+        except ValueError:
+            pass
+
+
+@test
 def a_multi_line_entry_can_be_shown_as_one_row():
     """Ten stack traces is four hundred lines and each pushes the next
     entry off the screen, so the thing you are doing — deciding whether

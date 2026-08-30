@@ -93,6 +93,32 @@ than a heuristic that would disagree with timberfs about where an entry
 begins.
 .RE
 .TP
+.B t
+The investigation's WINDOW: the tape stops at it instead of scrolling out
+of the period you are looking at.
+.B "from T to T"
+, either end droppable, or
+.B none
+to remove it.
+.RS
+.PP
+Scrolling cannot cross it and changing it is one typed act, deliberately:
+a bound you can drift out of is not one you can sort or count against,
+and the point of the window is that what is in front of you is the WHOLE
+of the period.
+.PP
+⚠ On the WRITE clock, widened. The window is stated in logline time and a
+chunk written after it can hold entries stamped inside it, so the bound
+can only stop LATE \(em showing a little either side rather than losing a
+line that belongs. The edge says so rather than reading as the end of the
+log.
+.PP
+.B "create session from ... to ..."
+in
+.BR timbersh (1)
+is the same window, and a pager opened from there starts with it.
+.RE
+.TP
 .B z
 Show each multi-line entry as ONE row \(em the stack trace on the same
 line as the message that raised it, its indent stripped so the rows line

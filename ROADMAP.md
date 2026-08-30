@@ -334,18 +334,15 @@ here.
   over ssh, without failing silently; and an answer screen that EXTENDS —
   it is a closed set today, so it takes one page and says the answer
   continues, where the tape fetches the next chunk as you reach it.
-  Also **an investigation window that outlives the statement**: a drill-down
-  has a time frame, and `where logline since ... until ...` bounds the query
-  and then the pager escapes it — `o` opens the log around a hit and there is
-  no bound on the tape at all. A session-scoped window (`create session from
-  X to Y`, or whatever it is spelled) would bound every query AND the pager
-  until it is dropped, which is also what makes a local sort and other
-  whole-answer transformations affordable: a bounded window is usually a small
-  number of entries. ⚠ The two clocks land differently on the two halves — a
-  query bounds on the LOGLINE axis, the tape is addressed on the WRITE axis
-  and its edges are chunk windows — so the bound is exact for one and
-  approximate for the other, and an edge that stops for the session must say
-  which clock stopped it rather than read as the end of the log. Design note:
+  **An investigation window that outlives the statement** — DONE:
+  `create session from X to Y` in timbersh bounds every statement (narrow
+  within it, never out of it) and the pager with them, and `t` changes it
+  from inside the viewer. The two clocks land differently on the two halves,
+  so the tape's bound is the WRITE axis widened and its edge says so. What
+  it opens up is the part still to build: a bounded window is a small enough
+  set to hold whole, which is what makes sorting an answer by the clock its
+  entries carry affordable — `logline-order.md`'s "sort in the consumer over
+  a page it has whole", without the index field the streaming merge needs. Design note:
   [docs/plans/view.md](docs/plans/view.md).
 - **A fleet is a list of TARGETS, and a resolver derives it** — SHIPPED.
   `TIMBERFS_CMD` with `_TIMBERHOST_` in it made the transport a property of

@@ -33,7 +33,7 @@ import threading
 import time
 
 import timberfs_client
-from timberfs_client import when                              # noqa: F401
+from timberfs_client import when, when_ms                     # noqa: F401
 
 DOC_V = "1.0-EXPERIMENTAL"
 
@@ -208,6 +208,15 @@ def frames_from(buf):
             return out, buf[start:]       # this one is still coming
         kind, fields, payload, i = got
         out.append((kind, fields, payload))
+
+
+# The tape is addressed on the WRITE axis and an investigation window is
+# stated on the LOGLINE one, so a chunk written at 14:05 can hold an entry
+# stamped 13:00. timberfs widens a logline selection by the same margin
+# for the same reason; the bound can then only over-INCLUDE, which is the
+# safe direction — a line belonging to the window is never lost, and a few
+# that do not may be seen.
+WIDEN_MS = 60_000
 
 
 class Chunk:
@@ -656,8 +665,12 @@ class Tape:
 
     KEEP = 6
 
-    def __init__(self, backend, store):
+    def __init__(self, backend, store, window=None):
         self.backend, self.store = backend, store
+        # The investigation's window as `(from_ms, to_ms)`, either end
+        # possibly None. The tape will not scroll out of it — see
+        # `stopped_by_window`.
+        self.window = window
         self.chunks, self.lines = [], []
         # (seq, why) for a chunk that could not be read. Scrolling into
         # a host that went away must not look like the end of the tape.
@@ -798,10 +811,38 @@ class Tape:
         return self.tape_start + (self.store.get("logical_bytes", 0) or 0)
 
     def at_top(self):
-        return bool(self.chunks) and self.chunks[0].seq == self.first_seq
+        if not self.chunks:
+            return False
+        if self.chunks[0].seq == self.first_seq:
+            return True
+        return self.stopped_by_window(above=True)
 
     def at_bottom(self):
-        return bool(self.chunks) and self.chunks[-1].seq == self.last_seq
+        if not self.chunks:
+            return False
+        if self.chunks[-1].seq == self.last_seq:
+            return True
+        return self.stopped_by_window(above=False)
+
+    def stopped_by_window(self, above):
+        """Is the investigation's window the reason there is no more?
+
+        The chunk already loaded at this edge is checked, never the one
+        beyond it: if the top chunk's write window STARTS at or before the
+        window's floor, the chunk above it lies entirely before the window
+        and there is nothing there to want. So the bound costs no read.
+
+        ⚠ Widened, and on the WRITE clock the chunks carry. The window is
+        stated in logline time and a chunk written after it can hold
+        entries stamped inside it — so this can only ever stop LATE,
+        showing a little either side rather than losing a line that
+        belongs."""
+        if not self.window:
+            return False
+        lo, hi = self.window
+        if above:
+            return lo is not None and self.chunks[0].wf <= lo - WIDEN_MS
+        return hi is not None and self.chunks[-1].wl >= hi + WIDEN_MS
 
     def _rebuild(self):
         buf = b"".join(c.data for c in self.chunks)
@@ -874,6 +915,9 @@ class Tape:
 
     def top_notes(self):
         s = self.store
+        if self.chunks and self.chunks[0].seq != self.first_seq \
+                and self.stopped_by_window(above=True):
+            return [self.window_note(above=True)]
         notes = [f"── top of the log · chunk {s.get('first_seq')}"]
         if s.get("dropped_chunks"):
             notes.append(
@@ -882,8 +926,21 @@ class Tape:
                 f"off the tape)")
         return notes
 
+    def window_note(self, above):
+        """An edge that is the SESSION's and not the log's says so, and
+        says on which clock — otherwise it reads as the end of the store,
+        which is the one thing an edge must never be mistaken for."""
+        lo, hi = self.window
+        end = when_ms(lo) if above else when_ms(hi)
+        return (f"── the session window {'starts' if above else 'ends'} about "
+                f"here ({end}) · write clock, widened {WIDEN_MS // 1000}s · "
+                f"`t` to change it")
+
     def bottom_note(self):
         s = self.store
+        if self.chunks and self.chunks[-1].seq != self.last_seq \
+                and self.stopped_by_window(above=False):
+            return self.window_note(above=False)
         tail = (f"a writer holds it ({s['writer']}), so newer lines may not "
                 "be flushed yet" if s.get("writer")
                 else "nothing is appending")
@@ -1163,8 +1220,45 @@ class View:
 
     @source.setter
     def source(self, s):
+        # A new tape INHERITS the investigation's window. `o` into the log
+        # around an entry, and following a hit into another store, both
+        # replace the source outright — and they are exactly when the
+        # guard matters, since a tape has no predicate of its own to keep
+        # it near the incident.
+        if hasattr(s, "window") and s.window is None:
+            s.window = getattr(getattr(self, "_source", None), "window", None)
         self._source = s
         self._joined = Joined(s) if self.join else None
+
+    def set_window(self, text):
+        """`from T to T`, `to T`, `none` — the words the shell uses.
+
+        Parsed here rather than in the screen so the rule has one home,
+        and so a test can drive it without a terminal."""
+        toks = text.split()
+        if len(toks) == 1 and toks[0].lower() in ("none", "off", "drop"):
+            self.source.window = None
+            self.message = "window dropped"
+            return
+        lo = hi = None
+        i = 0
+        while i < len(toks):
+            w = toks[i].lower()
+            if w in ("from", "since", "after") and i + 1 < len(toks):
+                lo = when(toks[i + 1]); i += 2
+            elif w in ("to", "until", "before") and i + 1 < len(toks):
+                hi = when(toks[i + 1]); i += 2
+            elif w == "and":
+                i += 1
+            else:
+                raise ValueError(f"`{toks[i]}`? from <time> to <time>, "
+                                 f"or `none`")
+        if lo is None and hi is None:
+            raise ValueError("from <time> to <time>, or `none`")
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError("that window starts after it ends")
+        self.source.window = (lo, hi)
+        self.message = f"window {when_ms(lo)} .. {when_ms(hi)}"
 
     def join_entries(self, on=None):
         """Show each multi-line entry as one row, or stop.
@@ -1642,6 +1736,9 @@ HELP_KEYS = """
   z              a multi-line entry as ONE row — a stack trace beside the
                  message that raised it, so ten of them can be compared
                  at all. Nothing is hidden: h/l read along it
+  t              the investigation's window — the tape stops at it
+                 rather than scrolling out of the period you are looking
+                 at. `from T to T`, or `none`
   w              wrap / no wrap      y             this line's address
 
   Tab  ⇧Tab      the searchable terms, and on past the end of a line to
@@ -1797,6 +1894,8 @@ class Screen:
             v.scroll_h(-8)
         elif key in (ord("l"), c.KEY_RIGHT):
             v.scroll_h(8)
+        elif key == ord("t"):
+            self.set_window(stdscr)
         elif key == ord("z"):
             v.join_entries()
         elif key == ord("w"):
@@ -1864,6 +1963,35 @@ class Screen:
         finally:
             c.noecho()
             c.curs_set(0)
+
+    def set_window(self, stdscr):
+        """Change the investigation's window from inside the pager.
+
+        A SEPARATE act, deliberately, and not something scrolling can do
+        by accident: the window is what makes the set in front of you
+        complete, so a bound you can drift out of is not one you can sort
+        or count against. Changing it is therefore typed, once.
+
+        `from T to T`, either end droppable, and empty to leave it."""
+        v = self.view
+        if not hasattr(v.source, "window"):
+            v.message = ("this is an answer, already bounded when it was "
+                         "fetched — `create session ...` in the shell, then "
+                         "ask again")
+            return
+        now = v.source.window or (None, None)
+        shown = " ".join(
+            p for p in (f"from {when_ms(now[0])}" if now[0] else "",
+                        f"to {when_ms(now[1])}" if now[1] else "") if p)
+        typed = self.prompt(stdscr, f"window [{shown or 'unbounded'}]: ")
+        if not typed:
+            return
+        try:
+            v.set_window(typed)
+        except ValueError as e:
+            v.message = str(e)
+            return
+        self.reach(stdscr, "that window", lambda: v.open(at=v.source.window[0]))
 
     def do_search(self, stdscr, token):
         """Search, show the hits, and let a term picked out of THEM be
@@ -2052,7 +2180,7 @@ def watch_source(backend, source, what=None):
                                           screen.loop(stdscr))[1])
 
 
-def watch(backend, store, seq=None, at=None, offset=None):
+def watch(backend, store, seq=None, at=None, offset=None, window=None):
     """Open the viewer and return the address it was left at.
 
     The FIRST read happens inside curses, because it is the slowest one
@@ -2060,7 +2188,7 @@ def watch(backend, store, seq=None, at=None, offset=None):
     there still unwinds the terminal and reaches the caller intact —
     which matters for the refusals that are several lines long."""
     import curses
-    view = View(backend, store)
+    view = View(backend, source=Tape(backend, store, window))
     screen = Screen(view)
     where = view.store.get("name") or "the store"
     if view.store.get("_host"):
