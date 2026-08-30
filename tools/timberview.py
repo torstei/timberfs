@@ -1225,16 +1225,50 @@ class View:
         return ln.terms if ln else []
 
     def pick(self, step):
-        """Tab between the selectable terms, and on past the end of the
-        line: what can be picked is exactly what can be searched, so the
-        motion never lands anywhere a search cannot follow."""
+        """Tab between the selectable terms, and ON PAST the end of the
+        line to the next one that has any.
+
+        It used to wrap inside the line, which makes Tab a loop over four
+        tokens when what you are doing is reading down a screen. Off the
+        end of a line is the next line's first term; off the front is the
+        previous line's last.
+
+        Lines with nothing pickable are STEPPED OVER rather than landed
+        on. What can be picked is exactly what can be searched, so a stop
+        with nothing to search is a stop with nothing to do — and on the
+        tape the walk pulls more of it in as it nears an edge, so the end
+        is the source's end and not the buffer's."""
         toks = self.line_terms()
-        if not toks:
+        n = self.tok + step
+        if toks and 0 <= n < len(toks):
+            self.tok = n
+            self.follow_term = True
+            return toks[self.tok][2]
+        return self.pick_on(step)
+
+    def pick_on(self, step):
+        """The next line with a term on it, entered from the side Tab
+        arrived at: forwards lands on its first, backwards on its last."""
+        lines = self.source.lines
+        rng = (range(self.cur + 1, len(lines)) if step > 0
+               else range(self.cur - 1, -1, -1))
+        for i in rng:
+            toks = lines[i].terms
+            if not toks:
+                continue
+            self.cur = i
+            self.tok = 0 if step > 0 else len(toks) - 1
+            self.follow_term = True
+            self._widen()
+            return toks[self.tok][2]
+        # Nothing ahead has one. Say which way ran out, and stay put:
+        # wrapping to the far end is the loop this motion just stopped
+        # being, one size larger.
+        self.message = ("no searchable term below" if step > 0
+                        else "no searchable term above")
+        if not self.line_terms():
             self.message = self.nothing_pickable()
-            return None
-        self.tok = (self.tok + step) % len(toks)
-        self.follow_term = True
-        return toks[self.tok][2]
+        return None
 
     def selected(self):
         toks = self.line_terms()
@@ -1500,8 +1534,9 @@ HELP_KEYS = """
                  line is its own, since it parses nothing
   w              wrap / no wrap      y             this line's address
 
-  Tab  ⇧Tab      the searchable terms on this line — an identifier is
-                 ONE of them, separators and all
+  Tab  ⇧Tab      the searchable terms, and on past the end of a line to
+                 the next one that has any — an identifier is ONE of
+                 them, separators and all
   Enter  *       search the picked one, everywhere
   /              search a term you type
   n  N           the next / previous hit

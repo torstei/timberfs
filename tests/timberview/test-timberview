@@ -581,6 +581,18 @@ def _z(data):
                               capture_output=True).stdout
 
 
+def tab_to(v, term, step, limit=50):
+    """Tab until `term` is picked. BOUNDED: an unbounded `while` here
+    turned a change in what Tab does into a suite that hangs, which is a
+    worse way to learn it than a failure."""
+    for _ in range(limit):
+        if v.selected() == term:
+            return
+        v.pick(step)
+    raise AssertionError(f"{term!r} never picked in {limit} tabs; "
+                         f"stopped at {v.selected()!r} ({v.message})")
+
+
 def Screen_for_test():
     """`busy` needs the curses MODULE for its attribute constants, and
     nothing else — no terminal."""
@@ -762,6 +774,47 @@ def a_hit_list_is_itself_searchable():
     # And a list that is not searchable has none of it.
     assert screen.choose(Screenish([ord("*"), ord("q")]), "t", rows) \
         == (None, None)
+
+
+@test
+def tab_carries_on_to_the_next_line_rather_than_looping():
+    """It wrapped inside the line, so Tab was a loop over four tokens
+    while what you are doing is reading DOWN a screen. Off the end of a
+    line is the next line's first term; off the front is the previous
+    line's last."""
+    f = Fake(["alpha bravo\ncharlie\n"])
+    v = opened(f, seq=0)
+    v.cur, v.tok = 0, 0
+    assert v.selected() == "alpha"
+
+    v.pick(1)
+    assert v.selected() == "bravo" and v.cur == 0, (v.selected(), v.cur)
+    # Off the end of the line, not round to the start of it.
+    v.pick(1)
+    assert (v.selected(), v.cur) == ("charlie", 1), (v.selected(), v.cur)
+    # And backwards enters the previous line from ITS end.
+    v.pick(-1)
+    assert (v.selected(), v.cur) == ("bravo", 0), (v.selected(), v.cur)
+
+    # The end of the source stops and says which way ran out, rather than
+    # wrapping to the far end — that is the same loop one size larger.
+    tab_to(v, "charlie", 1)
+    v.pick(1)
+    assert v.selected() == "charlie", v.selected()
+    assert "below" in v.message, v.message
+
+
+@test
+def tab_steps_over_a_line_with_nothing_to_pick():
+    """What can be picked is exactly what can be searched, so a stop with
+    nothing to search is a stop with nothing to do. `26.1.18` is three
+    runs of under three characters and the index holds none of them."""
+    f = Fake(["alpha\n26.1.18\n\nomega9\n"])
+    v = opened(f, seq=0)
+    v.cur, v.tok = 0, 0
+    assert v.selected() == "alpha"
+    v.pick(1)
+    assert (v.selected(), v.cur) == ("omega9", 3), (v.selected(), v.cur)
 
 
 @test
@@ -1042,8 +1095,7 @@ def tabbing_brings_the_term_into_view():
     assert v.col == 0
 
     # Tab to the term at the far right; the window follows it.
-    while v.selected() != "omega9":
-        v.pick(1)
+    tab_to(v, "omega9", 1)
     v.layout(80, 10)
     span = v.selected_span()
     assert v.col <= span[0] and span[1] <= v.col + 80, (v.col, span)
@@ -1051,9 +1103,9 @@ def tabbing_brings_the_term_into_view():
     # context beside it reads as the end of the line.
     assert span[1] < v.col + 80, (v.col, span)
 
-    # And back to the first, which is off to the LEFT from there.
-    while v.selected() != "alpha":
-        v.pick(1)
+    # And BACK to the first, which is off to the left from there. Back,
+    # not round: Tab does not wrap inside a line any more.
+    tab_to(v, "alpha", -1)
     v.layout(80, 10)
     span = v.selected_span()
     assert v.col <= span[0] and span[1] <= v.col + 80, (v.col, span)

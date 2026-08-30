@@ -102,8 +102,12 @@ toggles wrapping. Neither is a default that can be argued into being
 correct, so it changes at runtime.
 .TP
 .BR Tab " " Shift\-Tab
-Move between the searchable TERMS on the line \(em the widest identifier
-at each position, separators and all.
+Move between the searchable TERMS \(em the widest identifier at each
+position, separators and all \(em and ON PAST the end of a line to the
+next one that has any. Reading is downwards, so a Tab that wrapped inside
+the line was a loop over four tokens. A line with nothing pickable is
+stepped over rather than landed on: what can be picked is exactly what
+can be searched.
 .PP
 .RS
 A term is not an index token. The index holds alphanumeric runs of 3 to
