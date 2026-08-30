@@ -41,7 +41,8 @@ commit exists whose only content is a version number.
 scheme could not help doing: between two releases every build reported the
 earlier one's number and was indistinguishable from it, including in the
 `server_version` every query answer carries. A build three commits past a tag
-now says `0.27.0-3.gcee4152`.
+now says `0.27.0+3.gcee4152` — `+`, not `-`, so it sorts *above* the release it
+follows in both semver and dpkg rather than below it.
 
 Read the documentation against the diff. `git log vX.Y.Z..HEAD` is the
 work-list, which makes this a bounded pass rather than an audit.

@@ -12,7 +12,14 @@
 #
 # The stamp is a pure function of the git ref, so a build of a tag stamps
 # exactly that tag's version wherever it runs, and a build three commits
-# past it says so: 0.27.0-3.gcee4152.
+# past it says so: 0.27.0+3.gcee4152.
+#
+# ⚠ `+` and not `-`. A build three commits AFTER 0.27.0 is newer than it,
+# and `0.27.0-3.g...` says the opposite in both systems that will read it:
+# semver makes it a PRERELEASE of 0.27.0, and dpkg sorts the `~` cargo-deb
+# renders it as BELOW 0.27.0-1. `+` is build metadata — semver ignores it
+# for precedence, dpkg sorts it above — so the string agrees with the
+# history it came from.
 #
 # ⚠ `--match` PER LINEAGE, never a bare `git describe`. Two release trains
 # share this repository and the newest tag is often the other one's — on
@@ -26,7 +33,7 @@ cd "$(dirname "$0")/.."
 # another name.
 stamp() {
     git describe --tags --match "$1*" --always 2>/dev/null \
-        | sed "s/^$1//; s/-\([0-9]*\)-g/-\1.g/"
+        | sed "s/^$1//; s/-\([0-9]*\)-g/+\1.g/"
 }
 
 ver=$(stamp v)
