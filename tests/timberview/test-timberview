@@ -593,13 +593,14 @@ def Screen_for_test():
 class Screenish:
     """Enough of a curses window to draw on, and to type at."""
 
-    def __init__(self, keys=()):
+    def __init__(self, keys=(), width=200):
         self.painted = []
         self.keys = list(keys)
         self.exhausted = False
+        self.width = width
 
     def getmaxyx(self):
-        return (24, 200)
+        return (24, self.width)
 
     def addnstr(self, y, x, text, n, attr=0):
         self.painted.append(text)
@@ -761,6 +762,45 @@ def a_hit_list_is_itself_searchable():
     # And a list that is not searchable has none of it.
     assert screen.choose(Screenish([ord("*"), ord("q")]), "t", rows) \
         == (None, None)
+
+
+@test
+def tabbing_in_the_hit_list_brings_the_term_into_view():
+    """The pager's Tab follows the pick sideways and the hit list's did
+    not: a term picked past the right edge was highlighted nowhere and
+    named only in the footer, so the motion had nothing to show for
+    itself. A hit line is long by construction — a store, a host, a
+    timestamp, then the entry."""
+    uuid = "9da3dcf1-5a4b-4d36-b907-917daa60bd90"
+    row = (f"{'app @ mail01':28} 12:00:01 INFO handling "
+           + "padding " * 12 + f"req={uuid} done")
+    screen = Screen_for_test()
+
+    # How many Tabs reach the id is a property of the line, not something
+    # to hard-code: ask by searching what each pick offers.
+    taps = next(n for n in range(20)
+                if screen.choose(Screenish([KEY_TAB] * n + [ord("*")]),
+                                 "t", [row], searchable=True,
+                                 terms_from=29) == ("term", uuid))
+
+    # ⚠ The ROW, not the footer. The footer names the picked term too,
+    # and "named in the footer while highlighted nowhere" is precisely
+    # the state this is about — a check that accepts it passes before the
+    # fix and proves nothing. A painted row is a suffix of the whole row,
+    # because scrolling sideways is what slices it.
+    def seen(scr, w):
+        return [t[:w - 1] for t in scr.painted if row.endswith(t)]
+
+    wide = Screenish([KEY_TAB] * taps + [ord("q")], width=200)
+    screen.choose(wide, "t", [row], searchable=True, terms_from=29)
+    assert any(uuid in t for t in seen(wide, 200)), "wide enough anyway"
+
+    # 60 columns cannot hold the line, so the window has to move.
+    narrow = Screenish([KEY_TAB] * taps + [ord("q")], width=60)
+    screen.choose(narrow, "t", [row], searchable=True, terms_from=29)
+    visible = seen(narrow, 60)
+    assert any(uuid in t for t in visible), (
+        "the picked term is off-screen:\n  " + "\n  ".join(visible))
 
 
 def answer(*entries, source_id=ID_A, path="/l/app.log", version="0.26.0"):

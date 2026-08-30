@@ -540,6 +540,24 @@ class QueryBackend:
 
 
 # ---------------------------------------------------------------- text
+def scrolled_to(span, col, width):
+    """The sideways offset that shows `span`, given the current one.
+
+    A little context either side, so the term does not sit against the
+    edge it just came from — a term flush against the right reads as the
+    end of the line.
+
+    Shared by the pager and the hit list because Tab means the same thing
+    on both screens, and a pick the window does not follow is a pick you
+    cannot see."""
+    margin = min(8, max(0, (width - (span[1] - span[0])) // 2))
+    if span[0] < col + margin:
+        return max(0, span[0] - margin)
+    if span[1] > col + width - margin:
+        return max(0, span[1] - width + margin)
+    return col
+
+
 def sanitise(s):
     """A raw-mode screen has to be told what to draw. Tabs become
     columns; every other control byte becomes one visible glyph, so an
@@ -1206,16 +1224,11 @@ class View:
     def bring_term_into_view(self, width):
         """Tab across a 200-character log line walks straight off the
         screen otherwise: the pick moves and the sideways scroll does
-        not follow it. A little context either side, so the term does
-        not sit against the edge it just came from."""
+        not follow it."""
         span = self.selected_span()
         if self.wrap or not span:
             return
-        margin = min(8, max(0, (width - (span[1] - span[0])) // 2))
-        if span[0] < self.col + margin:
-            self.col = max(0, span[0] - margin)
-        elif span[1] > self.col + width - margin:
-            self.col = max(0, span[1] - width + margin)
+        self.col = scrolled_to(span, self.col, width)
 
     def nothing_pickable(self):
         ln = self.line()
@@ -1773,26 +1786,33 @@ class Screen:
         Answers `(what, value)`: `("open", index)`, `("term", text)`,
         or `(None, None)` for a cancel."""
         c = self.curses
-        sel, top, tok = 0, 0, 0
+        sel, top, tok, col = 0, 0, 0, 0
         while True:
-            h, _ = stdscr.getmaxyx()
+            h, w = stdscr.getmaxyx()
             body = max(1, h - 2)
             top = min(top, sel)
             if sel >= top + body:
                 top = sel - body + 1
             picked = (self.term_of(rows[sel][terms_from:], tok)
                       if searchable else None)
+            # The pick moves sideways and the window follows it, exactly
+            # as it does on the pager. A hit line is often long — a fleet
+            # path, a store name and the entry — so a term picked past the
+            # edge was highlighted nowhere and only named in the footer.
+            found = terms(rows[sel][terms_from:]) if searchable else []
+            if found:
+                a, b, _t = found[tok % len(found)]
+                col = scrolled_to((a + terms_from, b + terms_from), col, w - 1)
             stdscr.erase()
             self.put(stdscr, 0, f"── {title}", c.A_REVERSE)
             for y, i in enumerate(range(top, min(len(rows), top + body)),
                                   start=1):
                 base = c.A_REVERSE if i == sel else 0
-                self.put(stdscr, y, rows[i], base)
+                self.put(stdscr, y, rows[i][col:], base)
                 if searchable and i == sel:
-                    found = terms(rows[i][terms_from:])
                     for n, (a, b, _t) in enumerate(found):
-                        a, b = a + terms_from, b + terms_from
-                        if b <= stdscr.getmaxyx()[1] - 1:
+                        a, b = a + terms_from - col, b + terms_from - col
+                        if 0 <= a and b <= w - 1:
                             try:
                                 stdscr.chgat(y, a, b - a, base | (
                                     c.A_BOLD if n == tok % max(1, len(found))
@@ -1824,13 +1844,13 @@ class Screen:
                 if typed:
                     return "term", typed
             elif key in (ord("j"), c.KEY_DOWN):
-                sel, tok = min(len(rows) - 1, sel + 1), 0
+                sel, tok, col = min(len(rows) - 1, sel + 1), 0, 0
             elif key in (ord("k"), c.KEY_UP):
-                sel, tok = max(0, sel - 1), 0
+                sel, tok, col = max(0, sel - 1), 0, 0
             elif key in (ord(" "), c.KEY_NPAGE):
-                sel, tok = min(len(rows) - 1, sel + body), 0
+                sel, tok, col = min(len(rows) - 1, sel + body), 0, 0
             elif key == c.KEY_PPAGE:
-                sel, tok = max(0, sel - body), 0
+                sel, tok, col = max(0, sel - body), 0, 0
 
     @staticmethod
     def term_of(row, n):
