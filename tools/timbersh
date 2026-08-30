@@ -169,7 +169,8 @@ HELP = """
     the last chunk first and back from there. It parses nothing -- so it
     works on a store whose lines timberfs cannot read, and on one with
     no index. Tab picks a searchable token, Enter finds it everywhere,
-    and it leaves you the address of where you stopped.
+    m marks and c copies -- the region, or the whole entry under the
+    cursor -- and it leaves you the address of where you stopped.
 
   select <kind> from <source> [where ...] [limit N [chunks]] [into view];
   tail   <kind> from <source> [where ...];

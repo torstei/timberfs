@@ -290,8 +290,9 @@ knows the PLACE it came from: the same coordinate the tape is addressed
 by. `Tab` and the search work as they do anywhere — `Enter` searches the
 picked term on an answer exactly as it does on the tape, because a key
 that changes meaning with the screen is the surprise a mode is. `y`
-gives you that entry's address, and **`o` leaves the answer for the log
-around it** — the one motion an answer cannot make for itself, since
+gives you that entry's address and copies it, `c` copies the entry
+itself — all forty lines of a stack trace, not the one the cursor is on —
+and **`o` leaves the answer for the log around it** — the one motion an answer cannot make for itself, since
 what you usually want next is what was happening either side of a
 match.
 
@@ -374,6 +375,41 @@ fields rather than sit inside a name. A term the index cannot hold at all
 (`26.1.18`, three runs of under three characters) is refused where you
 point at it, with the reason, rather than discovered later as an empty
 answer.
+
+**Taking a selection away.** `m` sets the mark, the cursor is the other
+end, and `c` copies the region; `x` swaps the ends, and `^Space`/`^G` are
+the same keys for a hand that came from emacs. With **no mark** `c` copies
+the whole ENTRY under the cursor, which is the case it exists for: a stack
+trace is one entry and forty lines, so the line you are on is one frame of
+it and what you want is the trace, in something that analyses one. On an
+answer that framing is timberfs's; on the tape, which parses nothing,
+every line is its own, exactly as the entry motion is a line there. `z`
+first if you want entries as rows — a joined row copies as the log's own
+lines rather than with the `↵` in, because that rendering is for reading.
+
+The screen says which is which **before** the copy is made: the region is
+the reversed block — padded to the width, since a bar that stops where the
+text does reads as chrome next to a reversed header — and the entry a bare
+`c` would take is the bold one. So the forty lines of a stack trace are
+visible as a unit while the cursor is anywhere in them, and on the tape,
+where every line is its own entry, the bold is just the line you are on.
+
+⚠ **`c` copies AT ONCE; `m` is what begins a selection.** So both are
+named in the status line, a copy that took no region ends with `m marks a
+region`, and a live one says what its keys do — `c` alone reads as the
+whole feature, and someone who expects it to start a selection and then
+moves sees nothing happen.
+
+⚠ **The route is said, because one of them cannot be confirmed.** A
+clipboard helper (`wl-copy`, `xclip`, `xsel`, `pbcopy`) where there is a
+display to use one on: it writes the clipboard of the machine the pager is
+on, and its exit status says whether it did. **OSC 52** otherwise, which
+is the one route that crosses an ssh or a multiplexer — and whose failure
+is *silence*, since a terminal that does not implement it does nothing and
+says nothing. So the status line names the route it used and hedges on
+that one, `y` keeps showing the address as well as copying it, and a copy
+neither route could make is **written to a file** whose path is said. A
+selection is never lost quietly.
 
 **One module, two front ends.** timbersh calls it in process, because a
 separate program would have to leave the alt screen carrying "search this

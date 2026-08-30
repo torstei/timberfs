@@ -187,14 +187,105 @@ anything first.
 .B Enter
 there still goes to the hit.
 .TP
+.BR m " " Ctrl\-Space
+SET THE MARK here; again drops it, and so does
+.BR Ctrl\-G .
+The cursor is the other end, so every motion the pager has \(em a line, an
+entry, a page, a search \(em is a way of choosing one, and nothing has to
+be typed as a coordinate.
+.B x
+swaps the mark and the cursor, since a region can be longer than the
+screen and the cheapest way to check its far end is to go and look.
+.RS
+.PP
+.B m
+is the key that is always there: a terminal is free to send nothing for a
+modifier. It is named in the status line beside
+.BR c ,
+because
+.B c
+alone reads as the whole feature \(em it copies AT ONCE, and a reader who
+expected it to begin a selection sees nothing happen.
+.RE
+.TP
+.B c
+COPY \(em the region if a mark is set, else the whole ENTRY under the
+cursor. The second is the case this exists for: a stack trace is one entry
+and forty lines, so the line the cursor happens to be on is one frame of
+what you are looking at. On an ANSWER that framing is timberfs's own; on
+the tape, which parses nothing, every line is its own, exactly as the
+entry motion is a line there.
+.RS
+.PP
+Under
+.B z
+each entry is a row, and a row copies as the log's OWN lines rather than
+with the
+.B ↵
+in \(em that rendering is for reading. So
+.B z
+and then a mark is how a run of whole entries is selected. Toggling
+.B z
+with a region live keeps what was selected rather than the row numbers:
+both ends travel as offsets, and the upper one is taken to the END of the
+entry it lands in, since a row unjoins into several lines and an offset
+resolves to the first of them.
+.PP
+The screen says which is which, so what a copy will take is visible
+before it is made: the region is the REVERSED block \(em padded to the
+width, because a bar that stops where the text does reads as chrome \(em
+and the entry a bare
+.B c
+would take is the BOLD one. On the tape every line is its own entry, so
+there the bold is the line you are on and nothing changes.
+.PP
+What is copied is what was on the SCREEN: tabs in columns, every other
+control byte one glyph. An ANSI escape in a log line must not reach a
+clipboard as an escape.
+.PP
+⚠ A mark is a row of the run that is loaded. Scrolling that renumbers the
+run carries it, a seek or another store drops it, and a mark whose line
+the run no longer holds is dropped and said so. The cursor may slide to
+the nearest line \(em you were moving it \(em but a region of lines nobody
+chose is a wrong answer.
+.RE
+.TP
 .B y
-Show this line's address.
+Show this line's address, and copy it.
 .B S
 opens another store.
 .B ?
 lists the keys.
 .B q
 quits, printing the address you stopped at.
+.SH WHERE A COPY GOES
+Two routes, and the difference is which machine the terminal is on.
+.PP
+A clipboard HELPER \(em
+.BR wl\-copy ,
+.BR xclip ,
+.BR xsel ,
+.B pbcopy
+\(em where there is a display to use one on, each gated on the display it
+writes to. It writes the clipboard of the machine the pager runs on and
+its exit status says whether it did, which makes it the only route that
+can be confirmed.
+.PP
+.B "OSC 52"
+otherwise: the escape that hands the bytes to the TERMINAL, which is the
+one route that reaches a workstation from the far end of an ssh or a
+multiplexer. ⚠ Its failure is SILENCE \(em a terminal that does not
+implement it does nothing and says nothing \(em so the status line names
+the route it used and hedges on this one, and
+.B y
+keeps SHOWING the address as well as copying it, so that selecting it by
+hand is always there.
+.PP
+Where neither answered, the text is written to a FILE and the path said.
+A selection that is too big to hand a terminal goes there too, rather
+than to something that would truncate it without saying so. A copy that
+could not be made must still leave the selection somewhere it can be got
+at.
 .SH AN ANSWER INSTEAD OF A STORE
 A
 .BR timberfs\-records (5)

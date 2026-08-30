@@ -607,6 +607,7 @@ class Screenish:
 
     def __init__(self, keys=(), width=200):
         self.painted = []
+        self.marked = []
         self.keys = list(keys)
         self.exhausted = False
         self.width = width
@@ -621,7 +622,7 @@ class Screenish:
         pass
 
     def chgat(self, y, x, n, attr):
-        pass
+        self.marked.append((y, x, n))
 
     def refresh(self):
         pass
@@ -1245,6 +1246,378 @@ def tabbing_brings_the_term_into_view():
     v.pick(1)
     v.layout(80, 10)
     assert v.col == 0, v.col
+
+
+# --------------------------------------------------------------- region
+@test
+def a_region_is_the_same_whichever_way_it_was_made():
+    """The mark is one END and the cursor is the other, not a start and a
+    length: so marking and walking BACK selects the same rows as marking
+    and walking forward, and every motion the pager has is a way of
+    choosing an end."""
+    f = Fake(["a\nb\nc\nd\ne\n"])
+    v = opened(f, seq=0)
+    v.cur = 1
+    v.set_mark()
+    v.move(2)
+    assert v.region() == (1, 3), v.region()
+    assert v.selection()[0] == "b\nc\nd\n", v.selection()
+
+    v.mark = None
+    v.cur = 3
+    v.set_mark()
+    v.move(-2)
+    assert v.region() == (1, 3), v.region()
+    assert v.selection()[0] == "b\nc\nd\n", v.selection()
+
+
+@test
+def a_copy_with_no_mark_takes_the_whole_entry():
+    """The case this exists for: a stack trace is ONE entry and forty
+    lines, so copying the line the cursor happens to be on hands you one
+    frame of what you were looking at. On the TAPE, which parses nothing,
+    every line is its own — the rule the entry motion already follows
+    there."""
+    frames = "\n".join(f"\tat frame.{i}(F.java:1)" for i in range(40))
+    r = tv.Records(answer(("before", {"offset": 0}),
+                          (f"boom\n{frames}", {"offset": 100}),
+                          ("after", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.cur = 20                                  # inside the trace
+    text, what = v.selection()
+    assert text.startswith("boom\n"), text[:40]
+    assert text.count("\n") == 41, text.count("\n")
+    assert text.rstrip("\n").endswith("at frame.39(F.java:1)"), text[-60:]
+    assert what == "this entry, 41 lines", what
+
+    t = opened(Fake(["boom\n  at A\n  at B\n"]), seq=0)
+    t.cur = 0
+    assert t.selection() == ("boom\n", "this line"), t.selection()
+
+
+@test
+def a_joined_row_copies_as_the_logs_own_lines():
+    """`z` renders an entry as one row with `↵` between its lines, which
+    is a thing to READ. A stack-trace analyser wants the lines, so the
+    copy reaches past the rendering to what the log actually holds."""
+    r = tv.Records(answer(("boom\n  at A\n  at B", {"offset": 0}),
+                          ("next", {"offset": 100})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.join_entries()
+    v.cur = 0
+    assert "↵" in v.source.lines[0].text, v.source.lines[0].text
+    assert v.selection()[0] == "boom\n  at A\n  at B\n", v.selection()
+
+    v.set_mark()
+    v.move(1)
+    text, what = v.selection()
+    assert text == "boom\n  at A\n  at B\nnext\n", text
+    assert what == "the region, 2 rows — 4 lines", what
+
+
+@test
+def the_join_toggle_keeps_what_was_selected():
+    """`z` is a display toggle, and the row-to-line mapping changes
+    underneath it: a joined row IS an entry, so unjoining one is several
+    lines and an offset resolves to the FIRST of them. Keeping the row
+    numbers collapsed a selection of two records to their two first
+    lines — a highlight that looked lost, and a copy that then took two
+    lines of the fourteen that were selected."""
+    r = tv.Records(answer(("one", {"offset": 0}),
+                          ("boom\n  at A\n  at B", {"offset": 100}),
+                          ("three", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.join_entries()
+    v.cur = 0
+    v.set_mark()
+    v.move(1)                                   # "one", then the trace
+    whole = "one\nboom\n  at A\n  at B\n"
+    assert v.region() == (0, 1) and v.selection()[0] == whole, v.selection()
+
+    v.join_entries()                            # ...and back
+    assert v.region() == (0, 3), v.region()
+    assert v.selection()[0] == whole, v.selection()
+    v.join_entries()                            # round trip
+    assert v.region() == (0, 1) and v.selection()[0] == whole, v.selection()
+
+    # The mark BELOW the cursor: the ends keep their identity, so `x`
+    # still swaps to the one you were not on.
+    v.mark = None
+    v.cur = 1
+    v.set_mark()
+    v.move(-1)
+    assert (v.mark, v.cur) == (1, 0), (v.mark, v.cur)
+    v.join_entries()
+    assert (v.mark, v.cur) == (3, 0), (v.mark, v.cur)
+    assert v.selection()[0] == whole, v.selection()
+
+    # On the tape every line is its own entry, so nothing widens.
+    w = opened(Fake(["a\nb\nc\nd\n"]), seq=0)
+    w.cur = 1
+    w.set_mark()
+    w.move(1)
+    w.join_entries()
+    assert w.selection()[0] == "b\nc\n", w.selection()
+    w.join_entries()
+    assert w.selection()[0] == "b\nc\n", w.selection()
+
+
+@test
+def the_mark_travels_when_the_run_renumbers():
+    """Scrolling up PREPENDS lines, so every index shifts. A mark left as
+    a number would silently be on a different line than the one it was
+    set on — the same reason the cursor is kept by offset."""
+    f = Fake(["a1\na2\na3\n", "b1\nb2\nb3\n", "c1\nc2\nc3\n"])
+    v = opened(f, seq=2)
+    v.cur = v.source.index_of(18)               # "c1", the third chunk
+    assert v.line().text == "c1", v.line().text
+    v.set_mark()
+    v.move(-1)                                  # which pulls in the chunk above
+    assert len(v.source.lines) == 9, [ln.text for ln in v.source.lines]
+    assert v.source.lines[v.mark].text == "c1", (v.mark, v.message)
+
+
+@test
+def a_mark_the_run_no_longer_holds_is_dropped_and_said():
+    """The run keeps a few chunks either side, so scrolling far enough
+    throws away the end the mark was on. The CURSOR may slide to the
+    nearest line — you were moving it — but a region of lines nobody
+    chose is a wrong answer, so the mark goes, and says so."""
+    f = Fake([f"{c}1\n{c}2\n{c}3\n" for c in "abcdefgh"])
+    v = opened(f, seq=7)
+    v.cur = len(v.source.lines) - 1
+    v.set_mark()
+    for _ in range(30):
+        if v.mark is None:
+            break
+        v.move(-1)
+    assert v.mark is None, "the mark outlived the chunk it was on"
+    assert "scrolled out of the run" in v.message, v.message
+
+
+@test
+def a_seek_and_another_store_drop_the_mark():
+    """A row index is a place in the run that is loaded. `g`, a window
+    change and a hit in another store all replace it outright, and a mark
+    carried across would select whatever is now numbered that."""
+    f = Fake(["a\nb\nc\n", "d\ne\nf\n"])
+    v = opened(f, seq=1)
+    v.set_mark()
+    v.home()
+    assert v.mark is None, "a seek kept a row of the old run"
+
+    v = opened(f, seq=1)
+    v.set_mark()
+    v.source = tv.Records(answer(("boom", {"offset": 0})))
+    assert v.mark is None, "a new source kept a row of the old one"
+
+
+@test
+def a_copy_says_which_route_it_took():
+    """OSC 52's failure is SILENCE — a terminal that does not implement
+    it does nothing and says nothing — so a copy that cannot be confirmed
+    must not read like one that can. Three routes, three sentences, and
+    the last one names the file, because a selection is never lost
+    quietly."""
+    f = Fake(["one\ntwo\n"])
+    v = opened(f, seq=0)
+    got = {}
+    real = (tv.helpers, tv.osc52, tv.spill)
+
+    def as_if(helpers, terminal):
+        tv.helpers = lambda: helpers
+
+        def osc(text):
+            if not terminal:
+                raise OSError("not a terminal")
+            got["osc"] = text
+        tv.osc52 = osc
+
+        def spill(data):
+            got["spilled"] = data
+            return "/tmp/timberview-test.txt"
+        tv.spill = spill
+
+    try:
+        # A helper answered, and its name is the confirmation.
+        as_if([["cat"]], terminal=True)
+        v.cur = 0
+        v.copy()
+        assert "on the clipboard (cat)" in v.message, v.message
+        assert "osc" not in got, got
+        # A copy that took no region names the key that would make one:
+        # that is where a reader stands when they wonder.
+        assert "m marks a region" in v.message, v.message
+
+        # One that failed is not the answer: the next is tried.
+        as_if([["false"], ["cat"]], terminal=True)
+        v.copy()
+        assert "on the clipboard (cat)" in v.message, v.message
+        assert "osc" not in got, got
+
+        # None of them worked, so the terminal is asked — and that answer
+        # hedges, because its failure is silence.
+        as_if([["false"]], terminal=True)
+        v.copy()
+        assert got.pop("osc") == "one\n", got
+        assert "OSC 52" in v.message and "nothing pastes" in v.message, v.message
+
+        # Neither: the text is on disk, and the path is on the screen.
+        as_if([], terminal=False)
+        v.copy()
+        assert "written to /tmp/timberview-test.txt" in v.message, v.message
+        assert got.pop("spilled") == b"one\n", got
+
+        # Too big to hand a terminal that would truncate it without
+        # saying so.
+        as_if([], terminal=True)
+        w = opened(Fake(["x" * (tv.OSC_LIMIT + 10) + "\n"]), seq=0)
+        w.cur = 0
+        w.copy()
+        assert "osc" not in got, "a big selection was offered to OSC 52"
+        assert "more than OSC 52" in w.message, w.message
+        assert "written to" in w.message, w.message
+    finally:
+        tv.helpers, tv.osc52, tv.spill = real
+
+
+@test
+def the_region_is_on_the_screen_and_counted():
+    """A selection you cannot see is not one, and a region can be longer
+    than the screen — so the rows say which they are and the status line
+    says how many there are."""
+    f = Fake(["a\nb\nc\nd\n"])
+    v = opened(f, seq=0)
+    v.cur = 1
+    v.set_mark()
+    v.move(1)
+    rows = [r for r in v.layout(80, 20) if not r["edge"]]
+    assert [r["text"] for r in rows if r.get("region")] == ["b", "c"], rows
+    v.message = ""
+    assert v.status().startswith("region 2 rows"), v.status()
+
+
+@test
+def what_a_bare_copy_would_take_is_on_the_screen_too():
+    """`c` with no mark takes the whole ENTRY, so the rows of that entry
+    are marked as well: what a copy will take is visible BEFORE it is
+    made, whether or not a mark is set. On the tape every line is its
+    own entry, so there it is the line the cursor is on and the screen
+    is unchanged."""
+    frames = "\n".join(f"\tat frame.{i}(F.java:1)" for i in range(3))
+    r = tv.Records(answer(("before", {"offset": 0}),
+                          (f"boom\n{frames}", {"offset": 100}),
+                          ("after", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.cur = 3                                   # a frame, mid-trace
+    rows = [x for x in v.layout(80, 20) if not x["edge"]]
+    marked = [x["text"] for x in rows if x.get("entry")]
+    assert len(marked) == 4 and marked[0] == "boom", marked
+    assert [x["text"] for x in rows if x.get("region")] == [], "no mark, no region"
+    # And it is the same rows the copy takes, which is the point.
+    assert v.selection()[0] == "".join(t + "\n" for t in marked), v.selection()
+
+    t = opened(Fake(["a\nb\nc\n"]), seq=0)
+    t.cur = 1
+    rows = [x for x in t.layout(80, 20) if not x["edge"]]
+    assert [x["text"] for x in rows if x.get("entry")] == ["b"], rows
+
+
+@test
+def an_address_is_shown_as_well_as_copied():
+    """The clipboard cannot always be confirmed, so selecting the address
+    with the mouse has to stay possible — which needs it on the screen
+    whether or not the copy worked."""
+    v = opened(Fake(["one\ntwo\n"]), seq=0)
+    took = []
+    real = (tv.helpers, tv.osc52)
+    try:
+        tv.helpers = lambda: []
+        tv.osc52 = lambda text: took.append(text)
+        v.copy_address()
+    finally:
+        tv.helpers, tv.osc52 = real
+    assert took == [str(v.address())], took
+    assert v.message.startswith(str(v.address())), v.message
+    assert "OSC 52" in v.message, v.message
+
+
+@test
+def a_row_in_the_region_is_drawn_uniform():
+    """The block is the whole message, so the term markers are dropped
+    inside it. `sel` is itself A_REVERSE: over a reversed row it is
+    either invisible or a HOLE, and the hole lands exactly where the
+    line's first term is — its timestamp, which is what `sel` defaults
+    to before any Tab — so it read as a rendering bug. Torstein saw it
+    within a minute."""
+    v = opened(Fake(["2026-08-30T10:00:00Z one\n2026-08-30T10:00:01Z two\n"]),
+               seq=0)
+    screen = Screen_for_test()
+    screen.view = v
+    v.cur = 0
+    assert v.selected().startswith("2026-08-30"), v.selected()
+
+    plain = Screenish()
+    screen.draw(plain)
+    assert plain.marked, "the cursor row's terms are marked when nothing is"
+
+    v.set_mark()
+    v.move(1)
+    marked = Screenish()
+    screen.draw(marked)
+    assert marked.marked == [], marked.marked
+    # And the term is still named, so pointing at it is not lost.
+    v.message = ""
+    assert f"[{v.selected()}]" in v.status(), v.status()
+
+
+@test
+def the_help_reaches_its_last_line_on_a_short_terminal():
+    """The keys stopped fitting 24 rows, and the help is where a key is
+    found — one that falls off the bottom might as well not exist. So it
+    scrolls, and says there is more."""
+    lines = tv.HELP_KEYS.strip("\n").splitlines()
+    assert len(lines) > 23, "the help fits, and this test has nothing to say"
+    screen = Screen_for_test()
+    scr = Screenish([ord(" ")] * 6 + [ord("q")])
+    screen.help(scr)
+    assert lines[-1] in scr.painted, "the last line was never drawn"
+    assert any("more below" in p for p in scr.painted), scr.painted[-1]
+
+
+@test
+def the_mark_and_the_copy_are_keys_on_the_screen():
+    """The model is driven by the keys, and a binding nothing exercises
+    is one a refactor can lose. ^Space and ^G are here because that is
+    the hand this motion comes from; `m` is the one that is always there,
+    since a terminal is free to send nothing for a modifier."""
+    v = opened(Fake(["a\nb\nc\nd\n"]), seq=0)
+    screen = Screen_for_test()
+    screen.view = v
+    took = []
+    real = (tv.helpers, tv.osc52)
+    try:
+        tv.helpers = lambda: []
+        tv.osc52 = lambda text: took.append(text)
+        v.cur = 1
+        screen.step(Screenish(), ord("m"))
+        assert v.mark == 1, v.mark
+        screen.step(Screenish(), ord("j"))
+        screen.step(Screenish(), ord("x"))          # the ends swapped
+        assert (v.mark, v.cur) == (2, 1), (v.mark, v.cur)
+        screen.step(Screenish(), ord("c"))
+        assert took == ["b\nc\n"], took
+        assert v.mark is None, "the copy left a region nobody chose"
+        # ...and a copy that WAS a region does not explain the mark to
+        # someone who has just used it.
+        assert "m marks a region" not in v.message, v.message
+
+        screen.step(Screenish(), tv.KEY_NUL)        # ^Space
+        assert v.mark == v.cur, (v.mark, v.cur)
+        screen.step(Screenish(), tv.KEY_BEL)        # ^G
+        assert v.mark is None, v.mark
+    finally:
+        tv.helpers, tv.osc52 = real
 
 
 def main():

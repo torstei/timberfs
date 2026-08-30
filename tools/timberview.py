@@ -24,11 +24,13 @@ second kind of source is a second implementation of the same four.
 ⚠ The fan-out is not here. `search` is asked for a token and does not
 know there are ten hosts; whoever provides the backend does.
 """
+import base64
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -636,6 +638,94 @@ def grouped(n):
     return f"{n:,}".replace(",", " ")
 
 
+# ----------------------------------------------------------- clipboard
+# What OSC 52 is trusted with. A terminal that dislikes the size does not
+# say so — it truncates, or drops the sequence whole — so past this the
+# text goes to a file, where a truncation cannot be silent.
+OSC_LIMIT = 100_000
+
+
+def helpers():
+    """The clipboard commands that could work HERE, in order.
+
+    Each is gated on the display it writes to, because one without it
+    does not fail usefully: it writes a clipboard nothing will read, or
+    reports a connection error the reader never asked about."""
+    import shutil
+    out = []
+    if os.environ.get("WAYLAND_DISPLAY"):
+        out.append(["wl-copy"])
+    if os.environ.get("DISPLAY"):
+        out += [["xclip", "-selection", "clipboard"], ["xsel", "-ib"]]
+    if sys.platform == "darwin":
+        out.append(["pbcopy"])
+    return [c for c in out if shutil.which(c[0])]
+
+
+def osc52(text):
+    """Hand the bytes to the TERMINAL — the one route that reaches a
+    workstation from the far end of an ssh or a multiplexer.
+
+    ⚠ Its failure is SILENCE: a terminal that does not implement it
+    does nothing and says nothing. So a copy says which route it took
+    rather than that the text is on a clipboard.
+
+    Written to /dev/tty rather than through curses, because it is a
+    message to the terminal and not output: the screen curses is holding
+    is neither drawn on nor invalidated."""
+    seq = b"\033]52;c;" + base64.b64encode(text.encode("utf-8")) + b"\a"
+    with open("/dev/tty", "wb", buffering=0) as tty:
+        tty.write(seq)
+
+
+def spill(data):
+    """The last resort: the text in a file, and the path said.
+
+    A copy that could not be made must still leave the selection
+    somewhere it can be got at."""
+    fd, path = tempfile.mkstemp(prefix="timberview-", suffix=".txt")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
+
+
+def to_clipboard(text):
+    """`text` out of the pager, and the phrase saying by which route.
+
+    A helper first where there is a display to use one on: it writes the
+    clipboard of the machine this process is on, and its exit status says
+    whether it did. OSC 52 next, the only route that crosses an ssh. A
+    file last, so a selection is never lost quietly.
+
+    ⚠ The helper's output is DISCARDED rather than captured: `wl-copy`
+    daemonises to serve the selection, and a captured pipe it inherits
+    keeps `run()` waiting until the clipboard is next replaced.
+
+    ⚠ It runs on the CALLING thread, and must: `osc52` writes the
+    terminal curses is also writing, and two writers can split an escape
+    sequence between them."""
+    data = text.encode("utf-8")
+    for cmd in helpers():
+        try:
+            p = subprocess.run(cmd, input=data, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if p.returncode == 0:
+            return f"on the clipboard ({cmd[0]})"
+    if len(data) <= OSC_LIMIT:
+        try:
+            osc52(text)
+            # Short on purpose: this is a status LINE, and the hedge has
+            # to survive being read next to what was copied.
+            return "to the terminal (OSC 52) — if nothing pastes, it was dropped"
+        except OSError:
+            pass
+    why = (f"{human(len(data))} is more than OSC 52 can be trusted with"
+           if len(data) > OSC_LIMIT else "no clipboard is reachable from here")
+    return f"{why} — written to {spill(data)}"
+
+
 class Line:
     __slots__ = ("offset", "text", "_terms", "at", "store", "first", "wf")
 
@@ -1137,6 +1227,7 @@ class Joined:
         self.source = source
         self._n = None
         self._lines = []
+        self._runs = []
 
     def __getattr__(self, name):
         # Everything not about lines is the source's, including the
@@ -1146,12 +1237,28 @@ class Joined:
 
     @property
     def lines(self):
-        if self._n != len(self.source.lines):
-            self._rebuild()
+        self._fresh()
         return self._lines
 
+    def _fresh(self):
+        if self._n != len(self.source.lines):
+            self._rebuild()
+
+    def rows_as_lines(self, lo, hi):
+        """The LOG's lines behind rows `lo`..`hi`, inclusive.
+
+        A join is a rendering: `↵` between the frames of a stack trace
+        is a thing to read, and not a thing to paste into something that
+        analyses one. So what is taken away is the lines the row was made
+        of, in the order the log holds them."""
+        self._fresh()
+        out = []
+        for run in self._runs[lo:hi + 1]:
+            out.extend(run)
+        return out
+
     def _rebuild(self):
-        out, run = [], []
+        out, runs, run = [], [], []
 
         def flush():
             if not run:
@@ -1162,6 +1269,7 @@ class Joined:
                 self.SEP + x.text.lstrip() for x in run[1:])
             ln.at, ln.store, ln.wf, ln.first = head.at, head.store, head.wf, True
             out.append(ln)
+            runs.append(list(run))
 
         for line in self.source.lines:
             if getattr(line, "first", True) and run:
@@ -1169,7 +1277,8 @@ class Joined:
                 run = []
             run.append(line)
         flush()
-        self._lines, self._n = out, len(self.source.lines)
+        self._lines, self._runs = out, runs
+        self._n = len(self.source.lines)
 
     # An offset lands on the ENTRY holding it, which is the row it is now
     # part of. The base implementations would scan the source's lines and
@@ -1205,6 +1314,10 @@ class View:
         self.message = ""
         self.hits, self.hit = [], -1
         self.term = None
+        # The row a region starts at, or None. A ROW index and not an
+        # offset: it is a place on this screen, which is what the reader
+        # marked — and `_keep_place` carries it when the run renumbers.
+        self.mark = None
         # Set when the PICK moved, so the next layout brings the term
         # into view. Only then: scrolling sideways by hand and having
         # the screen snap back would be the same fight from the other
@@ -1229,6 +1342,10 @@ class View:
             s.window = getattr(getattr(self, "_source", None), "window", None)
         self._source = s
         self._joined = Joined(s) if self.join else None
+        # A mark is a row of the tape it was set on. Following a hit into
+        # another store keeps neither end of a region, so it is dropped
+        # here rather than quietly re-used against different lines.
+        self.mark = None
 
     def set_window(self, text):
         """`from T to T`, `to T`, `none` — the words the shell uses.
@@ -1267,11 +1384,29 @@ class View:
         either way, so the same entry is under you before and after, and
         a toggle is not also a jump."""
         where = self.line()
+        lines = self.source.lines
+        # Both ends of the region travel as OFFSETS, for the reason the
+        # cursor does: a display toggle must not change what is selected.
+        span = self.region()
+        ends = (lines[span[0]].offset, lines[span[1]].offset) if span else None
+        mark_low = span is not None and self.mark <= self.cur
         self.join = (not self.join) if on is None else on
         self.source = self._source          # re-wrap, or unwrap
         if where is not None:
             self.cur = self.source.index_of(where.offset)
             self.top = min(self.top, self.cur)
+        if ends:
+            # ⚠ The UPPER end is taken to the END of the entry it lands
+            # in. A joined row IS an entry, so unjoining it is several
+            # lines, and an offset resolves to the FIRST of them: keeping
+            # the row numbers collapsed a selection of two records to
+            # their two first lines — a highlight that looked lost, and a
+            # copy that quietly took two lines of the fourteen selected.
+            # Joined, every row is a first, so this widens nothing and the
+            # rule needs no direction.
+            lo = self.source.index_of(ends[0])
+            hi = self.entry_span(at=self.source.index_of(ends[1]))[1]
+            self.mark, self.cur = (lo, hi) if mark_low else (hi, lo)
         self.tok, self.col = 0, 0
         self.message = ("multi-line entries as one row" if self.join
                         else "entries as they are written")
@@ -1322,6 +1457,9 @@ class View:
                 "place in it cannot be written down — `timberfs identity "
                 "--mint` makes the pair a store")
         self.source.refresh()
+        # A seek loads a different run, so a row index into the old one
+        # is not a place any more.
+        self.mark = None
         c = self.source.open(seq=seq, at=at, offset=offset)
         anchor = offset if offset is not None else c.start
         landed_at_the_end = seq is None and at is None and offset is None
@@ -1358,10 +1496,25 @@ class View:
         lines = self.source.lines
         top_off = lines[self.top].offset if lines else None
         cur_off = lines[self.cur].offset if lines else None
+        mark_off = (lines[self.mark].offset
+                    if self.mark is not None and self.mark < len(lines)
+                    else None)
         fn()
         if top_off is not None:
             self.top = self.source.index_of(top_off)
             self.cur = self.source.index_of(cur_off)
+        if mark_off is not None:
+            self.mark = self.source.index_of(mark_off)
+            # The run is bounded, so scrolling far enough drops the end
+            # the mark was on. The cursor may SLIDE to the nearest line —
+            # you were moving it — but a mark that slides is a selection
+            # of lines nobody chose, so it goes, and says so.
+            got = self.source.lines[self.mark] if self.source.lines else None
+            if got is None or got.offset != mark_off:
+                self.mark = None
+                self.message = ("the mark scrolled out of the run and was "
+                                "dropped: the tape holds a few chunks either "
+                                "side of you, not the whole log")
 
     def _widen(self):
         if self.cur < NEAR and not self.source.at_top():
@@ -1494,6 +1647,133 @@ class View:
             return "nothing on this line"
         longest = max(ln.text.split(), key=len)
         return "no searchable term on this line — " + why_not_a_term(longest)
+
+    # -- the region, and taking it away
+    def set_mark(self):
+        """One end of a region, here; again and it is dropped.
+
+        `set-mark`, because the other design — a start typed as a
+        coordinate — makes you name what is already under your eyes. The
+        cursor is the other end, so every motion the pager has is a way
+        of choosing one."""
+        if self.mark is not None:
+            self.mark = None
+            self.message = "mark dropped"
+            return
+        self.mark = self.cur
+        self.message = "mark set — move to the other end, then c copies"
+
+    def exchange_mark(self):
+        """Point and mark swapped, to see the end you are not on.
+
+        A region can be longer than the screen, and the cheapest way to
+        check what its far end actually is, is to go and look."""
+        if self.mark is None:
+            self.message = "no mark to exchange with — m sets one"
+            return
+        self.mark, self.cur = self.cur, self.mark
+        self.tok = 0
+        self._widen()
+
+    def region(self):
+        """The rows a region covers as `(lo, hi)`, inclusive, or None.
+
+        Neither end is privileged: the region is the same whichever way
+        round it was made, so marking and walking BACK works."""
+        if self.mark is None:
+            return None
+        last = len(self.source.lines) - 1
+        if last < 0:
+            return None
+        lo, hi = sorted((self.mark, self.cur))
+        return max(0, lo), min(last, hi)
+
+    def entry_span(self, at=None):
+        """The rows of the ENTRY at `at`, or under the cursor, as
+        `(lo, hi)`.
+
+        A stack trace is one entry and forty lines, so the line the
+        cursor happens to be on is one frame of what you are looking at.
+        Where the source knows the framing — an answer, where timberfs
+        said which lines belong together — this is the whole entry; on
+        the TAPE, which parses nothing, every line is its own, exactly as
+        the entry motion is a line there."""
+        lines = self.source.lines
+        if not lines:
+            return None
+        lo = hi = min(self.cur if at is None else at, len(lines) - 1)
+        while lo > 0 and not getattr(lines[lo], "first", True):
+            lo -= 1
+        while hi + 1 < len(lines) and not getattr(lines[hi + 1], "first", True):
+            hi += 1
+        return lo, hi
+
+    def selection(self):
+        """What a copy would take: `(text, what)`, or None.
+
+        The region if there is a mark, else the entry under the cursor --
+        the one that needs no mark being the one you reach for most.
+
+        ⚠ The LOG's lines, never the rows: `z` renders an entry as one
+        row with `↵` between its lines, which is for reading rather than
+        for pasting into something that analyses a stack trace.
+
+        ⚠ And the lines AS SHOWN — tabs in columns, every other control
+        byte one glyph. What is copied is what was on the screen, and an
+        ANSI escape in a log line must not reach a clipboard as an
+        escape."""
+        span = self.region() or self.entry_span()
+        if span is None:
+            return None
+        lo, hi = span
+        lines = (self._joined.rows_as_lines(lo, hi) if self._joined
+                 else self.source.lines[lo:hi + 1])
+        if not lines:
+            return None
+        n, rows = len(lines), hi - lo + 1
+        if self.mark is not None:
+            what = f"the region, {rows} row{'' if rows == 1 else 's'}"
+            if n != rows:
+                what += f" — {n} lines"
+        elif n > 1:
+            what = f"this entry, {n} lines"
+        else:
+            what = "this line"
+        return "".join(ln.text + "\n" for ln in lines), what
+
+    def copy(self):
+        """The selection out, and the mark dropped with it.
+
+        Dropped because the region was made FOR the copy: leaving it
+        behind leaves a highlight that means nothing, and the next `c`
+        would take what you already have."""
+        got = self.selection()
+        if got is None:
+            self.message = "nothing here to copy"
+            return
+        text, what = got
+        # Whether this was a REGION is the one thing the message can teach:
+        # a reader who has just copied an entry and wanted several rows is
+        # standing exactly where the mark needs naming.
+        marked = self.mark is not None
+        route = to_clipboard(text)
+        self.mark = None
+        self.message = f"{what}, {human(len(text.encode('utf-8')))} · {route}"
+        if not marked:
+            self.message += " · m marks a region"
+
+    def copy_address(self):
+        """The address, shown AND copied.
+
+        Shown because the copy cannot always be confirmed — selecting it
+        with the mouse is the fallback that is always there, and it needs
+        the address on the screen to select."""
+        at = self.address()
+        if at is None:
+            self.message = ("this entry is at a live edge, so it has no "
+                            "address yet — no chunk holds it")
+            return
+        self.message = f"{at} · {to_clipboard(str(at))}"
 
     # -- search
     def search(self, token):
@@ -1644,6 +1924,12 @@ class View:
 
     def _build(self, width, height):
         rows, lines = [], self.source.lines
+        # A selection you cannot see is not one, so both of them are
+        # marked for the drawing: the region, and — since `c` with no
+        # mark takes the ENTRY — the entry the cursor is in. On the tape
+        # that is the cursor's own line and the screen is unchanged.
+        span = self.region()
+        here = self.entry_span()
         if self.top == 0:
             for text in (self.source.top_notes() if self.source.at_top()
                          else self.stuck_note(above=True)):
@@ -1671,7 +1957,9 @@ class View:
                         "spans": [(max(0, s - base), min(len(piece), e - base), a)
                                   for s, e, a in spans
                                   if e > base and s < base + width],
-                        "edge": False, "cursor": i == self.cur})
+                        "edge": False, "cursor": i == self.cur,
+                        "region": bool(span) and span[0] <= i <= span[1],
+                        "entry": bool(here) and here[0] <= i <= here[1]})
             else:
                 text = ln.text[self.col:self.col + width]
                 rows.append({
@@ -1679,7 +1967,9 @@ class View:
                     "spans": [(max(0, s - self.col), min(len(text), e - self.col), a)
                               for s, e, a in spans
                               if e > self.col and s < self.col + width],
-                    "edge": False, "cursor": i == self.cur})
+                    "edge": False, "cursor": i == self.cur,
+                    "region": bool(span) and span[0] <= i <= span[1],
+                    "entry": bool(here) and here[0] <= i <= here[1]})
             i += 1
         if i >= len(lines) and len(rows) < height:
             if self.source.at_bottom():
@@ -1715,14 +2005,25 @@ class View:
                 "o log around" if isinstance(self.source, Records)
                 else "n/N hits",
                 "w wrap" if not self.wrap else "w nowrap", "S stores",
-                "? help"]
+                "m mark", "c copy", "? help"]
         if sel:
             bits.insert(0, f"[{sel}]")
+        # A region can be longer than the screen, so its size is said
+        # rather than left to be counted off the rows that happen to show.
+        span = self.region()
+        if span:
+            rows = span[1] - span[0] + 1
+            bits.insert(0, f"region {rows} row{'' if rows == 1 else 's'} — "
+                           "c copies · x the other end · ^G drops it")
         return "  ".join(bits)
 
 
 # -------------------------------------------------------------- screen
 KEY_TAB, KEY_ESC, KEY_CR, KEY_LF = 9, 27, 13, 10
+# What a terminal sends for Ctrl-Space and Ctrl-G: the set-mark and the
+# cancel a hand that has used emacs reaches for. `m` is the key that is
+# always there — a terminal is free to send nothing for a modifier.
+KEY_NUL, KEY_BEL = 0, 7
 
 
 HELP_KEYS = """
@@ -1739,7 +2040,22 @@ HELP_KEYS = """
   t              the investigation's window — the tape stops at it
                  rather than scrolling out of the period you are looking
                  at. `from T to T`, or `none`
-  w              wrap / no wrap      y             this line's address
+  w              wrap / no wrap
+
+  m  ^Space      SET THE MARK here; again drops it (^G too). x swaps the
+                 mark and the cursor, so the far end of a long region can
+                 be looked at
+  c              COPY — the region if a mark is set, else the whole ENTRY
+                 under the cursor, which is the forty lines of a stack
+                 trace and not the one frame the cursor is on. Joined
+                 rows copy as the log's own lines, not with the ↵ in
+
+                 What is on the screen says which is which: the region is
+                 the REVERSED block, and the entry a bare c would take is
+                 the BOLD one — so what a copy will take is visible before
+                 it is made. On the tape every line is its own entry, so
+                 there the bold is the line you are on
+  y              this line's address, shown AND copied
 
   Tab  ⇧Tab      the searchable terms, and on past the end of a line to
                  the next one that has any — an identifier is ONE of
@@ -1757,6 +2073,11 @@ HELP_KEYS = """
 
   A hit is an address: timber://host/store-id#offset=N, which is where
   it is and what you paste into a ticket.
+
+  A copy goes to a clipboard helper where there is a display for one, to
+  the TERMINAL by OSC 52 otherwise — which is the route that crosses an
+  ssh, and whose failure is silence, so the status line says which was
+  used. Where neither answers it is written to a file, named there.
 """
 
 
@@ -1851,8 +2172,25 @@ class Screen:
         self.put(stdscr, 0, v.header()[:w - 1], c.A_REVERSE)
         for y, row in enumerate(v.layout(w - 1, body), start=1):
             base = c.A_DIM if row["edge"] else (
-                c.A_BOLD if row.get("cursor") else 0)
-            self.put(stdscr, y, row["text"][:w - 1], base)
+                c.A_BOLD if row.get("entry") or row.get("cursor") else 0)
+            text = row["text"][:w - 1]
+            if row.get("region"):
+                base |= c.A_REVERSE
+                # PADDED to the width: a bar that stops where the text
+                # does is a ragged edge that reads as chrome, and the
+                # header and status lines are already reverse. A solid
+                # block is what a selection looks like.
+                text = text.ljust(w - 1)
+            self.put(stdscr, y, text, base)
+            if row.get("region"):
+                # A row in the region is UNIFORM: the block is the whole
+                # message. Marking the terms inside it needs an attribute
+                # the block is not already using, and `sel` is itself
+                # A_REVERSE — reversing it again is invisible, and lifting
+                # it out is a hole where the cursor row's first term
+                # happens to be, which reads as a rendering bug. The
+                # picked term is `[named]` in the status line either way.
+                continue
             for s, e, kind in row["spans"]:
                 if 0 <= s < e <= w - 1:
                     try:
@@ -1920,8 +2258,16 @@ class Screen:
             v.cycle(-1)
         elif key == ord("S"):
             self.pick_store(stdscr)
+        elif key in (ord("m"), KEY_NUL):
+            v.set_mark()
+        elif key == KEY_BEL and v.mark is not None:
+            v.set_mark()                        # ^G cancels the region
+        elif key == ord("x"):
+            self.scroll(stdscr, v.exchange_mark)
+        elif key == ord("c"):
+            v.copy()
         elif key == ord("y"):
-            v.message = str(v.address())
+            v.copy_address()
         elif key == ord("?"):
             self.help(stdscr)
         elif key == c.KEY_RESIZE or key == 12:
@@ -2072,14 +2418,41 @@ class Screen:
         self.reach(stdscr, stores[i].get("name", "that store"), v.open)
 
     def help(self, stdscr):
+        """The keys, on the pager's own motions.
+
+        They stopped fitting a 24-row terminal, and a help screen that
+        silently ends at the bottom of one loses whichever keys are last
+        — the same failure as an edge that stops without saying why. So
+        it scrolls, and says when there is more."""
         c = self.curses
-        stdscr.erase()
-        for y, line in enumerate(HELP_KEYS.strip("\n").splitlines()):
-            self.put(stdscr, y, line)
-        h, _ = stdscr.getmaxyx()
-        self.put(stdscr, h - 1, "  any key to go back", c.A_REVERSE)
-        stdscr.refresh()
-        stdscr.getch()
+        lines = HELP_KEYS.strip("\n").splitlines()
+        top = 0
+        while True:
+            h, _ = stdscr.getmaxyx()
+            body = max(1, h - 1)
+            top = max(0, min(top, len(lines) - body))
+            stdscr.erase()
+            for y, line in enumerate(lines[top:top + body]):
+                self.put(stdscr, y, line)
+            left = len(lines) - (top + body)
+            note = ("  any key to go back" if not left and not top
+                    else f"  {left} more below · j k space b · "
+                         "any other key to go back" if left > 0
+                    else "  j k space b to go back up · "
+                         "any other key to leave")
+            self.put(stdscr, h - 1, note, c.A_REVERSE)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (ord("j"), c.KEY_DOWN):
+                top += 1
+            elif key in (ord("k"), c.KEY_UP):
+                top -= 1
+            elif key in (ord(" "), c.KEY_NPAGE, ord("f")):
+                top += body
+            elif key in (ord("b"), c.KEY_PPAGE):
+                top -= body
+            elif key != c.KEY_RESIZE:
+                return
 
     def choose(self, stdscr, title, rows, searchable=False, terms_from=0):
         """Pick a row, or — where the rows are hits — a TERM out of one.
