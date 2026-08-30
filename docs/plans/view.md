@@ -81,35 +81,73 @@ program from a pager. And which store — a picker, or "the same labels on
 another host", which is what an incident usually means? Better answered
 after living with the single-store version for a while.
 
-## Not built: taking a selection away
+## Built: taking a selection away
 
-Mark a run of lines and get it out — to a file, or to the clipboard.
+`m` sets the mark, the cursor is the other end, and `c` copies the
+region. `set-mark` rather than a typed range: the other design makes you
+name a coordinate that is already under your eyes, and here every motion
+the pager has — a line, an entry, a page, a search — is a way of choosing
+an end. `x` swaps the ends, `^Space`/`^G` are the same keys for a hand
+that came from emacs, and the copy drops the mark, because the region was
+made for it.
 
-- **The unit is lines**, not entries: lines are what the viewer shows,
-  and entries would mean parsing.
-- **A selection is a RANGE**, so it is two coordinates where an address
-  is one. `#offset=A..B` is still a PLACE, so it may belong in the
-  address grammar rather than beside it — unlike a search, which does
+- **The unit is rows**, and a row is what the viewer shows. What the
+  first version of this note called "lines, not entries — entries would
+  mean parsing" survives with one correction: on an ANSWER the framing is
+  timberfs's, not a guess, so `c` with **no mark** takes the whole entry
+  under the cursor. That is the case the feature exists for — a stack
+  trace is one entry and forty lines, and the line the cursor happens to
+  be on is one frame of it. On the tape, which parses nothing, every line
+  is its own, exactly as the entry motion is a line there.
+- **A joined row copies as the log's own lines.** `z` renders an entry as
+  one row with `↵` between its lines; that is a thing to read, and the
+  clipboard wants what the log holds. So `z` then a mark is how entry-wide
+  selection is done, and the rendering is not in the way.
+- **What is copied is what was on the screen** — tabs in columns, every
+  other control byte one glyph. An ANSI escape in a log line must not
+  reach a clipboard as an escape.
+- ⚠ **A mark is a row of the run that is loaded**, so scrolling that
+  renumbers the run carries it by offset, a seek or another store drops
+  it, and a mark whose line the run no longer holds is dropped and SAID.
+  The cursor may slide to the nearest line — you were moving it — but a
+  region of lines nobody chose is a wrong answer.
+- Still open: **a selection as the DOCUMENT that reproduces it.** The
+  bytes are the obvious answer and the weaker one; this project's habit
+  is to hand back something that can be RE-RUN, and a selection is a
+  start, a bound and a store — which is to say a query document, and
+  `--dump-json` already renders one. The bytes are what a stack-trace
+  analyser needs, so they went first; the document is the half that
+  survives being pasted into a ticket.
+- Still open: **a selection is a RANGE**, so it is two coordinates where
+  an address is one. `#offset=A..B` is still a PLACE, so it may belong in
+  the address grammar rather than beside it — unlike a search, which does
   not.
-- ⚠ **What is exported matters more than where it goes.** The bytes are
-  the obvious answer and the weaker one: this project's habit is to hand
-  back something that can be RE-RUN. A selection is a start, a bound and
-  a store — which is to say a query document, and `--dump-json` already
-  renders one. Offering both is cheap; offering only the bytes throws
-  away the half that survives being pasted into a ticket.
 
-## Not built: getting the address OUT
+## Built: getting the address and the text OUT
 
-`y` shows the address of the line you are on and `q` prints it on the
-way out, so it can be read and selected with a mouse. What is missing is
-the clipboard — and the case that matters is a workstation viewing a
-fleet, which means it has to work over ssh and through a multiplexer.
+`y` shows the address of the line you are on and now copies it too, and
+`q` still prints it on the way out. The case that mattered was a
+workstation viewing a fleet, which means over ssh and through a
+multiplexer.
 
-⚠ OSC 52 does, and its failure mode is **silence**: a terminal that does
-not support it does nothing and says nothing, which is the failure this
-project keeps removing from its answers. So a copy must either be
-confirmable or must keep showing the address, so that the fallback —
-selecting it by hand — is always there.
+- **A helper first where there is a display to use one on** — `wl-copy`,
+  `xclip`, `xsel`, `pbcopy`, each gated on the display it writes to. It
+  writes the clipboard of the machine the pager is on and its exit status
+  says whether it did, which is the only route that can be CONFIRMED.
+  ⚠ Its output must not be captured: `wl-copy` daemonises to serve the
+  selection, and a captured pipe it inherits keeps the read waiting until
+  the clipboard is next replaced.
+- **OSC 52 otherwise**, which is the route that crosses the ssh — and
+  whose failure mode is **silence**: a terminal that does not implement it
+  does nothing and says nothing, which is the failure this project keeps
+  removing from its answers. So the status line says which route was
+  taken and hedges on that one, and `y` keeps SHOWING the address so that
+  selecting it by hand is always there.
+- **A file where neither answered**, named on the status line. A copy
+  that could not be made must still leave the selection somewhere it can
+  be got at, and a size past what a terminal can be trusted with goes
+  there too rather than being handed to something that would truncate it
+  without saying so.
 
 ## /etc/hosts, and the DNS that would replace it
 

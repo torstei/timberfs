@@ -327,13 +327,20 @@ here.
   IDENTITY. An ANSWER is read on the same screen — `select ... into view`
   in timbersh, or a piped `records` stream — because an entry record
   carries the offset it came from, so `Enter` leaves the answer for the
-  log around a match. What remains: "what happened in $FOO around here", the
-  drill-down that starts from where you ARE and collides with the
-  viewer's no-parsing rule; taking a line selection away as bytes or as
-  the document that reproduces it; getting the address into a clipboard,
-  over ssh, without failing silently; and an answer screen that EXTENDS —
-  it is a closed set today, so it takes one page and says the answer
-  continues, where the tape fetches the next chunk as you reach it.
+  log around a match. A SELECTION comes away as text: `m` sets the mark and
+  `c` copies the region, or the whole entry under the cursor where no mark
+  is set — a stack trace into a stack-trace analyser, which is one entry
+  and forty lines. The route is a clipboard helper where there is a display
+  for one and OSC 52 otherwise, since the case that matters is a
+  workstation paging a fleet over ssh; OSC 52's failure is silence, so the
+  status line says which route was taken and a copy neither route could
+  make is written to a file rather than lost. What remains: "what happened
+  in $FOO around here", the drill-down that starts from where you ARE and
+  collides with the viewer's no-parsing rule; a selection as the DOCUMENT
+  that reproduces it rather than as the bytes it produced; and an answer
+  screen that EXTENDS — it is a closed set today, so it takes one page and
+  says the answer continues, where the tape fetches the next chunk as you
+  reach it.
   **An investigation window that outlives the statement** — DONE:
   `create session from X to Y` in timbersh bounds every statement (narrow
   within it, never out of it) and the pager with them, and `t` changes it

@@ -246,7 +246,10 @@ last chunk first, back from there, no predicate and no result set. It
 parses nothing, so it works where a query helps least: a store whose lines
 timberfs cannot read, and one with no index. `Tab` moves between the
 tokens the index actually holds, `Enter` finds one on every host, and a
-hit is a coordinate you can open, cycle and paste:
+hit is a coordinate you can open, cycle and paste. `m` sets the mark and
+`c` copies the region — or, with no mark, the whole ENTRY under the
+cursor, which is how a stack trace gets out of a log and into something
+that analyses one:
 
 ```sh
 timberview app.log
