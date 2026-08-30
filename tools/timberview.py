@@ -2172,15 +2172,19 @@ class Screen:
                 # block is what a selection looks like.
                 text = text.ljust(w - 1)
             self.put(stdscr, y, text, base)
+            if row.get("region"):
+                # A row in the region is UNIFORM: the block is the whole
+                # message. Marking the terms inside it needs an attribute
+                # the block is not already using, and `sel` is itself
+                # A_REVERSE — reversing it again is invisible, and lifting
+                # it out is a hole where the cursor row's first term
+                # happens to be, which reads as a rendering bug. The
+                # picked term is `[named]` in the status line either way.
+                continue
             for s, e, kind in row["spans"]:
                 if 0 <= s < e <= w - 1:
                     try:
-                        # Inside the block the picked term is punched OUT
-                        # of it rather than reversed again, which would
-                        # be the same attribute and so invisible.
-                        stdscr.chgat(y, s, e - s,
-                                     self.attr(kind) ^ base if base & c.A_REVERSE
-                                     else self.attr(kind) | base)
+                        stdscr.chgat(y, s, e - s, self.attr(kind) | base)
                     except c.error:
                         pass
         self.put(stdscr, h - 1, v.status()[:w - 1], c.A_REVERSE)

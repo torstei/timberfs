@@ -607,6 +607,7 @@ class Screenish:
 
     def __init__(self, keys=(), width=200):
         self.painted = []
+        self.marked = []
         self.keys = list(keys)
         self.exhausted = False
         self.width = width
@@ -621,7 +622,7 @@ class Screenish:
         pass
 
     def chgat(self, y, x, n, attr):
-        pass
+        self.marked.append((y, x, n))
 
     def refresh(self):
         pass
@@ -1492,6 +1493,35 @@ def an_address_is_shown_as_well_as_copied():
     assert took == [str(v.address())], took
     assert v.message.startswith(str(v.address())), v.message
     assert "OSC 52" in v.message, v.message
+
+
+@test
+def a_row_in_the_region_is_drawn_uniform():
+    """The block is the whole message, so the term markers are dropped
+    inside it. `sel` is itself A_REVERSE: over a reversed row it is
+    either invisible or a HOLE, and the hole lands exactly where the
+    line's first term is — its timestamp, which is what `sel` defaults
+    to before any Tab — so it read as a rendering bug. Torstein saw it
+    within a minute."""
+    v = opened(Fake(["2026-08-30T10:00:00Z one\n2026-08-30T10:00:01Z two\n"]),
+               seq=0)
+    screen = Screen_for_test()
+    screen.view = v
+    v.cur = 0
+    assert v.selected().startswith("2026-08-30"), v.selected()
+
+    plain = Screenish()
+    screen.draw(plain)
+    assert plain.marked, "the cursor row's terms are marked when nothing is"
+
+    v.set_mark()
+    v.move(1)
+    marked = Screenish()
+    screen.draw(marked)
+    assert marked.marked == [], marked.marked
+    # And the term is still named, so pointing at it is not lost.
+    v.message = ""
+    assert f"[{v.selected()}]" in v.status(), v.status()
 
 
 @test

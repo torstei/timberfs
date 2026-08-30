@@ -105,10 +105,15 @@ made for it.
   next to a reversed header, which is how the first version of this was
   missed — and the entry a bare `c` would take is the BOLD one, so the
   forty lines of a stack trace are a visible unit while the cursor is
-  anywhere in them. Inside the block the picked term is punched OUT of
-  it rather than reversed again, which would be the same attribute and
-  so invisible. No colour: reverse video is the terminal's own, and a
-  background chosen here is a bet on somebody's theme.
+  anywhere in them. A row in the region is UNIFORM — the term markers
+  are dropped inside it, as they are inside vim's visual selection: the
+  picked term is itself A_REVERSE, so over a reversed row it is either
+  invisible or a HOLE in the block, and a hole exactly where the line's
+  first term is (its timestamp, which is what `sel` defaults to before
+  any Tab) reads as a rendering bug. The status line `[names]` the
+  picked term, so nothing is lost. No colour: reverse video is the
+  terminal's own, and a background chosen here is a bet on somebody's
+  theme.
 - **A joined row copies as the log's own lines.** `z` renders an entry as
   one row with `↵` between its lines; that is a thing to read, and the
   clipboard wants what the log holds. So `z` then a mark is how entry-wide
