@@ -93,6 +93,23 @@ than a heuristic that would disagree with timberfs about where an entry
 begins.
 .RE
 .TP
+.B z
+Show each multi-line entry as ONE row \(em the stack trace on the same
+line as the message that raised it, its indent stripped so the rows line
+up. Ten traces is four hundred lines and every one of them pushes the
+next entry off the screen, which leaves no screen for the thing you are
+actually doing: deciding whether these ten are the same failure.
+.RS
+.PP
+Nothing is hidden \(em every line of the entry is on the row, and
+.BR h / l
+read along it. That is what makes it a rendering rather than a fold: the
+search, the terms, the hit list and
+.BR Shift\-\(da / Shift\-\(ua
+all keep working, because every line on the screen is a real line with a
+real address.
+.RE
+.TP
 .BR space " " b
 A page.
 .BR h " " l " " \(<- " " \(->

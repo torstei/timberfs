@@ -1049,6 +1049,84 @@ class Records:
                 if self.entries else "── nothing matched")
 
 
+class Joined:
+    """A source with each multi-line entry rendered as ONE line.
+
+    Ten stack traces in an answer is four hundred lines, and every one of
+    them pushes the next entry off the screen — so the thing you are
+    actually doing, deciding whether these ten are the same failure, has
+    no screen to do it on. Joined, each entry is a row: the message at the
+    left where the eye compares them, the frames trailing off to the
+    right where `h`/`l` can go and read them.
+
+    ⚠ The continuation lines are LSTRIPPED as they are joined. Their
+    indent is what puts the frames in a column under a message that is no
+    longer above them, and it is the difference between ten rows that
+    line up and ten that do not.
+
+    Nothing is hidden: every line of the entry is on the row. That is why
+    this is a rendering and not a fold — search, Tab, the hit list and
+    the entry motion all keep working, because every line on screen is a
+    real line with a real address.
+
+    A DECORATOR rather than a mode inside each source: `Tape` and
+    `Records` both have entries in this sense, the view swaps its source
+    at runtime (a hit in another store), and neither of them should learn
+    about a display option."""
+
+    SEP = " ↵ "
+
+    def __init__(self, source):
+        self.source = source
+        self._n = None
+        self._lines = []
+
+    def __getattr__(self, name):
+        # Everything not about lines is the source's, including the
+        # extends — which grow `source.lines` and so invalidate the cache
+        # by changing its length.
+        return getattr(self.source, name)
+
+    @property
+    def lines(self):
+        if self._n != len(self.source.lines):
+            self._rebuild()
+        return self._lines
+
+    def _rebuild(self):
+        out, run = [], []
+
+        def flush():
+            if not run:
+                return
+            head = run[0]
+            ln = Line(head.offset, b"")
+            ln.text = head.text + "".join(
+                self.SEP + x.text.lstrip() for x in run[1:])
+            ln.at, ln.store, ln.wf, ln.first = head.at, head.store, head.wf, True
+            out.append(ln)
+
+        for line in self.source.lines:
+            if getattr(line, "first", True) and run:
+                flush()
+                run = []
+            run.append(line)
+        flush()
+        self._lines, self._n = out, len(self.source.lines)
+
+    # An offset lands on the ENTRY holding it, which is the row it is now
+    # part of. The base implementations would scan the source's lines and
+    # answer with an index into the wrong list.
+    def index_of(self, offset):
+        for i, ln in enumerate(self.lines):
+            if ln.offset >= offset:
+                return i
+        return max(0, len(self.lines) - 1)
+
+    def chunk_of(self, offset):
+        return self.source.chunk_of(offset)
+
+
 # ---------------------------------------------------------------- view
 NEAR = 200          # lines from an edge at which the next chunk is fetched
 
@@ -1061,6 +1139,7 @@ class View:
 
     def __init__(self, backend, store=None, source=None):
         self.backend = backend
+        self.join = False
         self.source = source if source is not None else Tape(backend, store)
         self.wrap = False
         self.col = 0
@@ -1074,6 +1153,34 @@ class View:
         # the screen snap back would be the same fight from the other
         # side.
         self.follow_term = False
+
+    # `source` is a PROPERTY so the join survives the view swapping it —
+    # a hit in another store replaces the source outright, and a display
+    # option must not be something each of those sites remembers.
+    @property
+    def source(self):
+        return self._joined or self._source
+
+    @source.setter
+    def source(self, s):
+        self._source = s
+        self._joined = Joined(s) if self.join else None
+
+    def join_entries(self, on=None):
+        """Show each multi-line entry as one row, or stop.
+
+        The line under the cursor is kept: its offset addresses the ENTRY
+        either way, so the same entry is under you before and after, and
+        a toggle is not also a jump."""
+        where = self.line()
+        self.join = (not self.join) if on is None else on
+        self.source = self._source          # re-wrap, or unwrap
+        if where is not None:
+            self.cur = self.source.index_of(where.offset)
+            self.top = min(self.top, self.cur)
+        self.tok, self.col = 0, 0
+        self.message = ("multi-line entries as one row" if self.join
+                        else "entries as they are written")
 
     # -- opening
     def leave_for_the_log(self):
@@ -1532,6 +1639,9 @@ HELP_KEYS = """
                  the line motion already is; J/K is the same thing for a
                  terminal that sends no shifted arrow. On the tape every
                  line is its own, since it parses nothing
+  z              a multi-line entry as ONE row — a stack trace beside the
+                 message that raised it, so ten of them can be compared
+                 at all. Nothing is hidden: h/l read along it
   w              wrap / no wrap      y             this line's address
 
   Tab  ⇧Tab      the searchable terms, and on past the end of a line to
@@ -1687,6 +1797,8 @@ class Screen:
             v.scroll_h(-8)
         elif key in (ord("l"), c.KEY_RIGHT):
             v.scroll_h(8)
+        elif key == ord("z"):
+            v.join_entries()
         elif key == ord("w"):
             v.toggle_wrap()
         elif key == KEY_TAB:

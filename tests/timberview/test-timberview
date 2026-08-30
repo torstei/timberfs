@@ -818,6 +818,71 @@ def tab_steps_over_a_line_with_nothing_to_pick():
 
 
 @test
+def a_multi_line_entry_can_be_shown_as_one_row():
+    """Ten stack traces is four hundred lines and each pushes the next
+    entry off the screen, so the thing you are doing — deciding whether
+    these ten are the same failure — has no screen to do it on. Joined,
+    the message is at the left where the eye compares them."""
+    r = tv.Records(answer(
+        ("10:00:01 ERROR boom\n\tat frame.0(F.java:1)\n\tat frame.1(F.java:1)",
+         {"offset": 0}),
+        ("10:00:02 INFO after", {"offset": 100})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    assert len(v.source.lines) == 4
+
+    v.join_entries()
+    assert len(v.source.lines) == 2, [ln.text for ln in v.source.lines]
+    # The indent goes: it is what stops ten rows lining up.
+    assert v.source.lines[0].text == (
+        "10:00:01 ERROR boom ↵ at frame.0(F.java:1) ↵ at frame.1(F.java:1)"), \
+        v.source.lines[0].text
+    # Nothing is hidden, so the row is still an entry with its address.
+    assert str(v.source.address_of(v.source.lines[0])).endswith("#offset=0")
+    # ...and the terms of the frames are pickable, because they are there.
+    assert any(t[2].startswith("frame.0") for t in v.source.lines[0].terms), \
+        v.source.lines[0].terms
+
+    v.join_entries()
+    assert len(v.source.lines) == 4, "and back again"
+
+
+@test
+def joining_keeps_the_entry_you_are_on():
+    """A display toggle must not also be a jump. The offset addresses the
+    ENTRY either way, so the same one is under the cursor before and
+    after — including from a continuation line, which has no row of its
+    own once they are joined."""
+    r = tv.Records(answer(
+        ("first", {"offset": 0}),
+        ("second\n  at a\n  at b", {"offset": 100}),
+        ("third", {"offset": 200})))
+    v = tv.View(Fake(["x\n"]), source=r)
+
+    v.cur = 3                                  # "  at b", inside the second
+    v.join_entries()
+    assert v.source.lines[v.cur].text.startswith("second"), \
+        (v.cur, v.source.lines[v.cur].text)
+    v.join_entries()
+    assert v.source.lines[v.cur].text == "second", \
+        (v.cur, v.source.lines[v.cur].text)
+
+
+@test
+def the_join_survives_the_view_changing_store():
+    """A hit in another store replaces the source outright. A display
+    option nobody re-applies there is one that turns itself off when you
+    follow a hit, which is when you were using it."""
+    r = tv.Records(answer(("boom\n  at a", {"offset": 0})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.join_entries()
+    assert len(v.source.lines) == 1
+
+    v.source = tv.Records(answer(("other\n  at b\n  at c", {"offset": 0})))
+    assert v.join is True
+    assert len(v.source.lines) == 1, [ln.text for ln in v.source.lines]
+
+
+@test
 def an_entry_is_one_motion_however_many_lines_it_has():
     """A stack trace is forty lines of ONE entry, and `j` walks every one
     of them. `}` and `{` step over the continuation lines to the next
