@@ -88,9 +88,11 @@ the follower writes, `follower.lock` held while it runs.
 **forest** — a directory searched for stores by a short **handle**, so `timberfs
 query nginx` needs no path. Declared with `timberfs forest create`, which writes
 `/etc/timberfs/forests.d/*.conf`; a bare token that names no store on disk is
-the only thing it applies to. It is also the only thing a timberfs command names
-by **path** — every other argument names a store, and a store is found by what
-it declares. → `timberfs(1)` **FORESTS**
+the only thing it applies to. A bare **destination** is the same token: `create`
+and `--into` make the store in the forest, at `<forest>/<handle>/<handle>.log`,
+so what is written and what is read are one name. It is also the only thing a
+timberfs command names by **path** — every other argument names a store, and a
+store is found by what it declares. → `timberfs(1)` **FORESTS**
 
 **`forward-intake`** — the Fluentd Forward v1 receiver: what Docker's `fluentd`
 log driver, Fluent Bit and the fluent-logger libraries already speak. Every tag
@@ -120,7 +122,8 @@ Derived data — safe to delete, cheap to rebuild with `reindex`.
 → [design](design.md#custom-indexes-the-grain-token-index)
 
 **handle** — a store's short name within a forest (`nginx`), as opposed to its
-path. → `timberfs(1)` **FORESTS**
+path. The name a store is created BY as well as read by. → `timberfs(1)`
+**FORESTS**
 
 **head-drop** — dropping a chunk *prefix* in place with
 `fallocate(COLLAPSE_RANGE)`, rebasing the index and the grain inside one seqlock

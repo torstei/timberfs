@@ -69,9 +69,11 @@ timberfs query backing/app.log --from 13:40 --to 14:10 | grep -c 'tenantId=FOO'
 entries (stack traces stay intact) by named predicates, exact word predicates
 riding the token index automatically. `-f`/`--follow`, `--tail N` and `--max N`
 stream or cap. Stores in a **forest** (`/var/log/timberfs`) take a bare handle
-(`timberfs query nginx`), `timberfs list` shows what's there, `timberfs forest
-create` declares another one, and the package ships shell completion for all
-three tools. Full reference: `man timberfs`,
+(`timberfs query nginx`) — and so does a destination, so `timberfs create
+nginx` makes the store the same handle then reads, in the forest rather than
+in whatever directory you ran it from. `timberfs list` shows what's there,
+`timberfs forest create` declares another one, and the package ships shell
+completion for all three tools. Full reference: `man timberfs`,
 `man timber-filter`.
 
 Ship an investigation — with its provenance — as one self-describing file:

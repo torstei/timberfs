@@ -4,6 +4,11 @@
 //! forest is consulted only for a bare token that is not already a store on
 //! disk, so path-based usage carries zero added overhead.
 //!
+//! A handle is also where a store is MADE: `create` and the `--into`
+//! destinations resolve one through `resolve_new_store`, so the name a store
+//! is written by and the name it is read by are the same name, and neither
+//! depends on the directory the command ran in.
+//!
 //! Config lives in /etc/timberfs/forests.d/*.conf, one forest per file,
 //! KEY=VALUE (the same idiom as the /etc/timberfs/<instance>.conf mount
 //! configs). P1 reads one key, `DIR=<absolute path>`; blank lines, `#`
@@ -91,11 +96,19 @@ pub fn resolve_source(arg: &Path) -> anyhow::Result<PathBuf> {
     lookup_handle(handle)
 }
 
-/// True when `arg` already names a store: it exists, or its `<arg>.trunk` /
-/// `<arg>.rings` backing file does (the logical-name form resolve_backing
-/// accepts).
+/// True when `arg` already names a store: its `<arg>.trunk` / `<arg>.rings`
+/// backing file exists, or `arg` is itself a FILE — the logical name a mount
+/// serves, and equally any plain file, which must keep producing the error it
+/// always did instead of turning into a handle.
+///
+/// ⚠ A DIRECTORY is deliberately not one, though `arg.exists()` would say so:
+/// `<forest>/nginx` is the ordinary shape of a store in a forest, so from
+/// inside the forest root the token `nginx` meant that directory. Reading it
+/// failed with "no index file ./nginx.rings" there and nowhere else, and
+/// creating it wrote a second, FLAT store beside the nested one — after which
+/// the handle matched both and resolved to neither.
 fn is_existing_store(arg: &Path) -> bool {
-    arg.exists()
+    arg.is_file()
         || append_ext(arg, format::TRUNK_EXT).exists()
         || append_ext(arg, format::RINGS_EXT).exists()
 }
@@ -124,31 +137,109 @@ fn append_ext(path: &Path, ext: &str) -> PathBuf {
 /// matches with a message that points the user at a full path.
 fn lookup_handle(handle: &str) -> anyhow::Result<PathBuf> {
     let forests = load_forests();
-    // (forest name, store path) for every scanned store whose handle matches.
-    let mut matches: Vec<(&str, PathBuf)> = Vec::new();
-    for forest in &forests {
-        for (h, store) in scan_forest(&forest.dir) {
-            if h == handle {
-                matches.push((forest.name.as_str(), store));
-            }
-        }
-    }
+    let mut matches = handle_matches(handle, &forests);
     match matches.len() {
         1 => Ok(matches.pop().unwrap().1),
         // No directory by that name. It may be the name a store DECLARES
         // — the only name it has once its path is opaque — or an id,
         // which is what `list` prints beside it.
         0 => lookup_declared_name(handle, &forests),
-        _ => {
-            let candidates = matches
+        _ => Err(ambiguous_handle(handle, &matches)),
+    }
+}
+
+/// Every store whose handle is `handle`, as (forest name, store path).
+fn handle_matches<'a>(handle: &str, forests: &'a [Forest]) -> Vec<(&'a str, PathBuf)> {
+    let mut matches = Vec::new();
+    for forest in forests {
+        for (h, store) in scan_forest(&forest.dir) {
+            if h == handle {
+                matches.push((forest.name.as_str(), store));
+            }
+        }
+    }
+    matches
+}
+
+fn ambiguous_handle(handle: &str, matches: &[(&str, PathBuf)]) -> anyhow::Error {
+    let candidates = matches
+        .iter()
+        .map(|(name, store)| format!("  {name}: {}", store.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::anyhow!(
+        "handle `{handle}` is ambiguous — it matches several stores:\n{candidates}\n\
+         pass a full path or an id to pick one"
+    )
+}
+
+/// Resolve a user-supplied DESTINATION — the store a `create`, an
+/// `append --into` or an `import --into` may have to make — the way
+/// `resolve_source` resolves one to read.
+///
+/// A path is a path, exactly as it is for reading. A bare token is the
+/// HANDLE the store will be read back by, and a handle names a place in
+/// a forest: `<forest>/<handle>/<handle>.log`, the layout every intake
+/// already writes. Without this the two halves disagreed — `timberfs
+/// create nginx` made a store in whatever directory the caller happened
+/// to start in, which `timberfs query nginx` then could not find, and a
+/// provisioning unit re-running `create --if-not-exists nginx` from a
+/// different working directory made a second one.
+///
+/// Only the directory handle is matched, never a declared name or an id
+/// prefix: those can name several stores, and the one thing a write
+/// destination may not be is a guess.
+pub fn resolve_new_store(arg: &Path) -> anyhow::Result<PathBuf> {
+    if is_bundle(arg) || is_existing_store(arg) {
+        return Ok(arg.to_path_buf());
+    }
+    let Some(handle) = bare_token(arg) else {
+        return Ok(arg.to_path_buf());
+    };
+    let forests = load_forests();
+    let mut matches = handle_matches(handle, &forests);
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap().1),
+        0 => new_store_path(handle, &forests),
+        _ => Err(ambiguous_handle(handle, &matches)),
+    }
+}
+
+/// Where a store nothing holds yet goes: `<forest>/<handle>/<handle>.log`
+/// in the one declared forest. With none there is no such place, and with
+/// several the handle does not say which — both are refused rather than
+/// resolved to the working directory, which is the answer that reads as
+/// success and leaves a store no handle finds.
+fn new_store_path(handle: &str, forests: &[Forest]) -> anyhow::Result<PathBuf> {
+    let name = handle_of_logical(handle);
+    match forests {
+        [] => bail!(
+            "`{handle}` is a handle and no forest is declared to create it in \
+             (declarations live in {}) — `timberfs forest create /var/log/timberfs` \
+             declares one, or write the path out: ./{handle}",
+            forests_dir().display()
+        ),
+        [only] => Ok(only.dir.join(name).join(format!("{name}.log"))),
+        several => {
+            // An env-declared forest is named by its own directory, so
+            // printing both would be the same path twice.
+            let candidates = several
                 .iter()
-                .map(|(name, store)| format!("  {name}: {}", store.display()))
+                .map(|f| {
+                    let dir = f.dir.display().to_string();
+                    if f.name == dir {
+                        format!("  {dir}")
+                    } else {
+                        format!("  {}: {dir}", f.name)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             bail!(
-                "handle `{handle}` is ambiguous — it matches several stores:\n{candidates}\n\
-                 pass a full path or an id to pick one"
-            );
+                "no store `{handle}` yet, and several forests are declared, so the \
+                 handle does not say which one to create it in:\n{candidates}\n\
+                 pass a path"
+            )
         }
     }
 }
@@ -910,10 +1001,20 @@ mod tests {
     /// Resolve `arg` with TIMBERFS_FORESTS pointed at `dirs`. The env var is
     /// set and cleared under ENV_LOCK, around the resolve call only.
     fn resolve_with_forests(dirs: &[&Path], arg: &str) -> anyhow::Result<PathBuf> {
+        with_forests(dirs, || resolve_source(Path::new(arg)))
+    }
+
+    /// The same, for a destination: where a store by that name would be
+    /// created, or the one already standing there.
+    fn dest_with_forests(dirs: &[&Path], arg: &str) -> anyhow::Result<PathBuf> {
+        with_forests(dirs, || resolve_new_store(Path::new(arg)))
+    }
+
+    fn with_forests<T>(dirs: &[&Path], f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let joined = std::env::join_paths(dirs.iter().map(|d| d.as_os_str())).unwrap();
         std::env::set_var(FORESTS_ENV, &joined);
-        let result = resolve_source(Path::new(arg));
+        let result = f();
         std::env::remove_var(FORESTS_ENV);
         result
     }
@@ -1003,5 +1104,115 @@ mod tests {
     fn no_forests_configured_is_a_distinct_error() {
         let err = resolve_with_forests(&[], "nginx").unwrap_err().to_string();
         assert!(err.contains("no forests configured"), "got: {err}");
+    }
+
+    #[test]
+    fn a_directory_is_not_a_store_but_a_file_is() {
+        // `<forest>/nginx` is the ordinary shape of a store in a forest,
+        // so a directory answering `exists()` made the token `nginx` mean
+        // that directory whenever a command ran inside the forest root:
+        // the read failed there and nowhere else, and the create wrote a
+        // second, flat store beside the nested one.
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.path().join("nginx")).unwrap();
+        assert!(!is_existing_store(&dir.path().join("nginx")));
+        // A pair is one, by either of its files...
+        touch_rings(dir.path(), "app.log.rings");
+        assert!(is_existing_store(&dir.path().join("app.log")));
+        // ...and so is a plain file, which has to keep producing the
+        // error it always did instead of becoming a handle.
+        std::fs::write(dir.path().join("raw.log"), b"x").unwrap();
+        assert!(is_existing_store(&dir.path().join("raw.log")));
+    }
+
+    #[test]
+    fn a_new_store_is_created_in_the_forest_not_the_working_directory() {
+        // The half `create` was missing: a bare token is the handle the
+        // store will be read back by, so it names a place in the forest —
+        // `create nginx` then `query nginx` are the same store, whatever
+        // directory either was run from.
+        let forest = TempDir::new();
+        let dest = dest_with_forests(&[forest.path()], "nginx").unwrap();
+        assert_eq!(dest, forest.path().join("nginx").join("nginx.log"));
+        // The logical name is the same place: `create nginx.log` and
+        // `create nginx` cannot be two different stores, since both are
+        // read back as `nginx`.
+        let with_ext = dest_with_forests(&[forest.path()], "nginx.log").unwrap();
+        assert_eq!(with_ext, dest);
+        // Only a single trailing `.log` is stripped, as everywhere else.
+        assert_eq!(
+            dest_with_forests(&[forest.path()], "metrics.jsonl").unwrap(),
+            forest
+                .path()
+                .join("metrics.jsonl")
+                .join("metrics.jsonl.log")
+        );
+    }
+
+    #[test]
+    fn a_destination_that_already_exists_is_the_store_itself() {
+        // What `create --if-not-exists nginx` in a provisioning unit
+        // depends on: the store made last boot, not a second one beside
+        // it. The flat layout resolves too — it is a store in the forest.
+        let forest = TempDir::new();
+        touch_rings(&forest.path().join("nginx"), "nginx.log.rings");
+        touch_rings(forest.path(), "flat.log.rings");
+        assert_eq!(
+            dest_with_forests(&[forest.path()], "nginx").unwrap(),
+            forest.path().join("nginx").join("nginx.log")
+        );
+        assert_eq!(
+            dest_with_forests(&[forest.path()], "flat").unwrap(),
+            forest.path().join("flat.log")
+        );
+    }
+
+    #[test]
+    fn a_destination_path_is_still_a_path() {
+        // Nothing about writing to a path changes, forest or no forest:
+        // a separator makes it one, and so does an existing store.
+        let forest = TempDir::new();
+        let dir = TempDir::new();
+        assert_eq!(
+            dest_with_forests(&[forest.path()], "some/where/app.log").unwrap(),
+            Path::new("some/where/app.log")
+        );
+        touch_rings(dir.path(), "here.log.rings");
+        let here = dir.path().join("here.log");
+        assert_eq!(
+            with_forests(&[forest.path()], || resolve_new_store(&here)).unwrap(),
+            here
+        );
+    }
+
+    #[test]
+    fn a_new_store_with_no_forest_or_several_is_refused() {
+        // Refused rather than resolved to the working directory: that
+        // answer reads as success and leaves a store no handle finds.
+        let err = dest_with_forests(&[], "nginx").unwrap_err().to_string();
+        assert!(err.contains("no forest is declared"), "got: {err}");
+        assert!(err.contains("./nginx"), "got: {err}");
+
+        let a = TempDir::new();
+        let b = TempDir::new();
+        let err = dest_with_forests(&[a.path(), b.path()], "nginx")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("several forests"), "got: {err}");
+        assert!(err.contains(&a.path().display().to_string()), "got: {err}");
+    }
+
+    #[test]
+    fn an_ambiguous_destination_is_refused_rather_than_added_to() {
+        // Two stores answer to `dup` already; creating a third would not
+        // resolve the ambiguity, and writing into either is a guess.
+        let a = TempDir::new();
+        let b = TempDir::new();
+        touch_rings(a.path(), "dup.log.rings");
+        touch_rings(b.path(), "dup.log.rings");
+        let err = dest_with_forests(&[a.path(), b.path()], "dup")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "got: {err}");
     }
 }
