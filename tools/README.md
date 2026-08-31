@@ -416,6 +416,15 @@ match.
 - **A multi-line entry is one entry.** The lines of a stack trace belong
   to the entry that raised it; splitting them would be the same lie as
   splitting a line across a chunk boundary.
+- **Ten of them is four hundred lines**, and every one pushes the next
+  entry off the screen — which leaves no screen for the thing you are
+  doing, deciding whether these ten are the same failure. `z` renders
+  each entry as ONE row, the trace trailing off to the right of the
+  message that raised it, and `Z` opens the one you have picked out back
+  into its own lines while the other nine stay rows. Nothing is hidden
+  either way: a joined row carries every line of the entry, `h`/`l` read
+  along it, and the search, the terms and the entry motion keep working
+  because each row is a real line with a real address.
 - **An answer is a closed set.** Both ends are ends, nothing extends, and
   the boundary says "end of the answer" rather than naming a chunk you
   are not in.

@@ -1219,7 +1219,11 @@ class Joined:
     A DECORATOR rather than a mode inside each source: `Tape` and
     `Records` both have entries in this sense, the view swaps its source
     at runtime (a hit in another store), and neither of them should learn
-    about a display option."""
+    about a display option.
+
+    An entry can be OPENED out of the join and rendered as its own lines
+    again — the one of the ten you have decided to read, while the other
+    nine stay rows to come back to."""
 
     SEP = " ↵ "
 
@@ -1228,6 +1232,15 @@ class Joined:
         self._n = None
         self._lines = []
         self._runs = []
+        # Which entry each row belongs to, and which entries are open —
+        # both by ORDINAL, the nth entry of the source, rather than by
+        # offset: an entry still at a live edge has no offset yet and
+        # every one of them reports 0, so a set of offsets would open all
+        # of them together. An answer is a closed set, so the nth entry
+        # stays the nth — and the tape, where the run does renumber, has
+        # no multi-line entry to open.
+        self._of = []
+        self._open = set()
 
     def __getattr__(self, name):
         # Everything not about lines is the source's, including the
@@ -1258,18 +1271,32 @@ class Joined:
         return out
 
     def _rebuild(self):
-        out, runs, run = [], [], []
+        out, runs, of, run = [], [], [], []
+        n = 0
 
         def flush():
+            nonlocal n
             if not run:
                 return
-            head = run[0]
-            ln = Line(head.offset, b"")
-            ln.text = head.text + "".join(
-                self.SEP + x.text.lstrip() for x in run[1:])
-            ln.at, ln.store, ln.wf, ln.first = head.at, head.store, head.wf, True
-            out.append(ln)
-            runs.append(list(run))
+            if n in self._open:
+                # The source's OWN Line objects, so the framing on them is
+                # the entry framing again: the entry motion steps over the
+                # trace and a bare `c` takes the whole of it, exactly as
+                # they do with no join at all.
+                out.extend(run)
+                runs.extend([ln] for ln in run)
+                of.extend([n] * len(run))
+            else:
+                head = run[0]
+                ln = Line(head.offset, b"")
+                ln.text = head.text + "".join(
+                    self.SEP + x.text.lstrip() for x in run[1:])
+                ln.at, ln.store, ln.wf, ln.first = \
+                    head.at, head.store, head.wf, True
+                out.append(ln)
+                runs.append(list(run))
+                of.append(n)
+            n += 1
 
         for line in self.source.lines:
             if getattr(line, "first", True) and run:
@@ -1277,8 +1304,29 @@ class Joined:
                 run = []
             run.append(line)
         flush()
-        self._lines, self._runs = out, runs
+        self._lines, self._runs, self._of = out, runs, of
         self._n = len(self.source.lines)
+
+    def open_row(self, row):
+        """Open the entry rendered at `row` out into its own lines, or
+        join it again. Whether it is now open, or None where there is
+        nothing folded into it.
+
+        Any row of an open entry closes it, not just its first: what you
+        are pointing at is the entry, and having to walk back to its head
+        to put it away would be a coordinate the reader has to keep."""
+        self._fresh()
+        if not 0 <= row < len(self._of):
+            return None
+        n = self._of[row]
+        if n in self._open:
+            self._open.discard(n)
+        elif len(self._runs[row]) < 2:
+            return None
+        else:
+            self._open.add(n)
+        self._rebuild()
+        return n in self._open
 
     # An offset lands on the ENTRY holding it, which is the row it is now
     # part of. The base implementations would scan the source's lines and
@@ -1377,21 +1425,19 @@ class View:
         self.source.window = (lo, hi)
         self.message = f"window {when_ms(lo)} .. {when_ms(hi)}"
 
-    def join_entries(self, on=None):
-        """Show each multi-line entry as one row, or stop.
+    def _rerender(self, change):
+        """A change to how the lines are RENDERED, keeping the place and
+        the selection. What `change` returned comes back.
 
-        The line under the cursor is kept: its offset addresses the ENTRY
-        either way, so the same entry is under you before and after, and
-        a toggle is not also a jump."""
+        Rows renumber when entries join or open; offsets do not, so the
+        cursor and both ends of a region travel as offsets: a display
+        toggle must not also be a jump, nor change what a copy takes."""
         where = self.line()
         lines = self.source.lines
-        # Both ends of the region travel as OFFSETS, for the reason the
-        # cursor does: a display toggle must not change what is selected.
         span = self.region()
         ends = (lines[span[0]].offset, lines[span[1]].offset) if span else None
         mark_low = span is not None and self.mark <= self.cur
-        self.join = (not self.join) if on is None else on
-        self.source = self._source          # re-wrap, or unwrap
+        got = change()
         if where is not None:
             self.cur = self.source.index_of(where.offset)
             self.top = min(self.top, self.cur)
@@ -1408,8 +1454,44 @@ class View:
             hi = self.entry_span(at=self.source.index_of(ends[1]))[1]
             self.mark, self.cur = (lo, hi) if mark_low else (hi, lo)
         self.tok, self.col = 0, 0
-        self.message = ("multi-line entries as one row" if self.join
-                        else "entries as they are written")
+        return got
+
+    def join_entries(self, on=None):
+        """Show each multi-line entry as one row, or stop.
+
+        The line under the cursor is kept: its offset addresses the ENTRY
+        either way, so the same entry is under you before and after, and
+        a toggle is not also a jump."""
+        def flip():
+            self.join = (not self.join) if on is None else on
+            self.source = self._source      # re-wrap, or unwrap
+        self._rerender(flip)
+        self.message = ("multi-line entries as one row · Z opens the one you "
+                        "are on"
+                        if self.join else "entries as they are written")
+
+    def open_entry(self):
+        """THIS entry as its own lines, inside a screen that is otherwise
+        joined — or joined again.
+
+        `z` is the whole answer at once, which is what makes ten traces
+        comparable; this is the one of them you have decided to read.
+        Several can be open, because comparing two is the next thing
+        after picking them out of the ten — and `z` builds the rendering
+        afresh, so setting the whole screen again clears them."""
+        if self._joined is None:
+            self.message = ("nothing is joined — `z` shows each multi-line "
+                            "entry as one row")
+            return
+        if not self.source.lines:
+            self.message = "nothing here to open"
+            return
+        state = self._rerender(lambda: self._joined.open_row(self.cur))
+        if state is None:
+            self.message = "this entry is one line — nothing is folded into it"
+        else:
+            self.message = ("this entry as its own lines · Z joins it again"
+                            if state else "this entry as one row again")
 
     # -- opening
     def leave_for_the_log(self):
@@ -2037,6 +2119,10 @@ HELP_KEYS = """
   z              a multi-line entry as ONE row — a stack trace beside the
                  message that raised it, so ten of them can be compared
                  at all. Nothing is hidden: h/l read along it
+  Z              THIS entry back out of the join, as its own lines — the
+                 one of the ten you picked. Again joins it, from any of
+                 its lines; several can be open at once, and z sets the
+                 whole screen again
   t              the investigation's window — the tape stops at it
                  rather than scrolling out of the period you are looking
                  at. `from T to T`, or `none`
@@ -2236,6 +2322,8 @@ class Screen:
             self.set_window(stdscr)
         elif key == ord("z"):
             v.join_entries()
+        elif key == ord("Z"):
+            v.open_entry()
         elif key == ord("w"):
             v.toggle_wrap()
         elif key == KEY_TAB:
