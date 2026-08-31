@@ -60,7 +60,10 @@ enum Command {
     /// CREATE INDEX, and every later writer maintains the .grain
     /// automatically
     Create {
-        /// Backing file to create: logical name, .trunk or .rings path
+        /// Where the store goes: a bare NAME is the handle it will be
+        /// read back by, created in the declared forest as
+        /// <forest>/<name>/<name>.log; anything with a `/` is a path,
+        /// made exactly where it says
         dest: PathBuf,
         /// Declare the token index for this log
         #[arg(long)]
@@ -120,9 +123,10 @@ enum Command {
     /// One writer per file; appenders for different files share a
     /// directory. EOF, SIGTERM or SIGINT flush and sync before exit.
     Append {
-        /// Destination backing file: logical name, .trunk or .rings
-        /// path (destinations are always named --into; positionals are
-        /// sources)
+        /// Destination: a forest handle, or a .trunk/.rings path
+        /// (destinations are always named --into; positionals are
+        /// sources). A handle that names no store yet is created in the
+        /// forest, as `create` would
         #[arg(long = "into", value_name = "DEST")]
         into: Option<PathBuf>,
         /// stdin is a timberfs-records(5) stream, not raw text: entries
@@ -197,8 +201,10 @@ enum Command {
         /// store unchanged
         #[arg(long)]
         records: bool,
-        /// Destination backing file: logical name, .trunk or .rings path
-        /// (a named flag on purpose — a glob can never eat it)
+        /// Destination: a forest handle, or a .trunk/.rings path (a
+        /// named flag on purpose — a glob can never eat it). A handle
+        /// that names no store yet is created in the forest, as
+        /// `create` would
         #[arg(long = "into", value_name = "DEST")]
         dest: PathBuf,
         /// Uncompressed chunk size threshold in bytes
@@ -1042,6 +1048,7 @@ fn main() -> anyhow::Result<()> {
             sets,
             if_not_exists,
         } => {
+            let dest = forest::resolve_new_store(&dest)?;
             bark::cmd_create(
                 &dest,
                 index,
@@ -1089,6 +1096,7 @@ fn main() -> anyhow::Result<()> {
                      --into DEST; positionals are sources, and append has none)"
                 );
             }
+            let into = forest::resolve_new_store(&into)?;
             let cfg = store::Config {
                 chunk_size: chunk_size.max(1),
                 level,
@@ -1141,6 +1149,7 @@ fn main() -> anyhow::Result<()> {
             exit_on_upgrade,
             wait_for_writer,
         } => {
+            let dest = forest::resolve_new_store(&dest)?;
             let cfg = store::Config {
                 chunk_size: chunk_size.max(1),
                 level,

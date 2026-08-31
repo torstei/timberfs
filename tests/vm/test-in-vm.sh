@@ -1969,6 +1969,66 @@ a_forest_is_declared_by_a_command_not_by_hand_editing() {
     rm -rf "$d"
 }
 
+a_bare_destination_is_created_in_the_shipped_forest() {
+    # A handle is where a store is MADE, not only where it is found —
+    # and the forest that decides is the package's own default.conf, so
+    # this is the check the env-var unit tests cannot make. Run from a
+    # directory that is not the forest, since the bug was that the store
+    # landed in whatever one the caller happened to be in.
+    local cwd=/tmp/vmdest-cwd
+    rm -rf "$cwd" /var/log/timberfs/vmdest
+    mkdir -p "$cwd"
+    # The rule below is "the one declared forest", so a forest an earlier
+    # test left behind would fail this one for an unrelated reason.
+    [ "$(timberfs forest list --names 2>/dev/null)" = default ] \
+        || { echo "another forest is declared:" >&2; timberfs forest list >&2; return 1; }
+
+    (cd "$cwd" && timberfs create --index vmdest >/dev/null 2>&1) || return 1
+    [ -f /var/log/timberfs/vmdest/vmdest.log.rings ] \
+        || { echo "not created in the forest" >&2; ls -R "$cwd" >&2; return 1; }
+    [ -z "$(ls -A "$cwd")" ] || { echo "left a store in the cwd" >&2; ls -A "$cwd" >&2; return 1; }
+
+    # ...and every writer means the same store by that name, from anywhere.
+    (cd / && printf '2026-08-31T09:00:00Z vmdest line\n' \
+        | timberfs append --into vmdest --quiet 2>/dev/null) || return 1
+    local got
+    got=$(timberfs query vmdest --no-filename 2>/dev/null)
+    [ "$got" = "2026-08-31T09:00:00Z vmdest line" ] \
+        || { echo "query by handle gave '$got'" >&2; return 1; }
+
+    # From INSIDE the forest root the handle used to mean the store's own
+    # DIRECTORY, since that exists: the read failed there and nowhere
+    # else, and the create wrote a flat store beside the nested one, after
+    # which the handle matched both and resolved to neither.
+    (cd /var/log/timberfs && timberfs query vmdest --no-filename 2>/dev/null) \
+        | grep -qx '2026-08-31T09:00:00Z vmdest line' || return 1
+    (cd /var/log/timberfs && timberfs create --if-not-exists vmdest >/dev/null 2>&1) || return 1
+    [ ! -e /var/log/timberfs/vmdest.rings ] \
+        || { echo "a flat store beside the nested one" >&2; return 1; }
+
+    # What a provisioning unit does on every boot: the store it made
+    # last time, not a second one beside it.
+    (cd "$cwd" && timberfs create --if-not-exists --index vmdest >/dev/null 2>&1) || return 1
+    [ -z "$(ls -A "$cwd")" ] || { ls -A "$cwd" >&2; return 1; }
+    [ "$(timberfs query vmdest --no-filename 2>/dev/null | wc -l)" = 1 ] || return 1
+
+    # With a second forest declared the handle no longer says where, so a
+    # NEW store is refused rather than placed by a coin toss — while the
+    # one that already exists still resolves.
+    timberfs forest create /srv/vmdest2 --name vmdest2 >/dev/null 2>&1 || return 1
+    (cd "$cwd" && timberfs create vmdest-new >/dev/null 2>&1) && {
+        echo "an ambiguous destination was created anyway" >&2
+        timberfs forest remove vmdest2 >/dev/null 2>&1
+        return 1
+    }
+    (cd "$cwd" && timberfs create --if-not-exists vmdest >/dev/null 2>&1) || {
+        timberfs forest remove vmdest2 >/dev/null 2>&1
+        return 1
+    }
+    timberfs forest remove vmdest2 >/dev/null 2>&1 || return 1
+    rm -rf /srv/vmdest2 "$cwd" /var/log/timberfs/vmdest
+}
+
 an_intake_writes_into_a_forest_by_name() {
     # An intake creates stores as data arrives, so it has to be told
     # where. That is a forest NAME now; --into-dir still works and warns,
@@ -2716,6 +2776,7 @@ run_test "ceilings: /etc/timberfs/limits.conf bounds a document, and is declared
 run_test "query examples: shipped, indexed, and every one of them runs" the_query_examples_ship_and_run
 run_test "forest: declared by a command, refuses overlap, remove keeps data" a_forest_is_declared_by_a_command_not_by_hand_editing
 run_test "forest: an intake writes into a forest by name; --into-dir warns" an_intake_writes_into_a_forest_by_name
+run_test "forest: a bare destination is created in the forest, not the cwd" a_bare_destination_is_created_in_the_shipped_forest
 run_test "naming: a store is called what it declares, and all of it is matchable" a_store_is_called_what_it_declares
 run_test "incus-intake: unit installed; options checked before anything opens" incus_intake_is_installed_and_validates_its_options
 run_test "selection: the id list prints is the id info accepts" store_identity_is_printed_and_typeable

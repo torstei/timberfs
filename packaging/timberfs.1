@@ -159,6 +159,21 @@ makes an empty log with its properties declared up front in a
 .B .bark
 manifest \(em one flat, optional, human-editable JSON object beside the
 pair.
+.PP
+.I DEST
+is a
+.B path
+if it has a
+.BR / ,
+and a
+.B handle
+if it does not \(em the same rule reading uses, and the handle is the one
+.B timberfs query
+will find it by. A handle names a place in the declared forest,
+.IR <forest>/<handle>/<handle>.log ,
+never one in whatever directory the command happened to run in; see
+.B FORESTS
+below for the refusals when there is no forest, or several.
 .B \-\-index
 declares the token index, database-style: once declared, EVERY writer
 maintains the
@@ -2387,6 +2402,28 @@ bundle is always taken literally, so every existing invocation is
 unchanged \(em a forest is consulted only for a bare token (no
 .BR / )
 that names no store on disk.
+.PP
+A bare token is a
+.B destination
+too, and means the same store:
+.BR create ", " "append \-\-into" " and " "import \-\-into"
+resolve one the same way, and where nothing holds that handle yet the
+store is MADE in the forest, at
+.IR <forest>/<handle>/<handle>.log
+\(em the layout every intake already writes. So
+.B timberfs create nginx
+and
+.B timberfs query nginx
+are the same store whichever directory either ran in, and a provisioning
+unit re-running
+.B create \-\-if\-not\-exists nginx
+lands on the store it made last boot instead of a second one beside it.
+.PP
+With NO forest declared, or with several, a bare destination is refused
+and says which: the working directory is the answer that reads as success
+and leaves a store no handle finds. Only the directory handle is matched
+\(em never a declared name or an id prefix, since either can name several
+stores and the one thing a write destination may not be is a guess.
 .PP
 Forests are declared with
 .B timberfs forest create
