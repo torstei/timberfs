@@ -218,10 +218,16 @@ the reason to define it early, and they are not the same programs:
   That wrapper becomes a resolver by printing what it already computes.
   ⚠ Such a sweep is not cheap — probing every candidate is a round trip per
   host — which is why re-deriving the fleet is allowed to be a DIFFERENT
-  command from the one that produced it (`--refresh`, `$TIMBERFS_REFRESH`,
-  the document's own `refresh`). A full sweep to open a session with and a
-  cached re-ask are the same question asked at two prices, and the session
-  should not have to pick one for both.
+  asker from the one that produced it (`--refresh`, `$TIMBERFS_REFRESH`, the
+  document's own `refresh`). A full sweep to open a session with and a cached
+  re-ask are the same question asked at two prices, and the session should
+  not have to pick one for both.
+- **A resolver is a command or a URL**, told apart by the scheme, and a url
+  one is a GET because a resolver takes no arguments. That closes the gap the
+  wrapper above leaves: an agent that already derives the queryable set can
+  serve it on a socket instead of being shelled out to. `--targets` stays a
+  FILE — a url derives its answer, which is what makes `refresh` worth asking
+  again, where a file is a thing you edit.
 
 ⚠ It is queried by more than one tool. The shell, the viewer, and whatever
 comes next all ask "where is this store", and none of them should grow its

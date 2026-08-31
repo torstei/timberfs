@@ -10,7 +10,7 @@ placeholder swapped into it.
 The document a resolver prints, and the file that holds the same thing:
 
     {"v": "1.0-EXPERIMENTAL",
-     "refresh": ["fleet-sweep", "--cached"],
+     "refresh": {"cmd": ["fleet-sweep", "--cached"]},
      "targets": [
        {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query",
                                   "--query", "-"]},
@@ -54,11 +54,25 @@ The host is OPTIONAL and is never dialled; the socket is. It is the
 `Host:` header, which is what a server routing several names off one
 socket reads.
 
-`refresh` is the command to RE-DERIVE this fleet, where that is not the
-command that produced it — a full sweep to open a session with and a
-cheap one to re-ask. It applies to the fleet it arrived with: a refresh
-whose document names no `refresh` of its own leaves the next one
-re-running whatever produced the fleet originally.
+`refresh` is how to RE-DERIVE this fleet, where that is not how it was
+produced — a full sweep to open a session with and a cheap one to re-ask.
+It names a `cmd` or a `url`, the same two words a target is reached by,
+and it applies to the fleet it arrived with: a refresh whose own document
+names none leaves the next one re-running whatever produced the fleet
+originally.
+
+The RESOLVER is either too, and there it is one string — a flag and an
+export can be nothing else — so a url is told from a command by its
+SCHEME:
+
+    TIMBERFS_RESOLVER='fleet-sweep --json'
+    TIMBERFS_RESOLVER=https://fleet.internal/timberfs/targets
+    TIMBERFS_RESOLVER=unix+http:///run/timberfs-agent.sock//fleet
+
+A resolver is asked ONE question and gets no arguments, so a url one is a
+GET — where a target, which is handed a document, is a POST. `--targets`
+stays a FILE: a url derives its answer, which is what makes `refresh`
+worth asking again, and a file is a thing you edit.
 
 A `name` is what the HOST column and a `timber://<host>/…` address say.
 It is a HINT and not identity — the store id is what resolves — so
@@ -84,6 +98,7 @@ import datetime
 import http.client
 import json
 import os
+import re
 import shlex
 import socket as socketlib
 import subprocess
@@ -100,6 +115,9 @@ SCHEMES = ("http", "https", UNIX_SCHEME)
 # Enough of a failed response to hold the reason, and not so much that a
 # server answering an error page fills the screen with it.
 ERR_BYTES = 8192
+# What tells a url from a command in a flag or an export. A scheme, not a
+# guess: a command is a program name or a path, and neither can carry one.
+URLISH = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
 
 # ------------------------------------------------------------ transports
@@ -237,10 +255,11 @@ class Target:
         self.name = name or None
         self.cmd = list(cmd) if cmd else None
         self.url = url
-        self.socket = self._scheme = self._host = self._path = None
-        if url is not None:
-            self._scheme = urllib.parse.urlsplit(url).scheme
-            self.socket, self._host, self._path = split_url(url)
+        self.at = Endpoint(url) if url is not None else None
+
+    @property
+    def socket(self):
+        return self.at.socket if self.at else None
 
     @property
     def label(self):
@@ -264,13 +283,7 @@ class Target:
             except OSError as e:
                 return _Dead(str(e))
         try:
-            if self.socket:
-                conn = _UnixHTTPConnection(self.socket, self._host)
-            elif self._scheme == "https":
-                conn = http.client.HTTPSConnection(self._host)
-            else:
-                conn = http.client.HTTPConnection(self._host)
-            return _HttpCall(conn, self._path, payload,
+            return _HttpCall(self.at.connect(), self.at.path, payload,
                              {"Content-Type": "application/json"})
         except (OSError, http.client.HTTPException) as e:
             return _Dead(f"{self.via}: {e}")
@@ -288,6 +301,47 @@ class Target:
 
     def __repr__(self):
         return f"Target({self.label}, {self.via})"
+
+
+class Endpoint:
+    """A url, read once: what to dial, what name to put in `Host:`, and
+    what to ask for. Shared by the two directions — a TARGET is POSTed a
+    document here, a RESOLVER is GET a fleet from one — because they
+    differ in the verb and in nothing else."""
+
+    def __init__(self, url):
+        self.url = url
+        self.scheme = urllib.parse.urlsplit(url).scheme
+        self.socket, self.host, self.path = split_url(url)
+
+    def connect(self):
+        if self.socket:
+            return _UnixHTTPConnection(self.socket, self.host)
+        if self.scheme == "https":
+            return http.client.HTTPSConnection(self.host)
+        return http.client.HTTPConnection(self.host)
+
+    def get(self, source):
+        """The body of a GET, or a ValueError saying why there is none.
+
+        A resolver is asked ONE question and gets no arguments, so it is
+        a GET — where a target, which is handed a document, is a POST."""
+        try:
+            conn = self.connect()
+            conn.request("GET", self.path)
+            resp = conn.getresponse()
+            body, status, reason = resp.read(), resp.status, resp.reason
+            conn.close()
+        except (OSError, http.client.HTTPException) as e:
+            raise ValueError(f"{source}: could not reach {self.url}: "
+                             f"{e}") from None
+        if not 200 <= status < 300:
+            why = body[:ERR_BYTES].decode("utf-8", "replace").strip()
+            raise ValueError(
+                f"{source} failed (HTTP {status} {reason})"
+                + (":\n      " + "\n      ".join(why.splitlines()) if why
+                   else ""))
+        return body.decode("utf-8", "replace")
 
 
 def split_url(url):
@@ -308,7 +362,7 @@ def split_url(url):
                 else "")
         raise ValueError(
             f"`{url}`: {'no scheme' if not u.scheme else f'scheme `{u.scheme}`'}"
-            f" — a url target is http://…, https://… or "
+            f" — a url is http://…, https://… or "
             f"{UNIX_SCHEME}://[host]/path/to.sock//request/path{near}")
     if u.scheme == UNIX_SCHEME:
         socket, path = split_socket(u.path, url)
@@ -356,13 +410,17 @@ class Fleet:
                  doc_refresh=None):
         self.targets = list(targets)
         self.source = source
+        # Where the fleet ULTIMATELY came from, which `source` stops being
+        # after a refresh: it becomes "the `refresh` in …", and naming the
+        # next refresh against that would nest a level per re-ask.
+        self.origin = source
         self.unusable = list(unusable)
         # The `--cmd` with its placeholder still in it, where there was
         # one: `add host` needs something to reach a new host WITH.
         self.template = template
         self._how = how or {}
         # The envelope's own `refresh`, before precedence is applied.
-        self.doc_refresh = list(doc_refresh) if doc_refresh else None
+        self.doc_refresh = doc_refresh
         self.refresh = None
         self.refresh_source = None
 
@@ -374,8 +432,9 @@ class Fleet:
         the fleet and re-asking for it are allowed to be different
         commands, since the first can afford to be the expensive one."""
         if self.refresh:
-            fleet = from_resolver_argv(self.refresh, self.refresh_source)
+            fleet = self.refresh.ask(self.refresh_source)
             check(fleet.targets, fleet.source)
+            fleet.origin = self.origin
             return _apply_refresh(fleet, self._how)
         return resolve(**self._how)
 
@@ -395,6 +454,7 @@ class Fleet:
         is re-derived are unchanged by editing the set."""
         f = Fleet(targets, self.source, self.unusable, self.template,
                   self._how, self.doc_refresh)
+        f.origin = self.origin
         f.refresh, f.refresh_source = self.refresh, self.refresh_source
         return f
 
@@ -422,11 +482,8 @@ def parse(text, where):
             f"{where}: `v` is {doc.get('v')!r}, and this build speaks "
             f"{DOC_V!r}")
     refresh = doc.get("refresh")
-    if refresh is not None and not (isinstance(refresh, list) and refresh
-                                    and all(isinstance(x, str) for x in refresh)):
-        raise ValueError(
-            f"{where}: `refresh` is the command that re-derives this fleet, "
-            f"as a non-empty list of strings")
+    if refresh is not None:
+        refresh = Asker.from_member(refresh, where)
     listed = doc.get("targets")
     if not isinstance(listed, list):
         raise ValueError(f"{where}: `targets` is a list of objects")
@@ -529,6 +586,11 @@ def from_cmd_hosts(cmd, hosts, source):
 
 
 def from_file(path, source):
+    if URLISH.match(path):
+        raise ValueError(
+            f"{source} is a file; `{path}` is a url — that is `--resolver` "
+            f"/ $TIMBERFS_RESOLVER, which derives the fleet and so is what "
+            f"`refresh` asks again")
     try:
         with open(os.path.expanduser(path)) as f:
             text = f.read()
@@ -538,33 +600,95 @@ def from_file(path, source):
     return Fleet(targets, source, unusable, doc_refresh=refresh)
 
 
-def from_resolver(command, source):
-    """Run the resolver and read the fleet it prints."""
-    return from_resolver_argv(shlex.split(command), source)
+class Asker:
+    """How to ask for the fleet: a command to run, or a url to GET.
 
+    One type for all three places that hold the answer — `--resolver`,
+    `--refresh`, and the `refresh` a document carries — because they ask
+    the same question and a second copy of "command or url" would drift.
 
-def from_resolver_argv(argv, source):
-    """The same, from an argv already split — which is what a `refresh`
-    in the document carries, and what a `--refresh` becomes.
+    A resolver that failed is FATAL wherever it came from. Falling back to
+    a default would answer a question about one fleet with a different
+    one, and the empty case is worse still: a session that quietly asks
+    the local machine instead looks exactly like a fleet that held
+    nothing."""
 
-    A resolver that failed is FATAL. Falling back to a default would
-    answer a question about one fleet with a different one, and the
-    empty case is worse still: a session that quietly asks the local
-    machine instead looks exactly like a fleet that held nothing."""
-    if not argv:
-        raise ValueError(f"{source} is empty — there is no command to run")
-    try:
-        p = subprocess.run(argv, input=b"", capture_output=True)
-    except OSError as e:
-        raise ValueError(f"{source}: could not run {argv[0]!r}: {e}") from None
-    if p.returncode != 0:
-        why = p.stderr.decode("utf-8", "replace").strip()
-        raise ValueError(
-            f"{source} failed (exit {p.returncode})"
-            + (f":\n      " + "\n      ".join(why.splitlines()) if why else ""))
-    targets, unusable, refresh = parse(
-        p.stdout.decode("utf-8", "replace"), f"{source} ({argv[0]})")
-    return Fleet(targets, source, unusable, doc_refresh=refresh)
+    def __init__(self, argv=None, url=None):
+        self.argv = list(argv) if argv else None
+        self.url = url
+
+    @classmethod
+    def from_text(cls, value, source):
+        """A flag or an export, which is one string either way. A url is
+        recognised by its SCHEME, so a command can never be mistaken for
+        one — and something spelled like a url whose scheme this build
+        cannot dial is a url with a typo, not a program to run."""
+        if URLISH.match(value):
+            Endpoint(value)                 # its complaint, not "not found"
+            return cls(url=value)
+        argv = shlex.split(value)
+        # Named and empty is a mistake worth saying, not a silent
+        # fallback: the whole point of naming it is that it is not what
+        # would otherwise be asked.
+        if not argv:
+            raise ValueError(f"{source} names nothing to ask")
+        return cls(argv=argv)
+
+    @classmethod
+    def from_member(cls, value, where):
+        """The document's `refresh`, which is JSON and so says which it
+        is rather than being sniffed: `{"cmd": [...]}` or `{"url": "..."}`,
+        the same two words a target is reached by."""
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"{where}: `refresh` is how to ask for this fleet again — "
+                f'{{"cmd": [...]}} or {{"url": "..."}}, as a target is')
+        extra = sorted(set(value) - {"cmd", "url"})
+        if extra:
+            raise ValueError(f"{where}: `refresh` has unknown member(s) "
+                             f"{', '.join(extra)}")
+        cmd, url = value.get("cmd"), value.get("url")
+        if (cmd is None) == (url is None):
+            raise ValueError(
+                f"{where}: `refresh` names a `cmd` or a `url`, one of them")
+        if url is not None:
+            if not (isinstance(url, str) and url):
+                raise ValueError(f"{where}: `refresh` has a `url` that is "
+                                 f"not a non-empty string")
+            Endpoint(url)
+            return cls(url=url)
+        if not (isinstance(cmd, list) and cmd
+                and all(isinstance(x, str) for x in cmd)):
+            raise ValueError(f"{where}: `refresh` has a `cmd` that is not a "
+                             f"non-empty list of strings")
+        return cls(argv=cmd)
+
+    def describe(self):
+        return self.url if self.url else " ".join(self.argv)
+
+    def ask(self, source):
+        """The fleet, as this says to get it."""
+        if self.url:
+            return self._parsed(Endpoint(self.url).get(source), source,
+                                self.url)
+        try:
+            p = subprocess.run(self.argv, input=b"", capture_output=True)
+        except OSError as e:
+            raise ValueError(
+                f"{source}: could not run {self.argv[0]!r}: {e}") from None
+        if p.returncode != 0:
+            why = p.stderr.decode("utf-8", "replace").strip()
+            raise ValueError(
+                f"{source} failed (exit {p.returncode})"
+                + (":\n      " + "\n      ".join(why.splitlines()) if why
+                   else ""))
+        return self._parsed(p.stdout.decode("utf-8", "replace"), source,
+                            self.argv[0])
+
+    @staticmethod
+    def _parsed(text, source, what):
+        targets, unusable, refresh = parse(text, f"{source} ({what})")
+        return Fleet(targets, source, unusable, doc_refresh=refresh)
 
 
 def _apply_refresh(fleet, how):
@@ -573,22 +697,16 @@ def _apply_refresh(fleet, how):
     whatever produced the fleet. Same flag-beats-export precedence as
     everywhere else here, and `show hosts` says which won."""
     fleet._how = how
-    flag = how.get("refresh")
-    env = os.environ.get("TIMBERFS_REFRESH")
-    for value, source in ((flag, "--refresh"), (env, "$TIMBERFS_REFRESH")):
-        if not value:
-            continue
-        argv = shlex.split(value)
-        # Named and empty is a mistake worth saying, not a silent
-        # fallback to the resolver — the whole point of naming it is
-        # that the two commands are not the same.
-        if not argv:
-            raise ValueError(f"{source} names no command to re-derive with")
-        fleet.refresh, fleet.refresh_source = argv, source
-        return fleet
+    for value, source in ((how.get("refresh"), "--refresh"),
+                          (os.environ.get("TIMBERFS_REFRESH"),
+                           "$TIMBERFS_REFRESH")):
+        if value:
+            fleet.refresh = Asker.from_text(value, source)
+            fleet.refresh_source = source
+            return fleet
     if fleet.doc_refresh:
-        fleet.refresh = list(fleet.doc_refresh)
-        fleet.refresh_source = f"the `refresh` in {fleet.source}"
+        fleet.refresh = fleet.doc_refresh
+        fleet.refresh_source = f"the `refresh` in {fleet.origin}"
     return fleet
 
 
@@ -614,13 +732,14 @@ def resolve(resolver=None, targets=None, cmd=None, hosts=None, refresh=None):
             + " — they are three ways to say where the fleet is")
     env = os.environ
     if resolver:
-        fleet = from_resolver(resolver, "--resolver")
+        fleet = Asker.from_text(resolver, "--resolver").ask("--resolver")
     elif targets:
         fleet = from_file(targets, "--targets")
     elif cmd or hosts:
         fleet = from_cmd_hosts(cmd, hosts, "--cmd/--hosts")
     elif env.get("TIMBERFS_RESOLVER"):
-        fleet = from_resolver(env["TIMBERFS_RESOLVER"], "$TIMBERFS_RESOLVER")
+        fleet = Asker.from_text(env["TIMBERFS_RESOLVER"],
+                                "$TIMBERFS_RESOLVER").ask("$TIMBERFS_RESOLVER")
     elif env.get("TIMBERFS_TARGETS"):
         fleet = from_file(env["TIMBERFS_TARGETS"], "$TIMBERFS_TARGETS")
     elif env.get("TIMBERFS_CMD") or env.get("TIMBERFS_HOSTS"):

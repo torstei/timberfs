@@ -43,7 +43,7 @@ The document a resolver prints, and the file that holds the same thing:
 .RS
 .EX
 {"v": "1.0-EXPERIMENTAL",
- "refresh": ["fleet-sweep", "--cached"],
+ "refresh": {"cmd": ["fleet-sweep", "--cached"]},
  "targets": [
    {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
    {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
@@ -171,23 +171,60 @@ must not read as a host that had nothing.
 The resolver is asked ONE question, what the fleet is, and gets no
 arguments.
 .B refresh
-asks again, because a resolver derives its answer \(em by default with
-the command that produced the fleet, and otherwise with the one named by
+asks again, because a resolver derives its answer \(em by default the way
+the fleet was produced, and otherwise as named by
 .BR \-\-refresh ,
 .BR $TIMBERFS_REFRESH ,
 or the document's own
 .BR refresh ,
 in that order. Getting the fleet and re-asking for it may cost different
 amounts \(em a full sweep to open a session with, a cheap one to re-ask
-\(em so they are allowed to be different commands. A document's
+\(em so they are allowed to be different. A document's
 .B refresh
 applies to the fleet it arrived with: a refresh whose document names none
 of its own leaves the next one re-running whatever produced the fleet
 originally.
+.PP
+A RESOLVER is a command or a url, and
+.B \-\-refresh
+is too. A flag and an export are one string either way, so a url is told
+from a command by its SCHEME \(em a command is a program name or a path,
+and neither can carry one:
+.PP
+.RS
+.EX
+TIMBERFS_RESOLVER='fleet-sweep --json'
+TIMBERFS_RESOLVER=https://fleet.internal/timberfs/targets
+TIMBERFS_RESOLVER=unix+http:///run/timberfs-agent.sock//fleet
+.EE
+.RE
+.PP
+A resolver is asked ONE question and gets no arguments, so a url one is a
+GET \(em where a target, which is handed a document, is a POST. A
+resolver that failed is fatal whichever it is; a non-2xx carries the body
+as the reason, being the only channel a url has. Something spelled like a
+url whose scheme this build cannot dial is a url with a TYPO, and says
+so, rather than being run as a program.
+.PP
+The document's
+.B refresh
+says which it is rather than being sniffed, JSON having somewhere to put
+that:
+.B {"cmd": [...]}
+or
+.BR {"url":\ "..."} ,
+the same two words a target is reached by.
+.PP
+⚠
+.B \-\-targets
+stays a FILE. A url DERIVES its answer, which is what makes
+.B refresh
+worth asking again; a file is a thing you edit.
 .SH OPTIONS
 .TP
-.BI \-\-resolver " CMD"
-A command that prints the fleet as a target document.
+.BI \-\-resolver " CMD|URL"
+A command that prints the fleet as a target document, or a url to GET it
+from \(em told apart by the url's scheme.
 .RB ( $TIMBERFS_RESOLVER )
 .TP
 .BI \-\-targets " FILE"
@@ -207,10 +244,10 @@ works \(em a wrapper,
 a container exec.
 .RB ( $TIMBERFS_CMD )
 .TP
-.BI \-\-refresh " CMD"
-The command
+.BI \-\-refresh " CMD|URL"
+How
 .B refresh
-re-derives the fleet with, where that is not the one that produced it. It
+re-derives the fleet, where that is not how it was produced. It
 is not a fourth way to say where the fleet is, so it does not join the
 one-of-three rule above.
 .RB ( $TIMBERFS_REFRESH ;

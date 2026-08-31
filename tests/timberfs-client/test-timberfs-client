@@ -66,6 +66,12 @@ def doc(*targets, refresh=None):
     return json.dumps(d)
 
 
+def fleet_server(seen, body):
+    """A resolver over HTTP: a GET answers the fleet document."""
+    seen.reply = body.encode()
+    return seen
+
+
 # ------------------------------------------------------------- a server
 class Seen:
     """What the last request carried, so a test can assert on the wire
@@ -85,6 +91,14 @@ def handler_for(seen):
 
         def log_message(self, *a):
             pass
+
+        def do_GET(self):
+            seen.method, seen.path = self.command, self.path
+            seen.host = self.headers.get("Host")
+            self.send_response(seen.status)
+            self.send_header("Content-Length", str(len(seen.reply)))
+            self.end_headers()
+            self.wfile.write(seen.reply)
 
         def do_POST(self):
             seen.method, seen.path = self.command, self.path
@@ -584,7 +598,7 @@ def a_document_can_name_the_command_that_re_derives_it():
         open(f"{d}/next.json", "w").write(doc({"name": "two", "cmd": ["y"]}))
         f = os.path.join(d, "t.json")
         open(f, "w").write(doc({"name": "one", "cmd": ["x"]},
-                               refresh=["cat", f"{d}/next.json"]))
+                               refresh={"cmd": ["cat", f"{d}/next.json"]}))
         fleet = fc.resolve(targets=f)
         assert fleet.names == ["one"]
         assert "the `refresh` in --targets" == fleet.refresh_source
@@ -602,7 +616,7 @@ def the_refresh_in_force_is_the_most_explicit_one():
                 doc({"name": who, "cmd": ["x"]}))
         f = os.path.join(d, "t.json")
         open(f, "w").write(doc({"name": "one", "cmd": ["x"]},
-                               refresh=["cat", f"{d}/in-doc.json"]))
+                               refresh={"cmd": ["cat", f"{d}/in-doc.json"]}))
         assert fc.resolve(targets=f).again().names == ["in-doc"]
         os.environ["TIMBERFS_REFRESH"] = f"cat {d}/export.json"
         assert fc.resolve(targets=f).again().names == ["export"]
@@ -637,7 +651,7 @@ def a_refresh_named_with_no_command_in_it_is_a_mistake():
             fc.resolve(targets=f, refresh="   ")
             raise AssertionError("accepted an empty --refresh")
         except ValueError as e:
-            assert "names no command" in str(e), str(e)
+            assert "names nothing to ask" in str(e), str(e)
 
 
 @test
@@ -657,13 +671,135 @@ def a_refresh_that_failed_is_fatal_like_a_resolver_that_failed():
 
 
 @test
-def a_malformed_refresh_member_is_named_like_a_malformed_cmd():
-    for bad in ("fleet-sweep --cached", [], ["sweep", 3]):
+def a_malformed_refresh_member_is_named_like_a_malformed_target():
+    """It says which it is rather than being sniffed, so the same two
+    words a target is reached by mean the same two things here."""
+    for bad, want in (
+            ("fleet-sweep --cached", "as a target is"),
+            (["fleet-sweep"], "as a target is"),
+            ({}, "one of them"),
+            ({"cmd": ["x"], "url": "http://h/f"}, "one of them"),
+            ({"cmd": ["sweep", 3]}, "non-empty list of strings"),
+            ({"url": ""}, "not a non-empty string"),
+            ({"url": "quic://h/f"}, "scheme `quic`"),
+            ({"cmd": ["x"], "when": "often"}, "unknown member(s) when")):
         try:
             fc.parse(doc({"name": "h", "cmd": ["x"]}, refresh=bad), "test")
             raise AssertionError(f"accepted refresh {bad!r}")
         except ValueError as e:
-            assert "non-empty list of strings" in str(e), str(e)
+            assert want in str(e), f"{bad!r} -> {e}"
+
+
+# ------------------------------------------------------- a url resolver
+@test
+def a_resolver_may_be_a_url_and_is_told_from_a_command_by_its_scheme():
+    """A flag and an export are one string either way, so the scheme is
+    what separates them — a command is a program name or a path, and
+    neither can carry one. A resolver is asked ONE question and gets no
+    arguments, so a url one is a GET."""
+    seen = Seen()
+    with tcp_server(seen) as base, env():
+        seen.reply = doc({"name": "over-http", "cmd": ["x"]}).encode()
+        f = fc.resolve(resolver=base + "/timberfs/targets")
+        assert f.names == ["over-http"], f.names
+        assert f.source == "--resolver"
+        assert seen.method == "GET", seen.method
+        assert seen.path == "/timberfs/targets", seen.path
+        # And from the export, which is the shape a profile carries.
+        os.environ["TIMBERFS_RESOLVER"] = base + "/timberfs/targets"
+        assert fc.resolve().source == "$TIMBERFS_RESOLVER"
+
+
+@test
+def a_url_resolver_reaches_a_unix_socket_too():
+    """The case the url format exists for: a local agent that derives the
+    fleet, with no port and no command to wrap it in."""
+    seen = Seen()
+    with tmp() as d, env():
+        sock = os.path.join(d, "agent.sock")
+        with unix_server(seen, sock):
+            seen.reply = doc({"name": "from-the-agent", "cmd": ["x"]}).encode()
+            f = fc.resolve(resolver=f"unix+http://fleet.local{sock}//fleet")
+            assert f.names == ["from-the-agent"], f.names
+            assert (seen.method, seen.path) == ("GET", "/fleet"), seen.method
+            assert seen.host == "fleet.local", seen.host
+
+
+@test
+def a_url_resolver_that_failed_is_fatal_with_the_bodys_reason():
+    """Same rule as a command that exited non-zero, and for the same
+    reason: being wrong about what the fleet IS makes every later answer
+    describe the wrong thing. A url has no stderr, so the body is it."""
+    seen = Seen()
+    with tcp_server(seen) as base, env():
+        seen.status, seen.reply = 503, b"the registry is not answering"
+        try:
+            fc.resolve(resolver=base + "/fleet")
+            raise AssertionError("survived a failing url resolver")
+        except ValueError as e:
+            assert "HTTP 503" in str(e) and "registry" in str(e), str(e)
+    with env():
+        try:
+            fc.resolve(resolver="http://127.0.0.1:1/fleet")
+            raise AssertionError("survived an unreachable url resolver")
+        except ValueError as e:
+            assert "could not reach" in str(e), str(e)
+
+
+@test
+def a_url_with_a_scheme_this_build_cannot_dial_is_not_run_as_a_command():
+    """It is a url with a typo, not a program, and reporting it as
+    `could not run 'quic://…'` would send the reader looking for a
+    binary. Same for a `--targets` handed a url: that one is a file."""
+    with env():
+        for bad, want in ((("--resolver", "quic://fleet/x"), "scheme `quic`"),
+                          (("--targets", "https://fleet/x"), "is a file")):
+            try:
+                fc.resolve(**{bad[0].lstrip("-"): bad[1]})
+                raise AssertionError(f"accepted {bad}")
+            except ValueError as e:
+                assert want in str(e), f"{bad} -> {e}"
+
+
+@test
+def a_refresh_does_not_nest_its_own_name_once_per_re_ask():
+    """After a refresh the fleet's SOURCE is "the `refresh` in X", and
+    naming the next one against that would read "the `refresh` in the
+    `refresh` in X", a level deeper every time. The origin is what the
+    document's member is named against."""
+    with tmp() as d, env():
+        f = os.path.join(d, "t.json")
+        body = doc({"name": "one", "cmd": ["x"]},
+                   refresh={"cmd": ["cat", f]})
+        open(f, "w").write(body)
+        os.environ["TIMBERFS_TARGETS"] = f
+        fleet = fc.resolve()
+        want = "the `refresh` in $TIMBERFS_TARGETS"
+        assert fleet.refresh_source == want, fleet.refresh_source
+        for _ in range(3):
+            fleet = fleet.again()
+            assert fleet.refresh_source == want, fleet.refresh_source
+            assert fleet.source == want, fleet.source
+
+
+@test
+def a_refresh_may_be_a_url_from_any_of_the_three_places():
+    """The flag, the export and the document's own member — the same
+    precedence as before, now over both kinds of asker."""
+    seen = Seen()
+    with tmp() as d, tcp_server(seen) as base, env():
+        seen.reply = doc({"name": "refetched", "cmd": ["x"]}).encode()
+        f = os.path.join(d, "t.json")
+        open(f, "w").write(doc({"name": "one", "cmd": ["x"]},
+                               refresh={"url": base + "/fleet"}))
+        fleet = fc.resolve(targets=f)
+        assert fleet.refresh.describe() == base + "/fleet"
+        assert fleet.again().names == ["refetched"], "from the document"
+        os.environ["TIMBERFS_REFRESH"] = base + "/fleet"
+        assert fc.resolve(targets=f).again().names == ["refetched"]
+        assert fc.resolve(targets=f).refresh_source == "$TIMBERFS_REFRESH"
+        assert fc.resolve(targets=f, refresh=base + "/fleet"
+                          ).refresh_source == "--refresh"
 
 
 def main():

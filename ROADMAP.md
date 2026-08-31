@@ -377,9 +377,13 @@ here.
   means deciding what a timberfs server puts on the wire, which is the
   read-only-serve entry above and stays open. Nothing here serves such a
   URL; these are clients for endpoints that already exist.
-  Re-deriving the fleet is its own command where it needs to be
-  (`--refresh`, `$TIMBERFS_REFRESH`, the document's `refresh`), since a full
-  sweep to open a session with and a cheap re-ask are not the same call.
+  A RESOLVER is a command or a url too, told apart by the scheme, and asked
+  with a GET since it takes no arguments — so a local agent that derives the
+  fleet needs no command wrapped around it. Re-deriving is its own asker
+  where it needs to be (`--refresh`, `$TIMBERFS_REFRESH`, the document's
+  `refresh`, each a `cmd` or a `url`), since a full sweep to open a session
+  with and a cheap re-ask are not the same call. `--targets` stays a file: a
+  url derives its answer, a file is a thing you edit.
   What remains is the other half of DNS — "who has this store",
   deliberately not designed yet, since broadcast is fine at the measured
   fleet. Design note: [docs/plans/view.md](docs/plans/view.md).

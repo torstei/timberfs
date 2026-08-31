@@ -42,6 +42,15 @@ something else again at the far end.
 
 `--help` lists the flags; each has an environment variable beside it.
 
+  TIMBERFS_RESOLVER
+                 a command that prints the fleet as a target document,
+                 or a url to GET it from:
+
+                   TIMBERFS_RESOLVER='fleet-sweep --json'
+                   TIMBERFS_RESOLVER=https://fleet.internal/targets
+                   TIMBERFS_RESOLVER=unix+http:///run/agent.sock//fleet
+
+                 A url is told from a command by its SCHEME.
   TIMBERFS_CMD   argv prefix, default `timberfs query --query -`
   TIMBERFS_HOSTS comma-separated hosts to fan out to. Every occurrence of
                  _TIMBERHOST_ in TIMBERFS_CMD is replaced with the host:
@@ -59,8 +68,9 @@ something else again at the far end.
                  remembers where it lives. Unset, there is one unnamed host
                  and nothing is substituted.
   TIMBERFS_REFRESH
-                 the command `refresh` re-derives the fleet with, where
-                 that is not the one that produced it
+                 how `refresh` re-derives the fleet, where that is not
+                 how it was produced. A command or a url, like the
+                 resolver
   TIMBERSH_RC    statements run at startup, default ~/.timbershrc
   TIMBERSH_HISTFILE
                  line history, default ~/.timbersh-history, mode 0600
@@ -1334,7 +1344,7 @@ class Shell:
                 # Getting the fleet and re-asking for it are allowed to be
                 # different commands, so which one `refresh` runs is not
                 # derivable from where the fleet came from.
-                print(f"  refresh runs {' '.join(FLEET.refresh)}"
+                print(f"  refresh asks {FLEET.refresh.describe()}"
                       f"   ({FLEET.refresh_source})")
             for name, why in FLEET.unusable:
                 print(f"  ⚠ {label(name)} was not asked: {why}")
@@ -2059,9 +2069,10 @@ def parse_args(argv):
                "one local `timberfs query --query -`. `show hosts;` says which won.\n"
                "\n"
                "Inside the shell, `\\?` prints the statement syntax.")
-    ap.add_argument("--resolver", metavar="CMD",
+    ap.add_argument("--resolver", metavar="CMD|URL",
                     help="a command that prints the fleet as a target "
-                         "document. $TIMBERFS_RESOLVER")
+                         "document, or a url to GET it from — told apart by "
+                         "the url's scheme. $TIMBERFS_RESOLVER")
     ap.add_argument("--targets", metavar="FILE",
                     help="the same document, from a file. $TIMBERFS_TARGETS; "
                          "else ~/.config/timberfs/targets.json, else "
@@ -2072,11 +2083,12 @@ def parse_args(argv):
                          "`timberfs query --query -`. $TIMBERFS_CMD")
     ap.add_argument("--hosts", metavar="H,H",
                     help="the hosts that command reaches. $TIMBERFS_HOSTS")
-    ap.add_argument("--refresh", metavar="CMD",
-                    help="the command `refresh` re-derives the fleet with, "
-                         "where that is not the one that produced it. "
-                         "$TIMBERFS_REFRESH; else the document's `refresh`; "
-                         "else whatever produced the fleet")
+    ap.add_argument("--refresh", metavar="CMD|URL",
+                    help="how `refresh` re-derives the fleet, where that is "
+                         "not how it was produced — a command, or a url to "
+                         "GET it from. $TIMBERFS_REFRESH; else the "
+                         "document's `refresh`; else whatever produced the "
+                         "fleet")
     ap.add_argument("--rc", metavar="FILE", default=RC,
                     help="statements run at startup. $TIMBERSH_RC")
     ap.add_argument("--page", metavar="N", type=int, default=PAGE,

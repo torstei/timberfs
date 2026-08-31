@@ -2647,13 +2647,14 @@ def main(argv=None):
                f"{SCHEME}: address.\nWith none, the first store is opened "
                "at its last chunk; S switches.")
     ap.add_argument("target", metavar="TARGET", nargs="?")
-    ap.add_argument("--resolver", metavar="CMD",
+    ap.add_argument("--resolver", metavar="CMD|URL",
                     help="a command that prints the fleet as a target "
-                         "document. $TIMBERFS_RESOLVER")
-    ap.add_argument("--refresh", metavar="CMD",
-                    help="the command that re-derives the fleet, where that "
-                         "is not the one that produced it. $TIMBERFS_REFRESH; "
-                         "else the document's `refresh`")
+                         "document, or a url to GET it from. "
+                         "$TIMBERFS_RESOLVER")
+    ap.add_argument("--refresh", metavar="CMD|URL",
+                    help="how the fleet is re-derived, where that is not how "
+                         "it was produced. $TIMBERFS_REFRESH; else the "
+                         "document's `refresh`")
     ap.add_argument("--targets", metavar="FILE",
                     help="the same document, from a file. $TIMBERFS_TARGETS; "
                          "else ~/.config/timberfs/targets.json, else "

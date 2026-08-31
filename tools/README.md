@@ -66,9 +66,9 @@ export for one session and nothing else:
 
 | flag | variable | |
 |---|---|---|
-| `--resolver` | `TIMBERFS_RESOLVER` | a command that prints the fleet — see below |
+| `--resolver` | `TIMBERFS_RESOLVER` | a command that prints the fleet, or a url to GET it from |
 | `--targets` | `TIMBERFS_TARGETS` | the same document, from a file |
-| `--refresh` | `TIMBERFS_REFRESH` | the command `refresh` re-derives the fleet with |
+| `--refresh` | `TIMBERFS_REFRESH` | how `refresh` re-derives the fleet — a command or a url |
 | `--cmd` | `TIMBERFS_CMD` | one command reaching every host, with `_TIMBERHOST_` substituted |
 | `--hosts` | `TIMBERFS_HOSTS` | the hosts that command reaches |
 | `--rc` | `TIMBERSH_RC` | statements run at startup |
@@ -214,7 +214,7 @@ The document a resolver prints, and the file that holds the same thing:
 
 ```json
 {"v": "1.0-EXPERIMENTAL",
- "refresh": ["fleet-sweep", "--cached"],
+ "refresh": {"cmd": ["fleet-sweep", "--cached"]},
  "targets": [
    {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
    {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
@@ -307,14 +307,43 @@ one local `timberfs query --query -`          found on PATH
 
 **And how it is asked AGAIN.** Getting the fleet and re-asking for it may
 cost different amounts — a full sweep to open a session with, a cheap one to
-re-ask — so they are allowed to be different commands:
+re-ask — so they are allowed to be different:
 
 ```
---refresh CMD
+--refresh CMD|URL
 $TIMBERFS_REFRESH
 the document's `refresh`
 otherwise: whatever produced the fleet
 ```
+
+### A resolver may be a url too
+
+`--resolver` and `$TIMBERFS_RESOLVER` take either, and so does `--refresh`:
+
+```sh
+TIMBERFS_RESOLVER='fleet-sweep --json'
+TIMBERFS_RESOLVER=https://fleet.internal/timberfs/targets
+TIMBERFS_RESOLVER=unix+http:///run/timberfs-agent.sock//fleet
+```
+
+A flag and an export are one string either way, so a url is told from a
+command by its **scheme** — a command is a program name or a path, and
+neither can carry one. Something spelled like a url whose scheme this build
+cannot dial is a url with a typo, and says so, rather than being run as a
+program and reported as `could not run 'quic://…'`.
+
+A resolver is asked **one** question and gets no arguments, so a url one is a
+**GET**; a target, which is handed a document, is a POST. A resolver that
+failed is fatal whichever it is — a non-2xx carries the body as the reason,
+being the only channel a url has.
+
+The document's `refresh` says which it is rather than being sniffed, JSON
+having somewhere to put that — `{"cmd": [...]}` or `{"url": "..."}`, the same
+two words a target is reached by.
+
+⚠ **`--targets` stays a FILE.** A url *derives* its answer, which is what
+makes `refresh` worth asking again; a file is a thing you edit. Handing a url
+to `--targets` says so and points at `--resolver`.
 
 `--refresh` is not a fourth way to say where the fleet is, so it does not
 join the one-of-three rule above: it answers a different question and may

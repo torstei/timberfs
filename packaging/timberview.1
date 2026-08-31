@@ -30,9 +30,10 @@ address. With none, the first store is opened and
 switches between the rest.
 .SH OPTIONS
 .TP
-.BI \-\-resolver " CMD"
-A command that prints the fleet as a target document \(em a name and the
-way to reach it, per target: an argv to run, or a
+.BI \-\-resolver " CMD|URL"
+A command that prints the fleet as a target document, or a url to GET it
+from. The document is a name and the way to reach it, per target: an argv
+to run, or a
 .B url
 to POST the document to \(em
 .BR http:// ,
@@ -49,9 +50,8 @@ in.
 The same document, from a file.
 .RB ( $TIMBERFS_TARGETS )
 .TP
-.BI \-\-refresh " CMD"
-The command that re-derives the fleet, where that is not the one that
-produced it.
+.BI \-\-refresh " CMD|URL"
+How the fleet is re-derived, where that is not how it was produced.
 .RB ( $TIMBERFS_REFRESH ;
 then the document\(aqs
 .BR refresh )
