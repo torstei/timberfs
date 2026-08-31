@@ -262,6 +262,40 @@ def a_tail_keeps_up_with_a_store_stamped_ahead_of_the_clock():
         f"an entry came back twice:\n{s.plain[-800:]}"
     s.cleanup()
 
+
+@test
+def a_store_stamped_ahead_cannot_starve_the_ones_beside_it():
+    """The tail asked every host the SAME document and advanced its window
+    from whichever answered — so one store's clock chose where every other
+    store was read from next, and the skewed host silenced its neighbour
+    as thoroughly as itself.
+
+    A position is per store, so each now resumes from its own."""
+    now = int(time.time() * 1000)
+
+    def entries(sid, skew, upto):
+        return [{"id": sid, "text": f"{sid[:1]} line {i}", "offset": i * 100,
+                 "wf": now + i * 1000, "ts": now + skew + i * 1000}
+                for i in range(1, upto + 1)]
+
+    def host(name, sid, skew):
+        return {"stores": [store(name, sid)],
+                "sequence": [{"records": entries(sid, skew, n)}
+                             for n in (1, 2, 3)]}
+
+    s = Pty({"ontime": host("ontime", ID_A, 0),
+             "ahead": host("ahead", ID_B, 2 * 3600 * 1000)},
+            hosts=["ontime", "ahead"]).start()
+    s.expect("timberfs=#")
+    s.send("tail records from [];\n")
+    # Both, and in neither order: each store is waited for on its own,
+    # which is the isolation being asserted.
+    s.expect("a line 3").expect("b line 3")
+    s.send("\x03")
+    s.expect("stopped")
+    s.finish()
+    s.cleanup()
+
 @test
 def an_incoherent_axis_never_reaches_a_host():
     """`written since` cannot answer with loglines, and nine hosts each
