@@ -134,18 +134,57 @@ elif kind == "stores":
         print(json.dumps({"server_version": me.get("version", "timberfs, 0.25.0"),
                           "stores": stores}))
 elif kind == "records":
+    entries = me.get("records", [])
+    win = doc.get("window") or {}
+    cursor = {c["id"]: c["offset"] for c in doc.get("cursor", []) if "offset" in c}
+
+    def delivered(e):
+        """What a real server would still have to send.
+
+        The two clocks are kept apart on purpose: a chunk is SELECTED on
+        the write clock (widened a minute) and an entry then FILTERED on
+        the one its line carries, so a window chasing stamps that run
+        ahead of the writes selects no chunk at all. A position beats
+        both, being a place rather than a time."""
+        if "offset" in e and e["id"] in cursor:
+            return e["offset"] > cursor[e["id"]]
+        if "from" in win:
+            if "wf" in e and e["wf"] < win["from"] - 60_000:
+                return False
+            if "ts" in e and e["ts"] < win["from"]:
+                return False
+        return True
+
+    entries = [e for e in entries if delivered(e)]
+    # Every store EXAMINED reports one, and a store that delivered
+    # nothing reports where it was resumed from. Scripted `positions`
+    # win, so a scenario that says nothing about offsets gets none.
+    positions = me.get("positions")
+    if positions is None and any("offset" in e for e in me.get("records", [])):
+        positions = []
+        for s in me.get("stores", []):
+            seen = [e["offset"] for e in entries
+                    if e["id"] == s["id"] and "offset" in e]
+            off = max(seen) if seen else cursor.get(s["id"])
+            positions.append({"id": s["id"],
+                              **({"offset": off} if off is not None else {})})
     out = [f"\x1estream-start\x1fv=1\x1fserver_version={me.get('version', 'timberfs, 0.25.0')}"
            f"\x1forder=sequential\x1fsources={len(me.get('stores', []))}\0"]
     for s in me.get("stores", []):
         out.append(f"\x1esource\x1fpath=/l/{s['name']}.log\x1fid={s['id']}"
                    f"\x1fkept=1\x1ftotal=1\0")
-    for e in me.get("records", []):
-        out.append(f"\x1eentry\x1flen={len(e['text'])}\x1fid={e['id']}\0{e['text']}\0")
-    for p in me.get("positions", []):
+    for e in entries:
+        # Whatever the entry knows about itself, as a real one carries it:
+        # a consumer that reads the stamp is a consumer this can mislead.
+        said = "".join(f"\x1f{k}={e[k]}" for k in ("ts", "wf", "offset")
+                       if k in e)
+        out.append(f"\x1eentry\x1flen={len(e['text'])}\x1fid={e['id']}"
+                   f"{said}\0{e['text']}\0")
+    for p in (positions or []):
         off = f"\x1foffset={p['offset']}" if "offset" in p else ""
         out.append(f"\x1eposition\x1fpath=/l/x.log\x1fid={p['id']}{off}"
                    f"\x1fchunks_read=1\x1fchunks_selected=1\0")
-    out.append(f"\x1estream-end\x1fentries={len(me.get('records', []))}"
+    out.append(f"\x1estream-end\x1fentries={len(entries)}"
                f"\x1fstatus={me.get('status', 'exhausted')}\0")
     sys.stdout.write("".join(out))
 else:

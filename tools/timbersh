@@ -197,6 +197,10 @@ HELP = """
     entry. Only `records` can -- it is the kind that carries the offset
     a line needs to say where it came from.
 
+    `tail` does not end. It resumes from the position each answer
+    reports, so nothing arrives twice and no clock the lines carry can
+    move where the next poll reads from.
+
     <kind>    records | loglines | stores | chunks
     <source>  a view name, or a predicate literal like [type=console].
               [] is the EMPTY predicate, and an empty predicate is every
@@ -1970,19 +1974,31 @@ class Shell:
         show_stores(got, unreachable=bad)
 
     def tail(self, doc):
-        """The ONE statement with no document behind it: a poll loop. By
-        TIMESTAMP, which is inexact at a chunk boundary — the cursor in
-        docs/plans/paging.md is what makes it exact."""
-        print("  tailing (ctrl-c to stop).  ⚠ polling by timestamp: at a chunk"
-              "\n  boundary this can duplicate or miss. The cursor fixes that.")
+        """A poll loop, resumed by POSITION.
+
+        Every answer says where each store it examined got to, and the
+        next request hands those back — the same cursor `fetch` pages
+        with. The window's `from` is set once, from THIS machine's clock,
+        and never moves: it bounds a store that has no position yet, and
+        nothing else.
+
+        ⚠ Never advance it by the entries' own timestamps. One store
+        stamped ahead of the clock — a log read in the wrong zone, a
+        skewed writer — then asks for a window that has not happened, and
+        every store on every host goes silent until the clock catches up.
+        A position is a place on the tape, which no clock moves."""
+        print("  tailing (ctrl-c to stop).")
         doc = dict(doc, response_format={"kind": "records"})
-        seen = doc.get("window", {}).get("from", when(time.strftime("%H:%M")))
+        window = dict(doc.get("window") or {"axis": "logline"})
+        window.setdefault("from", when(time.strftime("%H:%M")))
+        doc = dict(doc, window=window)
+        at = {}
         # Said once per host per outage, not once per poll.
         complained = {}
         try:
             while True:
-                d = dict(doc, window=dict(doc.get("window", {"axis": "logline"}),
-                                          **{"from": seen}))
+                d = dict(doc, cursor=list(at.values())) if at else doc
+                more = False
                 for host in TARGETS:
                     out, err, rc = self.ask(d, host)
                     if rc != 0:
@@ -1995,12 +2011,15 @@ class Shell:
                         if kind == "source":
                             self.names[f.get("id", "?")] = os.path.basename(
                                 f.get("path", "?"))
-                        elif kind == "entry" and int(f.get("ts", 0)) >= seen:
+                        elif kind == "entry":
                             who = self.names.get(f.get("id", ""), "")
                             where = f"{label(host)} " if len(TARGETS) > 1 else ""
                             print(f"  {where}{who:28} {(payload or '').rstrip()}")
-                            seen = max(seen, int(f.get("ts", 0)) + 1)
-                time.sleep(2)
+                    more |= self.next_page(out, at)
+                # A bound stopped one of them: there is already more than
+                # one answer's worth waiting, so ask again now.
+                if not more:
+                    time.sleep(2)
         except KeyboardInterrupt:
             print("\n  stopped.")
 

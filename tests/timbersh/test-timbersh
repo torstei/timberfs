@@ -224,6 +224,44 @@ def store(name, sid, **labels):
             "retain_unconsumed": False, "rings_bytes": 100}
 
 
+
+@test
+def a_tail_keeps_up_with_a_store_stamped_ahead_of_the_clock():
+    """A tail printed one burst and then went silent while the store kept
+    filling — reported against a production store read in the wrong zone,
+    where every entry is stamped two hours ahead.
+
+    The poll advanced its window to the last entry's own timestamp, and
+    no chunk is written in the future, so every store on every host went
+    quiet together. It resumes from a position now."""
+    now = int(time.time() * 1000)
+    ahead = now + 2 * 3600 * 1000
+
+    def entry(i):
+        return {"id": ID_A, "text": f"line {i}", "offset": i * 100,
+                "wf": now + i * 1000, "ts": ahead + i * 1000}
+
+    s = Pty({"": {"stores": [store("app", ID_A)],
+                  "sequence": [{"records": [entry(1)]},
+                               {"records": [entry(1), entry(2)]},
+                               {"records": [entry(1), entry(2), entry(3)]}]}}
+            ).start()
+    s.expect("timberfs=#")
+    s.send("tail records from [];\n")
+    s.expect("line 3")
+    s.send("\x03")
+    s.expect("stopped")
+    s.finish()
+    docs = s.docs("records")
+    assert len(docs) >= 3, docs
+    assert all("cursor" in d for d in docs[1:]), \
+        f"a poll that carried no position: {docs}"
+    assert len({d["window"]["from"] for d in docs}) == 1, \
+        f"the window followed the entries' clock: {[d['window'] for d in docs]}"
+    assert s.plain.count("line 1") == 1, \
+        f"an entry came back twice:\n{s.plain[-800:]}"
+    s.cleanup()
+
 @test
 def an_incoherent_axis_never_reaches_a_host():
     """`written since` cannot answer with loglines, and nine hosts each

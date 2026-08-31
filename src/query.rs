@@ -1141,14 +1141,23 @@ fn query_entries<W: Write>(
         let s = &mut srcs[i];
         let c = s.chunks[s.pos].1;
         s.pos += 1;
-        let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
-            continue; // retained away by a race between selection and read
-        };
         // Resume: a chunk wholly before the position holds nothing new,
         // and the one the position lands in is entered part-way. Byte
         // exact, where a timestamp cannot tell two entries of the same
         // second apart — which is why a position is an offset at all.
+        //
+        // The index carries the span, so a chunk the position is past is
+        // skipped without decompressing it — what a poll resuming from a
+        // cursor rests on.
         let chunk_base = s.dropped_bytes + c.uncomp_start;
+        if s.resume_at
+            .is_some_and(|at| at >= chunk_base + c.uncomp_len)
+        {
+            continue;
+        }
+        let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
+            continue; // retained away by a race between selection and read
+        };
         let (data, base) = match s.resume_at {
             Some(at) if at >= chunk_base + data.len() as u64 => continue,
             Some(at) if at > chunk_base => (&data[(at - chunk_base) as usize..], at),
@@ -4111,6 +4120,34 @@ mod paging_tests {
         }
         let want: Vec<String> = (1..=6).map(|i| format!("page entry {i}")).collect();
         assert_eq!(seen, want, "every entry once, in order");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A resumed read does not open what it has already delivered — what
+    /// a poll resuming from a cursor rests on, since its window stays
+    /// open behind it. Checked by SCRIBBLING over the compressed bytes
+    /// below the cursor: a read that decompressed them could not answer.
+    #[test]
+    fn a_cursor_skips_what_is_below_it_without_decompressing_it() {
+        use std::io::Write;
+        let lines: Vec<(String, u64)> = (1..=20).map(|i| (format!("line {i}"), i)).collect();
+        let refs: Vec<(&str, u64)> = lines.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        let d = store_of("cursorskip", &refs);
+        let files = [d.join("app.log")];
+        let cursor = cursor_of(&read(&files, &Default::default(), Some(10)));
+        assert!(!cursor.is_empty(), "no position to resume from");
+
+        let cut = open_source(&files[0]).unwrap().records[10].comp_start;
+        assert!(cut > 0, "nothing below the cursor to scribble over");
+        let mut trunk = std::fs::OpenOptions::new()
+            .write(true)
+            .open(crate::format::trunk_path(&d, "app.log"))
+            .unwrap();
+        trunk.write_all(&vec![0xff; cut as usize]).unwrap();
+        trunk.sync_all().unwrap();
+
+        let want: Vec<String> = (11..=20).map(|i| format!("line {i}")).collect();
+        assert_eq!(bodies(&read(&files, &cursor, None)), want);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
