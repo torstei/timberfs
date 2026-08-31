@@ -2647,9 +2647,14 @@ def main(argv=None):
                f"{SCHEME}: address.\nWith none, the first store is opened "
                "at its last chunk; S switches.")
     ap.add_argument("target", metavar="TARGET", nargs="?")
-    ap.add_argument("--resolver", metavar="CMD",
+    ap.add_argument("--resolver", metavar="CMD|URL",
                     help="a command that prints the fleet as a target "
-                         "document. $TIMBERFS_RESOLVER")
+                         "document, or a url to GET it from. "
+                         "$TIMBERFS_RESOLVER")
+    ap.add_argument("--refresh", metavar="CMD|URL",
+                    help="how the fleet is re-derived, where that is not how "
+                         "it was produced. $TIMBERFS_REFRESH; else the "
+                         "document's `refresh`")
     ap.add_argument("--targets", metavar="FILE",
                     help="the same document, from a file. $TIMBERFS_TARGETS; "
                          "else ~/.config/timberfs/targets.json, else "
@@ -2666,7 +2671,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     try:
-        fleet = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts)
+        fleet = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts,
+                                        a.refresh)
     except ValueError as e:
         sys.exit(f"timberview: {e}")
     for name, why in fleet.unusable:
@@ -2677,14 +2683,8 @@ def main(argv=None):
         t = fleet.by_name(host)
         if t is None:
             return (b"" if raw else ""), f"no target named {host!r}", 127
-        try:
-            p = subprocess.run(t.cmd, input=json.dumps(doc).encode(),
-                               capture_output=True)
-        except OSError as e:
-            return (b"" if raw else ""), str(e), 127
-        err = p.stderr.decode("utf-8", "replace").strip()
-        return (p.stdout if raw
-                else p.stdout.decode("utf-8", "replace")), err, p.returncode
+        out, err, rc = t.run(json.dumps(doc).encode())
+        return (out if raw else out.decode("utf-8", "replace")), err, rc
 
     backend = QueryBackend(ask, fleet.names)
 

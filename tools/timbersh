@@ -42,6 +42,15 @@ something else again at the far end.
 
 `--help` lists the flags; each has an environment variable beside it.
 
+  TIMBERFS_RESOLVER
+                 a command that prints the fleet as a target document,
+                 or a url to GET it from:
+
+                   TIMBERFS_RESOLVER='fleet-sweep --json'
+                   TIMBERFS_RESOLVER=https://fleet.internal/targets
+                   TIMBERFS_RESOLVER=unix+http:///run/agent.sock//fleet
+
+                 A url is told from a command by its SCHEME.
   TIMBERFS_CMD   argv prefix, default `timberfs query --query -`
   TIMBERFS_HOSTS comma-separated hosts to fan out to. Every occurrence of
                  _TIMBERHOST_ in TIMBERFS_CMD is replaced with the host:
@@ -50,11 +59,18 @@ something else again at the far end.
                    TIMBERFS_CMD="ssh _TIMBERHOST_ timberfs query --query -"
 
                  Any command that reaches a timberfs works, so a wrapper
-                 that takes the host as an argument does too.
+                 that takes the host as an argument does too. A target
+                 document (TIMBERFS_RESOLVER, TIMBERFS_TARGETS) can name
+                 a `url` instead: http://, https:// or
+                 unix+http:///path/to.sock//request/path
 
                  Stores from every host are presented as one set, and each
                  remembers where it lives. Unset, there is one unnamed host
                  and nothing is substituted.
+  TIMBERFS_REFRESH
+                 how `refresh` re-derives the fleet, where that is not
+                 how it was produced. A command or a url, like the
+                 resolver
   TIMBERSH_RC    statements run at startup, default ~/.timbershrc
   TIMBERSH_HISTFILE
                  line history, default ~/.timbersh-history, mode 0600
@@ -64,7 +80,7 @@ something else again at the far end.
                  not the statement's `limit`, which is how much of the
                  answer you want
 """
-import argparse, json, os, queue, re, readline, subprocess, sys, threading, time
+import argparse, json, os, queue, re, readline, sys, threading, time
 
 # The viewer, and the pieces both front ends share. A checkout finds
 # them beside this script; the package installs them where both do.
@@ -78,10 +94,10 @@ from timberfs_client import HOST_TOKEN, when, when_ms
 # The fleet, as TARGETS (names) and FLEET (the targets themselves). A
 # name is the currency everywhere below — the HOST column, a store's
 # `_host`, the host in an address — and only the transport looks up the
-# command behind it.
-FLEET = timberfs_client.Fleet([timberfs_client.Target(None,
-                                                      timberfs_client.DEFAULT_CMD)],
-                              "the default")
+# way to reach it behind that.
+FLEET = timberfs_client.Fleet(
+    [timberfs_client.Target(None, cmd=timberfs_client.DEFAULT_CMD)],
+    "the default")
 TARGETS = [None]
 # How long the store list is reused for completion and `\d`. ZERO is
 # never: the list is read once and kept, because a store appearing
@@ -91,11 +107,11 @@ TARGETS = [None]
 STORE_TTL = float(os.environ.get("TIMBERSH_STORE_TTL", "0"))
 # How much of an answer comes back per CALL, which is not the `limit` in
 # the statement: that says how much of the ANSWER you want, this says how
-# much of it may be in memory at once. Nothing streams — a call is one
-# `subprocess.run`, so an unbounded read holds the whole answer, times the
-# hosts asked in parallel — and a 1 GiB store on thirteen hosts is not a
-# query, it is an OOM. An unbounded read is walked a page at a time and
-# hands the positions back as the next page's cursor.
+# much of it may be in memory at once. Nothing streams — one call is one
+# whole answer buffered, times the hosts asked in parallel — and a 1 GiB
+# store on thirteen hosts is not a query, it is an OOM. An unbounded read
+# is walked a page at a time and hands the positions back as the next
+# page's cursor.
 PAGE = int(os.environ.get("TIMBERSH_PAGE", "10000"))
 RC = os.environ.get("TIMBERSH_RC", os.path.expanduser("~/.timbershrc"))
 HISTFILE = os.environ.get("TIMBERSH_HISTFILE",
@@ -270,30 +286,26 @@ def parse_pred(text):
 
 
 # ------------------------------------------------------------- timberfs
-def argv_for(host):
-    """The argv that reaches one target. A LOOKUP, not a substitution:
-    two hosts may be reached in completely different ways, which is why
-    the command belongs to the target."""
+def target_for(host):
+    """The target reached under one name. A LOOKUP, not a substitution:
+    two hosts may be reached in completely different ways — one over ssh,
+    one over a socket — which is why the transport belongs to the target."""
     t = FLEET.by_name(host)
     if t is None:
         raise ValueError(f"no target named {host!r} — `show hosts;` lists them")
-    return t.cmd
+    return t
 
 
 def run(doc, host=None, raw=False):
     """One document to one host. A transport that never started — ssh
-    refusing, a wrapper missing — comes back as a non-zero rc with its own
-    words, and is reported rather than counted as an empty answer.
+    refusing, a wrapper missing, nothing listening on the socket — comes
+    back as a non-zero rc with its own words, and is reported rather than
+    counted as an empty answer.
 
     `raw` keeps the answer as BYTES: a `chunks` answer carries compressed
     frames, and decoding those as text destroys them."""
-    try:
-        p = subprocess.run(argv_for(host), input=json.dumps(doc).encode(),
-                           capture_output=True)
-    except OSError as e:
-        return (b"" if raw else ""), str(e), 127
-    return ((p.stdout if raw else p.stdout.decode("utf-8", "replace")),
-            p.stderr.decode("utf-8", "replace").strip(), p.returncode)
+    out, err, rc = target_for(host).run(json.dumps(doc).encode())
+    return (out if raw else out.decode("utf-8", "replace")), err, rc
 
 
 def stream(doc, host, emit, framed=True):
@@ -306,29 +318,13 @@ def stream(doc, host, emit, framed=True):
     fastest host's first line waits for the slowest host's last one.
 
     ⚠ `read1`, not `read`. A `BufferedReader.read(n)` blocks until it has
-    n bytes or EOF, which is the buffering this exists to avoid.
-
-    ⚠ stderr gets a thread of its own. Two pipes and one reader is a
-    process that stops when the one nobody drains fills up, and timberfs
-    writes its explanations there — the sentences that say why an answer
-    looks wrong."""
-    try:
-        p = subprocess.Popen(argv_for(host), stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError as e:
-        return str(e), 127
-    errbuf = []
-    drain = threading.Thread(target=lambda: errbuf.append(p.stderr.read()),
-                             daemon=True)
-    drain.start()
-    try:
-        p.stdin.write(json.dumps(doc).encode())
-        p.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass                      # it died before reading; rc says so
+    n bytes or EOF, which is the buffering this exists to avoid — and it
+    is what a chunked HTTP body gives back a piece at a time too, which
+    is why one loop serves a pipe and a socket alike."""
+    call = target_for(host).open(json.dumps(doc).encode())
     buf = b""
     while True:
-        chunk = p.stdout.read1(65536)
+        chunk = call.read1(65536)
         if not chunk:
             break
         buf += chunk
@@ -343,11 +339,7 @@ def stream(doc, host, emit, framed=True):
     # A last line with no newline is still a line.
     if not framed and buf:
         emit(("line", {}, buf))
-    p.stdout.close()
-    rc = p.wait()
-    drain.join()
-    err = errbuf[0].decode("utf-8", "replace").strip() if errbuf else ""
-    return err, rc
+    return call.finish()
 
 
 # --------------------------------------------------------------- render
@@ -1268,8 +1260,8 @@ class Shell:
                             f"how to reach each target — there is no command "
                             f"to reach `{n}` with. Add it there and `refresh`")
                     now.append(timberfs_client.Target(
-                        n, [a.replace(timberfs_client.HOST_TOKEN, n)
-                            for a in FLEET.template]))
+                        n, cmd=[a.replace(timberfs_client.HOST_TOKEN, n)
+                                for a in FLEET.template]))
                 else:
                     if not any(t.name == n for t in now):
                         raise ValueError(
@@ -1278,8 +1270,7 @@ class Shell:
             if not now:
                 raise ValueError(
                     "that is the last host; a shell with none has nothing to ask")
-            FLEET = timberfs_client.Fleet(now, FLEET.source, FLEET.unusable,
-                                          FLEET.template, FLEET._how)
+            FLEET = FLEET.with_targets(now)
             TARGETS = FLEET.names
             # The cached stores are tagged with the host they came from, so
             # a changed set makes the cache answer for a fleet that is no
@@ -1349,6 +1340,12 @@ class Shell:
         if head == "show" and len(toks) > 1 and toks[1][1].lower().startswith("host"):
             self.universe()  # cheap: cached, and it is what fills this in
             print(f"  {len(TARGETS)} target(s), from {FLEET.source}")
+            if FLEET.refresh:
+                # Getting the fleet and re-asking for it are allowed to be
+                # different commands, so which one `refresh` runs is not
+                # derivable from where the fleet came from.
+                print(f"  refresh asks {FLEET.refresh.describe()}"
+                      f"   ({FLEET.refresh_source})")
             for name, why in FLEET.unusable:
                 print(f"  ⚠ {label(name)} was not asked: {why}")
             w = max([len(label(h)) for h in TARGETS] + [4])
@@ -1380,7 +1377,7 @@ class Shell:
                 # than being assumed uniform.
                 t = FLEET.by_name(host)
                 if t:
-                    print(f"  {'':{w}}  via: {' '.join(t.cmd)}")
+                    print(f"  {'':{w}}  via: {t.via}")
                 if st.get("note"):
                     for line in st["note"].splitlines():
                         if line.strip():
@@ -2072,9 +2069,10 @@ def parse_args(argv):
                "one local `timberfs query --query -`. `show hosts;` says which won.\n"
                "\n"
                "Inside the shell, `\\?` prints the statement syntax.")
-    ap.add_argument("--resolver", metavar="CMD",
+    ap.add_argument("--resolver", metavar="CMD|URL",
                     help="a command that prints the fleet as a target "
-                         "document. $TIMBERFS_RESOLVER")
+                         "document, or a url to GET it from — told apart by "
+                         "the url's scheme. $TIMBERFS_RESOLVER")
     ap.add_argument("--targets", metavar="FILE",
                     help="the same document, from a file. $TIMBERFS_TARGETS; "
                          "else ~/.config/timberfs/targets.json, else "
@@ -2085,6 +2083,12 @@ def parse_args(argv):
                          "`timberfs query --query -`. $TIMBERFS_CMD")
     ap.add_argument("--hosts", metavar="H,H",
                     help="the hosts that command reaches. $TIMBERFS_HOSTS")
+    ap.add_argument("--refresh", metavar="CMD|URL",
+                    help="how `refresh` re-derives the fleet, where that is "
+                         "not how it was produced — a command, or a url to "
+                         "GET it from. $TIMBERFS_REFRESH; else the "
+                         "document's `refresh`; else whatever produced the "
+                         "fleet")
     ap.add_argument("--rc", metavar="FILE", default=RC,
                     help="statements run at startup. $TIMBERSH_RC")
     ap.add_argument("--page", metavar="N", type=int, default=PAGE,
@@ -2115,7 +2119,8 @@ def main(argv=None):
         sys.exit("timbersh: --page wants a positive number of entries")
     PAGE = a.page
     try:
-        FLEET = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts)
+        FLEET = timberfs_client.resolve(a.resolver, a.targets, a.cmd, a.hosts,
+                                        a.refresh)
     except ValueError as e:
         sys.exit(f"timbersh: {e}")
     TARGETS = FLEET.names

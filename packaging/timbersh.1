@@ -30,20 +30,25 @@ so a predicate means here exactly what it means there.
 .SH WHERE THE FLEET IS
 A
 .B target
-is a name and the command that reaches it. The command belongs to the
-TARGET rather than to the session, so an
+is a name and the way to reach it: an argv to run, or a URL to POST the
+document to. The transport belongs to the TARGET rather than to the
+session, so an
 .BR ssh (1)
-to one host and a site wrapper taking the host as an argument are one
-fleet \(em which one command with a placeholder could not express.
+to one host, a site wrapper taking the host as an argument, and an HTTP
+endpoint on a unix socket are one fleet \(em which one command with a
+placeholder could not express.
 .PP
 The document a resolver prints, and the file that holds the same thing:
 .PP
 .RS
 .EX
 {"v": "1.0-EXPERIMENTAL",
+ "refresh": {"cmd": ["fleet-sweep", "--cached"]},
  "targets": [
    {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
    {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
+   {"name": "db01",   "url": "http://db01:9099/query"},
+   {"name": "local",  "url": "unix+http:///run/timberfs.sock//query"},
    {"cmd": ["timberfs", "query", "--query", "-"]}
  ]}
 .EE
@@ -52,7 +57,73 @@ The document a resolver prints, and the file that holds the same thing:
 .B cmd
 is a LIST because a command line written as one string would have to be
 split again at this end, under rules that are ours to invent and get
-wrong. A
+wrong.
+.PP
+A
+.B url
+is POSTed the document and answers with the stream, read as it arrives
+exactly as a pipe is. A unix socket is written into it:
+.PP
+.RS
+.EX
+http://db01:9099/query                      https:// too
+unix+http:///run/timberfs.sock//query       dial it, POST /query
+unix+http:///run/timberfs.sock              the request path defaults to /
+unix+http://logs.internal/run/x.sock//q     and Host: logs.internal
+.EE
+.RE
+.PP
+⚠
+.B //
+is the boundary between the socket and the request path, because it is
+the one sequence that cannot MEAN anything inside a filesystem path
+\(em POSIX collapses repeated slashes, so a
+.B //
+in a path names the file a single
+.B /
+does. Every other candidate (:, #, !) can legally be part of a socket
+path, and one holding the separator would split in the wrong place
+SILENTLY. The first one decides; later ones stay in the request path,
+where HTTP allows them. The socket path is then percent-decoded, being a
+filesystem path rather than a wire path.
+.PP
+⚠ The boundary is NOT found by statting the prefixes. That would make a
+document stop parsing when the agent is down, so \(lqthis target is
+unreachable\(rq and \(lqthis URL is malformed\(rq would be one error, and no
+document could be reviewed or tested without first creating its sockets.
+.PP
+⚠ NOT
+.BR http+unix:// ,
+which is requests-unixsocket\(aqs and spells the socket percent-encoded in
+the AUTHORITY. That grammar needs no boundary, but it spends the
+authority on the socket and so has nowhere to put a
+.BR Host: .
+Writing one gets a message naming the other.
+.PP
+The host is OPTIONAL and is never dialled \(em the socket is. It is the
+.B Host:
+header, which is what a server routing several names off one socket
+reads; absent, it is
+.BR localhost .
+.PP
+A target is reached ONE way: a
+.B cmd
+and a
+.B url
+on the same target is a mistake in the document and is named, not
+resolved by preferring one. A member this build does not read leaves that
+target NAMED rather than reached anyway \(em it may be the member that
+says how.
+.PP
+⚠ A url target has NO stderr. timberfs writes the sentences that explain
+an answer which looks wrong \(em
+.BR "no store matches \(rs..." ,
+.B "retention overtook this follower"
+\(em to fd 2 and still exits 0, and HTTP has no second channel to carry
+them on. A url target's notes therefore arrive only when the request
+FAILS, out of the response body. Closing that gap means deciding what a
+timberfs server puts on the wire, which is deliberately not decided yet.
+A
 .B name
 is what the
 .B HOST
@@ -91,21 +162,69 @@ differ: the resolver is how you know what the fleet IS, and being wrong
 about that makes every later answer describe the wrong thing; one machine
 refusing a connection only means its logs are missing from this answer.
 .PP
-⚠ A target this build cannot reach \(em a future
+⚠ A target this build cannot reach \(em a
 .B url
-in place of
-.B cmd
-\(em is NAMED, never dropped, for the same reason: a host that was never
-asked must not read as a host that had nothing.
+whose scheme it cannot dial, a future member in place of both \(em is
+NAMED, never dropped, for the same reason: a host that was never asked
+must not read as a host that had nothing.
 .PP
 The resolver is asked ONE question, what the fleet is, and gets no
 arguments.
 .B refresh
-re-runs it, because a resolver derives its answer.
+asks again, because a resolver derives its answer \(em by default the way
+the fleet was produced, and otherwise as named by
+.BR \-\-refresh ,
+.BR $TIMBERFS_REFRESH ,
+or the document's own
+.BR refresh ,
+in that order. Getting the fleet and re-asking for it may cost different
+amounts \(em a full sweep to open a session with, a cheap one to re-ask
+\(em so they are allowed to be different. A document's
+.B refresh
+applies to the fleet it arrived with: a refresh whose document names none
+of its own leaves the next one re-running whatever produced the fleet
+originally.
+.PP
+A RESOLVER is a command or a url, and
+.B \-\-refresh
+is too. A flag and an export are one string either way, so a url is told
+from a command by its SCHEME \(em a command is a program name or a path,
+and neither can carry one:
+.PP
+.RS
+.EX
+TIMBERFS_RESOLVER='fleet-sweep --json'
+TIMBERFS_RESOLVER=https://fleet.internal/timberfs/targets
+TIMBERFS_RESOLVER=unix+http:///run/timberfs-agent.sock//fleet
+.EE
+.RE
+.PP
+A resolver is asked ONE question and gets no arguments, so a url one is a
+GET \(em where a target, which is handed a document, is a POST. A
+resolver that failed is fatal whichever it is; a non-2xx carries the body
+as the reason, being the only channel a url has. Something spelled like a
+url whose scheme this build cannot dial is a url with a TYPO, and says
+so, rather than being run as a program.
+.PP
+The document's
+.B refresh
+says which it is rather than being sniffed, JSON having somewhere to put
+that:
+.B {"cmd": [...]}
+or
+.BR {"url":\ "..."} ,
+the same two words a target is reached by.
+.PP
+⚠
+.B \-\-targets
+stays a FILE. A url DERIVES its answer, which is what makes
+.B refresh
+worth asking again; a file is a thing you edit.
 .SH OPTIONS
 .TP
-.BI \-\-resolver " CMD"
-A command that prints the fleet as a target document.
+.BI \-\-resolver " CMD|URL"
+A command that prints the fleet as a target document, or a url to GET it
+from \(em told apart by the url's scheme.
 .RB ( $TIMBERFS_RESOLVER )
 .TP
 .BI \-\-targets " FILE"
@@ -124,6 +243,17 @@ works \(em a wrapper,
 .BR ssh (1),
 a container exec.
 .RB ( $TIMBERFS_CMD )
+.TP
+.BI \-\-refresh " CMD|URL"
+How
+.B refresh
+re-derives the fleet, where that is not how it was produced. It
+is not a fourth way to say where the fleet is, so it does not join the
+one-of-three rule above.
+.RB ( $TIMBERFS_REFRESH ;
+then the document\(aqs
+.BR refresh ;
+then whatever produced the fleet)
 .TP
 .BI \-\-hosts " H,H"
 The hosts that command reaches. Their stores present as one set with a
