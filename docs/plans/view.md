@@ -114,17 +114,17 @@ made for it.
   picked term, so nothing is lost. No colour: reverse video is the
   terminal's own, and a background chosen here is a bet on somebody's
   theme.
-- ⚠ **Toggling `z` keeps what was SELECTED, not the row numbers.** Both
-  ends travel as offsets, and the upper one is taken to the END of the
-  entry it lands in: a joined row is an entry, so unjoining it is several
-  lines and an offset resolves to the first of them. Keeping the numbers
-  collapsed a selection of two records to their two first lines — a
-  highlight that read as lost, and a copy that then took two lines of the
-  fourteen selected. Joined, every row is a first, so the rule widens
-  nothing in that direction and needs no test of which way the toggle
-  went. The cursor is one of those ends, so where it was the upper one
-  the view follows it to the entry's end; a selection longer than the
-  screen cannot show both ends anyway.
+- ⚠ **Toggling `z`, or opening one entry with `Z`, keeps what was
+  SELECTED, not the row numbers.** Both ends travel as offsets, and the
+  upper one is taken to the END of the entry it lands in: a joined row is
+  an entry, so unjoining it is several lines and an offset resolves to
+  the first of them. Keeping the numbers collapsed a selection of two
+  records to their two first lines — a highlight that read as lost, and a
+  copy that then took two lines of the fourteen selected. Joined, every
+  row is a first, so the rule widens nothing in that direction and needs
+  no test of which way the toggle went. The cursor is one of those ends,
+  so where it was the upper one the view follows it to the entry's end; a
+  selection longer than the screen cannot show both ends anyway.
 - **A joined row copies as the log's own lines.** `z` renders an entry as
   one row with `↵` between its lines; that is a thing to read, and the
   clipboard wants what the log holds. So `z` then a mark is how entry-wide
@@ -174,6 +174,45 @@ multiplexer.
   be got at, and a size past what a terminal can be trusted with goes
   there too rather than being handed to something that would truncate it
   without saying so.
+
+## Built: ten traces on one screen, and one of them opened
+
+`z` renders every multi-line entry as one row and `Z` opens the entry
+under the cursor back out into its own lines.
+
+- **The question `z` answers is "are these ten the same failure".** Four
+  hundred lines of trace answer it with no screen to answer it on; ten
+  rows put the messages in a column where the eye compares them, with
+  the frames trailing off to the right where `h`/`l` can go and read
+  them. The continuation lines are LSTRIPPED as they join — their indent
+  is what puts frames under a message that is no longer above them, and
+  it is the difference between ten rows that line up and ten that do not.
+- **A rendering, not a fold.** Every line of the entry is on the row, so
+  the search, `Tab`, the hit list and the entry motion all keep working:
+  each row is a real line with a real address. A fold would have had to
+  teach every one of those about lines that are not on the screen.
+- **And `Z` is the next question**: which is exactly one of the ten, read
+  in full, while the other nine stay rows to come back to. Several can be
+  open at once, because comparing two of them is what picking them out of
+  the ten was for. It is an EXCEPTION to a rendering rather than a second
+  mode — an open entry is the source's own lines, so its framing is the
+  entry framing again and a bare `c` still takes the whole trace — and
+  `z`, which sets the whole screen, builds the join afresh and so clears
+  the exceptions.
+- **Any of its lines closes it**, not just its first: what the reader is
+  pointing at is the entry, and having to walk back to its head to put it
+  away is a coordinate they would have to keep.
+- ⚠ **An open entry is remembered by its ORDINAL**, the nth entry of the
+  answer — not by its offset, which is how every other position in this
+  pager is held. An entry still at a live edge has no offset yet and they
+  all report 0, so a set of offsets would open every live-edge entry at
+  once. The answer is a closed set, so the nth entry stays the nth.
+- **A decorator over the source, not a mode inside it.** `Tape` and
+  `Records` both have entries in this sense, the view swaps its source at
+  runtime when a hit is in another store, and neither should learn about
+  a display option. On the tape, which parses nothing, every line is its
+  own entry — so joining is the identity there and `Z` says there is
+  nothing folded in, exactly as the entry motion is a line there.
 
 ## /etc/hosts, and the DNS that would replace it
 
