@@ -49,9 +49,9 @@ class Session:
         for h in self.hosts or [""]:
             sock = os.path.join(self.dir, f"{h or 'local'}.sock")
             self.servers.append(serve_fake(sock, h, self.dir, status))
-            targets.append({"url": f"http://{h or 'local'}.timberfs/query",
-                            "socket": sock,
-                            **({"name": h} if h else {})})
+            targets.append({
+                "url": f"unix+http://{h or 'local'}.timberfs{sock}//query",
+                **({"name": h} if h else {})})
         self.targets = os.path.join(self.dir, "targets.json")
         json.dump({"v": "1.0-EXPERIMENTAL", "targets": targets},
                   open(self.targets, "w"))
@@ -934,7 +934,8 @@ def a_url_target_runs_a_whole_session_over_a_unix_socket():
                 hosts=hosts).over_http().run(
         "show hosts;", "select records from [] where entry has 'hit' limit 9;")
     assert "hit on alpha" in s.out and "hit on beta" in s.out, s.out
-    assert "via: POST http://alpha.timberfs/query over " in s.out, s.out
+    assert "via: POST unix+http://alpha.timberfs/" in s.out, s.out
+    assert "//query" in s.out, s.out
     # A set: hosts are asked at once, so which answer lands first is
     # arrival and not order.
     assert sorted(r["host"] for r in s.requests

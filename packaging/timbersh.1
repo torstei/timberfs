@@ -48,8 +48,7 @@ The document a resolver prints, and the file that holds the same thing:
    {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
    {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
    {"name": "db01",   "url": "http://db01:9099/query"},
-   {"name": "local",  "url": "http://localhost/query",
-                      "socket": "/run/timberfs.sock"},
+   {"name": "local",  "url": "unix+http:///run/timberfs.sock//query"},
    {"cmd": ["timberfs", "query", "--query", "-"]}
  ]}
 .EE
@@ -59,24 +58,62 @@ The document a resolver prints, and the file that holds the same thing:
 is a LIST because a command line written as one string would have to be
 split again at this end, under rules that are ours to invent and get
 wrong.
-.B socket
-is a member of its own for that same reason: a unix socket is a
-filesystem path and a URL has nowhere to put one, so folding it in means
-either percent-encoding it into the authority or inventing a separator we
-would then own \(em and a socket path containing that separator would
-break silently. The URL stays an ordinary URL, and
-.B socket
-says what to dial instead of resolving its host. That host is still the
+.PP
+A
+.B url
+is POSTed the document and answers with the stream, read as it arrives
+exactly as a pipe is. A unix socket is written into it:
+.PP
+.RS
+.EX
+http://db01:9099/query                      https:// too
+unix+http:///run/timberfs.sock//query       dial it, POST /query
+unix+http:///run/timberfs.sock              the request path defaults to /
+unix+http://logs.internal/run/x.sock//q     and Host: logs.internal
+.EE
+.RE
+.PP
+⚠
+.B //
+is the boundary between the socket and the request path, because it is
+the one sequence that cannot MEAN anything inside a filesystem path
+\(em POSIX collapses repeated slashes, so a
+.B //
+in a path names the file a single
+.B /
+does. Every other candidate (:, #, !) can legally be part of a socket
+path, and one holding the separator would split in the wrong place
+SILENTLY. The first one decides; later ones stay in the request path,
+where HTTP allows them. The socket path is then percent-decoded, being a
+filesystem path rather than a wire path.
+.PP
+⚠ The boundary is NOT found by statting the prefixes. That would make a
+document stop parsing when the agent is down, so \(lqthis target is
+unreachable\(rq and \(lqthis URL is malformed\(rq would be one error, and no
+document could be reviewed or tested without first creating its sockets.
+.PP
+⚠ NOT
+.BR http+unix:// ,
+which is requests-unixsocket\(aqs and spells the socket percent-encoded in
+the AUTHORITY. That grammar needs no boundary, but it spends the
+authority on the socket and so has nowhere to put a
+.BR Host: .
+Writing one gets a message naming the other.
+.PP
+The host is OPTIONAL and is never dialled \(em the socket is. It is the
 .B Host:
 header, which is what a server routing several names off one socket
-reads.
+reads; absent, it is
+.BR localhost .
 .PP
 A target is reached ONE way: a
 .B cmd
 and a
 .B url
 on the same target is a mistake in the document and is named, not
-resolved by preferring one.
+resolved by preferring one. A member this build does not read leaves that
+target NAMED rather than reached anyway \(em it may be the member that
+says how.
 .PP
 ⚠ A url target has NO stderr. timberfs writes the sentences that explain
 an answer which looks wrong \(em

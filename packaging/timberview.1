@@ -34,8 +34,11 @@ switches between the rest.
 A command that prints the fleet as a target document \(em a name and the
 way to reach it, per target: an argv to run, or a
 .B url
-to POST the document to, over TCP or a unix
-.BR socket .
+to POST the document to \(em
+.BR http:// ,
+.B https://
+or
+.BR unix+http:///path/to.sock//request/path .
 See
 .BR timbersh (1),
 WHERE THE FLEET IS, for the document and the order the sources are tried

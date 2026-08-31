@@ -52,7 +52,8 @@ something else again at the far end.
                  Any command that reaches a timberfs works, so a wrapper
                  that takes the host as an argument does too. A target
                  document (TIMBERFS_RESOLVER, TIMBERFS_TARGETS) can name
-                 a `url` instead, over TCP or a unix `socket`.
+                 a `url` instead: http://, https:// or
+                 unix+http:///path/to.sock//request/path
 
                  Stores from every host are presented as one set, and each
                  remembers where it lives. Unset, there is one unnamed host

@@ -16,8 +16,7 @@ The document a resolver prints, and the file that holds the same thing:
                                   "--query", "-"]},
        {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
        {"name": "db01",   "url": "http://db01:9099/query"},
-       {"name": "local",  "url": "http://localhost/query",
-                          "socket": "/run/timberfs.sock"},
+       {"name": "local",  "url": "http+unix:///run/timberfs.sock//query"},
        {"cmd": ["timberfs", "query", "--query", "-"]}
      ]}
 
@@ -25,14 +24,35 @@ The document a resolver prints, and the file that holds the same thing:
 split again at the far end, and the rules for that are ours to invent
 and get wrong. Same call the query document makes for `stores.select`.
 
-`socket` is a MEMBER of its own rather than something folded into the
-URL, for that same reason. A unix socket is a filesystem path and a URL
-has nowhere to put one, so every scheme that tries either percent-encodes
-it into the authority or invents a separator we would then own — and a
-socket path containing that separator would break silently. Here the URL
-stays an ordinary URL that `urlsplit` reads, and `socket` says what to
-dial instead of resolving its host. Its host is still the `Host:` header,
-which is what a server routing several names off one socket needs.
+A unix socket is `unix+http://[host]/socket/path//request/path`:
+
+    unix+http:///run/timberfs.sock//query     dial it, POST /query
+    unix+http:///run/timberfs.sock            the request path is /
+    unix+http://logs.internal/run/x.sock//q   and `Host: logs.internal`
+
+⚠ NOT `http+unix://`, which is requests-unixsocket's and spells the
+socket percent-encoded in the AUTHORITY — `http+unix://%2Frun%2Fx.sock/q`.
+That grammar needs no boundary, but it spends the authority on the socket
+and so has nowhere to put a `Host:`. Reusing its name for a different
+grammar is the trap this avoids; writing one is answered by a message
+naming the other.
+
+⚠ `//` is the boundary because it is the one sequence that cannot MEAN
+anything inside a filesystem path: POSIX collapses repeated slashes, so
+a `//` in a path names the file a single `/` does. Every other candidate
+— `:`, `#`, `!` — can legally be part of a socket path, and a path
+holding one would then split in the wrong place SILENTLY. The FIRST `//`
+decides; later ones stay in the request path, where HTTP allows them.
+
+⚠ The boundary is not found by STATTING the prefixes. That would make a
+document stop parsing when the agent is down, so "this target is
+unreachable" and "this URL is malformed" would be one error — the
+distinction the unusable/UNREACHABLE split exists to keep — and no
+document could be reviewed or tested without first creating its sockets.
+
+The host is OPTIONAL and is never dialled; the socket is. It is the
+`Host:` header, which is what a server routing several names off one
+socket reads.
 
 `refresh` is the command to RE-DERIVE this fleet, where that is not the
 command that produced it — a full sweep to open a session with and a
@@ -75,7 +95,8 @@ DEFAULT_CMD = ["timberfs", "query", "--query", "-"]
 HOST_TOKEN = "_TIMBERHOST_"
 CONFIG_PATHS = ("~/.config/timberfs/targets.json",
                 "/etc/timberfs/targets.json")
-SCHEMES = ("http", "https")
+UNIX_SCHEME = "unix+http"
+SCHEMES = ("http", "https", UNIX_SCHEME)
 # Enough of a failed response to hold the reason, and not so much that a
 # server answering an error page fills the screen with it.
 ERR_BYTES = 8192
@@ -212,15 +233,14 @@ class _HttpCall(Call):
 class Target:
     """One timberfs, and the transport that reaches it."""
 
-    def __init__(self, name, cmd=None, url=None, socket=None):
+    def __init__(self, name, cmd=None, url=None):
         self.name = name or None
         self.cmd = list(cmd) if cmd else None
         self.url = url
-        self.socket = socket
-        self._scheme = self._host = self._path = None
+        self.socket = self._scheme = self._host = self._path = None
         if url is not None:
             self._scheme = urllib.parse.urlsplit(url).scheme
-            self._host, self._path = split_url(url, socket)
+            self.socket, self._host, self._path = split_url(url)
 
     @property
     def label(self):
@@ -232,8 +252,7 @@ class Target:
         different ways says so there rather than being assumed uniform."""
         if self.cmd:
             return " ".join(self.cmd)
-        return f"POST {self.url}" + (f" over {self.socket}" if self.socket
-                                     else "")
+        return f"POST {self.url}"
 
     def open(self, payload):
         """Start the call. A transport that never started comes back as a
@@ -271,22 +290,60 @@ class Target:
         return f"Target({self.label}, {self.via})"
 
 
-def split_url(url, socket=None):
-    """A target URL as `(host, path)`, or a ValueError saying what is
-    wrong with it. The query string is kept: a `?` is part of the address
-    the endpoint was named by, not decoration."""
+def split_url(url):
+    """A target URL as `(socket, host, path)` — the socket to dial or
+    None for an ordinary TCP connection, the name for `Host:`, and the
+    request target. A ValueError says what is wrong with it instead.
+
+    The query string is kept: a `?` is part of the address the endpoint
+    was named by, not decoration."""
     u = urllib.parse.urlsplit(url)
     if u.scheme not in SCHEMES:
+        # The name most people reach for first, and it means something
+        # else: the socket percent-encoded in the authority. Say so,
+        # rather than listing the schemes at someone who picked the one
+        # every Python client on the machine already speaks.
+        near = ("; that is requests-unixsocket's, which spells the socket "
+                "percent-encoded in the authority" if u.scheme == "http+unix"
+                else "")
         raise ValueError(
             f"`{url}`: {'no scheme' if not u.scheme else f'scheme `{u.scheme}`'}"
-            f" — a url target is " + " or ".join(f"{s}://…" for s in SCHEMES)
-            + (", with `socket` for a unix socket" if not socket else ""))
-    host = u.netloc or ("localhost" if socket else "")
-    if not host:
-        raise ValueError(
-            f"`{url}` names no host, and there is no `socket` to dial instead")
-    path = u.path or "/"
-    return host, (f"{path}?{u.query}" if u.query else path)
+            f" — a url target is http://…, https://… or "
+            f"{UNIX_SCHEME}://[host]/path/to.sock//request/path{near}")
+    if u.scheme == UNIX_SCHEME:
+        socket, path = split_socket(u.path, url)
+        # Never dialled — the socket is. An absent one is `localhost`,
+        # which is what a server that does not route on the name sees.
+        host = u.netloc or "localhost"
+    else:
+        socket, host, path = None, u.netloc, (u.path or "/")
+        if not host:
+            raise ValueError(
+                f"`{url}` names no host to connect to — a unix socket is "
+                f"{UNIX_SCHEME}:///path/to.sock//request/path")
+    return socket, host, (f"{path}?{u.query}" if u.query else path)
+
+
+def split_socket(path, url):
+    """The socket path and the request path, split at the first `//`.
+
+    `//` is the boundary because it cannot MEAN anything inside a
+    filesystem path — POSIX collapses repeated slashes — so splitting
+    there can never cut a path in half. `:`, `#` and `!` can all legally
+    be part of a socket path, and one holding the separator would split
+    in the wrong place with nothing to say it had.
+
+    The socket path is then DECODED, being a filesystem path rather than
+    a wire path: `%23` is a `#`, which RFC 3986 requires there anyway
+    since a raw one would start the fragment. It also leaves the escape
+    hatch for the pathological socket — `%2F%2F` decodes to `//` after
+    the split rather than acting as one. The REQUEST path keeps its
+    encoding: that one goes on the wire as written."""
+    at = path.find("//", 1)
+    socket, rest = (path, "/") if at < 0 else (path[:at], path[at + 1:])
+    if not socket.strip("/"):
+        raise ValueError(f"`{url}` names no socket to dial")
+    return urllib.parse.unquote(socket), rest or "/"
 
 
 # ---------------------------------------------------------------- fleets
@@ -381,7 +438,17 @@ def parse(text, where):
         if name is not None and not isinstance(name, str):
             raise ValueError(f"{where}: target {i} has a non-string `name`")
         who = f"target {i} (`{name or 'unnamed'}`)"
-        cmd, url, sock = t.get("cmd"), t.get("url"), t.get("socket")
+        cmd, url = t.get("cmd"), t.get("url")
+        # A member this build does not read leaves that ONE target named
+        # rather than reached anyway: it may be the member that says HOW,
+        # and a target reached the wrong way is worse than one not reached.
+        extra = sorted(set(t) - {"name", "cmd", "url"})
+        if extra:
+            unusable.append((
+                name, f"declares {', '.join(extra)}, which this build does "
+                      f"not read; a target is reached by `cmd` or `url`, and "
+                      f"a member that might say how must not be ignored"))
+            continue
         # Two transports on one target is a mistake in the document, not a
         # target this build cannot reach: preferring one silently is
         # exactly the error the target list exists to remove.
@@ -391,18 +458,11 @@ def parse(text, where):
                 f"reached one way, and choosing for you is the mistake this "
                 f"list removes")
         if cmd is None and url is None:
-            declared = ", ".join(sorted(k for k in t if k != "name"))
             unusable.append((
-                name, f"declares {declared or 'no way to reach it'}, and "
-                      f"this build reaches a target by `cmd` or `url`"))
+                name, "declares no way to reach it, and this build reaches a "
+                      "target by `cmd` or `url`"))
             continue
-        if sock is not None and not isinstance(sock, str):
-            raise ValueError(f"{where}: {who} has a non-string `socket`")
         if cmd is not None:
-            if sock is not None:
-                raise ValueError(
-                    f"{where}: {who} has a `socket`, which says how to dial a "
-                    f"`url`; a `cmd` reaches its own timberfs")
             if not (isinstance(cmd, list) and cmd
                     and all(isinstance(x, str) for x in cmd)):
                 raise ValueError(
@@ -414,7 +474,7 @@ def parse(text, where):
             raise ValueError(f"{where}: {who} has a `url` that is not a "
                              f"non-empty string")
         try:
-            targets.append(Target(name, url=url, socket=sock))
+            targets.append(Target(name, url=url))
         except ValueError as e:
             # A URL this build does not know how to dial leaves that ONE
             # target named-with-a-reason. A future scheme lands here

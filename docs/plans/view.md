@@ -185,8 +185,9 @@ placeholder meant every host had to be reached the same way, so an `ssh`
 and a site wrapper taking the host as an argument could not be one fleet.
 
 A **target** is now a name and the way to reach it — an argv to run, or a
-`url` to POST the document to, over TCP or a unix `socket` — and a
-**resolver** is any command that prints the list. `tools/README.md` has the
+`url` to POST the document to, over TCP or a unix socket
+(`unix+http:///path/to.sock//request/path`) — and a **resolver** is any
+command that prints the list. `tools/README.md` has the
 document and the order the sources are tried in.
 `TIMBERFS_CMD`/`TIMBERFS_HOSTS` survive as one producer of a target list
 rather than as the only way to describe a fleet.

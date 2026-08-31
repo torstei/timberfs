@@ -363,11 +363,15 @@ here.
   machine looks exactly like a fleet that held nothing; a target this build
   cannot reach is named rather than dropped.
   A target reaches its timberfs by `cmd` or by **`url`** — POSTed the
-  document, streamed the answer, over TCP or a unix `socket`. `socket` is a
-  member of its own for the reason `cmd` is a list: a filesystem path folded
-  into a URL means percent-encoding it into the authority or inventing a
-  separator we then own, and a socket path containing that separator would
-  break silently. The gap it leaves is real and stated: a url target has no
+  document, streamed the answer, over TCP or a unix socket written into the
+  url as `unix+http://[host]/path/to.sock//request/path`. `//` is the
+  boundary because it is the one sequence that cannot MEAN anything inside a
+  filesystem path (POSIX collapses repeated slashes), where `:` or `#` can
+  legally be part of one and would split in the wrong place silently; and it
+  is deliberately not `http+unix://`, which is requests-unixsocket's and
+  spells the socket percent-encoded in the authority — a grammar that needs
+  no boundary but has nowhere left to put a `Host:`. The gap it leaves is
+  real and stated: a url target has no
   stderr, so timberfs's explanations — the sentences that say why an answer
   looks wrong — arrive only out of a failed response's body. Closing that
   means deciding what a timberfs server puts on the wire, which is the

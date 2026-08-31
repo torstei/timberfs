@@ -219,8 +219,7 @@ The document a resolver prints, and the file that holds the same thing:
    {"name": "mail01", "cmd": ["ssh", "mail01", "timberfs", "query", "--query", "-"]},
    {"name": "web01",  "cmd": ["site-wrapper", "query", "web01"]},
    {"name": "db01",   "url": "http://db01:9099/query"},
-   {"name": "local",  "url": "http://localhost/query",
-                      "socket": "/run/timberfs.sock"},
+   {"name": "local",  "url": "unix+http:///run/timberfs.sock//query"},
    {"cmd": ["timberfs", "query", "--query", "-"]}
  ]}
 ```
@@ -235,22 +234,49 @@ reached, leaves every written address valid.
 ### A url instead of a command
 
 `url` is POSTed the query document and answers with the stream, read as it
-arrives exactly as a pipe is. `http` and `https`; the URL's query string is
-kept, since a `?` is part of the address the endpoint was named by.
+arrives exactly as a pipe is. The URL's query string is kept, since a `?` is
+part of the address the endpoint was named by.
 
-`socket` is a **member of its own** rather than something folded into the
-URL, for the reason `cmd` is a list. A unix socket is a filesystem path and
-a URL has nowhere to put one, so every scheme that tries either
-percent-encodes it into the authority (`http+unix://%2Frun%2F…`) or invents
-a separator we would then own — and a socket path containing that separator
-would break silently. Here the URL stays an ordinary URL that `urlsplit`
-reads, and `socket` says what to dial instead of resolving its host. That
-host is still the `Host:` header, which is what a server routing several
-names off one socket needs.
+```
+http://db01:9099/query                      https:// too
+unix+http:///run/timberfs.sock//query       dial the socket, POST /query
+unix+http:///run/timberfs.sock              the request path defaults to /
+unix+http://logs.internal/run/x.sock//q     and `Host: logs.internal`
+```
+
+⚠ **`//` is the boundary** between the socket and the request path, because
+it is the one sequence that cannot *mean* anything inside a filesystem path
+— POSIX collapses repeated slashes, so a `//` in a path names the file a
+single `/` does. Every other candidate (`:`, `#`, `!`) can legally be part
+of a socket path, and one holding the separator would split in the wrong
+place **silently**. The first `//` decides; later ones stay in the request
+path, where HTTP allows them. The socket path is then percent-decoded,
+being a filesystem path rather than a wire path — which also leaves
+`%2F%2F` as the way to write the pathological socket.
+
+⚠ The boundary is **not** found by statting the prefixes. That would make a
+document stop parsing when the agent is down, so "this target is
+unreachable" and "this URL is malformed" would be one error — the
+distinction the whole `unusable`/`UNREACHABLE` split exists to keep — and no
+document could be reviewed or tested without first creating its sockets.
+
+⚠ **Not `http+unix://`**, which is
+[requests-unixsocket](https://github.com/msabramo/requests-unixsocket)'s and
+spells the socket percent-encoded in the *authority*
+(`http+unix://%2Frun%2Fx.sock/query`). That grammar needs no boundary, but it
+spends the authority on the socket and so has nowhere to put a `Host:`.
+Reusing its name for a different grammar is the trap this avoids; writing one
+gets a message naming the other.
+
+The host is **optional and is never dialled** — the socket is. It is the
+`Host:` header, which is what a server routing several names off one socket
+reads; absent, it is `localhost`.
 
 A target is reached **one** way. A `cmd` and a `url` on the same target is a
 mistake in the document and is named as one, rather than resolved by
-preferring whichever came first.
+preferring whichever came first. A member this build does not read leaves
+that target **named**, not reached anyway: it may be the member that says
+*how*, and a target reached the wrong way is worse than one not reached.
 
 ⚠ **A url target has no stderr.** timberfs writes the sentences that explain
 an answer which looks wrong — `no store matches …`, `retention overtook this
