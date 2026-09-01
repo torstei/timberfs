@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! *              every store
+//! text           the NAME contains text  (`name=*text`)
 //! key=value      the label equals value
 //! key!=value     it does not
 //! key=~regex     it matches regex, anchored at both ends
@@ -14,6 +15,14 @@
 //! key=*text      it CONTAINS text, anywhere in the value
 //! key!*text      it does not
 //! ```
+//!
+//! A bare word is the name because that is what a person types when they
+//! know which log they want and not how it is labelled. It is `=*` and
+//! not equality: `[apache]` is asked of a fleet, where the store is
+//! called `apache-access` on one host and `apache2` on the next. A word
+//! carrying `=`, `~`, `!` or `*` is a mistyped operator rather than a
+//! name, and is refused — read as a name it would answer "no stores" for
+//! a search nobody ran.
 //!
 //! `=*` exists because "the store whose name has `apache` in it" is the
 //! commonest thing anyone asks, and an anchored regex is a poor way to
@@ -188,11 +197,17 @@ fn parse_term(part: &str) -> anyhow::Result<Term> {
         (k, Op::Contains, v)
     } else if let Some((k, v)) = part.split_once('=') {
         (k, Op::Eq, v)
-    } else {
+    } else if part.contains(['=', '~', '!', '*']) {
+        // Something that LOOKS like an operator but is not one is a typo,
+        // not a store called that. Read as a name it would answer "no
+        // stores" for a search nobody ran — which is the reading the bare
+        // word below would otherwise give it.
         bail!(
-            "selector term {part:?} has no operator — expected key=value, \
-             key!=value, key=~regex, key!~regex, key=*text or key!*text"
+            "selector term {part:?} has no operator I know — one of {}",
+            OPS.join(", ")
         );
+    } else {
+        ("name", Op::Contains, part)
     };
     let key = key.trim();
     if key.is_empty() {
@@ -398,8 +413,12 @@ mod tests {
     #[test]
     fn malformed_selectors_are_refused_not_guessed() {
         assert!(Selector::parse("").is_err());
-        assert!(Selector::parse("host").is_err(), "no operator");
         assert!(Selector::parse("=web01").is_err(), "no label name");
+        // A word carrying an operator character but no operator: a typo,
+        // and the one case the bare-word rule must not swallow.
+        for typo in ["host~web01", "host!web01", "web*01", "!host"] {
+            assert!(Selector::parse(typo).is_err(), "{typo} should be refused");
+        }
         assert!(Selector::parse("host=web01,").is_err(), "stray comma");
         assert!(
             Selector::parse(r#"host=~"web.*"#).is_err(),
@@ -413,5 +432,35 @@ mod tests {
         let mut l = Map::new();
         l.insert("replicas".to_string(), Value::from(3));
         assert!(Selector::parse("replicas=3").unwrap().matches(&l));
+    }
+
+    /// A bare word is the store's name, matched anywhere in it — the same
+    /// thing `[apache]` means in timbersh, so a selector an operator
+    /// tested there is the selector a declaration can hold.
+    #[test]
+    fn a_bare_word_is_the_name_matched_anywhere_in_it() {
+        let l = labels(&[("name", "apache-access"), ("host", "web01")]);
+        assert!(Selector::parse("apache").unwrap().matches(&l));
+        assert!(Selector::parse("access").unwrap().matches(&l));
+        assert!(!Selector::parse("nginx").unwrap().matches(&l));
+        // Contains, not equality: the same word finds a store called
+        // something else on the next host.
+        assert!(Selector::parse("apache")
+            .unwrap()
+            .matches(&labels(&[("name", "apache2")])));
+        // It is a term like any other, so it ANDs and it quotes.
+        assert!(Selector::parse("apache,host=web01").unwrap().matches(&l));
+        assert!(Selector::parse("\"apache-access\"").unwrap().matches(&l));
+    }
+
+    /// A bare word says `name`, so it is a LITERAL — the reason `=*`
+    /// exists rather than a regex spelling of it.
+    #[test]
+    fn a_bare_word_is_not_read_as_a_pattern() {
+        let l = labels(&[("name", "apacheXaccess")]);
+        assert!(!Selector::parse("apache.access").unwrap().matches(&l));
+        assert!(Selector::parse("apache.access")
+            .unwrap()
+            .matches(&labels(&[("name", "apache.access")])));
     }
 }

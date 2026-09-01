@@ -1139,8 +1139,20 @@ is a LITERAL substring anywhere in the value \(em what a person means by
 .BR name=~.*apache.* ,
 where a
 .B .
-in the text would be read as a pattern). An absent label reads as the
-empty string, so
+in the text would be read as a pattern). A BARE WORD is the store's name
+matched anywhere in it:
+.B \-\-select apache
+is
+.B \-\-select
+\(aqname=*apache\(aq, which is what one means asking a fleet where the store
+is called
+.B apache\-access
+on one host and
+.B apache2
+on the next. A word carrying \fB=\fP, \fB~\fP, \fB!\fP or \fB*\fP without a
+whole operator is a typo rather than a name, and is refused: read as a
+name it would answer "no stores" for a search nobody ran. An absent
+label reads as the empty string, so
 .B key=
 selects the stores that do NOT declare it and
 .B key!=

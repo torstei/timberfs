@@ -467,13 +467,15 @@ enum Command {
         /// A JSON array of objects instead of the human table
         #[arg(long)]
         json: bool,
-        /// Select stores by their manifest LABELS rather than by name:
-        /// `--select 'type=console,host=web01'`. Comma-separated terms are
-        /// ANDed; `key=value`, `key!=value`, `key=~regex` and `key!~regex`
-        /// (regexes anchored at both ends); an absent label reads as the
-        /// empty string, so `key!=` selects the stores that declare it.
-        /// `*` is every store, as an omitted --select is. Quote a value
-        /// that must contain a comma
+        /// Select stores by their manifest: `--select
+        /// 'type=console,host=web01'`. Comma-separated terms are ANDed;
+        /// `key=value`, `key!=value`, `key=~regex`, `key!~regex`,
+        /// `key=*text` (a literal anywhere in the value) and `key!*text`
+        /// (regexes anchored at both ends); a BARE WORD is the name,
+        /// matched anywhere in it. An absent label reads as the empty
+        /// string, so `key!=` selects the stores that declare it. `*` is
+        /// every store, as an omitted --select is. Quote a value that
+        /// must contain a comma
         #[arg(long, value_name = "EXPR")]
         select: Option<String>,
         /// Print each store's whole id instead of the leading 8
