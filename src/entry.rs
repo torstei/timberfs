@@ -75,14 +75,14 @@ pub struct EntrySink {
     entry_write_win: (u64, u64),
     cur_write_win: (u64, u64),
     /// The number of the chunk being pushed, and the one the open entry
-    /// started in. `None` for the live edge: those entries are in no chunk
-    /// yet, so there is no resumable position to name — a consumer counts
-    /// them as delivered but cannot durably stand inside them.
+    /// started in. `None` for the live edge: those bytes are in no chunk
+    /// yet. That is a fact about the CONTAINER, not about the address —
+    /// see `entry_begin`.
     entry_chunk: Option<u64>,
     cur_chunk: Option<u64>,
-    /// Where the open entry BEGINS on the tape. Meaningful only while
-    /// `entry_chunk` is set: a live-edge entry is in no chunk and has no
-    /// position at all.
+    /// Where the open entry BEGINS on the tape — always meaningful. The
+    /// live edge is the tape's last stretch, so an entry there has an
+    /// address like any other; only its chunk is missing.
     entry_begin: u64,
 
     /// Where the line being accumulated STARTED, as an absolute offset on
@@ -304,16 +304,21 @@ impl EntrySink {
             }
             let (wf, wl) = self.entry_write_win;
             write!(out, "\x1fwf={wf}\x1fwl={wl}")?;
-            // Present only for an entry that is already in a chunk: its
-            // ABSENCE is how a consumer knows this one came from the live
-            // edge and cannot be resumed from yet.
-            //
-            // `offset` is where this run of bytes BEGINS on the tape, and
+            // `offset` is where this run of bytes BEGINS on the tape and
             // `len` above is how long it is, so the record states both
             // ends of what it served. Same name the `position` record
             // uses: there is one kind of position in this protocol.
+            //
+            // It is stated for a live entry too. The tape is a byte
+            // stream and the write-ahead segment is its last stretch —
+            // those bytes are addressable exactly like any other, which
+            // is what lets a consumer resume past one before the chunk
+            // holding it exists. `chunk` is the separate fact of whether
+            // a container has closed over them yet, so it is absent
+            // there and the two are written apart.
+            write!(out, "\x1foffset={}", self.entry_begin)?;
             if let Some(seq) = self.entry_chunk {
-                write!(out, "\x1fchunk={seq}\x1foffset={}", self.entry_begin)?;
+                write!(out, "\x1fchunk={seq}")?;
             }
             if let Some(label) = &self.framing.label {
                 out.write_all(b"\x1fsrc=")?;
@@ -487,9 +492,8 @@ mod tests {
 
     #[test]
     fn a_live_edge_entry_carries_no_chunk_at_all() {
-        // Absence is the signal: the entry is in no chunk yet, so there is
-        // no position a consumer could durably resume from inside it. A
-        // zero would be a lie — chunk 0 is a real chunk.
+        // Absence is the signal: the entry is in no chunk yet. A zero
+        // would be a lie — chunk 0 is a real chunk.
         let mut sink = records_sink();
         let mut out = Vec::new();
         sink.push_chunk(
@@ -505,8 +509,43 @@ mod tests {
         assert_eq!(h.len(), 1, "{h:?}");
         assert!(!h[0].contains("chunk="), "{}", h[0]);
         // The write window is still there — that is a fact about the entry,
-        // unlike its position.
+        // unlike its container.
         assert!(h[0].contains("wf=100"), "{}", h[0]);
+    }
+
+    /// ...but it does carry an ADDRESS, continuous with the chunk before
+    /// it. The tape is a byte stream and the write-ahead segment is its
+    /// last stretch, so a consumer can resume past a live entry; what it
+    /// cannot do is name the chunk holding it, there being none yet.
+    #[test]
+    fn a_live_edge_entry_still_says_where_it_sits() {
+        let mut sink = records_sink();
+        let mut out = Vec::new();
+        let sealed = b"2026-08-21T10:00:00Z in a chunk\n";
+        sink.push_chunk(sealed, Some(7), (100, 200), 900, &mut out)
+            .unwrap();
+        sink.push_chunk(
+            b"2026-08-21T10:00:01Z at the live edge\n",
+            None,
+            (200, 300),
+            900 + sealed.len() as u64,
+            &mut out,
+        )
+        .unwrap();
+        sink.finish(&mut out).unwrap();
+        let h = heads(&out);
+        assert_eq!(h.len(), 2, "{h:?}");
+        assert!(
+            h[0].contains("offset=900") && h[0].contains("chunk=7"),
+            "{}",
+            h[0]
+        );
+        assert!(
+            h[1].contains(&format!("offset={}", 900 + sealed.len())),
+            "{}",
+            h[1]
+        );
+        assert!(!h[1].contains("chunk="), "{}", h[1]);
     }
 
     #[test]

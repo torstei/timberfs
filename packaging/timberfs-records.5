@@ -157,11 +157,15 @@ becomes one when its stamped line closes, so a line split across two
 chunks reports the second; present when known \(em a stream converted from
 raw text has none),
 .B chunk
-(the number of that same chunk, in the SOURCE store \(em what a consumer's
-cursor holds, and exact where a timestamp is not, chunk numbers only moving
-forward. ABSENT means the producer read the entry from the live edge, where
-no chunk exists yet: it may be delivered, but no resumable position inside
-it can be recorded. It is a POSITION, not a fact about the entry, so unlike
+(the number of that same chunk, in the SOURCE store \(em exact where a
+timestamp is not, chunk numbers only moving forward. ABSENT means the
+producer read the entry from the live edge, where no chunk exists yet: that
+is a fact about the CONTAINER and not about the address, so such an entry
+still carries an
+.B offset
+and can be resumed past \(em a segment's bytes are the next chunk's bytes,
+and it reports the same address for them. It is a POSITION, not a fact about
+the entry, so unlike
 .BR wf / wl
 it is not carried into a destination store \(em an ingesting writer numbers
 its own chunks, or two fan-in sources would interleave into a sequence that
@@ -177,9 +181,11 @@ trust that it is: the end of one entry is the start of the next, and the
 end of the last is the
 .B position
 that store reports. Same name and same quantity as that record's, because
-there is one kind of position here. Absent under the same condition as
-.BR chunk ,
-and for the same reason),
+there is one kind of position here. Present whatever
+.B chunk
+says: the write-ahead segment is the tape's last stretch, so an entry with
+no chunk still has an address \(em and it is the address the chunk that
+segment becomes will report for those bytes),
 .B src
 (source path; present only in multi-source streams \(em single-source
 streams name their source once, in

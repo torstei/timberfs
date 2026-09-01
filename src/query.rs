@@ -1512,15 +1512,18 @@ fn query_follow(
         entries: &[crate::sap::SapEntry],
         sink: &mut Option<crate::entry::EntrySink>,
         label: Option<&[u8]>,
+        base: u64,
     ) -> anyhow::Result<()> {
+        let mut at = base;
         for e in entries {
             match sink {
-                // The live edge is in no chunk yet, so it has no position
-                // on the tape — which is exactly why an entry from it
-                // carries no `chunk` either.
-                Some(s) => s.push_chunk(&e.payload, None, (e.wf, e.wl), 0, out)?,
+                // In no chunk yet — but on the same tape, at `at`. A
+                // segment's bytes are the next chunk's bytes, so this
+                // address is the one that chunk will report for them.
+                Some(s) => s.push_chunk(&e.payload, None, (e.wf, e.wl), at, out)?,
                 None => emit_raw(out, &e.payload, label)?,
             }
+            at += e.payload.len() as u64;
         }
         Ok(())
     }
@@ -1721,7 +1724,11 @@ fn query_follow(
         // tail passed over them) — and this is the only place a BOUNDED
         // --tail can see them, since it never enters the poll loop.
         if !capped(&limit) {
-            emit_live(&mut out, &live.poll()?, &mut sink, label.as_deref())?;
+            // Its address on the tape: what has left the store, plus
+            // where the segment says its own bytes sit.
+            let (at, entries) = live.poll()?;
+            let base = dropped_bytes_of(f) + at;
+            emit_live(&mut out, &entries, &mut sink, label.as_deref(), base)?;
         }
         // Anchor to the latest committed chunk even when nothing was emitted
         // (from-now), so only new chunks are followed.
@@ -1826,9 +1833,15 @@ fn query_follow(
             }
             // The live edge last: it is always newer than any chunk.
             if !done {
-                let entries = s.live.poll()?;
+                let (at, entries) = s.live.poll()?;
+                // On the same tape the chunks above sit on. `dropped` is
+                // re-read per pass because a head trim moves it and the
+                // segment's own base by the same amount in opposite
+                // directions: the sum holds only while both are of one
+                // generation.
+                let base = dropped_bytes_of(&s.path) + at;
                 got |= !entries.is_empty();
-                emit_live(&mut out, &entries, &mut s.sink, s.label.as_deref())?;
+                emit_live(&mut out, &entries, &mut s.sink, s.label.as_deref(), base)?;
                 done = capped(&limit);
             }
             // Fires once per idle streak, and only after new data has
@@ -4121,6 +4134,73 @@ mod paging_tests {
         let want: Vec<String> = (1..=6).map(|i| format!("page entry {i}")).collect();
         assert_eq!(seen, want, "every entry once, in order");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A position taken at the LIVE EDGE is honoured by the chunked read
+    /// path once those bytes are in a chunk — the two paths address one
+    /// tape. Without that a consumer could not resume past an entry it
+    /// had been shown, which is what the burst of a tail is made of.
+    #[test]
+    fn a_position_taken_live_resumes_once_the_chunk_seals() {
+        use crate::store::{Config, Store};
+        let dir = std::env::temp_dir().join(format!("timberfs-liveseek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            chunk_size: 1 << 20,
+            level: 3,
+            flush_age_ms: 60_000,
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        // Declared BEFORE the writer opens: that is when the segment is
+        // created, and the live edge is what this test is about.
+        crate::bark::declare_wal(&dir, "app.log").unwrap();
+        let mut st = Store::open(&dir, cfg).unwrap();
+        st.create("app.log").unwrap();
+        crate::bark::ensure_identified(&dir, "app.log").unwrap();
+        let id = crate::bark::load(&dir, "app.log")
+            .unwrap()
+            .get("id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let f = st.files.get_mut("app.log").unwrap();
+        let line = |i: usize| format!("2026-08-28T10:00:0{i}Z line {i}\n");
+        // Two entries, sealed into a chunk.
+        for i in 0..2 {
+            f.append_stamped(line(i).as_bytes(), 1_000 + i as u64, &cfg)
+                .unwrap();
+        }
+        f.flush_chunk(&cfg).unwrap();
+        // Two more, still only in the write-ahead segment: no chunk holds
+        // them, and this is where a live reader would address them.
+        for i in 2..4 {
+            f.append_stamped(line(i).as_bytes(), 1_000 + i as u64, &cfg)
+                .unwrap();
+        }
+        // What makes them readable at all: the segment is buffered until
+        // a sync, which is the writer's once-a-second tick.
+        f.sap_sync().unwrap();
+        let files = [dir.join("app.log")];
+        // What a live reader sees, and where it says those bytes sit —
+        // the reader's own answer, not this test's arithmetic.
+        let mut tail = crate::live::LiveTail::open(&dir, "app.log", false);
+        let (live_at, live) = tail.poll().unwrap();
+        assert_eq!(live.len(), 2, "the entries no chunk holds yet");
+        assert_eq!(live_at, line(0).len() as u64 * 2, "the tape end");
+        // Just past the FIRST of them: what a consumer shown that entry
+        // would hand back.
+        let at = live_at + live[0].payload.len() as u64;
+
+        f.flush_chunk(&cfg).unwrap();
+        drop(st);
+        let cursor = std::collections::BTreeMap::from([(id, at)]);
+        assert_eq!(
+            bodies(&read(&files, &cursor, None)),
+            vec!["line 3".to_string()],
+            "the chunked path resumed exactly where the live edge left off"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A resumed read does not open what it has already delivered — what

@@ -14,9 +14,13 @@
 //!
 //!   * A segment's content is exactly the next chunk's bytes. So a reader
 //!     that served N bytes live drops N bytes from the front of the chunk
-//!     that segment becomes (`skip_for_chunk`) — no double-emit, no gap,
-//!     and no absolute positions, which matters because a retention head
-//!     trim rebases every logical offset in the store.
+//!     that segment becomes (`skip_for_chunk`) — no double-emit and no
+//!     gap. It also means a live entry HAS an address: the segment starts
+//!     where the store's chunks end, so `served` counts into the same
+//!     tape a chunk's bytes sit on (`LiveTail::served`). Logical offsets
+//!     are the ones a head trim rebases; the tape is what it holds
+//!     still, because what leaves the store is added back to every
+//!     address.
 //!   * The swap is a rename, so a reader's own descriptor never sees
 //!     bytes mutate or truncate, and a NEW INODE is the generation
 //!     marker. The header's bases are rewritten in place by a head trim
@@ -48,6 +52,12 @@ struct Segment {
     /// passed over, when the follow started mid-segment: both mean "do
     /// not emit these again from the chunk".
     served: u64,
+    /// Where this segment starts in the store's logical stream, as its
+    /// header states it. Re-read on every poll: a head trim rewrites it
+    /// in place, and reading it here — from the same descriptor the
+    /// records come off — is what keeps the address and the bytes from
+    /// coming from two different generations of the store.
+    base: u64,
 }
 
 /// A reader's view of a store's live write-ahead segment.
@@ -57,6 +67,15 @@ pub struct LiveTail {
     /// Payload bytes served out of segments that have since been sealed,
     /// waiting for the chunks those segments became.
     skip: u64,
+}
+
+/// The segment's `uncomp_base`: where its bytes sit in the store's
+/// logical stream. `None` for a file too short to hold a header — a
+/// writer between creating it and writing one.
+fn read_base(f: &File) -> Option<u64> {
+    let mut b = [0u8; 8];
+    f.read_exact_at(&mut b, 16).ok()?;
+    Some(u64::from_le_bytes(b))
 }
 
 impl LiveTail {
@@ -137,21 +156,38 @@ impl LiveTail {
         self.skip = 0;
     }
 
-    /// The entries appended since the last call, in order. An empty
-    /// result is the normal quiet case.
-    pub fn poll(&mut self) -> io::Result<Vec<SapEntry>> {
+    /// The entries appended since the last call, in order, with WHERE
+    /// the first of them sits in the store's logical stream — the
+    /// segment's own base plus what this reader has already taken out of
+    /// it. Add what has left the store and the result is an address on
+    /// the tape, the same one the chunk this segment becomes will report.
+    ///
+    /// ⚠ The base is read here rather than derived from the ring index.
+    /// A flush landing between a caller's ring snapshot and this call
+    /// creates a new segment further along the stream, and a derived base
+    /// would place these entries a whole chunk too low.
+    ///
+    /// An empty result is the normal quiet case; the address still says
+    /// where the next entry will sit.
+    pub fn poll(&mut self) -> io::Result<(u64, Vec<SapEntry>)> {
         let f = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 self.roll();
-                return Ok(Vec::new());
+                return Ok((0, Vec::new()));
             }
             Err(e) => return Err(e),
         };
         self.attach(&f)?;
         let Some(seg) = self.seg.as_mut() else {
-            return Ok(Vec::new());
+            return Ok((0, Vec::new()));
         };
+        // In place, by a head trim: same segment, same bytes, new
+        // coordinates.
+        if let Some(base) = read_base(&f) {
+            seg.base = base;
+        }
+        let at = seg.base + seg.served;
         // fstat, so the length describes the inode we are holding — a
         // rename between the open and here cannot mislead it.
         let len = f.metadata()?.len();
@@ -162,14 +198,14 @@ impl LiveTail {
             // rather than re-reading keeps that impossible case from
             // turning into duplicates.
             seg.off = seg.off.min(len);
-            return Ok(Vec::new());
+            return Ok((at, Vec::new()));
         }
         let mut buf = vec![0u8; (len - seg.off) as usize];
         f.read_exact_at(&mut buf, seg.off)?;
         let (entries, used) = sap::parse_records(&buf);
         seg.off += used as u64;
         seg.served += entries.iter().map(|e| e.payload.len() as u64).sum::<u64>();
-        Ok(entries)
+        Ok((at, entries))
     }
 
     /// Bind to the segment `f` refers to, rolling first if it is not the
@@ -193,11 +229,18 @@ impl LiveTail {
         if f.read_exact_at(&mut magic, 0).is_err() || &magic != SAP_MAGIC {
             return Ok(());
         }
+        // No base, no attachment: a zero would be an address, and a
+        // wrong one. The same shape as the magic check above — a reader
+        // that landed mid-header simply tries again.
+        let Some(base) = read_base(f) else {
+            return Ok(());
+        };
         self.seg = Some(Segment {
             dev,
             ino,
             off: HEADER_LEN,
             served: 0,
+            base,
         });
         Ok(())
     }
@@ -255,13 +298,13 @@ mod tests {
 
         w.append(1, 1, b"one\n").unwrap();
         w.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["one\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["one\n"]);
         // Nothing new is not an error, and does not re-emit.
-        assert!(t.poll().unwrap().is_empty());
+        assert!(t.poll().unwrap().1.is_empty());
 
         w.append(2, 2, b"two\n").unwrap();
         w.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["two\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["two\n"]);
     }
 
     #[test]
@@ -273,14 +316,14 @@ mod tests {
         w.sync().unwrap();
 
         let mut t = LiveTail::open(d.path(), "app", true);
-        assert!(t.poll().unwrap().is_empty(), "already-there is not new");
+        assert!(t.poll().unwrap().1.is_empty(), "already-there is not new");
         // …but it still belongs to the chunk that segment becomes, so it
         // must be skipped there too.
         assert_eq!(t.skip_for_chunk(100), 0, "not yet sealed");
 
         w.append(2, 2, b"after\n").unwrap();
         w.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["after\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["after\n"]);
     }
 
     #[test]
@@ -292,7 +335,7 @@ mod tests {
         w.sync().unwrap();
 
         let mut t = LiveTail::open(d.path(), "app", false);
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["buffered\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["buffered\n"]);
     }
 
     #[test]
@@ -304,7 +347,7 @@ mod tests {
 
         w.append(1, 1, b"whole\n").unwrap();
         w.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["whole\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["whole\n"]);
 
         // A record only half on disk: the reader must not consume it…
         let full = {
@@ -318,14 +361,14 @@ mod tests {
         let end = std::fs::metadata(&p).unwrap().len();
         f.write_all_at(&rec[..rec.len() - 3], end).unwrap();
         assert!(
-            t.poll().unwrap().is_empty(),
+            t.poll().unwrap().1.is_empty(),
             "a torn record is not a record"
         );
 
         // …and must see it once the rest lands.
         let end = std::fs::metadata(&p).unwrap().len();
         f.write_all_at(&rec[rec.len() - 3..], end).unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["torn\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["torn\n"]);
     }
 
     #[test]
@@ -336,7 +379,7 @@ mod tests {
         let mut t = LiveTail::open(d.path(), "app", true);
         w.append(1, 1, b"served-live\n").unwrap();
         w.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["served-live\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["served-live\n"]);
 
         // The flush: seal (rename), then a fresh segment.
         std::fs::rename(&p, crate::format::sap_seal_path(d.path(), "app")).unwrap();
@@ -351,7 +394,7 @@ mod tests {
 
         w2.append(3, 3, b"next\n").unwrap();
         w2.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["next\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["next\n"]);
     }
 
     #[test]
@@ -362,7 +405,7 @@ mod tests {
         let mut t = LiveTail::open(d.path(), "app", true);
         w.append(1, 1, b"served-live\n").unwrap();
         w.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["served-live\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["served-live\n"]);
         std::fs::rename(&p, crate::format::sap_seal_path(d.path(), "app")).unwrap();
         Sap::create(&p, 40, 12).unwrap();
         t.reconcile().unwrap();
@@ -382,14 +425,22 @@ mod tests {
         let mut t = LiveTail::open(d.path(), "app", true);
         w.append(1, 1, b"kept\n").unwrap();
         w.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["kept\n"]);
+        let (at, got) = t.poll().unwrap();
+        assert_eq!(payloads(&got), vec!["kept\n"]);
+        assert_eq!(at, 900, "the segment's own base");
 
         // Retention rebases the store under the live segment: same file,
         // new bases. Nothing was sealed, so nothing may be re-emitted or
         // charged to a chunk.
         w.refresh_base(100, 100).unwrap();
         t.reconcile().unwrap();
-        assert!(t.poll().unwrap().is_empty());
+        let (rebased, got) = t.poll().unwrap();
+        assert!(got.is_empty());
+        // The address followed the rebase, by the 800 that left the
+        // store — so adding what left it back leaves the TAPE offset
+        // where it was, which is the axis a cursor is on.
+        assert_eq!(rebased, 100 + b"kept\n".len() as u64);
+        assert_eq!(rebased + 800, at + b"kept\n".len() as u64);
         assert_eq!(t.skip_for_chunk(1000), 0);
     }
 
@@ -398,14 +449,14 @@ mod tests {
         let d = TempDir::new();
         let mut t = LiveTail::open(d.path(), "app", true);
         assert!(!t.live());
-        assert!(t.poll().unwrap().is_empty());
+        assert!(t.poll().unwrap().1.is_empty());
         assert_eq!(t.skip_for_chunk(100), 0);
 
         // …until one is declared under it, which needs no restart.
         let mut w = Sap::create(&crate::format::sap_path(d.path(), "app"), 0, 0).unwrap();
         w.append(1, 1, b"now live\n").unwrap();
         w.sync().unwrap();
-        assert_eq!(payloads(&t.poll().unwrap()), vec!["now live\n"]);
+        assert_eq!(payloads(&t.poll().unwrap().1), vec!["now live\n"]);
         assert!(t.live());
     }
 }

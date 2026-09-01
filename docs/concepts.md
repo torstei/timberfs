@@ -158,7 +158,10 @@ this store's retaining followers have not read. Additive, never a cap — see
 
 **live edge** — the newest data: buffered, not yet a chunk. `query --follow`
 tails it through the `.sap`; a plain `query` never includes it; an entry from it
-has no chunk number, and that absence is the signal (a zero would be a lie).
+has no chunk number, and that absence is the signal (a zero would be a lie). It
+does carry an **offset**: the tape is a byte stream and the segment is its last
+stretch, so a consumer can resume past a live entry — the chunk that segment
+becomes reports the same address for those bytes.
 → [README](../README.md#durability-and-the-live-edge---wal)
 
 **lineage** — see **derived store**.
