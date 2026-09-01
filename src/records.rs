@@ -16,9 +16,9 @@ pub struct EntryRec {
     pub wf: Option<u64>,
     pub wl: Option<u64>,
     /// The number of the chunk this entry came from IN THE SOURCE STORE.
-    /// `None` means the producer read it from the live edge, where no chunk
-    /// exists yet — so a consumer may deliver it but cannot record a
-    /// resumable position inside it.
+    /// `None` means the producer read it from the live edge, where no
+    /// chunk exists yet — a fact about the container, not the address:
+    /// such an entry still states the `offset` it sits at.
     ///
     /// ⚠ A position, not a fact about the entry: unlike `wf`/`wl` it is
     /// NOT carried into a destination store (see `sink.rs`).

@@ -1111,10 +1111,14 @@ class Records:
                 continue
             sid = f.get("id") or (seen[0] if len(seen) == 1 else None)
             store = self.by_id.get(sid) or {"id": sid, "name": names.get(sid)}
-            # An entry still at the live edge is real and has no place
-            # yet, so it is SHOWN and simply cannot be opened.
+            # BOTH, as the hit list requires: an entry at the live edge
+            # states the offset it sits at, but no chunk holds those bytes
+            # yet and this screen opens the log by reading chunks. So it
+            # is SHOWN, with a place it cannot be opened at — the same
+            # answer a hit gets.
             where = (Address(sid, store.get("_host"), "offset",
-                             int(f["offset"])) if "offset" in f else None)
+                             int(f["offset"]))
+                     if "offset" in f and "chunk" in f else None)
             if where is None:
                 if version and version < PLACED_FROM:
                     self.stale += 1

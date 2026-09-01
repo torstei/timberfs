@@ -160,13 +160,13 @@ here.
   for compression cannot also inherit an edge's small ones for latency.
   Expect addressing to survive exactly ONE hop in a three-tier fleet, and
   say so rather than let it be found out.
-  **The live edge has no address**, by construction: `EntryRec.chunk` is
-  `None` there because the chunk does not exist yet, which is also why a
-  cursor does not advance on those entries. So a `wal`-backed follower
-  delivering sub-second carries no address for the newest data, and an
-  address becomes available one chunk AFTER the entry does. Consistent
-  with the asymmetry retention already lives with (delivery is
-  entry-granular, erasure chunk-granular) rather than a new surprise.
+  **The live edge has no chunk NUMBER**, `EntryRec.chunk` being `None`
+  there until one exists — but it does have an address: the segment
+  states where its bytes sit in the store's logical stream, and those
+  bytes are the next chunk's, so the offset an entry reports there is the
+  one that chunk will report for it. A `wal`-backed follower delivering
+  sub-second can therefore be resumed past; what becomes available one
+  chunk later is the citation `(origin, seq)`, not the position.
   **The line is whole-chunk versus entry-level selection**, not window
   versus whole. A chunk copied INTACT keeps its address however few of its
   siblings came along: `export`'s window and `rotate`'s prefix both take
@@ -486,19 +486,36 @@ here.
   store is v2 an older timberfs cannot read it, so a package rollback needs
   either the newer binary kept around or a v2→v1 downgrade in that same
   converter. Nothing is at risk but the choice of binary.
-- **A resumable position for the live edge**: an entry read from the `.sap`
-  carries no chunk number, its chunk not existing yet, so it is delivered
-  and counted but moves no position — a restart re-reads from the last
-  chunk boundary. That is bounded and permitted by at-least-once, and it is
-  the reason nothing more was built. If the re-delivery ever costs enough
-  to notice, the exact fix is for the `.sap` header to declare the number of
-  the chunk its entries will become: the writer knows it, and a reader
-  deriving it instead (`max(header_hwm, last.seq + 1)`) is unsound — a flush
-  landing between the reader's rings read and its sap read labels those
-  entries one chunk too low, and `n` then skips real entries on resume.
-  Cheap when wanted: the sap is recreated on every seal-and-swap, so a
-  format bump there needs no converter and no grace period, unlike the
-  rings.
+- **A resumable position for the live edge** — SHIPPED, and by the axis
+  rather than by the number. An entry from the `.sap` carries no chunk (one
+  does not exist yet) and now states its `offset` anyway: the tape is a
+  byte stream, the segment is its last stretch, and `chunk` is a fact about
+  the container while `offset` is the address. So the two are written
+  apart, and a consumer resumes past an entry it was shown before any chunk
+  held it — measured against a store whose newest lines were in no chunk at
+  all.
+  The address comes from the segment's OWN header (`uncomp_base`, which
+  `sap.rs` had already called "the planned live-tail reader's realignment
+  anchor") plus what the reader has taken out of it, never from the ring
+  index: a flush landing between a reader's rings read and its sap read
+  creates a new segment further along, and a derived base would place those
+  entries a whole chunk too low. That is the same unsoundness this entry
+  used to describe for a derived chunk NUMBER — it applies to any derived
+  coordinate, and the fix is to read the writer's own statement.
+  No format bump was needed: the header already carried the field, and a
+  head trim rewrites it in place (`Sap::refresh_base`), so the address
+  follows a rebase by exactly what leaves the store and the TAPE offset
+  does not move.
+  ⚠ What stays with the chunk is durability, not position: the sap is
+  readable at `flush` and durable at `sync`, so a live address is exact and
+  survives as far as the writer's last sync — the bargain `tail -f` makes.
+  The other half shipped with it: a read that RESUMES — a cursor and no
+  window — is served the segment as well as the chunks, so a polling
+  consumer no longer waits out the writer's flush age for data already
+  durable (measured: 0.03-0.64 s against a 20-second flush age). A windowed
+  read still stops at the chunks, and so does a chunk-granular predicate
+  sweep: one selects by a write window the segment has not got, the other
+  by an index that has not covered it.
 - **Retaining what a follower has not consumed** (SHIPPED: the registry,
   `retain_unconsumed` and `trim`): retention drops
   by age and by size. A frontend box wants a third rule — drop what is

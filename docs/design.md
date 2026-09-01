@@ -383,9 +383,26 @@ entry was written upstream, which stays true anywhere; a position does not.
 
 **An entry from the live edge has no number**, its chunk not existing yet,
 and the ABSENCE is the signal — a zero would be a lie, chunk 0 being a real
-chunk. Such an entry is delivered and counted, but no position moves: there
-is nowhere inside an unwritten chunk to resume from. A restart re-reads from
-the last chunk boundary, which chunk-granular resume already does.
+chunk. It does have an **offset**, and the two are written apart for that
+reason: a chunk is a container, an offset is an address, and the live
+segment is the tape's last stretch rather than a place off it. A segment's
+bytes are exactly the next chunk's bytes, so the address a live entry
+reports is the one that chunk will report for them — which is what lets a
+consumer resume past an entry it was shown before any chunk held it.
+Durability is the separate question: the sap is readable at `flush` and
+durable at `sync`, so a live position is exact and survives as far as the
+writer's last sync — the same bargain `tail -f` makes.
+
+**A read that resumes serves the edge too**, not only `--follow`: a cursor
+with no window is a consumer following the store, and making it wait out
+the writer's flush age to be told about data already durable was the
+latency nobody chose. Measured with a 20-second flush age, entries reached
+a polling client in 0.03–0.64 s instead of not at all until the flush. The
+segment is appended to the chunks only where it BEGINS where they end: a
+flush landing between the ring snapshot and the sap read leaves the bytes
+between them in a chunk that answer never saw, and delivering the segment
+anyway would report a position past them — a gap nothing downstream could
+detect. Being one poll late is the cheap failure.
 
 **Both migrations are lazy, so no store needs an operator step.** A v1
 index is read with its numbers synthesized — the oldest surviving record is

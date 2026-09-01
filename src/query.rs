@@ -891,6 +891,51 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
 /// timestamps fall inside the asked window. Unfilterable stores (no
 /// parseable line timestamps) fall back to the unwidened raw window with
 /// a note — never both looser AND unexplained.
+/// Does this live segment begin exactly where the store's chunks end?
+///
+/// Only then can its entries be appended to what the chunks gave. A flush
+/// landing between the ring snapshot and the sap read leaves the two
+/// unrelated: the bytes in between are in a chunk this answer never saw,
+/// and delivering the segment anyway would move the reported position
+/// PAST them — a gap the consumer cannot know it has. Being one poll late
+/// is the cheap failure; the chunk carries those bytes next time.
+fn live_follows_the_chunks(at: u64, dropped: u64, chunks: &[ChunkRecord]) -> bool {
+    at == dropped + chunks.last().map_or(0, |c| c.uncomp_end())
+}
+
+/// The live edge, after what the chunks gave: the newest entries, which
+/// are durable and readable but in no chunk yet. For a read that is
+/// RESUMING — a position and no window — because a consumer following the
+/// store otherwise waits out the writer's flush age to see them.
+///
+/// Each entry is placed like a chunk would be: its own address, and the
+/// same slicing where the position lands inside one.
+fn emit_live_edge(
+    live: &mut crate::live::LiveTail,
+    dropped: u64,
+    chunks: &[ChunkRecord],
+    resume_at: Option<u64>,
+    sink: &mut crate::entry::EntrySink,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let (mut at, entries) = live.poll()?;
+    if entries.is_empty() || !live_follows_the_chunks(at, dropped, chunks) {
+        return Ok(());
+    }
+    for e in entries {
+        let end = at + e.payload.len() as u64;
+        match resume_at {
+            Some(r) if r >= end => {}
+            Some(r) if r > at => {
+                sink.push_chunk(&e.payload[(r - at) as usize..], None, (e.wf, e.wl), r, out)?
+            }
+            _ => sink.push_chunk(&e.payload, None, (e.wf, e.wl), at, out)?,
+        }
+        at = end;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn query_entries<W: Write>(
     mut out: &mut W,
@@ -929,8 +974,16 @@ fn query_entries<W: Write>(
         dropped_bytes: u64,
         /// Its sink was already closed, on reaching the end of its chunks.
         finished: bool,
+        /// The store's live write-ahead segment, for a read that resumes.
+        /// `none()` otherwise: a windowed read answers about the past, and
+        /// the edge is not in it.
+        live: crate::live::LiveTail,
     }
     let multi = files.len() > 1 && !no_filename;
+    // A predicate the token index answers, rather than one judged on the
+    // entry: the difference decides whether the live edge can be part of
+    // the answer (see the `live` field below).
+    let sweeping = (!has.is_empty() || !any.is_empty()) && entry_preds.is_none();
     // --max: a total entry cap shared by every source's sink.
     let limit = max.map(|m| (Rc::new(Cell::new(0u64)), m));
     // WHICH bound stopped the read. A consumer needs the name, not just
@@ -946,6 +999,7 @@ fn query_entries<W: Write>(
         }
         let mut source = open_source(f)?;
         let guard = seq_guard(f);
+        let guard_for_live = guard.clone();
         let tf = crate::bark::time_format(source.bark.as_ref());
         let extractor =
             crate::import::Extractor::new(tf.regex.as_deref(), tf.format.as_deref(), tf.utc)?;
@@ -1026,13 +1080,22 @@ fn query_entries<W: Write>(
             // is the durable one.
             store_id: (multi && records).then(|| store_id_of(&source)).flatten(),
         };
+        // A position past a chunk's END makes it dead weight, and the
+        // index is ordered by where a chunk sits — so the first one that
+        // survives is found rather than walked to. A following read
+        // carries no window, so its selection is the whole store and
+        // this is the only thing narrowing it: on a store of 100k chunks
+        // that is a search instead of 100k comparisons, every poll.
+        let start = resume_at.map_or(0, |at| {
+            selected.partition_point(|(_, c)| dropped + c.uncomp_end() <= at)
+        });
         srcs.push(Src {
             path: f.clone(),
             guard,
             total_chunks: source.records.len(),
             handle: source,
             chunks: selected,
-            pos: 0,
+            pos: start,
             sink: crate::entry::EntrySink::new(
                 extractor,
                 window,
@@ -1047,6 +1110,20 @@ fn query_entries<W: Write>(
             dropped_bytes: dropped,
             resume_at,
             finished: false,
+            // A POSITION and no window is a consumer following this
+            // store; anything else is a question about the past.
+            //
+            // Not under a CHUNK-granular predicate, though: that answer is
+            // the chunks the token index says may contain the terms, and
+            // the index cannot speak for a segment it has not covered.
+            // Emitting it whole would answer a different question; one
+            // flush later the chunk is indexed and it is answered.
+            live: match (&guard_for_live, windowed, resume_at, sweeping) {
+                (Some((dir, name)), false, Some(_), false) => {
+                    crate::live::LiveTail::open(dir, name, false)
+                }
+                _ => crate::live::LiveTail::none(),
+            },
         });
     }
 
@@ -1141,14 +1218,23 @@ fn query_entries<W: Write>(
         let s = &mut srcs[i];
         let c = s.chunks[s.pos].1;
         s.pos += 1;
-        let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
-            continue; // retained away by a race between selection and read
-        };
         // Resume: a chunk wholly before the position holds nothing new,
         // and the one the position lands in is entered part-way. Byte
         // exact, where a timestamp cannot tell two entries of the same
         // second apart — which is why a position is an offset at all.
+        //
+        // The index carries the span, so a chunk the position is past is
+        // skipped without decompressing it — what a poll resuming from a
+        // cursor rests on.
         let chunk_base = s.dropped_bytes + c.uncomp_start;
+        if s.resume_at
+            .is_some_and(|at| at >= chunk_base + c.uncomp_len)
+        {
+            continue;
+        }
+        let Some(data) = read_chunk(&s.path, &s.guard, &mut s.handle, c)? else {
+            continue; // retained away by a race between selection and read
+        };
         let (data, base) = match s.resume_at {
             Some(at) if at >= chunk_base + data.len() as u64 => continue,
             Some(at) if at > chunk_base => (&data[(at - chunk_base) as usize..], at),
@@ -1187,6 +1273,14 @@ fn query_entries<W: Write>(
         // other store's body — the answer interleaved after all.
         let s = &mut srcs[i];
         if s.pos == s.chunks.len() {
+            emit_live_edge(
+                &mut s.live,
+                s.dropped_bytes,
+                &s.handle.records,
+                s.resume_at,
+                &mut s.sink,
+                &mut out,
+            )?;
             s.sink.finish(&mut out)?;
             s.finished = true;
         }
@@ -1213,6 +1307,18 @@ fn query_entries<W: Write>(
         if !s.finished {
             if s.pos < s.chunks.len() {
                 s.sink.discard_pending();
+            } else {
+                // The loop never ran for this one — a position at the
+                // tape's end leaves no chunk to walk, which is the steady
+                // state of a consumer that has caught up.
+                emit_live_edge(
+                    &mut s.live,
+                    s.dropped_bytes,
+                    &s.handle.records,
+                    s.resume_at,
+                    &mut s.sink,
+                    &mut out,
+                )?;
             }
             s.sink.finish(&mut out)?;
         }
@@ -1503,15 +1609,18 @@ fn query_follow(
         entries: &[crate::sap::SapEntry],
         sink: &mut Option<crate::entry::EntrySink>,
         label: Option<&[u8]>,
+        base: u64,
     ) -> anyhow::Result<()> {
+        let mut at = base;
         for e in entries {
             match sink {
-                // The live edge is in no chunk yet, so it has no position
-                // on the tape — which is exactly why an entry from it
-                // carries no `chunk` either.
-                Some(s) => s.push_chunk(&e.payload, None, (e.wf, e.wl), 0, out)?,
+                // In no chunk yet — but on the same tape, at `at`. A
+                // segment's bytes are the next chunk's bytes, so this
+                // address is the one that chunk will report for them.
+                Some(s) => s.push_chunk(&e.payload, None, (e.wf, e.wl), at, out)?,
                 None => emit_raw(out, &e.payload, label)?,
             }
+            at += e.payload.len() as u64;
         }
         Ok(())
     }
@@ -1532,9 +1641,6 @@ fn query_follow(
         // pending entry has already been closed for this quiet streak.
         last_data: std::time::Instant,
         flushed_idle: bool,
-        /// What has left this store, so an offset is on the tape rather
-        /// than in the file as it stands.
-        dropped_bytes: u64,
     }
 
     // An entry is only closed by the NEXT stamped line, so the newest
@@ -1690,6 +1796,11 @@ fn query_follow(
         } else {
             None
         };
+        // ONE reading per pass, for the chunks and the live edge alike: a
+        // head trim moves it and every offset under it in opposite
+        // directions, so two readings can put the two halves of one
+        // answer on different tapes.
+        let dropped = dropped_bytes_of(f);
         for c in &chunks[start..] {
             if let Some(data) = read_chunk(f, &guard, &mut source, *c)? {
                 match &mut sink {
@@ -1697,7 +1808,7 @@ fn query_follow(
                         &data,
                         Some(c.seq),
                         (c.first_write_ms, c.last_write_ms),
-                        dropped_bytes_of(f) + c.uncomp_start,
+                        dropped + c.uncomp_start,
                         &mut out,
                     )?,
                     None => emit_raw(&mut out, &data, label.as_deref())?,
@@ -1712,7 +1823,12 @@ fn query_follow(
         // tail passed over them) — and this is the only place a BOUNDED
         // --tail can see them, since it never enters the poll loop.
         if !capped(&limit) {
-            emit_live(&mut out, &live.poll()?, &mut sink, label.as_deref())?;
+            // Its address on the tape: the same `dropped` the chunks
+            // above were addressed with, plus where the segment says its
+            // own bytes sit.
+            let (at, entries) = live.poll()?;
+            let base = dropped + at;
+            emit_live(&mut out, &entries, &mut sink, label.as_deref(), base)?;
         }
         // Anchor to the latest committed chunk even when nothing was emitted
         // (from-now), so only new chunks are followed.
@@ -1731,7 +1847,6 @@ fn query_follow(
             noted_overtaken: false,
             last_data: std::time::Instant::now(),
             flushed_idle: false,
-            dropped_bytes: dropped_bytes_of(f),
         });
     }
     out.flush()?;
@@ -1751,6 +1866,8 @@ fn query_follow(
                 Err(_) => continue, // transient (mid-rename by retention): retry
             };
             let guard = seq_guard(&s.path);
+            // As in the backfill above: one reading, both halves.
+            let dropped = dropped_bytes_of(&s.path);
             // BEFORE the chunks below are emitted: a flush that landed
             // since this ring snapshot was taken sealed a segment whose
             // entries may already have gone out live, and its chunk
@@ -1799,7 +1916,7 @@ fn query_follow(
                                     (c.first_write_ms, c.last_write_ms),
                                     // `skip` bytes of this chunk were
                                     // already delivered on an earlier poll.
-                                    s.dropped_bytes + c.uncomp_start + skip as u64,
+                                    dropped + c.uncomp_start + skip as u64,
                                     &mut out,
                                 )?,
                                 None => emit_raw(&mut out, fresh, s.label.as_deref())?,
@@ -1817,9 +1934,15 @@ fn query_follow(
             }
             // The live edge last: it is always newer than any chunk.
             if !done {
-                let entries = s.live.poll()?;
+                let (at, entries) = s.live.poll()?;
+                // On the same tape the chunks above sit on. `dropped` is
+                // re-read per pass because a head trim moves it and the
+                // segment's own base by the same amount in opposite
+                // directions: the sum holds only while both are of one
+                // generation.
+                let base = dropped + at;
                 got |= !entries.is_empty();
-                emit_live(&mut out, &entries, &mut s.sink, s.label.as_deref())?;
+                emit_live(&mut out, &entries, &mut s.sink, s.label.as_deref(), base)?;
                 done = capped(&limit);
             }
             // Fires once per idle streak, and only after new data has
@@ -4111,6 +4234,274 @@ mod paging_tests {
         }
         let want: Vec<String> = (1..=6).map(|i| format!("page entry {i}")).collect();
         assert_eq!(seen, want, "every entry once, in order");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A position taken at the LIVE EDGE is honoured by the chunked read
+    /// path once those bytes are in a chunk — the two paths address one
+    /// tape. Without that a consumer could not resume past an entry it
+    /// had been shown, which is what the burst of a tail is made of.
+    #[test]
+    fn a_position_taken_live_resumes_once_the_chunk_seals() {
+        use crate::store::{Config, Store};
+        let dir = std::env::temp_dir().join(format!("timberfs-liveseek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            chunk_size: 1 << 20,
+            level: 3,
+            flush_age_ms: 60_000,
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        // Declared BEFORE the writer opens: that is when the segment is
+        // created, and the live edge is what this test is about.
+        crate::bark::declare_wal(&dir, "app.log").unwrap();
+        let mut st = Store::open(&dir, cfg).unwrap();
+        st.create("app.log").unwrap();
+        crate::bark::ensure_identified(&dir, "app.log").unwrap();
+        let id = crate::bark::load(&dir, "app.log")
+            .unwrap()
+            .get("id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let f = st.files.get_mut("app.log").unwrap();
+        let line = |i: usize| format!("2026-08-28T10:00:0{i}Z line {i}\n");
+        // Two entries, sealed into a chunk.
+        for i in 0..2 {
+            f.append_stamped(line(i).as_bytes(), 1_000 + i as u64, &cfg)
+                .unwrap();
+        }
+        f.flush_chunk(&cfg).unwrap();
+        // Two more, still only in the write-ahead segment: no chunk holds
+        // them, and this is where a live reader would address them.
+        for i in 2..4 {
+            f.append_stamped(line(i).as_bytes(), 1_000 + i as u64, &cfg)
+                .unwrap();
+        }
+        // What makes them readable at all: the segment is buffered until
+        // a sync, which is the writer's once-a-second tick.
+        f.sap_sync().unwrap();
+        let files = [dir.join("app.log")];
+        // What a live reader sees, and where it says those bytes sit —
+        // the reader's own answer, not this test's arithmetic.
+        let mut tail = crate::live::LiveTail::open(&dir, "app.log", false);
+        let (live_at, live) = tail.poll().unwrap();
+        assert_eq!(live.len(), 2, "the entries no chunk holds yet");
+        assert_eq!(live_at, line(0).len() as u64 * 2, "the tape end");
+        // Just past the FIRST of them: what a consumer shown that entry
+        // would hand back.
+        let at = live_at + live[0].payload.len() as u64;
+
+        f.flush_chunk(&cfg).unwrap();
+        drop(st);
+        let cursor = std::collections::BTreeMap::from([(id, at)]);
+        assert_eq!(
+            bodies(&read(&files, &cursor, None)),
+            vec!["line 3".to_string()],
+            "the chunked path resumed exactly where the live edge left off"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store with a live segment, its `lines` in chunks and its
+    /// `live` ones only in the sap. Returns the store id and the tape
+    /// offset the chunks end at.
+    fn store_with_a_live_edge(
+        tag: &str,
+        lines: &[&str],
+        live: &[&str],
+    ) -> (std::path::PathBuf, String, u64) {
+        use crate::store::{Config, Store};
+        let dir = std::env::temp_dir().join(format!("timberfs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            chunk_size: 1 << 20,
+            level: 3,
+            flush_age_ms: 60_000,
+        };
+        // Declared BEFORE the writer opens: that is when the segment is
+        // created.
+        crate::bark::declare_wal(&dir, "app.log").unwrap();
+        let mut st = Store::open(&dir, cfg).unwrap();
+        st.create("app.log").unwrap();
+        crate::bark::ensure_identified(&dir, "app.log").unwrap();
+        let id = crate::bark::load(&dir, "app.log")
+            .unwrap()
+            .get("id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let f = st.files.get_mut("app.log").unwrap();
+        let mut ms = 1_000u64;
+        for text in lines {
+            f.append_stamped(text.as_bytes(), ms, &cfg).unwrap();
+            ms += 1;
+        }
+        f.flush_chunk(&cfg).unwrap();
+        let sealed = lines.iter().map(|l| l.len() as u64).sum();
+        for text in live {
+            f.append_stamped(text.as_bytes(), ms, &cfg).unwrap();
+            ms += 1;
+        }
+        // Buffered until a sync: that tick is what makes them readable.
+        f.sap_sync().unwrap();
+        drop(st);
+        (dir, id, sealed)
+    }
+
+    fn stamped(n: usize) -> String {
+        format!("2026-08-28T10:00:{n:02}Z line {n}\n")
+    }
+
+    /// A read that RESUMES also gives the live edge: those entries are
+    /// durable and readable, and a consumer following the store would
+    /// otherwise wait out the writer's flush age to be told about them.
+    /// They carry an address and no chunk, and the position the answer
+    /// reports is past them — so the next poll does not repeat them.
+    #[test]
+    fn a_resumed_read_gives_the_live_edge_too() {
+        let all: Vec<String> = (0..4).map(stamped).collect();
+        let text: Vec<&str> = all.iter().map(String::as_str).collect();
+        let (d, id, end) = store_with_a_live_edge("liveresume", &text[..2], &text[2..]);
+        let files = [d.join("app.log")];
+
+        let at_the_end = std::collections::BTreeMap::from([(id.clone(), end)]);
+        let buf = read(&files, &at_the_end, None);
+        assert_eq!(
+            bodies(&buf),
+            vec!["line 2".to_string(), "line 3".to_string()],
+            "the entries no chunk holds yet"
+        );
+        let recs = records(&buf);
+        let live: Vec<_> = recs.iter().filter(|r| r.0 == "entry").collect();
+        assert!(
+            live.iter().all(|r| r.1.contains_key("offset")),
+            "a live entry states where it sits"
+        );
+        assert!(
+            live.iter().all(|r| !r.1.contains_key("chunk")),
+            "...and names no chunk, there being none"
+        );
+        let after: std::collections::BTreeMap<String, u64> = cursor_of(&buf);
+        assert_eq!(
+            after.get(&id).copied(),
+            Some(end + all[2].len() as u64 + all[3].len() as u64),
+            "the position is past what was delivered"
+        );
+        // Handing that back delivers nothing twice.
+        assert!(bodies(&read(&files, &after, None)).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Resuming INSIDE the live edge: the entry the position lands on and
+    /// everything after it, once.
+    #[test]
+    fn a_position_inside_the_live_edge_resumes_there() {
+        let all: Vec<String> = (0..4).map(stamped).collect();
+        let text: Vec<&str> = all.iter().map(String::as_str).collect();
+        let (d, id, end) = store_with_a_live_edge("livemid", &text[..2], &text[2..]);
+        let files = [d.join("app.log")];
+        let mid = std::collections::BTreeMap::from([(id, end + all[2].len() as u64)]);
+        assert_eq!(
+            bodies(&read(&files, &mid, None)),
+            vec!["line 3".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A WINDOWED read is a question about the past, and the live edge is
+    /// not in it — unchanged, and deliberately: `--from`/`--until` select
+    /// chunks by their write window, and the segment has none.
+    #[test]
+    fn a_windowed_read_still_stops_at_the_chunks() {
+        let all: Vec<String> = (0..4).map(stamped).collect();
+        let text: Vec<&str> = all.iter().map(String::as_str).collect();
+        let (d, _id, _end) = store_with_a_live_edge("livewindow", &text[..2], &text[2..]);
+        let files = [d.join("app.log")];
+        let mut buf = Vec::new();
+        query_entries(
+            &mut buf,
+            &files,
+            0,
+            u64::MAX,
+            None,
+            true, // windowed
+            &[],
+            &[],
+            None,
+            None,
+            &Default::default(),
+            true,
+            false,
+            false,
+            true,
+            None,
+            Default::default(),
+            &Budget::Unbounded,
+        )
+        .unwrap();
+        assert_eq!(
+            bodies(&buf),
+            vec!["line 0".to_string(), "line 1".to_string()],
+            "the chunks, and nothing the segment holds"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The segment is appended to the chunks ONLY where it begins where
+    /// they end. A flush landing between the ring snapshot and the sap
+    /// read leaves the bytes in between in a chunk this answer never saw,
+    /// and delivering the segment anyway would report a position past
+    /// them — a gap nothing downstream could detect.
+    #[test]
+    fn a_segment_that_does_not_follow_the_chunks_is_left_alone() {
+        let chunk = |uncomp_start: u64, len: u64| ChunkRecord {
+            uncomp_start,
+            uncomp_len: len,
+            comp_start: 0,
+            comp_len: len / 2,
+            first_write_ms: 1,
+            last_write_ms: 2,
+            seq: uncomp_start / len.max(1),
+        };
+        let held = [chunk(0, 100), chunk(100, 100)];
+        assert!(live_follows_the_chunks(200, 0, &held));
+        assert!(!live_follows_the_chunks(300, 0, &held), "a flush landed");
+        assert!(!live_follows_the_chunks(150, 0, &held), "overlaps a chunk");
+        // What left the store is part of the address, on both sides.
+        assert!(live_follows_the_chunks(900, 700, &held));
+        assert!(live_follows_the_chunks(0, 0, &[]), "nothing flushed yet");
+    }
+
+    /// A resumed read does not open what it has already delivered. A
+    /// following read carries no window, so its selection is every chunk
+    /// the store has and the POSITION is the only thing narrowing it —
+    /// checked by SCRIBBLING over the compressed bytes below the cursor,
+    /// which a read that decompressed them could not survive.
+    #[test]
+    fn a_cursor_skips_what_is_below_it_without_decompressing_it() {
+        use std::io::Write;
+        let lines: Vec<(String, u64)> = (1..=20).map(|i| (format!("line {i}"), i)).collect();
+        let refs: Vec<(&str, u64)> = lines.iter().map(|(t, w)| (t.as_str(), *w)).collect();
+        let d = store_of("cursorskip", &refs);
+        let files = [d.join("app.log")];
+        let cursor = cursor_of(&read(&files, &Default::default(), Some(10)));
+        assert!(!cursor.is_empty(), "no position to resume from");
+
+        let cut = open_source(&files[0]).unwrap().records[10].comp_start;
+        assert!(cut > 0, "nothing below the cursor to scribble over");
+        let mut trunk = std::fs::OpenOptions::new()
+            .write(true)
+            .open(crate::format::trunk_path(&d, "app.log"))
+            .unwrap();
+        trunk.write_all(&vec![0xff; cut as usize]).unwrap();
+        trunk.sync_all().unwrap();
+
+        let want: Vec<String> = (11..=20).map(|i| format!("line {i}")).collect();
+        assert_eq!(bodies(&read(&files, &cursor, None)), want);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
