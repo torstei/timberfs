@@ -707,6 +707,24 @@ here.
   from an idle one), and any priority or weighting among followers
   (`retaining` is the only tier, and it is a declared property rather than
   a consequence of where a file happens to sit).
+- **A follower of a SET of stores**: forwarding N stores to one destination
+  is N declarations, N units and N processes today, with the destination
+  stated N times. So the subject of a follower becomes a SELECTION — the
+  same `[]` predicate `list --select` and the query document already take —
+  and a single-store follower is the one-term case `id=<the store's id>`.
+  One process serves the whole set: a request carries a position per store
+  and an answer returns one, so the reason the earlier design gave for one
+  child shipper per store (each store's own chunk axis) no longer holds.
+  What it costs: `positions.json` in place of `cursor.json`, the interest
+  axis evaluating selectors against each store rather than matching an
+  anchor, OTLP's `resourceLogs` carrying one group per store, and one
+  frames connection per store from one process until the wire is
+  multiplexed. Deliberately NOT a new object — no member of the set is ever
+  named, enabled or locked — which leaves "follower group" free for the
+  thing that has members: several processes sharing one selection, each
+  taking a shard.
+  Design note:
+  [docs/plans/follower-selection.md](docs/plans/follower-selection.md).
 - **Splitting downstream of a spool (fan-out by cursor)**: one store as the
   intake spool — everything a web server writes, the vhost in the line — plus a
   cursor consumer that routes entries into per-stream stores, instead of routing

@@ -56,20 +56,20 @@ path. A NODE's store set is static; an ARCHIVE's is not, so with
 `--auto-create` a new sender's data arrives and forwards NOWHERE until
 somebody registers a follower for it. So a follower wants a predicate rather
 than a store: `follower create --select 'service=~apache-.*' loki-apache
---type … `, or `--select '*'` for the whole forest. That expands to one child
-shipper per matching store, re-evaluated as stores appear — one child rather
-than one merged stream, because each store has its own chunk axis and so its
-own resumable position. Three consequences. Cursors become per (follower,
-store) and must be keyed by store ID
-(`followers/<name>/cursors/<store-id>.json`); keyed by name, a rename or a
-reinstall silently rebinds or loses a position. `retain_unconsumed` interest
-is then computed per store FROM a predicate, which makes the existing "an
-unreadable declaration fails closed globally" rule more load-bearing, since
-one bad predicate spans every matching store. And labels do double duty: the
-same `host`/`service`/`env` are the timberfs selector AND the downstream
-stream labels, since `timber-otlp` already sends them as OTLP resource
-attributes and Loki maps resource attributes to labels — one vocabulary end to
-end. The QUERY API takes the same primitive: its unit of work is a selection,
+--type … `, or `--select '*'` for the whole forest. ⚠ This note argued that
+such a declaration expands to one CHILD SHIPPER per matching store, because
+each store has its own chunk axis and so its own resumable position. That
+reason no longer holds: a request carries a position per store and an answer
+returns one, so one process serves the whole selection — see
+[follower-selection.md](follower-selection.md), which supersedes the
+mechanism here and keeps the primitive. Two consequences stand either way.
+`retain_unconsumed` interest is computed per store FROM a predicate, which
+makes the existing "an unreadable declaration fails closed globally" rule
+more load-bearing, since one bad predicate spans every matching store. And
+labels do double duty: the same `host`/`service`/`env` are the timberfs
+selector AND the downstream stream labels, since `timber-otlp` already sends
+them as OTLP resource attributes and Loki maps resource attributes to labels
+— one vocabulary end to end. The QUERY API takes the same primitive: its unit of work is a selection,
 so a response owes a COVERAGE statement (which stores it read, and what span
 each contributed), or "no results" cannot be told from "that selector matched
 nothing". ⚠ Two things to decide rather than discover: `--select '*'` with

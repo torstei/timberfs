@@ -31,6 +31,9 @@ messages and pull requests are for.
   and fetching bytes from whichever holder has them.
 - [receiving-end.md](receiving-end.md) — identity, names and selection on an
   archive that many senders ship into.
+- [follower-selection.md](follower-selection.md) — one follower declaration
+  for a SET of stores: the selection as its subject, and the poll loop that
+  serves the whole set from one process.
 - [paging.md](paging.md) — walking a bounded result set: a cursor beside the
   search rather than inside it, covering every store examined.
 - [logline-order.md](logline-order.md) — ordering a multi-store answer by the
