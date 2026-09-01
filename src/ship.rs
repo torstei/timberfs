@@ -78,7 +78,11 @@ pub struct Shipper {
     /// The forests to search; empty means every configured one.
     dirs: Vec<PathBuf>,
     positions: Positions,
-    positions_path: PathBuf,
+    /// Where they are kept, or `None` for a run that keeps them only in
+    /// memory — a preview, which must write nothing yet must still
+    /// advance, or every poll would show the same batch again.
+    positions_path: Option<PathBuf>,
+    read_only: bool,
     batch_entries: u64,
     /// Stores excluded for declaring no identity, so each is said once.
     idless: Vec<String>,
@@ -96,19 +100,29 @@ impl Shipper {
         consumer: &str,
         selector: Selector,
         dirs: Vec<PathBuf>,
-        positions_path: &Path,
+        positions_path: Option<&Path>,
     ) -> anyhow::Result<Shipper> {
-        let positions =
-            Positions::load(positions_path)?.unwrap_or_else(|| Positions::new(consumer));
+        let positions = positions_path
+            .map(Positions::load)
+            .transpose()?
+            .flatten()
+            .unwrap_or_else(|| Positions::new(consumer));
         Ok(Shipper {
             selector,
             dirs,
             positions,
-            positions_path: positions_path.to_path_buf(),
+            positions_path: positions_path.map(Path::to_path_buf),
+            read_only: false,
             batch_entries: BATCH_ENTRIES,
             idless: Vec::new(),
             stopped_in: None,
         })
+    }
+
+    /// Advance in memory and persist nothing: a preview.
+    pub fn read_only(mut self) -> Shipper {
+        self.read_only = true;
+        self
     }
 
     pub fn with_batch_entries(mut self, n: u64) -> Shipper {
@@ -188,7 +202,10 @@ impl Shipper {
                 );
             }
         }
-        self.positions.save(&self.positions_path)
+        match (&self.positions_path, self.read_only) {
+            (Some(path), false) => self.positions.save(path),
+            _ => Ok(()),
+        }
     }
 
     /// Parse one answer into slices, in the order the stores were read.
@@ -329,7 +346,7 @@ mod tests {
             "test",
             Selector::parse(expr).unwrap(),
             vec![root.to_path_buf()],
-            &root.join("positions.json"),
+            Some(&root.join("positions.json")),
         )
         .unwrap()
         .with_batch_entries(batch)

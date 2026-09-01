@@ -23,9 +23,12 @@ _timber_otlp() {
         '--batch-timeout=[send a partial batch after this long with nothing new]:duration:' \
         '--encoding=[wire encoding]:encoding:(proto json)' \
         '--compress=[compress request bodies]:mode:(none gzip)' \
+        '--select=[ship every store a predicate matches]:expr:' \
         '--dry-run[print the export requests instead of sending them]' \
         {-f,--follow}'[keep shipping as entries are committed]' \
         '--cursor=[persist the shipping position here]:file:_files' \
+        '--positions=[where a selection keeps each store position]:file:_files' \
+        '--poll=[how long to wait before asking a selection for more]:duration:' \
         '--start=[where to start with no cursor file yet]:where:(end begin)' \
         '--from=[replay: start of the logline window]:time:' \
         '--to=[replay: end of the logline window]:time:' \

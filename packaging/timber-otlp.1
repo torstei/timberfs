@@ -8,6 +8,12 @@ timber\-otlp \- ship a timberfs entry stream to an OTLP/HTTP receiver
 .RI [ options ]
 .RI [ STORE ]
 .br
+.B timber\-otlp \-\-select
+.I EXPR
+.B \-\-positions
+.I FILE
+.RI [ options ]
+.br
 .B timberfs query \-\-records
 .I ...
 .B | timber\-otlp
@@ -43,7 +49,8 @@ retains nothing.
 Raw text is refused rather than guessed at: only the record stream
 carries the write times and logline stamps this needs.
 .SH MODES
-Two, because they need different time axes.
+Three. The first two differ in the time axis they use; the third differs
+in what it is pointed at.
 .TP
 .B Follow
 .B \-\-follow
@@ -59,6 +66,46 @@ skip a late-arriving entry permanently.
 selects a LOGLINE window \(em \(lqre-ship what happened during the
 incident\(rq \(em and takes no cursor: a replay is a deliberate act, not
 a resumable one.
+.TP
+.B Selection
+.B \-\-select
+with
+.B \-\-positions
+ships every store a predicate matches \(em one process, one unit and one
+configuration per RECEIVER instead of one per store. Each matched store
+keeps its own position and its own resource attributes, and one request
+carries a group per store, so a set is never flattened into whichever
+store the shipper happened to open with.
+.RS
+.PP
+The selection is re-resolved every poll, so a store that appears is
+picked up with no configuration change and one that stops matching stops
+being read. A store's first appearance ships it from its beginning,
+which is what having no position means.
+.PP
+\(em A store that declares no identity is NOT followed, and says so: a
+position is keyed by the
+.B .bark
+id, so such a store would be re-shipped whole on every poll, forever.
+.B timberfs identity
+.I STORE
+.B \-\-mint
+gives it one.
+.PP
+\(em One destination means one queue: a stalled receiver stalls every
+store in the selection. That is the right coupling \(em they share the
+destination \(em and retention is the budget for it, exactly as it is for
+a single store.
+.PP
+The predicate is the one
+.B timberfs list \-\-select
+takes, so what a selection would ship can be listed before anything is
+configured. See
+.B \-\-select
+under
+.B What is sent
+for the grammar.
+.RE
 .SH THE CURSOR
 A cursor is CONSUMER state, so it lives at a path you name, outside the
 store: several consumers read one store at different positions, and a
@@ -199,6 +246,26 @@ is also read.
 Connect/read/write timeout per request (default 10s).
 .SS What is sent
 .TP
+.BI \-\-select " EXPR"
+Ship every store whose manifest satisfies
+.IR EXPR ,
+instead of one named store. Comma-separated terms are ANDed;
+.BR key=value ", " key!=value ", " key=~regex ", " key!~regex ", "
+.BR key=*text " and " key!*text
+(regexes anchored at both ends), a BARE WORD is the store's name matched
+anywhere in it, and
+.B *
+is every store in every configured forest. The same predicate
+.B timberfs list \-\-select
+takes, so a selection can be listed before it is configured. Requires
+.B \-\-positions
+unless
+.BR \-\-dry\-run ,
+and refuses
+.BR STORE ", " \-\-cursor ", " \-\-from ", " \-\-to " and " \-\-start :
+a selection's position is one per store, and where each one starts is
+what its own position says.
+.TP
 .BI \-\-service " NAME"
 Resource
 .BR service.name .
@@ -244,6 +311,21 @@ Keep shipping as entries are committed.
 Persist the position here (requires
 .BR \-\-follow ).
 .TP
+.BI \-\-positions " PATH"
+Where a selection keeps its positions: ONE file holding each matched
+store's place, keyed by store identity, so a restart resumes every one
+of them. One write per batch, so a batch spanning several stores
+advances all of them or none. Required with
+.B \-\-select
+unless
+.BR \-\-dry\-run ,
+which advances in memory and writes nothing.
+.TP
+.BI \-\-poll " DUR"
+How long to wait before asking a selection for more, once an answer said
+it had been exhausted (default 1s). A bounded answer is followed
+immediately by the next read rather than by a wait.
+.TP
 .BI \-\-start " end|begin"
 Where to start when the cursor file does not exist yet (default
 .BR end ).
@@ -278,6 +360,19 @@ Ship a store as it is written, resumably:
 .EX
 timber\-otlp \-\-follow \-\-cursor /var/lib/timberfs/app.otlp \\
     \-\-endpoint http://collector:4318 backing/app.log
+.EE
+.RE
+.PP
+Ship every apache store on the host to one collector \(em one process,
+whatever the store count, and a store created tomorrow is picked up
+without touching this:
+.PP
+.RS
+.EX
+timberfs list \-\-select 'service=~apache\-.*'      # what it will ship
+timber\-otlp \-\-follow \-\-select 'service=~apache\-.*' \\
+    \-\-positions /var/lib/timberfs/collector.positions \\
+    \-\-endpoint http://collector:4318
 .EE
 .RE
 .PP

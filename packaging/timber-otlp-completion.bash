@@ -18,8 +18,8 @@ _timber_otlp() {
 
     local flags="--endpoint --header --timeout --service --resource \
 --severity-regex --batch-size --batch-timeout --encoding --compress \
---dry-run -f --follow --cursor --start --from --to --quiet \
--h --help -V --version"
+--select --dry-run -f --follow --cursor --positions --poll --start \
+--from --to --quiet -h --help -V --version"
 
     # A flag that takes a value: the word after it is never a handle.
     case "$prev" in
@@ -35,12 +35,13 @@ _timber_otlp() {
         COMPREPLY=($(compgen -W "none gzip" -- "$cur"))
         return 0
         ;;
-    --cursor)
+    --cursor | --positions)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;
     --endpoint | --header | --timeout | --service | --resource | \
-        --severity-regex | --batch-size | --batch-timeout | --from | --to)
+        --severity-regex | --batch-size | --batch-timeout | --from | --to | \
+        --select | --poll)
         return 0
         ;;
     esac
