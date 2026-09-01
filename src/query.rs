@@ -1544,9 +1544,6 @@ fn query_follow(
         // pending entry has already been closed for this quiet streak.
         last_data: std::time::Instant,
         flushed_idle: bool,
-        /// What has left this store, so an offset is on the tape rather
-        /// than in the file as it stands.
-        dropped_bytes: u64,
     }
 
     // An entry is only closed by the NEXT stamped line, so the newest
@@ -1702,6 +1699,11 @@ fn query_follow(
         } else {
             None
         };
+        // ONE reading per pass, for the chunks and the live edge alike: a
+        // head trim moves it and every offset under it in opposite
+        // directions, so two readings can put the two halves of one
+        // answer on different tapes.
+        let dropped = dropped_bytes_of(f);
         for c in &chunks[start..] {
             if let Some(data) = read_chunk(f, &guard, &mut source, *c)? {
                 match &mut sink {
@@ -1709,7 +1711,7 @@ fn query_follow(
                         &data,
                         Some(c.seq),
                         (c.first_write_ms, c.last_write_ms),
-                        dropped_bytes_of(f) + c.uncomp_start,
+                        dropped + c.uncomp_start,
                         &mut out,
                     )?,
                     None => emit_raw(&mut out, &data, label.as_deref())?,
@@ -1724,10 +1726,11 @@ fn query_follow(
         // tail passed over them) — and this is the only place a BOUNDED
         // --tail can see them, since it never enters the poll loop.
         if !capped(&limit) {
-            // Its address on the tape: what has left the store, plus
-            // where the segment says its own bytes sit.
+            // Its address on the tape: the same `dropped` the chunks
+            // above were addressed with, plus where the segment says its
+            // own bytes sit.
             let (at, entries) = live.poll()?;
-            let base = dropped_bytes_of(f) + at;
+            let base = dropped + at;
             emit_live(&mut out, &entries, &mut sink, label.as_deref(), base)?;
         }
         // Anchor to the latest committed chunk even when nothing was emitted
@@ -1747,7 +1750,6 @@ fn query_follow(
             noted_overtaken: false,
             last_data: std::time::Instant::now(),
             flushed_idle: false,
-            dropped_bytes: dropped_bytes_of(f),
         });
     }
     out.flush()?;
@@ -1767,6 +1769,8 @@ fn query_follow(
                 Err(_) => continue, // transient (mid-rename by retention): retry
             };
             let guard = seq_guard(&s.path);
+            // As in the backfill above: one reading, both halves.
+            let dropped = dropped_bytes_of(&s.path);
             // BEFORE the chunks below are emitted: a flush that landed
             // since this ring snapshot was taken sealed a segment whose
             // entries may already have gone out live, and its chunk
@@ -1815,7 +1819,7 @@ fn query_follow(
                                     (c.first_write_ms, c.last_write_ms),
                                     // `skip` bytes of this chunk were
                                     // already delivered on an earlier poll.
-                                    s.dropped_bytes + c.uncomp_start + skip as u64,
+                                    dropped + c.uncomp_start + skip as u64,
                                     &mut out,
                                 )?,
                                 None => emit_raw(&mut out, fresh, s.label.as_deref())?,
@@ -1839,7 +1843,7 @@ fn query_follow(
                 // segment's own base by the same amount in opposite
                 // directions: the sum holds only while both are of one
                 // generation.
-                let base = dropped_bytes_of(&s.path) + at;
+                let base = dropped + at;
                 got |= !entries.is_empty();
                 emit_live(&mut out, &entries, &mut s.sink, s.label.as_deref(), base)?;
                 done = capped(&limit);

@@ -1029,12 +1029,21 @@ def tabbing_in_the_hit_list_brings_the_term_into_view():
 
 
 def answer(*entries, source_id=ID_A, path="/l/app.log", version="0.26.0"):
-    """A `records` stream, as timberfs writes one."""
+    """A `records` stream, as timberfs writes one.
+
+    An entry is IN A CHUNK unless it says otherwise, which is what all
+    but the live edge are: `chunk` and `offset` are separate fields —
+    where the bytes are, and whether a container closed over them — so a
+    fixture has to say which of the two it means. `chunk: None` is the
+    live edge: an address, no container."""
     recs = [("stream-start", {"v": 1, "server_version": f"timberfs, {version}"},
              None),
             ("source", {"path": path, "id": source_id}, None)]
     for text, fields in entries:
         body = text.encode()
+        fields = {"chunk": 0, **fields} if "offset" in fields else dict(fields)
+        if fields.get("chunk") is None:
+            fields.pop("chunk", None)
         recs.append(("entry", {"len": len(body), **fields}, body))
     return wire(*recs)
 
@@ -1066,9 +1075,12 @@ def an_answer_is_a_closed_set():
 
 @test
 def an_entry_at_the_live_edge_is_shown_but_cannot_be_opened():
-    """It is real and it matched, so it is in the answer. It is in no
-    chunk yet, so there is no place to open — said, not guessed at."""
-    r = tv.Records(answer(("fresh", {"ts": 9})))       # no offset
+    """It is real and it matched, so it is in the answer. It STATES the
+    offset it sits at — the tape is bytes and the write-ahead segment is
+    its last stretch — but no chunk holds those bytes yet and this screen
+    reads chunks, so there is no place to open. Said, not guessed at."""
+    # An address, and no container: what a live entry looks like.
+    r = tv.Records(answer(("fresh", {"ts": 9, "offset": 500, "chunk": None})))
     assert r.entries == 1 and r.unplaced == 1
     assert r.address_of(r.lines[0]) is None
     assert "live edge" in r.top_notes()[0], r.top_notes()
