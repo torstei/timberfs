@@ -125,6 +125,58 @@ One process per destination, and its shape is the shell's `tail`:
 3. Ship the batch; on the destination's acknowledgement, save the positions.
 4. `status=limited` means drain again now; `exhausted` means sleep.
 
+## What a poll costs, and where a store index would go
+
+Measured 2026-09-02 on synthetic forests of identically-shaped stores, warm
+page cache, release build, one entry per store. A poll is process start plus
+resolving the selection over the whole forest plus reading every matched
+store.
+
+    forest    matched    resolve    whole poll
+     1,000        500      <0.01s        0.01s
+    10,000      5,000       0.07s        0.15s
+
+So ~6 µs per store SCANNED and ~16 µs per store READ, and at ten thousand
+stores a one-second poll costs 15% of a core. Both halves are syscall-bound:
+a readdir per store directory plus one manifest read, then one open of each
+matched store's index.
+
+⚠ Those numbers are what they are only because of a defect this work found
+and fixed: `Extractor::new` compiled FIVE regexes and a records read built
+one per store, so a fleet poll was compiling thousands of regexes a second.
+Measured before and after — `query --records` over 5,000 stores **10.06 s →
+0.11 s**, the 10,000-store poll above **9.55 s → 0.15 s**. It was never a
+forwarding problem: every multi-store `--records` answer paid it, timbersh's
+fleet reads included.
+
+**A store index is therefore not the next thing.** Three cheaper levers come
+first, in this order.
+
+1. **Resolve on its own cadence.** The store set changes when a store is
+   created; the data arrives continuously. Re-resolving every poll spends the
+   scan at the read's rate for no reason — a new store starting to forward
+   thirty seconds late costs nothing, its data being retained meanwhile. That
+   turns 0.07 s per second into 0.07 s per thirty.
+2. **Skip a store that cannot have anything new.** After (1) the read is the
+   whole cost, and a store whose index and write-ahead segment have not grown
+   since the last poll has nothing to give. A stat is cheaper than an open,
+   but this one has to be got exactly right — the failure mode is silently
+   skipping data — so it wants its own change with its own tests.
+3. **Bound the selection.** A forwarder matching five thousand stores is a
+   decision; `create --dry-run` reporting the count is what makes it one.
+
+An index earns its place only when a NARROW selector must stop paying for the
+whole forest — today `service=nope` over 10,000 stores costs 0.06 s and reads
+nothing. ⚠ And the shape it must not take is a shared derived FILE somebody
+maintains: its failure mode is a store silently invisible to forwarding,
+which is the worst direction available. A process-local cache keyed on each
+store directory's mtime has no such failure — a missed invalidation is a
+stale label, and the tmp+rename `set` performs is INSIDE the store's
+directory, so that mtime does move (unlike the forest's own, which is the
+trap the follower registry's tick already refuses to fall into). What stays
+true either way is receiving-end.md's sentence: an index is an implementation
+detail behind "where is this store", not a change to the model.
+
 ⚠ **A shared cap needs a round-robin.** The read drains its sources in order
 under one entry cap, so a store producing faster than one poll can drain it
 takes the whole cap every time and every store behind it ships NOTHING —
