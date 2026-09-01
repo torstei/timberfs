@@ -24,13 +24,33 @@ each keep one code path.
 
     /var/lib/timberfs/followers/<name>/
         follower.json    select, type, endpoint, retaining, args
-        positions.json   { "<store-id>": {seq, n, delivered}, ... }
+        positions.json   { "<store-id>": {offset, wl, delivered}, ... }
         follower.lock    held while it runs
 
 `positions.json` is one file rather than a directory of cursors because a
 batch spanning several stores is acknowledged once: one tmp+rename either
 advances every store in that batch or none of them, where N files can tear.
 There is exactly one writer, so nothing wants the finer granularity.
+
+The position is an **offset** on the store's tape, not the `(seq, n)` a
+`Cursor` holds. It is what the answer's `position` record carries, so no
+conversion can disagree with the wire — and it addresses an entry in the
+write-ahead segment, which a chunk number cannot: a chunk-granular position
+stands still at the live edge, so a restart re-delivers everything written
+since the last flush. The interest axis wants a chunk number and derives one,
+the store's own rings being what says which chunk an offset sits in.
+
+A store that leaves the selection keeps its entry — bringing it back should
+resume, not re-ship a history — and membership is decided by the selection,
+never by what the file happens to hold, so a stale entry holds no retention.
+
+⚠ **A store with no identity cannot be followed.** The cursor is keyed by the
+`.bark` id, so a store that declares none gets no `position` record and no
+resume: a poll loop would re-ship it in full on every poll, forever. Such a
+store is therefore excluded from the selection with a note naming
+`timberfs identity <store> --mint`, which is the remedy. Nothing shipped
+beats shipping the same store endlessly, and a reader has no business
+minting an identity into someone else's manifest.
 
 ## Why there is no follower group
 
