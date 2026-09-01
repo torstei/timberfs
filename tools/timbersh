@@ -113,6 +113,10 @@ STORE_TTL = float(os.environ.get("TIMBERSH_STORE_TTL", "0"))
 # is walked a page at a time and hands the positions back as the next
 # page's cursor.
 PAGE = int(os.environ.get("TIMBERSH_PAGE", "10000"))
+# What a tail opens with, when the statement names no `limit`: the last N
+# entries, the way `tail -n` does. The server delivers ABOUT that many —
+# it starts at a chunk boundary — so it is trimmed to exactly N here.
+BURST = int(os.environ.get("TIMBERSH_TAIL", "20"))
 RC = os.environ.get("TIMBERSH_RC", os.path.expanduser("~/.timbershrc"))
 HISTFILE = os.environ.get("TIMBERSH_HISTFILE",
                           os.path.expanduser("~/.timbersh-history"))
@@ -197,9 +201,12 @@ HELP = """
     entry. Only `records` can -- it is the kind that carries the offset
     a line needs to say where it came from.
 
-    `tail` does not end. It resumes from the position each answer
-    reports, so nothing arrives twice and no clock the lines carry can
-    move where the next poll reads from.
+    `tail` does not end, and asks about no time at all: it opens with
+    the last N entries (`limit N`, default 20) and then follows each
+    store from where the last answer left it, so nothing arrives twice.
+    A time bound is refused -- for a window, `select` it. Entries arrive
+    a flush behind the writer, a positioned read being served out of
+    chunks.
 
     <kind>    records | loglines | stores | chunks
     <source>  a view name, or a predicate literal like [type=console].
@@ -1974,48 +1981,71 @@ class Shell:
         show_stores(got, unreachable=bad)
 
     def tail(self, doc):
-        """A poll loop, resumed by POSITION.
+        """Follow the end of the tape. NO CLOCK IS INVOLVED.
 
-        Every answer says where each store it examined got to, and the
-        next request hands those back — the same cursor `fetch` pages
-        with. The window's `from` is set once, from THIS machine's clock,
-        and never moves: it bounds a store that has no position yet, and
-        nothing else.
+        Joining a store means asking where its tape ends and resuming
+        there; every answer after that says where it got to, and that
+        place is what the next poll carries. Each store keeps its own.
 
-        ⚠ Never advance it by the entries' own timestamps. One store
-        stamped ahead of the clock — a log read in the wrong zone, a
-        skewed writer — then asks for a window that has not happened, and
-        every store on every host goes silent until the clock catches up.
-        A position is a place on the tape, which no clock moves."""
-        print("  tailing (ctrl-c to stop).")
+        ⚠ Never bound this by time. A window on the logline clock made
+        one store's stamps decide where every store was read from next,
+        and a store stamped ahead of the wall clock then silenced the
+        whole fleet until the clock caught up.
+
+        What it cannot show is the live edge: a positioned read is served
+        out of flushed chunks, so entries appear a flush behind the
+        writer, and an entry not yet in a chunk has no place to resume
+        from — which is why the opening burst stops where the tape does.
+        """
+        if (doc.get("match") or {}).get("granularity") == "chunks":
+            raise ValueError(
+                "`chunk may have` names whole chunks out of the token index, "
+                "which has nothing to skip on a read that is following the "
+                "end of the tape.\n     Ask `entry has ...` to filter the "
+                "entries as they arrive.")
+        window = doc.get("window") or {}
+        if window.get("from") is not None or window.get("to") is not None:
+            raise ValueError(
+                "a tail follows the END OF THE TAPE, which is a place and not "
+                "a time, so it takes no time bound"
+                + (" — and this session is one" if self.session else "")
+                + ".\n     Drop the `since`/`until`"
+                + (" or the session (`drop session;`)" if self.session else "")
+                + ", or ask `select` for a window.")
+        # `limit N` on a tail is how much to OPEN with, which is what
+        # `tail -n` means; `max` would instead cap every poll for ever.
+        bound = doc.pop("max", None) or {"entries": BURST}
         doc = dict(doc, response_format={"kind": "records"})
-        window = dict(doc.get("window") or {"axis": "logline"})
-        window.setdefault("from", when(time.strftime("%H:%M")))
-        doc = dict(doc, window=window)
-        at = {}
-        # Said once per host per outage, not once per poll.
-        complained = {}
+        doc.pop("window", None)
+        print("  tailing (ctrl-c to stop).")
+        at, complained, opened = {}, {}, set()
         try:
             while True:
-                d = dict(doc, cursor=list(at.values())) if at else doc
                 more = False
                 for host in TARGETS:
-                    out, err, rc = self.ask(d, host)
-                    if rc != 0:
+                    # PER HOST. One that was down at the start, or added
+                    # since, has no position — and with no window either, a
+                    # cursorless read is the whole store.
+                    if host not in opened:
+                        err = self.tail_join(host, doc, bound, at)
+                    else:
+                        out, err, rc = self.ask(
+                            dict(doc, cursor=list(at.values())) if at else doc,
+                            host)
+                        if rc == 0:
+                            self.show_tail(out, host)
+                            more |= self.next_page(out, at)
+                    if err:
+                        # Said once per host per outage, not once per poll.
                         if complained.get(host) != err:
                             print(f"  ⚠ {label(host)}: {fmt_err(err)}")
                             complained[host] = err
+                        # NOT un-opened: its positions are still held, so a
+                        # blip resumes where it left off. Re-joining would
+                        # take up the tape's END and skip the outage.
                         continue
                     complained.pop(host, None)
-                    for kind, f, payload in records(out):
-                        if kind == "source":
-                            self.names[f.get("id", "?")] = os.path.basename(
-                                f.get("path", "?"))
-                        elif kind == "entry":
-                            who = self.names.get(f.get("id", ""), "")
-                            where = f"{label(host)} " if len(TARGETS) > 1 else ""
-                            print(f"  {where}{who:28} {(payload or '').rstrip()}")
-                    more |= self.next_page(out, at)
+                    opened.add(host)
                 # A bound stopped one of them: there is already more than
                 # one answer's worth waiting, so ask again now.
                 if not more:
@@ -2023,6 +2053,79 @@ class Shell:
         except KeyboardInterrupt:
             print("\n  stopped.")
 
+    def tail_join(self, host, doc, bound, at):
+        """Take up a host's stores at the end of their tapes, and show the
+        last few entries of each. Returns what went wrong, or None.
+
+        The two reads are in this order for a reason: the LISTING fixes
+        where each store had got to, and the burst is then shown only up
+        to that point. An entry written between the two arrives on the
+        first poll instead — printed once, from one side or the other,
+        which the other order cannot promise.
+
+        ⚠ A tail answer names no store: it carries no `source` record,
+        and an entry carries an `id` only where the answer holds several.
+        So the ENDS are what attribute it — the listing is not an
+        optimisation here, it is where the identity comes from."""
+        probe = {k: v for k, v in doc.items() if k in ("v", "stores")}
+        probe["response_format"] = {"kind": "stores"}
+        out, err, rc = self.ask(probe, host)
+        if rc != 0:
+            return err or f"exit {rc}"
+        try:
+            stores, _ = unwrap(out)
+        except ValueError as e:
+            return str(e)
+        ends = {}
+        for s in stores:
+            if not s.get("id"):
+                continue
+            # Where the tape ENDS: what has left the store plus what it
+            # still holds, which retention moves together.
+            ends[s["id"]] = (s.get("dropped_uncompressed_bytes", 0)
+                             + s.get("logical_bytes", 0))
+            self.names[s["id"]] = os.path.basename(s.get("path", "?"))
+            at[s["id"]] = {"id": s["id"], "offset": ends[s["id"]]}
+        if not ends:
+            return None
+        out, err, rc = self.ask(dict(doc, tail=bound), host)
+        if rc != 0:
+            return err or f"exit {rc}"
+        self.show_tail(out, host, bound, ends)
+        return None
+
+    def show_tail(self, out, host, trim=None, upto=None):
+        """The entries in one answer, attributed and printed.
+
+        `trim` keeps the last N of each store — the server delivers ABOUT
+        the last N, starting at a chunk boundary, and on a store with 256
+        KiB chunks about-twenty is hundreds of lines. `upto` drops what a
+        poll will deliver anyway: an entry past where the tape was
+        measured, or one with no place at all (the live edge)."""
+        seen, by_store = [], {}
+        for kind, f, payload in records(out):
+            if kind == "source":
+                self.names[f.get("id", "?")] = os.path.basename(
+                    f.get("path", "?"))
+                seen.append(f.get("id", ""))
+            elif kind == "entry":
+                # An entry names its store only where the answer holds
+                # more than one; with a single source there is no doubt.
+                sid = f.get("id") or (seen[0] if len(seen) == 1 else
+                                      next(iter(upto)) if upto and
+                                      len(upto) == 1 else "")
+                if upto is not None:
+                    if "offset" not in f or "len" not in f:
+                        continue
+                    if int(f["offset"]) + int(f["len"]) > upto.get(sid, 0):
+                        continue
+                by_store.setdefault(sid, []).append(payload)
+        n = (trim or {}).get("entries")
+        for sid, payloads in by_store.items():
+            who = self.names.get(sid, "")
+            where = f"{label(host)} " if len(TARGETS) > 1 else ""
+            for payload in (payloads[-n:] if n else payloads):
+                print(f"  {where}{who:28} {(payload or '').rstrip()}")
 
 def load_history(path, size):
     """Read the history, and arrange for it to be written back.

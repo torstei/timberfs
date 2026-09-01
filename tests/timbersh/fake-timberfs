@@ -147,7 +147,9 @@ elif kind == "records":
         ahead of the writes selects no chunk at all. A position beats
         both, being a place rather than a time."""
         if "offset" in e and e["id"] in cursor:
-            return e["offset"] > cursor[e["id"]]
+            # A position is just PAST the last entry delivered, so the
+            # next entry begins AT it. `>` would drop one per page.
+            return e["offset"] >= cursor[e["id"]]
         if "from" in win:
             if "wf" in e and e["wf"] < win["from"] - 60_000:
                 return False
@@ -156,14 +158,26 @@ elif kind == "records":
         return True
 
     entries = [e for e in entries if delivered(e)]
+    # `tail: {entries: N}` is the last N, per store — and a real tail
+    # answer carries NO `position` record, so a client has to read the
+    # places off the entries themselves.
+    want = (doc.get("tail") or {}).get("entries")
+    if want is not None:
+        keep = {}
+        for e in entries:
+            keep.setdefault(e["id"], []).append(e)
+        entries = [e for es in keep.values() for e in es[-want:]]
     # Every store EXAMINED reports one, and a store that delivered
     # nothing reports where it was resumed from. Scripted `positions`
     # win, so a scenario that says nothing about offsets gets none.
     positions = me.get("positions")
-    if positions is None and any("offset" in e for e in me.get("records", [])):
+    if doc.get("tail"):
+        positions = []
+    elif positions is None and any("offset" in e for e in me.get("records", [])):
         positions = []
         for s in me.get("stores", []):
-            seen = [e["offset"] for e in entries
+            # Just past the last entry delivered, as a real one reports.
+            seen = [e["offset"] + len(e["text"]) for e in entries
                     if e["id"] == s["id"] and "offset" in e]
             off = max(seen) if seen else cursor.get(s["id"])
             positions.append({"id": s["id"],

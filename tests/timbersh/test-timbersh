@@ -241,7 +241,10 @@ def a_tail_keeps_up_with_a_store_stamped_ahead_of_the_clock():
         return {"id": ID_A, "text": f"line {i}", "offset": i * 100,
                 "wf": now + i * 1000, "ts": ahead + i * 1000}
 
-    s = Pty({"": {"stores": [store("app", ID_A)],
+    # The tape ends just past entry 1 — so that one is the opening burst
+    # and the rest arrive while the tail is running.
+    app = {**store("app", ID_A), "logical_bytes": 200}
+    s = Pty({"": {"stores": [app],
                   "sequence": [{"records": [entry(1)]},
                                {"records": [entry(1), entry(2)]},
                                {"records": [entry(1), entry(2), entry(3)]}]}}
@@ -254,10 +257,12 @@ def a_tail_keeps_up_with_a_store_stamped_ahead_of_the_clock():
     s.finish()
     docs = s.docs("records")
     assert len(docs) >= 3, docs
-    assert all("cursor" in d for d in docs[1:]), \
+    assert not any("window" in d for d in docs), \
+        f"a tail asked about a time: {docs}"
+    assert "tail" in docs[0] and "cursor" not in docs[0], \
+        f"the opening read was not the end of the tape: {docs[0]}"
+    assert all("cursor" in d and "tail" not in d for d in docs[1:]), \
         f"a poll that carried no position: {docs}"
-    assert len({d["window"]["from"] for d in docs}) == 1, \
-        f"the window followed the entries' clock: {[d['window'] for d in docs]}"
     assert s.plain.count("line 1") == 1, \
         f"an entry came back twice:\n{s.plain[-800:]}"
     s.cleanup()
@@ -274,12 +279,14 @@ def a_store_stamped_ahead_cannot_starve_the_ones_beside_it():
     now = int(time.time() * 1000)
 
     def entries(sid, skew, upto):
-        return [{"id": sid, "text": f"{sid[:1]} line {i}", "offset": i * 100,
+        return [{"id": sid, "text": f"{sid[:1]} line {i}",
+                 "offset": (i - 1) * 100,
                  "wf": now + i * 1000, "ts": now + skew + i * 1000}
                 for i in range(1, upto + 1)]
 
     def host(name, sid, skew):
-        return {"stores": [store(name, sid)],
+        # Empty when the tail joins, so every entry arrives on a poll.
+        return {"stores": [{**store(name, sid), "logical_bytes": 0}],
                 "sequence": [{"records": entries(sid, skew, n)}
                              for n in (1, 2, 3)]}
 
@@ -294,6 +301,72 @@ def a_store_stamped_ahead_cannot_starve_the_ones_beside_it():
     s.send("\x03")
     s.expect("stopped")
     s.finish()
+    s.cleanup()
+
+
+
+@test
+def a_host_that_joins_a_tail_late_opens_at_the_end_of_its_tape():
+    """A tail carries no window, so a read with no position for a store is
+    the WHOLE store. A host that was down when the tail started — or was
+    added to it since — has no position, and would have dumped its
+    history onto the terminal on the poll it came back for. It opens the
+    way the first one did: the last N entries."""
+    def entry(i):
+        return {"id": ID_B, "text": f"late {i}", "offset": i * 100}
+
+    held = [entry(i) for i in range(1, 40)]
+    # Its tape ends past the last of those: a history to dump, if the
+    # join were skipped.
+    late = {**store("late", ID_B),
+            "logical_bytes": held[-1]["offset"] + len(held[-1]["text"])}
+    s = Pty({"up": {"stores": [{**store("up", ID_A), "logical_bytes": 0}],
+                    "records": [{"id": ID_A, "text": "up 1", "offset": 0}]},
+             "late": {"stores": [late],
+                      "sequence": [{"fail": "ssh: no route to host",
+                                    "code": 255},
+                                   {"records": held}]}},
+            hosts=["up", "late"]).start()
+    s.expect("timberfs=#")
+    s.send("tail records from [] limit 3;\n")
+    s.expect("no route to host")
+    s.expect("late 39")
+    s.send("\x03")
+    s.expect("stopped")
+    s.finish()
+    assert "late 1 " not in s.plain and "late 20" not in s.plain, \
+        f"the late host dumped its history:\n{s.plain[-900:]}"
+    asked = [r["doc"] for r in s.requests if r["host"] == "late"]
+    kinds = [(d.get("response_format") or {}).get("kind") for d in asked]
+    assert kinds[0] == "stores", f"it read entries before finding the end: {kinds}"
+    reads = [d for d in asked if (d.get("response_format") or {}).get("kind")
+             == "records"]
+    assert reads and all("tail" in d or "cursor" in d for d in reads), \
+        f"a read with neither a place nor a bound is the whole store: {reads}"
+    assert reads[0]["tail"] == {"entries": 3}, reads[0]
+    s.cleanup()
+
+@test
+def a_tail_refuses_a_time_bound_rather_than_ignoring_it():
+    """A tail follows the end of the tape, so a `since`/`until` — or a
+    session, which is one — describes something it cannot do. Refused in
+    the words that were typed, before any host is asked: accepting the
+    bound and then not applying it is how a poll came to chase a clock in
+    the first place."""
+    st = store("app", ID_A)
+    for statement, why in (
+            ("tail records from [] where logline since '12:00';", "since"),
+            ("create session from '12:00' to '13:00';"
+             " tail records from [];", "session")):
+        s = Session({"": {"stores": [st], "records": []}}).run(*statement.split("; "))
+        assert "END OF THE TAPE" in s.out, f"{why}: {s.out}"
+        assert not s.docs("records"), f"{why} reached a host: {s.docs('records')}"
+        s.cleanup()
+
+    s = Session({"": {"stores": [st], "records": []}}).run(
+        "tail records from [] where chunk may have 'req-8f3a';")
+    assert "token index" in s.out, s.out
+    assert not s.docs("records"), s.docs("records")
     s.cleanup()
 
 @test
