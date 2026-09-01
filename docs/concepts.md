@@ -157,9 +157,13 @@ this store's retaining followers have not read. Additive, never a cap — see
 **retention**.
 
 **live edge** — the newest data: buffered, not yet a chunk. `query --follow`
-tails it through the `.sap`; a plain `query` never includes it; an entry from it
-has no chunk number, and that absence is the signal (a zero would be a lie). It
-does carry an **offset**: the tape is a byte stream and the segment is its last
+tails it through the `.sap`, and so does a read that RESUMES — a cursor and no
+window, which is a consumer following the store rather than asking about the
+past. A windowed read never includes it (chunks are selected by their write
+window, and a segment has none), nor does a chunk-granular predicate sweep (the
+token index cannot speak for bytes it has not covered). An entry from it has no
+chunk number, and that absence is the signal (a zero would be a lie). It does
+carry an **offset**: the tape is a byte stream and the segment is its last
 stretch, so a consumer can resume past a live entry — the chunk that segment
 becomes reports the same address for those bytes.
 → [README](../README.md#durability-and-the-live-edge---wal)

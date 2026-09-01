@@ -509,9 +509,13 @@ here.
   ⚠ What stays with the chunk is durability, not position: the sap is
   readable at `flush` and durable at `sync`, so a live address is exact and
   survives as far as the writer's last sync — the bargain `tail -f` makes.
-  And a windowed or cursored read is still served out of chunks, so a
-  consumer sees the live edge only in the read that OPENS a follow. Making
-  the windowed path read the segment too is the remaining half.
+  The other half shipped with it: a read that RESUMES — a cursor and no
+  window — is served the segment as well as the chunks, so a polling
+  consumer no longer waits out the writer's flush age for data already
+  durable (measured: 0.03-0.64 s against a 20-second flush age). A windowed
+  read still stops at the chunks, and so does a chunk-granular predicate
+  sweep: one selects by a write window the segment has not got, the other
+  by an index that has not covered it.
 - **Retaining what a follower has not consumed** (SHIPPED: the registry,
   `retain_unconsumed` and `trim`): retention drops
   by age and by size. A frontend box wants a third rule — drop what is

@@ -204,9 +204,9 @@ HELP = """
     `tail` does not end, and asks about no time at all: it opens with
     the last N entries (`limit N`, default 20) and then follows each
     store from where the last answer left it, so nothing arrives twice.
-    A time bound is refused -- for a window, `select` it. Entries arrive
-    a flush behind the writer, a positioned read being served out of
-    chunks.
+    A time bound is refused -- for a window, `select` it. On a store with
+    a `wal` the newest entries arrive within a poll; without one, a flush
+    behind the writer.
 
     <kind>    records | loglines | stores | chunks
     <source>  a view name, or a predicate literal like [type=console].
