@@ -121,6 +121,13 @@ One process per destination, and its shape is the shell's `tail`:
 3. Ship the batch; on the destination's acknowledgement, save the positions.
 4. `status=limited` means drain again now; `exhausted` means sleep.
 
+⚠ **A shared cap needs a round-robin.** The read drains its sources in order
+under one entry cap, so a store producing faster than one poll can drain it
+takes the whole cap every time and every store behind it ships NOTHING —
+permanent starvation, not a delay. So a bounded poll starts the next one
+just AFTER the store it stopped in, and that store's remaining backlog waits
+a turn, which retention is already the budget for.
+
 The selection is resolved by the read, so a store that appears between polls
 is in the next answer with no cursor entry, which reads it from the start —
 and one that stops matching simply stops appearing. Nothing watches the

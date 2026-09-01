@@ -886,6 +886,46 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     )
 }
 
+/// Read a set of stores FORWARD from where a previous read left each one:
+/// the whole tape from `cursor` on, entries only, bounded to `max`
+/// entries.
+///
+/// The poll a follower runs, and the same read the query document
+/// describes carrying `cursor` and `max.entries` and nothing else — so a
+/// follower shipping from this host and one shipping over the wire ask
+/// the same question of the same code.
+///
+/// ⚠ Entries are attributed (`src`/`id`) only in a MULTI-store answer.
+/// With one store the `source` and `position` records name it and the
+/// entries do not repeat it, so a caller must attribute them itself.
+pub fn read_forward<W: Write>(
+    out: &mut W,
+    files: &[std::path::PathBuf],
+    cursor: &std::collections::BTreeMap<String, u64>,
+    max: u64,
+) -> anyhow::Result<()> {
+    query_entries(
+        out,
+        files,
+        0,
+        u64::MAX,
+        None,
+        false,
+        &[],
+        &[],
+        None,
+        None,
+        cursor,
+        false,
+        false,
+        false,
+        true,
+        Some(max),
+        Default::default(),
+        &Budget::Unbounded,
+    )
+}
+
 /// The default read path: select chunks by the write-time rings (widened
 /// when the logline filter can verify), then emit whole ENTRIES whose own
 /// timestamps fall inside the asked window. Unfilterable stores (no

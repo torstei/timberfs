@@ -270,6 +270,11 @@ pub struct Match {
     pub dir: std::path::PathBuf,
     /// The store's name within that directory.
     pub name: String,
+    /// Its `.bark` identity, when it declares one. What a durable
+    /// reference — a position, a follower's declaration — is keyed by, so
+    /// a store without one cannot be addressed across a move or a
+    /// restart, only read where it is.
+    pub id: Option<String>,
     pub labels: Map<String, Value>,
 }
 
@@ -299,6 +304,7 @@ pub fn resolve(dirs: &[std::path::PathBuf], sel: &Selector) -> Vec<Match> {
                     handle,
                     dir,
                     name,
+                    id: bark.get("id").and_then(Value::as_str).map(str::to_string),
                     labels,
                 });
             }
