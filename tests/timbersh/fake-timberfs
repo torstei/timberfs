@@ -135,26 +135,15 @@ elif kind == "stores":
                           "stores": stores}))
 elif kind == "records":
     entries = me.get("records", [])
-    win = doc.get("window") or {}
     cursor = {c["id"]: c["offset"] for c in doc.get("cursor", []) if "offset" in c}
 
     def delivered(e):
-        """What a real server would still have to send.
-
-        The two clocks are kept apart on purpose: a chunk is SELECTED on
-        the write clock (widened a minute) and an entry then FILTERED on
-        the one its line carries, so a window chasing stamps that run
-        ahead of the writes selects no chunk at all. A position beats
-        both, being a place rather than a time."""
+        """What a real server would still have to send: everything at or
+        past where this store was left. A position is just PAST the last
+        entry delivered, so the next entry begins AT it — `>` would drop
+        one per page."""
         if "offset" in e and e["id"] in cursor:
-            # A position is just PAST the last entry delivered, so the
-            # next entry begins AT it. `>` would drop one per page.
             return e["offset"] >= cursor[e["id"]]
-        if "from" in win:
-            if "wf" in e and e["wf"] < win["from"] - 60_000:
-                return False
-            if "ts" in e and e["ts"] < win["from"]:
-                return False
         return True
 
     entries = [e for e in entries if delivered(e)]

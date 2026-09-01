@@ -4203,10 +4203,11 @@ mod paging_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A resumed read does not open what it has already delivered — what
-    /// a poll resuming from a cursor rests on, since its window stays
-    /// open behind it. Checked by SCRIBBLING over the compressed bytes
-    /// below the cursor: a read that decompressed them could not answer.
+    /// A resumed read does not open what it has already delivered. A
+    /// following read carries no window, so its selection is every chunk
+    /// the store has and the POSITION is the only thing narrowing it —
+    /// checked by SCRIBBLING over the compressed bytes below the cursor,
+    /// which a read that decompressed them could not survive.
     #[test]
     fn a_cursor_skips_what_is_below_it_without_decompressing_it() {
         use std::io::Write;
