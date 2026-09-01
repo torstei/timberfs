@@ -288,6 +288,19 @@ pub struct At {
     /// Resume just here: absolute on the store's tape, so retention
     /// cannot move it.
     pub offset: u64,
+    /// The chunk the newest delivered entry came from, when it came from
+    /// one. TWO positions, because they answer different questions and
+    /// neither can answer the other's: the offset is where to RESUME,
+    /// exact and valid inside the write-ahead segment; this is the
+    /// RETENTION FLOOR, chunks strictly below it being fully consumed.
+    ///
+    /// Recorded rather than derived, so the interest axis needs no rings
+    /// file to convert an offset — the answer states the chunk on every
+    /// entry that has one. `None` only until the first entry from a
+    /// sealed chunk arrives: an entry read from the live edge has no
+    /// chunk yet, and leaving the floor where it was is the conservative
+    /// direction.
+    pub chunk: Option<u64>,
     /// The store's path when last written — informational, since identity
     /// is what matches.
     pub path: String,
@@ -341,6 +354,7 @@ impl Positions {
                         id,
                         At {
                             offset,
+                            chunk: o.get("chunk").and_then(Value::as_u64),
                             path: o
                                 .get("path")
                                 .and_then(Value::as_str)
@@ -362,6 +376,10 @@ impl Positions {
         for (id, a) in &self.at {
             let mut o = Map::new();
             o.insert("offset".into(), Value::from(a.offset));
+            match a.chunk {
+                Some(c) => o.insert("chunk".into(), Value::from(c)),
+                None => o.insert("chunk".into(), Value::Null),
+            };
             o.insert("path".into(), Value::String(a.path.clone()));
             o.insert("wl".into(), Value::from(a.wl));
             o.insert("delivered".into(), Value::from(a.delivered));
@@ -390,10 +408,20 @@ impl Positions {
     /// Record what one store delivered. `offset` is that store's own
     /// `position` record — which, where it delivered nothing, is the one
     /// it was resumed from, so writing it back is a no-op rather than a
-    /// rewind.
-    pub fn advance(&mut self, id: &str, path: &str, offset: u64, wl: u64, delivered: u64) {
+    /// rewind. `chunk` is the newest delivered entry's, absent when every
+    /// entry in the batch came from the live edge.
+    pub fn advance(
+        &mut self,
+        id: &str,
+        path: &str,
+        offset: u64,
+        chunk: Option<u64>,
+        wl: u64,
+        delivered: u64,
+    ) {
         let e = self.at.entry(id.to_string()).or_insert(At {
             offset,
+            chunk: None,
             path: path.to_string(),
             wl,
             delivered: 0,
@@ -401,7 +429,9 @@ impl Positions {
         e.offset = offset;
         e.path = path.to_string();
         // A quiet store reports the position it was resumed from and no
-        // entries, so neither counter moves backwards.
+        // entries, so nothing here moves backwards. The floor especially:
+        // it is what retention may drop below.
+        e.chunk = e.chunk.max(chunk);
         e.wl = e.wl.max(wl);
         e.delivered += delivered;
     }
@@ -1128,14 +1158,19 @@ mod tests {
         assert!(Positions::load(&path).unwrap().is_none(), "a first run");
 
         let mut p = Positions::new("loki");
-        p.advance("aaa", "/l/a.log", 33, 700, 12);
-        p.advance("bbb", "/l/b.log", 90, 800, 3);
+        p.advance("aaa", "/l/a.log", 33, Some(4), 700, 12);
+        p.advance("bbb", "/l/b.log", 90, None, 800, 3);
         p.save(&path).unwrap();
 
         let back = Positions::load(&path).unwrap().unwrap();
         assert_eq!(back, p);
         assert_eq!(back.cursor().get("aaa"), Some(&33));
         assert_eq!(back.cursor().get("ccc"), None);
+        assert_eq!(back.at["aaa"].chunk, Some(4));
+        assert_eq!(
+            back.at["bbb"].chunk, None,
+            "delivered from the live edge only"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1145,10 +1180,13 @@ mod tests {
     #[test]
     fn a_quiet_store_neither_advances_nor_rewinds() {
         let mut p = Positions::new("loki");
-        p.advance("aaa", "/l/a.log", 33, 700, 12);
-        p.advance("aaa", "/l/a.log", 33, 0, 0);
+        p.advance("aaa", "/l/a.log", 33, Some(4), 700, 12);
+        p.advance("aaa", "/l/a.log", 33, None, 0, 0);
         let a = &p.at["aaa"];
-        assert_eq!((a.offset, a.wl, a.delivered), (33, 700, 12));
+        assert_eq!(
+            (a.offset, a.chunk, a.wl, a.delivered),
+            (33, Some(4), 700, 12)
+        );
     }
 
     /// An entry with no offset is not a position. Read as zero it would

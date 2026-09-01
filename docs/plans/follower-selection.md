@@ -32,13 +32,17 @@ batch spanning several stores is acknowledged once: one tmp+rename either
 advances every store in that batch or none of them, where N files can tear.
 There is exactly one writer, so nothing wants the finer granularity.
 
-The position is an **offset** on the store's tape, not the `(seq, n)` a
-`Cursor` holds. It is what the answer's `position` record carries, so no
-conversion can disagree with the wire — and it addresses an entry in the
-write-ahead segment, which a chunk number cannot: a chunk-granular position
-stands still at the live edge, so a restart re-delivers everything written
-since the last flush. The interest axis wants a chunk number and derives one,
-the store's own rings being what says which chunk an offset sits in.
+**Two positions per store, because they answer different questions.** The
+`offset` is where to RESUME: what the answer's `position` record carries, so
+no conversion can disagree with the wire, and valid inside the write-ahead
+segment, which a chunk number is not — a chunk-granular position stands still
+at the live edge, so a restart re-delivers everything written since the last
+flush. The `chunk` is the RETENTION FLOOR: chunks strictly below it are fully
+consumed. It is recorded, not derived, because the answer states it on every
+entry that has one — deriving it would make the interest axis read a rings
+file to convert an offset, which is exactly what it must not do. It stays
+where it was while entries arrive only from the live edge, which is the
+conservative direction.
 
 A store that leaves the selection keeps its entry — bringing it back should
 resume, not re-ship a history — and membership is decided by the selection,
@@ -186,11 +190,20 @@ the follower on every store it matches.
   beginning (what the cursor's absence already means) or its end (the
   two-read join). A selection widened by a label edit ships an old store's
   whole history under the first.
-- Whether the interest axis evaluates selectors against every store per tick
-  (M selectors × N stores of cheap matching, replacing a hashmap lookup on
-  the anchor) or caches a resolved set and re-derives it on a manifest
-  change. The tick already refuses to gate on mtime, for reasons that apply
-  here too.
+- How the interest axis gets a store's LABELS. It needs them to evaluate a
+  selector where today it matches an anchor, and its whole shape rests on
+  reading the registry and nothing else — so either the retention tick hands
+  them in (one manifest read it has already made, but a signature change at
+  every call site in the retention path) or the axis reads them itself. The
+  floor half is settled: the position records the chunk, so nothing there
+  reads a rings file. Caching a resolved membership is not on the table for
+  the reason the tick already refuses to gate on the registry's mtime.
+- Whether a declaration holds `store` XOR `select` or only `select`. One
+  shape collapses a branch in four readers, but a store anchored by
+  `path:<canonical>` — one that declares no identity — cannot be written as
+  a predicate on `id`, so the collapse would lose the case `--store` exists
+  to serve. Two members, with `--store` unchanged in meaning, costs about
+  three branches and no migration.
 - Whether a follower may select stores it cannot retain — a selection read
   over the wire, from a host that is not the one holding them. The interest
   axis is host-local, so a remote follower can ship but cannot hold.

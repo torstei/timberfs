@@ -193,6 +193,7 @@ impl Shipper {
                     &s.id,
                     &s.path.display().to_string(),
                     offset,
+                    s.entries.iter().filter_map(|e| e.chunk).max(),
                     s.entries
                         .iter()
                         .map(|e| e.wl.unwrap_or(0))
