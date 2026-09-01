@@ -57,6 +57,7 @@ create logview [type=console] console;
 select stores  from console;
 select records from console where entry has 'ERROR' limit 100;
 select records from [] where chunk may have 'req-8f3a';
+tail   records from console limit 5;  -- the last 5, then the tape's end
 declare errs cursor for select records from console where entry has 'ERROR';
 fetch 100 from errs;
 ```
