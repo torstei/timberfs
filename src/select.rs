@@ -109,6 +109,21 @@ impl Selector {
         // is read — and whether they were there decides what EMPTY means.
         let (inner, bracketed) = match expr.strip_prefix('[').and_then(|e| e.strip_suffix(']')) {
             Some(inner) => (inner.trim(), true),
+            // ⚠ An UNCLOSED opening bracket is a syntax error, not a
+            // bare word. A dropped one is easy to type — `[service=apache`
+            // under a shell that ate the quote — and reading it as "the
+            // store with `[service=apache` in its name" answers «no store
+            // matches», which is the one thing a malformed predicate must
+            // never be mistaken for.
+            //
+            // ⚠ Only this direction. A trailing `]` with no opening one
+            // is a legal VALUE (`name=*[1]` searches for that substring),
+            // so refusing it would refuse a real search to catch a typo.
+            None if expr.starts_with('[') => bail!(
+                "selector `{expr}` opens a bracket it never closes. Write the whole predicate \
+                 inside them or leave them off entirely \u{2014} half of each reads as a store \
+                 NAME, and then answers \u{201c}no store matches\u{201d}"
+            ),
             None => (expr, false),
         };
         if inner.is_empty() || inner == "*" {
@@ -268,6 +283,16 @@ fn parse_term(part: &str) -> anyhow::Result<Term> {
     let key = key.trim();
     if key.is_empty() {
         bail!("selector term {part:?} has no label name");
+    }
+    // A key ENDING in an operator character is the same typo one term
+    // later: `service~=x` splits at the `=` into the key `service~`,
+    // which no manifest has, so it would match nothing for a search
+    // nobody meant to run. No label key ends in one of these.
+    if key.ends_with(['~', '!', '*']) {
+        bail!(
+            "selector term {part:?}: no label is called {key:?} — the operators are {}",
+            OPS.join(", ")
+        );
     }
     let value = unquote(value.trim());
     // An empty substring is contained in everything, so it says nothing —
@@ -563,9 +588,36 @@ mod tests {
         assert!(Selector::parse("=web01").is_err(), "no label name");
         // A word carrying an operator character but no operator: a typo,
         // and the one case the bare-word rule must not swallow.
-        for typo in ["host~web01", "host!web01", "web*01", "!host"] {
+        //
+        // ⚠ A MISTYPED operator whose text still splits on `=` is the
+        // same mistake one step later: `host~=web01` leaves the key
+        // `host~`, which no manifest has, so it would match nothing for
+        // a search nobody meant to run.
+        for typo in [
+            "host~web01",
+            "host!web01",
+            "web*01",
+            "!host",
+            "host~=web01",
+            "host*=web01",
+            "host!!=web01",
+        ] {
             assert!(Selector::parse(typo).is_err(), "{typo} should be refused");
         }
+        // ⚠ An UNCLOSED bracket, which the bare-word rule would otherwise
+        // read as a name — the easiest of these to type, and the one
+        // whose wrong answer looks most like a real one.
+        for half in ["[host=web01", "[", "[host=web01,service=a"] {
+            assert!(Selector::parse(half).is_err(), "{half} should be refused");
+        }
+        // ⚠ But a trailing `]` alone is a legal VALUE, not half a
+        // bracket: refusing it would refuse a real substring search.
+        assert!(Selector::parse("name=*[1]").is_ok());
+        assert!(Selector::parse("host=web01]").is_ok());
+        // Both brackets, and none, stay legal.
+        assert!(Selector::parse("[host=web01]").is_ok());
+        assert!(Selector::parse("host=web01").is_ok());
+        assert!(Selector::parse("[]").is_ok());
         assert!(Selector::parse("host=web01,").is_err(), "stray comma");
         assert!(
             Selector::parse(r#"host=~"web.*"#).is_err(),
