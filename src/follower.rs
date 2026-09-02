@@ -38,8 +38,8 @@
 //! drops keys it does not own (cursor.rs). One file would make every
 //! position write preserve operator fields, and would race `update`.
 //!
-//! The lock is a third file rather than the cursor because a cursor save
-//! REPLACES the inode by rename, and a lock on a renamed-over inode
+//! The lock is a third file rather than the positions because a positions
+//! save REPLACES the inode by rename, and a lock on a renamed-over inode
 //! silently stops excluding anyone — the same reason the store's writer
 //! lock is never the `.rings` (store.rs).
 //!
@@ -457,7 +457,7 @@ impl Declaration {
         map
     }
 
-    /// Atomic and durable, for the same reason a cursor save is: a torn
+    /// Atomic and durable, for the same reason a positions save is: a torn
     /// declaration after a crash is an unreadable registry, and an
     /// unreadable registry is a follower that cannot be started.
     pub fn save(&self, reg: &Path) -> anyhow::Result<()> {
@@ -1938,7 +1938,7 @@ pub fn cmd_update(
 ///
 /// Refused while `retaining=true` (set it false first, and see what that
 /// frees) and while the follower is RUNNING — deleting under a live
-/// process would leave it writing an unlinked cursor, silently doing
+/// process would leave it writing an unlinked positions file, silently doing
 /// nothing. One escape: a follower whose store no longer exists deletes
 /// freely, there being nothing to release.
 pub fn cmd_delete(name: &str, stop: bool, disable: bool) -> anyhow::Result<()> {
@@ -1976,7 +1976,8 @@ pub fn cmd_delete(name: &str, stop: bool, disable: bool) -> anyhow::Result<()> {
     match liveness(&reg, name) {
         Liveness::Running => bail!(
             "{name} is running{} — deleting it now would leave it writing an unlinked \
-             cursor, doing nothing at all. Stop it first (`--stop`, or `systemctl stop {}`)",
+             positions file, doing nothing at all. Stop it first (`--stop`, or \
+             `systemctl stop {}`)",
             store::describe_lock_holder(&lock_path(&reg, name))
                 .map(|w| format!(" ({w})"))
                 .unwrap_or_default(),
