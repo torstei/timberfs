@@ -299,28 +299,74 @@ fn feed(
 
     let mut said: Option<usize> = None;
     loop {
-        let (buf, stores, matched) = shipper.poll_raw()?;
+        let (buf, stores, matched) = {
+            // A store with anything UNACKNOWLEDGED is parked: it has
+            // nothing new to offer, and asking would cost the stores
+            // beside it. Its recorded position only moves when the
+            // consumer acknowledges, so a read starting there hands back
+            // the entries already in flight — duplicates, filling the
+            // shared entry cap, on every poll, for as long as the
+            // trouble lasts. Measured: a consumer taking entries and
+            // acknowledging none held this at 99% of a core without the
+            // park and 0% with it, and the test for it does not fail
+            // without it, it never finishes.
+            //
+            // ⚠ So the depth is one outstanding batch per store, and
+            // pipelining deeper is not a matter of raising a number: it
+            // needs a SENT offset per store, kept beside the
+            // acknowledged one and read from instead of it. Otherwise
+            // "further ahead" means "the same entries again", which is
+            // what this stops.
+            let parked = |id: &str| tracked.get(id).is_some_and(|t| !t.pending.is_empty());
+            shipper.poll_excluding(&parked)?
+        };
         if said != Some(matched) {
             crate::note!("timberfs: following {matched} store(s)");
             said = Some(matched);
         }
         announce(sink, &stores, tracked)?;
-        let more = splice(sink, &buf, tracked)?;
+        let (sent, more, stopped_in) = splice(sink, &buf, tracked)?;
+        shipper.stopped_in(stopped_in);
         sink.flush()?;
 
-        let moved = drain(shipper, reports, tracked, Drain::Now)?;
-        if moved {
+        if drain(shipper, reports, tracked, Drain::Now)? {
             shipper.persist()?;
         }
-        if more {
+        // Work was done, so go again rather than waiting on a clock.
+        if sent > 0 || more {
             continue;
         }
-        if !pacing.follow {
-            // The caller closes the consumer's input and drains it to
-            // the end, which is exact where a sleep is a guess.
-            return Ok(());
+        // Nothing to send. Either the stores are quiet, or every store
+        // that has anything left is parked waiting to be acknowledged.
+        if !tracked.values().any(|t| !t.pending.is_empty()) {
+            if !pacing.follow {
+                // The caller closes the consumer's input and drains it
+                // to the end, which is exact where a sleep is a guess.
+                return Ok(());
+            }
+            thread::sleep(pacing.poll);
+            continue;
         }
-        thread::sleep(pacing.poll);
+        // Something is in flight, so what to wait for is a REPORT and
+        // not the clock: a consumer that catches up is served at once
+        // rather than at the next tick, and a poll interval never
+        // becomes the ceiling on one store's throughput.
+        match reports.recv_timeout(pacing.poll) {
+            Ok(rep) => {
+                take(shipper, tracked, rep?)?;
+                drain(shipper, reports, tracked, Drain::Now)?;
+                shipper.persist()?;
+            }
+            // A whole interval with nothing said and nothing to send:
+            // for a one-shot there is nothing more coming, and for a
+            // follow it is a stall the notes explain.
+            Err(RecvTimeoutError::Timeout) => {
+                if !pacing.follow {
+                    return Ok(());
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => bail!("the consumer closed its output"),
+        }
     }
 }
 
@@ -370,13 +416,15 @@ fn announce(
 /// bookkeeping the consumer's own watermarks replace. Two authorities
 /// for one number is a bug waiting to be written.
 ///
-/// Returns whether a bound stopped the read, so the caller polls again
-/// rather than sleeping.
+/// Returns how many entries went out, whether a bound stopped the read
+/// (so the caller polls again rather than waiting), and which store it
+/// stopped in (so the next read starts after that one).
 fn splice(
     sink: &mut impl Write,
     buf: &[u8],
     tracked: &mut HashMap<String, Tracked>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(u64, bool, Option<String>)> {
+    let mut sent = 0u64;
     let mut more = false;
     let mut last_delivering: Option<String> = None;
     for frame in Frames::new(buf) {
@@ -399,6 +447,7 @@ fn splice(
                 }
                 last_delivering = Some(id.to_string());
                 sink.write_all(frame.bytes)?;
+                sent += 1;
             }
             b"stream-end" => {
                 more = frame.field("status") == Some("limited");
@@ -406,20 +455,61 @@ fn splice(
             _ => {}
         }
     }
-    if !more {
-        last_delivering = None;
-    }
-    Ok(more_and_stop(more, last_delivering, tracked))
+    // Only a capped read has a place to resume from: an exhausted one
+    // read every store to its end, so the order next time does not
+    // matter.
+    Ok((sent, more, if more { last_delivering } else { None }))
 }
 
-/// Records where a capped read stopped, for the round-robin, and hands
-/// back whether to poll again.
-fn more_and_stop(
-    more: bool,
-    _stop: Option<String>,
-    _tracked: &mut HashMap<String, Tracked>,
-) -> bool {
-    more
+/// One report, acted on. Extracted so the drain and the loop's own wait
+/// cannot come to treat a watermark differently.
+fn take(
+    shipper: &mut Shipper,
+    tracked: &mut HashMap<String, Tracked>,
+    rep: Report,
+) -> anyhow::Result<bool> {
+    match rep {
+        Report::Progress { id, offset } => {
+            let Some(t) = tracked.get_mut(&id) else {
+                crate::note!(
+                    "timberfs: the consumer acknowledged store {id}, which it was never sent \
+                     anything from — ignoring"
+                );
+                return Ok(false);
+            };
+            // What the position file records beside the offset — the
+            // chunk for the retention floor, the write time for a person
+            // — as the answer stated it when those entries went out.
+            let mut chunk = None;
+            let mut wl = 0u64;
+            let mut delivered = 0u64;
+            t.pending.retain(|p| {
+                if p.end <= offset {
+                    chunk = p.chunk.max(chunk);
+                    wl = wl.max(p.wl);
+                    delivered += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            let path = t.path.clone();
+            shipper.acknowledge(&id, &path, offset, chunk, wl, delivered);
+            Ok(true)
+        }
+        Report::Note { id, offset, text } => {
+            // Recorded rather than only logged: `follower status` is
+            // another process, and a stalled follower's reason has to
+            // outlive the line it was printed on.
+            crate::note!(
+                "timberfs: consumer note{}{}: {text}",
+                id.as_deref().map(|i| format!(" [{i}]")).unwrap_or_default(),
+                offset.map(|o| format!(" @{o}")).unwrap_or_default()
+            );
+            Ok(shipper.take_note(id.as_deref(), offset, &text))
+        }
+        Report::Hello { .. } => bail!("the consumer said hello twice"),
+    }
 }
 
 /// Take what the consumer has said, and move what it says to.
@@ -436,45 +526,7 @@ fn drain(
             Drain::ToEnd => reports.recv().map_err(|_| mpsc::TryRecvError::Disconnected),
         };
         match got {
-            Ok(Ok(Report::Progress { id, offset })) => {
-                let Some(t) = tracked.get_mut(&id) else {
-                    crate::note!(
-                        "timberfs: the consumer acknowledged store {id}, which it was never \
-                         sent anything from — ignoring"
-                    );
-                    continue;
-                };
-                // The chunk containing the last acknowledged byte, from
-                // what the answer said when those entries went out.
-                let mut chunk = None;
-                let mut wl = 0u64;
-                let mut delivered = 0u64;
-                t.pending.retain(|p| {
-                    if p.end <= offset {
-                        chunk = p.chunk.max(chunk);
-                        wl = wl.max(p.wl);
-                        delivered += 1;
-                        false
-                    } else {
-                        true
-                    }
-                });
-                let path = t.path.clone();
-                shipper.acknowledge(&id, &path, offset, chunk, wl, delivered);
-                moved = true;
-            }
-            Ok(Ok(Report::Note { id, offset, text })) => {
-                // Recorded rather than only logged: `follower status` is
-                // another process, and a stalled follower's reason has
-                // to outlive the line it was printed on.
-                crate::note!(
-                    "timberfs: consumer note{}{}: {text}",
-                    id.as_deref().map(|i| format!(" [{i}]")).unwrap_or_default(),
-                    offset.map(|o| format!(" @{o}")).unwrap_or_default()
-                );
-                moved |= shipper.take_note(id.as_deref(), offset, &text);
-            }
-            Ok(Ok(Report::Hello { .. })) => bail!("the consumer said hello twice"),
+            Ok(Ok(rep)) => moved |= take(shipper, tracked, rep)?,
             Ok(Err(e)) => return Err(e),
             Err(mpsc::TryRecvError::Empty) => return Ok(moved),
             Err(mpsc::TryRecvError::Disconnected) => match how {
@@ -631,6 +683,64 @@ done"#,
         let at = held.at.values().next().expect("one store");
         assert!(at.wl > 0, "the write time an entry stated was thrown away");
         assert!(at.delivered > 0 && at.offset > 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ONE STORE IN TROUBLE MUST NOT COST THE OTHERS. A consumer that
+    /// acknowledges S1 and never acknowledges S2 — its data refused, its
+    /// destination wedged, whatever — must leave S1 shipping at full
+    /// speed while S2 parks.
+    ///
+    /// ⚠ And the loop must not SPIN. Without a per-store window S2 is
+    /// re-read from the same place on every poll, its entries fill the
+    /// shared cap so the read always reports `limited`, and the loop
+    /// never rests: measured before the window, one store in trouble
+    /// pushed the same rejected entries at a full core indefinitely.
+    #[test]
+    fn a_store_that_is_never_acknowledged_parks_and_the_others_run() {
+        let _forking = crate::store::fork_guard();
+        let root = forest("stall", &[("aaa", 6), ("zzz", 6)]);
+        let out = root.join("got.txt");
+        let pos = root.join("positions.json");
+        // Acknowledges everything except the store named zzz.
+        let script = format!(
+            r#"printf '\036hello\037v=1\037reads=records\000'
+while IFS= read -r -d '' hdr; do
+  kind=${{hdr%%$'\037'*}}; kind=${{kind#$'\036'}}
+  [ "$kind" = entry ] || continue
+  f() {{ printf '%s' "$hdr" | tr '\037' '
+' | sed -n "s/^$1=//p"; }}
+  len=$(f len); off=$(f offset); id=$(f id); src=$(f src)
+  payload=$(head -c "$len"; head -c 1 >/dev/null)
+  printf '%s
+' "$payload" >> {out}
+  case "$src" in *zzz*) ;; *) printf '\036progress\037id=%s\037offset=%s\000' "$id" "$((off + len))";; esac
+done"#,
+            out = out.display()
+        );
+        let mut o = opts(&root, Some(&pos), vec!["bash".into(), "-c".into(), script]);
+        // A small cap, so a stalled store would crowd the other out.
+        o.batch_entries = 4;
+        run(o).unwrap();
+
+        let got = lines(&out);
+        assert_eq!(
+            got.iter().filter(|l| l.contains("aaa")).count(),
+            6,
+            "the healthy store did not finish: {got:?}"
+        );
+        // The stalled one was tried, once, up to its window — and not
+        // over and over.
+        let tried = got.iter().filter(|l| l.contains("zzz")).count();
+        assert!(tried > 0 && tried <= 8, "zzz was re-sent {tried} times");
+
+        let held = crate::cursor::Positions::load(&pos).unwrap().unwrap();
+        assert_eq!(
+            held.at.len(),
+            1,
+            "only the acknowledged store has a position"
+        );
+        assert_eq!(held.at.values().next().unwrap().delivered, 6);
         let _ = std::fs::remove_dir_all(&root);
     }
 

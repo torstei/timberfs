@@ -251,6 +251,37 @@ lifecycle below rather than a consequence of it: were the consumer to outlive
 the follower, the announced state would have to be persisted and reconciled
 against a consumer that might have missed an update.
 
+## One store in trouble must not cost the others
+
+A consumer that will not take one store's entries — refused by its
+destination, or a destination wedged for that stream alone — must leave every
+other store shipping at full speed. Two things make that so, and the second
+was a defect until it was measured.
+
+**A store with anything UNACKNOWLEDGED is parked.** Its recorded position only
+moves when the consumer acknowledges, so a read starting there hands back the
+entries already in flight — duplicates, filling the shared entry cap, on
+every poll, for as long as the trouble lasts. Measured: a consumer taking
+entries and acknowledging none held the process at **99% of a core** without
+the park and **0%** with it, and the test written for it does not merely fail
+without the park — it never finishes.
+
+**The loop waits for a REPORT, not for the clock.** With everything parked
+there is nothing to send, and the thing worth waking for is an
+acknowledgement; so a consumer that catches up is served at once rather than
+at the next tick, and the poll interval never becomes the ceiling on one
+store's throughput.
+
+⚠ So the depth is one outstanding batch per store, and pipelining deeper is
+not a matter of raising a number: it needs a SENT offset per store, kept
+beside the acknowledged one and read from instead of it. Otherwise "further
+ahead" means "the same entries again", which is what the park exists to stop.
+
+What the stalled store then costs is retention, not throughput: its position
+stops moving, so a `retaining` follower holds everything from there — which
+is the promise, with `retain_size` as the backstop — and its data waits until
+the trouble is fixed, at which point it resumes from exactly where it stopped.
+
 ## Lifecycle
 
 The consumer is a child of the follower. If the consumer dies the follower exits

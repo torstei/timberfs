@@ -156,6 +156,20 @@ impl Shipper {
     /// so nothing drifts between what timberfs wrote and what the
     /// consumer reads.
     pub fn poll_raw(&mut self) -> anyhow::Result<(Vec<u8>, Vec<Store>, usize)> {
+        self.poll_excluding(&|_| false)
+    }
+
+    /// The same read, skipping the stores `parked` names.
+    ///
+    /// PER-STORE FLOW CONTROL, which the caller owns because only it
+    /// knows what its consumer has taken. Without it one store that
+    /// never advances is re-read from the same place on every poll, its
+    /// entries fill the shared cap, and the loop never rests — the
+    /// head-of-line block the frames wire reserved a window for.
+    pub fn poll_excluding(
+        &mut self,
+        parked: &dyn Fn(&str) -> bool,
+    ) -> anyhow::Result<(Vec<u8>, Vec<Store>, usize)> {
         let matches = crate::select::resolve(&self.dirs, &self.selector);
         let matched = matches.len();
         let mut stores: Vec<Store> = Vec::new();
@@ -183,6 +197,9 @@ impl Shipper {
             }
         }
         rotate_past(&mut stores, self.stopped_in.as_deref());
+        // After the rotation, so parking a store does not change whose
+        // turn it is.
+        stores.retain(|(id, _, _)| !parked(id));
         if stores.is_empty() {
             return Ok((Vec::new(), stores, matched));
         }
