@@ -99,11 +99,12 @@ struct Cli {
     /// over loopback)
     #[arg(long, value_name = "MODE", default_value = "none", value_parser = ["none", "gzip"], help_heading = HEAD_WHAT)]
     compress: String,
-    /// Print the export requests instead of sending them, and report the
-    /// entries as taken — which is honest: a watermark says "do not send
-    /// me these again", and printing them twice is what it prevents. To
-    /// preview without remembering anything, run the feeder without a
-    /// positions file
+    /// Print the export requests ON STDERR instead of sending them —
+    /// stdout is the report channel, so `--dry-run 2>&1 >/dev/null | jq
+    /// .` is how to read them. The entries are still reported taken,
+    /// which is honest: a watermark says "do not send me these again",
+    /// and printing them twice is what it prevents. To preview without
+    /// remembering anything, run the feeder without a positions file
     #[arg(long, help_heading = HEAD_WHAT)]
     dry_run: bool,
 
@@ -364,8 +365,15 @@ impl Shipper {
         if self.dry_run {
             // The json spelling whatever the wire encoding is: the two
             // carry the same request, and one of them is readable.
+            //
+            // ⚠ STDERR, not stdout. Stdout is the report channel and a
+            // flag must not change what a file descriptor means: printed
+            // there, the dump interleaves with the reports and the
+            // feeder rejects the stream as malformed on the first
+            // unmarked byte. `--quiet` does not suppress it either —
+            // this dump is what was ASKED for, not a progress note.
             let body = otlp::render_groups(groups, env!("CARGO_PKG_VERSION"), &self.severity);
-            println!("{}", serde_json::to_string_pretty(&body)?);
+            eprintln!("{}", serde_json::to_string_pretty(&body)?);
             return Ok(Taken::Yes);
         }
         let text: Vec<u8> = match self.encoding {

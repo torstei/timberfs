@@ -1,11 +1,8 @@
 # bash completion for timber-otlp(1)
 #
-# timber-otlp has no subcommands, only flags and one positional: the
-# store to ship. It offers the bare handles from `timberfs list --names`
-# alongside normal file-path completion — same as the timberfs and
-# timber-filter scripts. When no forests are configured (or `list
-# --names` errors), that call is silent and empty, so completion just
-# falls back to files.
+# timber-otlp is a CONSUMER: it reads a records stream on stdin and takes
+# no store argument, so there are no store handles to offer here — only
+# flags, and the fixed value sets of the three that have them.
 #
 # Installed at /usr/share/bash-completion/completions/timber-otlp,
 # where the bash-completion package auto-sources it for interactive
@@ -18,15 +15,10 @@ _timber_otlp() {
 
     local flags="--endpoint --header --timeout --service --resource \
 --severity-regex --batch-size --batch-timeout --encoding --compress \
---select --dry-run -f --follow --cursor --positions --poll --start \
---from --to --quiet -h --help -V --version"
+--dry-run --quiet -h --help -V --version"
 
-    # A flag that takes a value: the word after it is never a handle.
+    # A flag that takes a value: only these three have a known value set.
     case "$prev" in
-    --start)
-        COMPREPLY=($(compgen -W "end begin" -- "$cur"))
-        return 0
-        ;;
     --encoding)
         COMPREPLY=($(compgen -W "proto json" -- "$cur"))
         return 0
@@ -35,27 +27,13 @@ _timber_otlp() {
         COMPREPLY=($(compgen -W "none gzip" -- "$cur"))
         return 0
         ;;
-    --cursor | --positions)
-        COMPREPLY=($(compgen -f -- "$cur"))
-        return 0
-        ;;
     --endpoint | --header | --timeout | --service | --resource | \
-        --severity-regex | --batch-size | --batch-timeout | --from | --to | \
-        --select | --poll)
+        --severity-regex | --batch-size | --batch-timeout)
         return 0
         ;;
     esac
 
-    case "$cur" in
-    -*)
-        COMPREPLY=($(compgen -W "$flags" -- "$cur"))
-        return 0
-        ;;
-    esac
-
-    local handles
-    handles=$(timberfs list --names 2>/dev/null)
-    COMPREPLY=($(compgen -W "$handles" -- "$cur") $(compgen -f -- "$cur"))
+    COMPREPLY=($(compgen -W "$flags" -- "$cur"))
     return 0
 }
 complete -F _timber_otlp timber-otlp
