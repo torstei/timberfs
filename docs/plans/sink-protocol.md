@@ -58,8 +58,9 @@ parser shape at both ends. Nothing travels the other way but the stream
 itself.
 
     hello      v=1  reads=records          (once, before anything else)
-               [ id=<store> offset=<n> ]*  what it ALREADY holds
+               [ id=<store> offset=<n> ]*  what it ALREADY holds — a HINT
     progress   id=<store>  offset=<n>      (whenever it likes)
+    note       [ id=<store> ] [ offset=<n> ]  text=<json string>
 
 **No hello, no run.** timberfs refuses rather than silently falling back to
 advancing on write-out, because "every sink implements this" is what makes
@@ -77,8 +78,68 @@ the frames handshake — the receiver answering with the coverage it holds —
 expressed as the same message, so replication stops being an exception to
 the model. ⚠ Not served in a first cut: see the deferred list.
 
+⚠ **A claim is a HINT, not a proof, so it is honoured only where timberfs
+has nothing recorded for that store.** A number cannot demonstrate that the
+bytes are held; honouring one over a recorded position would skip what was
+never delivered, silently. Where there IS no recorded position the claim
+costs nothing we know about and saves everything: a rebuilt follower
+pointed at a receiver already holding terabytes must not re-ship them. A
+claim BEHIND our position is ignored too — a rewind is safe but pure waste
+— and where a receiver really does hold what we then re-send, it
+deduplicates on `(origin, seq)`, chunks being addressed. The cost is
+bandwidth, never data.
+
+So the claim joins a question this design already has rather than adding
+one. Where a store with no position starts is decided in this order:
+
+    a recorded position  >  the sink's claim  >  --follow-from
+
+The claim outranks the declared policy because it is specific knowledge
+about THAT store, and yields to a recorded position because that is
+knowledge we own.
+
 **Batching is the sink's own business.** It reports when it likes; timberfs
 bounds its own reads for its own reasons. Backpressure is the pipe.
+
+## `note`: because silence is now a legitimate state
+
+Making the watermark mean "do not send me these again" made SILENCE
+meaningful — a sink that has not reported has not got there — so a stalled
+follower is a state the design intends. `follower status` can see that it
+is stalled and cannot see WHY, and only the sink knows. `note` is that
+half.
+
+    note  id=499544f0-…  offset=33724753900
+          text="400 from collector.internal: entry refused"
+
+  * **Opaque to timberfs**, displayed verbatim, never parsed — the same
+    reason the watermark carries no error codes: a taxonomy here would be a
+    second thing to keep in step with what sinks actually say.
+  * **Persisted, or it is pointless.** `follower status` is a DIFFERENT
+    PROCESS, so an in-memory note is invisible to the thing that needs it.
+    It belongs in `positions.json`, which is already atomic, already
+    per-store, and already what `status`, `list` and the interest axis read.
+  * ⚠ **Writable when nothing advanced**, which is a real change: positions
+    are written when a batch is accepted, so a stalled follower would
+    otherwise never write the note explaining why. A note alone justifies a
+    write — deduped by text, so a sink retrying once a second produces one
+    note and one write, not sixty.
+  * **Bounded by construction.** One per store, plus one follower-wide (an
+    absent `id` being "about me, not a store" — an unreachable endpoint is
+    not per store). Replaced, never accumulated; history is what the
+    journal is for.
+
+⚠ **`offset` in a note is an ADDRESS.** `timberview` opens
+`timber://host/<store-id>#offset=N`, so a note naming the entry a sink
+choked on gives `follower status` something an operator can open the log
+AT — that exact entry, in the pager — rather than "go read the sink's
+journal and correlate". It is the same quantity as a watermark and a
+position, which is the point of there being one kind of position here.
+
+Named `note` and not `status` because `stream-end` already carries a
+`status` FIELD, whose values are `exhausted`/`limited`. Two `status`es
+meaning different things is a wart to not acquire. It also matches
+`crate::note!`, already the vocabulary for a line addressed to an operator.
 
 ## What the stream carries
 
@@ -99,9 +160,14 @@ a conditional.
 One field and not flattened `label.*` keys, for a framing reason rather
 than taste: labels are open-ended, so a value could hold `0x1f` or NUL and
 break the framing, and a label key could collide with `path`/`id`/`kept`/
-`total`. A JSON string cannot contain a raw control character, so the
-framing is safe by construction instead of by hoping nobody labels a store
-oddly. The labels are `bark::provenance` — the one place that says what
+`total`.
+
+⚠ Which generalises into the format's one encoding rule: **any field whose
+value this protocol does not constrain is a JSON string.** `labels` and a
+note's `text` are both such fields, and so is the next one somebody adds.
+A JSON string cannot contain a raw control character, so content cannot
+break the framing — by construction rather than by hoping nobody labels a
+store oddly or puts a tab in an error message. The labels are `bark::provenance` — the one place that says what
 counts as a label — so settings (`wal`, `retain`, `index`) are not in it:
 they are operational and not a sink's business.
 
@@ -137,6 +203,7 @@ authorities for one number is a bug waiting to be written.
 | | lives in | survives a restart |
 |---|---|---|
 | positions (offset, chunk, per store) | `positions.json` | **yes** — or every store is re-shipped |
+| the sink's last `note`, per store and one for itself | `positions.json` | yes — `status` is another process |
 | labels last ANNOUNCED, per store | the loop's memory | no — and must not |
 | the sink's own copy of them | the sink's memory | no — rebuilt from stream start |
 
