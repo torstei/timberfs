@@ -2155,6 +2155,22 @@ class Shell:
                     at[sid] = {"id": sid, "offset": end}
 
 
+def bind_tab():
+    """Make Tab complete, whichever readline library this Python has.
+
+    ⚠ libedit is not GNU readline and takes a different binding syntax —
+    and says nothing about a line it does not understand, so under it
+    `tab: complete` binds nothing at all: Tab inserts a tab and the
+    completer is never called. Apple's python3 is libedit-backed,
+    which is a dead Tab on every Mac, silently. `readline.backend` names
+    the library from 3.13 on; before that the module's docstring is the
+    only place it says."""
+    editline = (getattr(readline, "backend", None) == "editline"
+                or "libedit" in (readline.__doc__ or ""))
+    readline.parse_and_bind("bind ^I rl_complete" if editline
+                            else "tab: complete")
+
+
 def load_history(path, size):
     """Read the history, and arrange for it to be written back.
 
@@ -2280,7 +2296,7 @@ def main(argv=None):
     # keys and values.
     readline.set_completer(Complete(sh))
     readline.set_completer_delims(" ")
-    readline.parse_and_bind("tab: complete")
+    bind_tab()
     save_history = load_history(a.histfile, a.histsize)
     if not a.quiet:
         print(HELP)

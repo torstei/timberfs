@@ -824,16 +824,23 @@ def a_chunk_read_takes_the_session_on_the_clock_it_is_addressed_by():
     s.cleanup()
 
 
-def completer(views=("console",), cursors=(), hosts=()):
-    """The completer, with a shell that has some of everything. It is
-    pure logic over the line typed, so it needs no terminal and no host —
-    which is why there is no excuse for the gap this closes."""
+def timbersh_module():
+    """timbersh imported rather than run, for the pieces that are plain
+    functions. By path, because the script is not named `.py`."""
     import importlib.machinery, importlib.util
     ld = importlib.machinery.SourceFileLoader("tsh", TIMBERSH)
     sp = importlib.util.spec_from_loader("tsh", ld)
     m = importlib.util.module_from_spec(sp)
     sys.modules["tsh"] = m
     ld.exec_module(m)
+    return m
+
+
+def completer(views=("console",), cursors=(), hosts=()):
+    """The completer, with a shell that has some of everything. It is
+    pure logic over the line typed, so it needs no terminal and no host —
+    which is why there is no excuse for the gap this closes."""
+    m = timbersh_module()
     m.TARGETS = list(hosts) or [None]
 
     class Sh:
@@ -930,6 +937,62 @@ def the_completer_still_knows_the_rest_of_the_grammar():
     # A predicate literal completes its own keys, then that key's values.
     assert c.options("select records from [", "[") == ["[host=", "[type="]
     assert c.options("select records from [host=", "[host=") == ["[host=web01"]
+
+
+@test
+def tab_is_bound_by_the_syntax_the_readline_library_takes():
+    """`tab: complete` is GNU readline's spelling and libedit binds
+    nothing from it — without saying so, so Tab inserted a tab and the
+    completer was never reached at all. Apple's python3 is libedit-backed,
+    so that was every Mac.
+
+    Both libraries are checked here because only one of them can be
+    checked by running: whichever this Python has, the other's spelling
+    is the one that would rot."""
+    m = timbersh_module()
+
+    class Fake:
+        def __init__(self, doc, backend=None):
+            self.__doc__ = doc
+            if backend is not None:
+                self.backend = backend
+            self.bound = []
+
+        def parse_and_bind(self, what):
+            self.bound.append(what)
+
+    GNU = "enables command line editing using GNU readline"
+    EDIT = "enables command line editing using libedit"
+    cases = [
+        (Fake(GNU, "readline"), "tab: complete"),
+        (Fake(EDIT, "editline"), "bind ^I rl_complete"),
+        # Before 3.13 there is no `backend` and the docstring is all there is.
+        (Fake(GNU), "tab: complete"),
+        (Fake(EDIT), "bind ^I rl_complete"),
+    ]
+    was = m.readline
+    try:
+        for fake, want in cases:
+            m.readline = fake
+            m.bind_tab()
+            assert fake.bound == [want], (fake.__doc__, fake.bound)
+    finally:
+        m.readline = was
+
+
+@test
+def tab_completes_a_statement_on_a_terminal():
+    """Through readline rather than around it. Every case above calls
+    `options()` directly — pure logic, no terminal — so the binding, the
+    delimiters and the completer hook itself had no test, and a Tab that
+    inserts a tab looks exactly like a completer with nothing to offer."""
+    s = Pty({"": {"stores": []}}).start()
+    s.expect("timberfs=#")
+    # `sel` is not a word this session could echo, so `select` on the
+    # screen was written by the completion and nothing else.
+    s.send("sel\t").expect("select")
+    s.finish()
+    s.cleanup()
 
 
 def tape(name, sid, n=9):

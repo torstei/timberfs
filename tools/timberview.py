@@ -650,15 +650,23 @@ def helpers():
 
     Each is gated on the display it writes to, because one without it
     does not fail usefully: it writes a clipboard nothing will read, or
-    reports a connection error the reader never asked about."""
+    reports a connection error the reader never asked about.
+
+    ⚠ macOS is decided by the PLATFORM, and the X helpers are not
+    offered there at all: XQuartz sets `DISPLAY` on a Mac, so an `xclip`
+    installed beside it would fill an X selection nothing pastes from,
+    exit 0, and be reported as the clipboard. `pbcopy` writes the
+    pasteboard, and if it is not there the terminal is the better next
+    route than a display nobody is looking at."""
     import shutil
     out = []
-    if os.environ.get("WAYLAND_DISPLAY"):
-        out.append(["wl-copy"])
-    if os.environ.get("DISPLAY"):
-        out += [["xclip", "-selection", "clipboard"], ["xsel", "-ib"]]
     if sys.platform == "darwin":
         out.append(["pbcopy"])
+    else:
+        if os.environ.get("WAYLAND_DISPLAY"):
+            out.append(["wl-copy"])
+        if os.environ.get("DISPLAY"):
+            out += [["xclip", "-selection", "clipboard"], ["xsel", "-ib"]]
     return [c for c in out if shutil.which(c[0])]
 
 

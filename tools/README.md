@@ -521,7 +521,9 @@ moves sees nothing happen.
 ⚠ **The route is said, because one of them cannot be confirmed.** A
 clipboard helper (`wl-copy`, `xclip`, `xsel`, `pbcopy`) where there is a
 display to use one on: it writes the clipboard of the machine the pager is
-on, and its exit status says whether it did. **OSC 52** otherwise, which
+on, and its exit status says whether it did. On macOS the PLATFORM decides
+and `pbcopy` is the only one offered — XQuartz sets `DISPLAY` there, and an
+X selection is not what a Mac pastes from. **OSC 52** otherwise, which
 is the one route that crosses an ssh or a multiplexer — and whose failure
 is *silence*, since a terminal that does not implement it does nothing and
 says nothing. So the status line names the route it used and hedges on

@@ -1494,6 +1494,60 @@ def a_copy_says_which_route_it_took():
 
 
 @test
+def a_clipboard_helper_is_offered_only_where_it_writes_a_clipboard():
+    """Every case above HANDS `to_clipboard` its helpers, so which ones a
+    machine offers had no test at all — and it is decided by a platform
+    and two environment variables, none of which the machine running the
+    suite can be asked to have.
+
+    The Mac case is the bug: XQuartz sets `DISPLAY` there, so a Mac with
+    `xclip` installed beside it filled an X selection nothing pastes
+    from, exit 0, and that was reported as the clipboard."""
+    import shutil
+    was = (sys.platform, shutil.which, os.environ.copy())
+    ALL = ("pbcopy", "xclip", "xsel", "wl-copy")
+
+    def as_if(platform, installed=ALL, **env):
+        sys.platform = platform
+        shutil.which = lambda c: c if c in installed else None
+        for k in ("DISPLAY", "WAYLAND_DISPLAY"):
+            os.environ.pop(k, None)
+        os.environ.update(env)
+
+    def offered():
+        return [c[0] for c in tv.helpers()]
+
+    try:
+        as_if("darwin", DISPLAY=":0")
+        assert offered() == ["pbcopy"], offered()
+        # And nothing takes its place when it is missing: the terminal is
+        # the next route, not a display nobody is looking at.
+        as_if("darwin", ("xclip", "xsel", "wl-copy"), DISPLAY=":0")
+        assert offered() == [], offered()
+
+        # Everywhere else it is the display and not the platform. Both
+        # variables at once is a Wayland session running Xwayland, so the
+        # native helper goes first.
+        as_if("linux", WAYLAND_DISPLAY="wayland-0", DISPLAY=":0")
+        assert offered() == ["wl-copy", "xclip", "xsel"], offered()
+        as_if("linux", DISPLAY=":0")
+        assert tv.helpers() == [["xclip", "-selection", "clipboard"],
+                                ["xsel", "-ib"]], tv.helpers()
+        # ⚠ `-selection clipboard`: without it xclip writes PRIMARY,
+        # which is the middle mouse button and not what anyone pastes.
+        as_if("linux", ("xsel",), DISPLAY=":0")
+        assert offered() == ["xsel"], offered()
+        # A terminal with no display at all offers none — OSC 52's job,
+        # and the case an ssh session is in.
+        as_if("linux")
+        assert offered() == [], offered()
+    finally:
+        sys.platform, shutil.which = was[0], was[1]
+        os.environ.clear()
+        os.environ.update(was[2])
+
+
+@test
 def the_region_is_on_the_screen_and_counted():
     """A selection you cannot see is not one, and a region can be longer
     than the screen — so the rows say which they are and the status line

@@ -285,6 +285,15 @@ writes to. It writes the clipboard of the machine the pager runs on and
 its exit status says whether it did, which makes it the only route that
 can be confirmed.
 .PP
+On macOS the PLATFORM decides and
+.B pbcopy
+is the only helper offered: XQuartz sets
+.B DISPLAY
+there, so an
+.B xclip
+installed beside it would fill an X selection nothing pastes from and
+report it as the clipboard.
+.PP
 .B "OSC 52"
 otherwise: the escape that hands the bytes to the TERMINAL, which is the
 one route that reaches a workstation from the far end of an ssh or a
