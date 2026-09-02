@@ -723,8 +723,15 @@ here.
   named, enabled or locked — which leaves "follower group" free for the
   thing that has members: several processes sharing one selection, each
   taking a shard.
-  Design note:
-  [docs/plans/follower-selection.md](docs/plans/follower-selection.md).
+  Design notes:
+  [docs/plans/follower-selection.md](docs/plans/follower-selection.md) for
+  the declaration and the loop, and
+  [docs/plans/sink-protocol.md](docs/plans/sink-protocol.md) for the
+  boundary it feeds: timberfs holds the position, a sink reports how far to
+  move it, and so a sink can be written in any language and run on another
+  machine. That is also the consumer-driven position the cursor entry above
+  says is missing — reached without letting a third party write the position
+  file.
 - **Splitting downstream of a spool (fan-out by cursor)**: one store as the
   intake spool — everything a web server writes, the vhost in the line — plus a
   cursor consumer that routes entries into per-stream stores, instead of routing

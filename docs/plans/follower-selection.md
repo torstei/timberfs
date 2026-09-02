@@ -169,21 +169,20 @@ timbersh already observes it: one expansion point, through which the terms a
 `create logview` stores also pass, so a saved view is exact. A declaration
 does the same at `create`.
 
-## A follower is local; a remote selection is ephemeral
+## The loop is local; a remote DESTINATION is not remote at all
 
-The shipping loop works over the wire — the same document, the same per-store
-cursor — so one process can pull a selection from a host it is not running
-on. That is an investigation or a temporary watch, not a registration: the
-interest axis is host-local, so `retaining` could not mean anything for a
-remote follower, and a flag that reads as a promise while holding nothing is
-worse than no flag.
+⚠ An earlier reading of this said remote followers must be ephemeral,
+because the interest axis is host-local so `retaining` could not mean
+anything for one. That reasoning assumed the whole loop ran elsewhere. It
+does not: under [sink-protocol.md](sink-protocol.md) the loop and the
+positions are always local and only the destination is a pipe away — over
+`ssh` if you like — so `retaining` works for a remote destination like any
+other.
 
-So the registry declares LOCAL followers, and a remote selection is something
-`timber-otlp --select` does directly. Which is why a selection may run
-without `--positions`, at the live end, keeping its places in memory and
-forgetting them on exit: that is the shape of watching production while
-looking into something, and refusing it would only push people into leaving
-a state file behind on a machine they were visiting.
+What stays ephemeral is a remote READER, one pulling from another host's
+stores. That is an investigation or a temporary watch rather than a
+registration, and it is why a selection may run without `--positions`, at
+the live end, keeping its places in memory and forgetting them on exit.
 
 ## Where a store's first appearance starts is declared
 
@@ -201,6 +200,15 @@ says the data is not lost until this follower has it, so skipping the backlog
 on the first run contradicts the declaration.
 
 ## The consumer is a poll loop
+
+⚠ **Who owns the position moved after this was written.** The loop below is
+right; the process it runs in is not. `timber-otlp --select --positions`
+holds the positions today, and under
+[sink-protocol.md](sink-protocol.md) timberfs holds them and the sink
+reports — because the position file is where the retention floor lives, and
+a program that writes it can get retention wrong silently where one that
+reports cannot. The loop, the fairness rotation and the resource grouping
+survive; they are re-homed into a `timberfs` subcommand.
 
 One process per destination, and its shape is the shell's `tail`:
 
