@@ -1542,6 +1542,16 @@ minted here when the store has none) as the one-term selection
 .BR [id=\&...] .
 Never by path \(em a store can move, and a path can come to hold a
 different store.
+.IP
+⚠ A store need not be IN a forest \(em a backing directory under a mount
+is the normal shape \(em and a follower resolves its selection against
+forests. So where the named store is not reachable through one, its
+DIRECTORY is recorded in the declaration as a
+.B look_in
+entry: a place to LOOK, beside the identity that says which store to look
+FOR. Nothing there is dereferenced, so a store that moves is still found
+either way; and it is dropped again if the selection is later widened,
+since a predicate is about forests rather than about that one store.
 .TP
 .BI \-\-follow\-from " WHERE"
 Where a store this follower has NEVER read is picked up; a store with a
@@ -1634,7 +1644,14 @@ is
 .BR select ,
 .B store
 or
-.BR follow_from ;
+.BR follow_from
+\(em and
+.B store
+re-derives its
+.B look_in
+while
+.B select
+clears it;
 a
 .B \-\-
 tail replaces the consumer wholesale. Validated before it is written, so
@@ -2091,16 +2108,20 @@ for this runs.
 frames want the
 .B chunks
 diet, which is refused rather than served wrongly (there is no per-store
-position on that path yet). So a frames stream is a unit of your own, and
-declares its retention interest with the superseded
-.B cursors=<dir>
-key.
+position on that path yet). So a frames stream is a unit of your own \(em
+and ⚠ it cannot hold retention back at all until that lands, since
+.B retain_unconsumed
+reads the follower registry and nothing else.
 .TP
 .BI \-\-cursor " PATH"
-Record what the far end has ACKNOWLEDGED, so
-.B retain_unconsumed
-knows what has left this box. Not a resume point: the receiver's coverage
-is what a resume reads.
+Record what the far end has ACKNOWLEDGED, so a store declaring
+.B cursors=<dir>
+can REPORT what has left this box
+.RB ( info ", " list ).
+⚠ Reporting only, in both senses: not a resume point \(em the receiver's
+coverage is what a resume reads \(em and not a retention hold, a file
+lying in a directory being deliberately unable to change what may be
+dropped (see FOLLOWERS).
 .TP
 .BI \-\-timeout " DUR"
 Socket read/write timeout (default 30s). A replication run that stalls

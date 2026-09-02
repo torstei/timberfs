@@ -727,12 +727,16 @@ enum Command {
         #[arg(long, value_name = "ADDR")]
         endpoint: String,
         /// Keep shipping as chunks seal, on the same connection — what a
-        /// registered `--type frames` follower runs
+        /// service unit for this runs
         #[arg(long, short = 'f')]
         follow: bool,
-        /// Record the far end's acknowledged position here, so
-        /// `retain_unconsumed` knows what has left this box. Not a resume
-        /// point: the receiver's own coverage is what a resume reads
+        /// Record the far end's acknowledged position here, so a store
+        /// declaring `cursors=<dir>` can REPORT what has left this box
+        /// (`info`, `list`). Not a resume point — the receiver's own
+        /// coverage is what a resume reads — and ⚠ not a retention hold
+        /// either: `retain_unconsumed` reads the follower registry
+        /// alone, and frames cannot be a follower until the `chunks`
+        /// diet lands
         #[arg(long, value_name = "PATH")]
         cursor: Option<PathBuf>,
         /// Ship no sidecars, so the receiver rebuilds its own index

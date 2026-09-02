@@ -179,6 +179,17 @@ pub fn validate_name(name: &str) -> anyhow::Result<()> {
 /// upgraded host would have got a declaration that HANGS until the
 /// hello times out. An error naming the one command that fixes it is
 /// the better failure.
+/// The extra directory a `--store` needs swept, if any: a store need not
+/// be in a forest, and a follower sweeps forests. Empty where the
+/// selection already reaches it, so an in-forest declaration carries no
+/// path at all.
+fn place_to_look(select: &str, dir: &Path) -> Vec<String> {
+    match crate::select::Selector::parse(select) {
+        Ok(p) if crate::select::resolve(&[], &p).is_empty() => vec![dir.display().to_string()],
+        _ => Vec::new(),
+    }
+}
+
 fn no_command(at: &Path, kind: &str) -> anyhow::Error {
     let what = match kind {
         "" => "declares no \"command\"".to_string(),
@@ -238,6 +249,19 @@ pub struct Declaration {
     /// change this with it, and a value written at create time would
     /// silently keep the old answer.
     pub follow_from: Option<crate::ship::FollowFrom>,
+    /// Extra directories to sweep BESIDE the configured forests.
+    ///
+    /// ⚠ A place to LOOK, never an address. The selection is still what
+    /// decides which store, so a store that moves inside a swept
+    /// directory is still found and one that moves out of it is still
+    /// found through its forest — nothing here is dereferenced.
+    ///
+    /// It exists because a store need not be in a forest: a backing
+    /// directory under a mount is the normal shape, and
+    /// `create --store <path>` there recorded an identity no sweep could
+    /// reach, so the follower followed nothing forever while reporting
+    /// that its store had not appeared YET.
+    pub look_in: Vec<String>,
     pub created: String,
     /// Keys this version does not know, kept so an `update` cannot eat
     /// them.
@@ -245,6 +269,23 @@ pub struct Declaration {
 }
 
 impl Declaration {
+    /// Every directory this follower's selection is resolved against:
+    /// the configured forests, plus whatever `look_in` adds.
+    ///
+    /// The forests are expanded rather than left implied, because a
+    /// non-empty directory list REPLACES them — so adding one place to
+    /// look would otherwise remove every other.
+    pub fn sweeps(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = crate::forest::forest_dirs();
+        for d in &self.look_in {
+            let d = PathBuf::from(d);
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        dirs
+    }
+
     /// The policy in force. `retaining` implies `begin`: it promises
     /// that data is not lost until this follower has it, so skipping a
     /// backlog on the first read would contradict the declaration.
@@ -372,6 +413,7 @@ impl Declaration {
             retaining,
             command,
             follow_from,
+            look_in: strings(&mut map, "look_in")?,
             created: take_str(&mut map, "created").unwrap_or_default(),
             extra: map,
         })
@@ -395,6 +437,17 @@ impl Declaration {
             map.insert(
                 "follow_from".into(),
                 Value::String(from.as_str().to_string()),
+            );
+        }
+        if !self.look_in.is_empty() {
+            map.insert(
+                "look_in".into(),
+                Value::Array(
+                    self.look_in
+                        .iter()
+                        .map(|d| Value::String(d.clone()))
+                        .collect(),
+                ),
             );
         }
         map.insert("created".into(), Value::String(self.created.clone()));
@@ -694,7 +747,7 @@ pub fn read(reg: &Path, name: &str) -> anyhow::Result<Registered> {
     let live = liveness(reg, name);
     let mut covered = Vec::new();
     if let Ok(sel) = decl.selector() {
-        for m in crate::select::resolve(&[], &sel) {
+        for m in crate::select::resolve(&decl.sweeps(), &sel) {
             let Some(id) = m.id else { continue };
             let id_for_note = id.clone();
             let path = m.dir.join(&m.name);
@@ -865,6 +918,15 @@ pub struct Interest {
     pub holder_at: Option<u64>,
     /// How many retaining followers were considered, for reporting.
     pub retaining: usize,
+    /// True when the registry could not be read and the axis is holding
+    /// everything as a consequence, rather than because nothing retains
+    /// this store.
+    ///
+    /// ⚠ Both hold nothing back, so both were once reported as "nothing
+    /// retains this store" — and an operator reading that while a
+    /// corrupt declaration silently pinned every store on the host has
+    /// been told the opposite of the truth.
+    pub blind: bool,
 }
 
 impl Interest {
@@ -993,7 +1055,10 @@ impl InterestIndex {
     /// policy, so the axis stays a function of what it is given.
     pub fn for_store(&self, fields: &Map<String, Value>, next_seq: u64) -> Interest {
         let Some(all) = &self.retaining else {
-            return Interest::default();
+            return Interest {
+                blind: true,
+                ..Interest::default()
+            };
         };
         // A store's identity is what a position is keyed by, so a store
         // that has none can hold nothing back — there is no position that
@@ -1031,6 +1096,7 @@ impl InterestIndex {
                         holder: Some((*name).clone()),
                         holder_at: None,
                         retaining,
+                        blind: false,
                     }
                 }
                 Some(seq) if *seq >= next_seq => {
@@ -1039,6 +1105,7 @@ impl InterestIndex {
                         holder: Some((*name).clone()),
                         holder_at: Some(*seq),
                         retaining,
+                        blind: false,
                     }
                 }
                 Some(seq) => {
@@ -1059,6 +1126,7 @@ impl InterestIndex {
             holder,
             holder_at: floor,
             retaining,
+            blind: false,
         }
     }
 }
@@ -1238,7 +1306,7 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
         );
     }
 
-    let select = match (&opts.select, &opts.store) {
+    let (select, look_in) = match (&opts.select, &opts.store) {
         (Some(_), Some(_)) => bail!(
             "--select names a SET and --store names one store, which is the one-term case of \
              it: give one of them"
@@ -1247,7 +1315,7 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
             "no selection: --select '[k=v]' for the stores a predicate matches, `[]` for every \
              one, or --store <store> for exactly one"
         ),
-        (Some(expr), None) => crate::select::canonical(expr)?,
+        (Some(expr), None) => (crate::select::canonical(expr)?, Vec::new()),
         // Identity, not address: a store can move, so one named store is
         // recorded by its `.bark` id, and one minted here when it has
         // none. A SELECTION mints nothing — a store it merely matched is
@@ -1277,7 +1345,16 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
                     store.display()
                 );
             }
-            format!("[id={anchor}]")
+            // ⚠ A store need not be in a forest — a backing directory
+            // under a mount is the normal shape — and a follower sweeps
+            // forests. So where the named store is not reachable through
+            // one, its DIRECTORY is recorded as a place to look, beside
+            // the identity that says which store to look FOR. Without it
+            // the follower resolves nothing and reports, wrongly, that
+            // its store had not appeared yet.
+            let sel = format!("[id={anchor}]");
+            let look_in = place_to_look(&sel, &sdir);
+            (sel, look_in)
         }
     };
 
@@ -1287,6 +1364,7 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
         retaining: opts.retaining,
         command: opts.command,
         follow_from: opts.follow_from,
+        look_in,
         created: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         extra: Map::new(),
     };
@@ -1296,7 +1374,7 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
     // predicate rather than a list the declaration holds.
     let covers = decl
         .selector()
-        .map(|sel| crate::select::resolve(&[], &sel))
+        .map(|sel| crate::select::resolve(&decl.sweeps(), &sel))
         .unwrap_or_default();
     let (identified, idless): (Vec<_>, Vec<_>) = covers.iter().partition(|m| m.id.is_some());
 
@@ -1724,7 +1802,14 @@ pub fn cmd_update(
                     _ => bail!("\"retaining\" is true or false"),
                 }
             }
-            "select" => decl.select = crate::select::canonical(v)?,
+            // ⚠ A place to look belonged to the STORE `--store` named.
+            // A predicate is about forests, so keeping it would sweep a
+            // directory nobody asked about — and silently pick up a
+            // store there that no forest holds.
+            "select" => {
+                decl.select = crate::select::canonical(v)?;
+                decl.look_in = Vec::new();
+            }
             "follow_from" => decl.follow_from = Some(crate::ship::FollowFrom::parse(v)?),
             "store" => {
                 let store = crate::forest::resolve_source(Path::new(v))?;
@@ -1762,6 +1847,10 @@ pub fn cmd_update(
                     );
                 }
                 decl.select = format!("[id={anchor}]");
+                // Re-pointed, so the place to look is re-derived: the new
+                // store may be outside every forest where the old one was
+                // not, or the other way round.
+                decl.look_in = place_to_look(&decl.select, &sdir);
             }
             "name" | "created" => {
                 bail!("\"{k}\" is identity, not configuration — it is not settable")
@@ -1965,7 +2054,7 @@ pub fn cmd_run(name: &str) -> anyhow::Result<()> {
     let held = lock;
     let result = crate::feed::run(crate::feed::Opts {
         selector,
-        dirs: Vec::new(),
+        dirs: decl.sweeps(),
         positions: Some(positions_path(&reg, name)),
         batch_entries: crate::ship::BATCH_ENTRIES,
         poll: std::time::Duration::from_secs(1),
@@ -2010,7 +2099,7 @@ fn migrate_cursor(reg: &Path, name: &str, decl: &Declaration) -> anyhow::Result<
     if c.delivered == 0 {
         return Ok(());
     }
-    let Some(m) = crate::select::resolve(&[], &decl.selector()?)
+    let Some(m) = crate::select::resolve(&decl.sweeps(), &decl.selector()?)
         .into_iter()
         .next()
     else {
@@ -2081,6 +2170,7 @@ mod tests {
                 "http://127.0.0.1:4318".into(),
             ],
             follow_from: None,
+            look_in: Vec::new(),
             created: "2026-08-21T00:00:00Z".into(),
             extra: Map::new(),
         }
@@ -2153,6 +2243,60 @@ mod tests {
         // Missing is an error too: a follower with no declaration is a
         // registry that cannot be trusted to answer, not an empty policy.
         assert!(Declaration::load(&reg, "absent").is_err());
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    /// ⚠ A store need NOT be in a forest, and a follower sweeps forests.
+    /// So `--store` on one outside every forest records its directory as
+    /// a place to look; without that the follower resolved nothing and
+    /// reported that its store had not appeared *yet*, forever — while a
+    /// `--retaining` one silently deleted freely, there being nothing it
+    /// could see to release. Measured against the VM suite, whose stores
+    /// live in a backing directory under a mount.
+    #[test]
+    fn a_store_outside_every_forest_is_still_reachable() {
+        let reg = scratch("outside");
+        let root = std::env::temp_dir().join(format!("tfs-outside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (backing, forest) = (root.join("backing"), root.join("forest"));
+        fs::create_dir_all(&backing).unwrap();
+        fs::create_dir_all(&forest).unwrap();
+
+        let outside = Declaration {
+            name: "out".into(),
+            select: "[id=x]".into(),
+            retaining: false,
+            command: vec!["true".into()],
+            follow_from: None,
+            look_in: vec![backing.display().to_string()],
+            created: String::new(),
+            extra: Map::new(),
+        };
+        // The recorded place is swept BESIDE the configured forests, not
+        // instead of them: a non-empty directory list replaces them, so
+        // adding one place to look would otherwise remove every other.
+        let swept = crate::forest::forest_dirs();
+        let with = outside.sweeps();
+        for d in &swept {
+            assert!(
+                with.contains(d),
+                "{} was dropped from the sweep",
+                d.display()
+            );
+        }
+        assert!(with.contains(&backing));
+
+        // And a declaration with no `look_in` sweeps exactly the forests,
+        // so the common case carries no path at all.
+        let inside = Declaration {
+            look_in: Vec::new(),
+            ..outside
+        };
+        assert_eq!(inside.sweeps(), swept);
+        // It is not written when it is empty, so an in-forest
+        // declaration reads as one.
+        assert!(!inside.to_map().contains_key("look_in"));
+        let _ = fs::remove_dir_all(&root);
         fs::remove_dir_all(&reg).ok();
     }
 
@@ -2528,6 +2672,28 @@ mod tests {
         fs::remove_dir_all(&reg).ok();
     }
 
+    /// ⚠ Fail-closed and nothing-retains-this hold the same amount back
+    /// — nothing — so they were once one message, and an operator reading
+    /// «nothing retains this store» while a corrupt declaration silently
+    /// pinned every store on the host was told the opposite of the truth.
+    /// `blind` is the difference, and it is what `trim` reports.
+    #[test]
+    fn a_registry_that_cannot_be_read_says_so_rather_than_nothing_retains_this() {
+        let fields = store_fields("store-id", &[]);
+        let blind = InterestIndex::closed().for_store(&fields, 10);
+        assert!(blind.blind, "a closed index is blind, not empty");
+        assert_eq!(blind.floor, None, "and it still holds everything back");
+        assert_eq!(blind.holder, None, "with nobody to name");
+
+        // An empty registry is a FACT, not a gap: nothing is registered,
+        // so nothing is held, and that is not blindness.
+        let reg = scratch("empty-registry");
+        fs::remove_dir_all(&reg).ok();
+        let seeing = InterestIndex::read(&reg).for_store(&fields, 10);
+        assert!(!seeing.blind);
+        assert_eq!(seeing.floor, None);
+    }
+
     #[test]
     fn the_axis_is_not_consulted_unless_the_store_declares_it() {
         // A host where nothing declares `retain_unconsumed` must never
@@ -2658,6 +2824,7 @@ mod tests {
             holder: Some("central".into()),
             holder_at: Some(4200),
             retaining: 1,
+            blind: false,
         };
         // The budget went past the floor: the overrun is recorded from the
         // floor, not from the start of the drop — chunks below it were
@@ -2681,6 +2848,7 @@ mod tests {
             holder: Some("fresh".into()),
             holder_at: None,
             retaining: 1,
+            blind: false,
         };
         let record = override_record("app.log", &policy, &stats(0, 12), &fresh).unwrap();
         assert!(
@@ -2705,6 +2873,7 @@ mod tests {
                 holder: Some("c".into()),
                 holder_at: Some(seq),
                 retaining: 1,
+                blind: false,
             };
             assert_eq!(
                 held.droppable(&records),
