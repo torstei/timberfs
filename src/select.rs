@@ -349,6 +349,10 @@ pub struct Match {
     /// a store without one cannot be addressed across a move or a
     /// restart, only read where it is.
     pub id: Option<String>,
+    /// When the store's manifest was first written, as it records it.
+    /// Not a label — `provenance` excludes it — and the one fact
+    /// `--follow-from discovery` compares against.
+    pub created: Option<String>,
     pub labels: Map<String, Value>,
 }
 
@@ -375,11 +379,16 @@ pub fn resolve(dirs: &[std::path::PathBuf], sel: &Selector) -> Vec<Match> {
             if sel.matches(&fields) {
                 let labels = crate::bark::provenance(&bark);
                 let id = fields.get("id").and_then(Value::as_str).map(str::to_string);
+                let created = fields
+                    .get("created")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 out.push(Match {
                     handle,
                     dir,
                     name,
                     id,
+                    created,
                     labels,
                 });
             }

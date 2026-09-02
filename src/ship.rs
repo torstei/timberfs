@@ -29,6 +29,77 @@ use crate::select::Selector;
 /// A store in a selection: its identity, where it is, and its labels.
 pub type Store = (String, PathBuf, Map<String, Value>);
 
+/// Where a store this follower has never read is picked up.
+///
+/// It decides one thing and only for a store with no recorded position:
+/// once there is one, that is where reading resumes and this has no say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FollowFrom {
+    /// The oldest byte the store still holds: everything it has.
+    Begin,
+    /// The next byte written. What an operator means by "start now" —
+    /// and a POSITION rather than a clock, because a clock is what
+    /// broke a tail once already.
+    End,
+    /// `Begin` for a store younger than this follower, `End` for one
+    /// older.
+    ///
+    /// The default, and the reason is the case the other two each get
+    /// wrong. `End` silently skips the seconds between a store's
+    /// creation and the poll that first sees it — which on a host with
+    /// an auto-creating intake can be a short-lived container's ENTIRE
+    /// log. `Begin` floods when an old store is relabelled into the
+    /// selection, dumping a month at the destination. This ships a store
+    /// born under this follower's watch whole, and one that predates it
+    /// from now on.
+    ///
+    /// ⚠ A heuristic, and it says so: a store's `created` is when its
+    /// manifest was first written, so one whose manifest was lost and
+    /// recovered reads as young. The failure is shipping more than
+    /// needed, which is the safe direction.
+    #[default]
+    Discovery,
+}
+
+impl FollowFrom {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FollowFrom::Begin => "begin",
+            FollowFrom::End => "end",
+            FollowFrom::Discovery => "discovery",
+        }
+    }
+
+    pub fn parse(s: &str) -> anyhow::Result<FollowFrom> {
+        match s {
+            "begin" => Ok(FollowFrom::Begin),
+            "end" => Ok(FollowFrom::End),
+            "discovery" => Ok(FollowFrom::Discovery),
+            other => anyhow::bail!("--follow-from {other:?} is not one of begin, end, discovery"),
+        }
+    }
+}
+
+/// An RFC 3339 stamp as an instant, for comparing two of them.
+fn instant(s: Option<&str>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(s?.trim()).ok()
+}
+
+/// The store's tape END: what has ever left it, plus everything it still
+/// holds in chunks.
+///
+/// ⚠ Not counting the write-ahead segment, so `End` ships up to one
+/// flush of what was already there — «from about now» rather than from
+/// an exact instant. Erring towards sending more is the safe direction,
+/// and an exact answer here would have to read the segment under the
+/// writer's own lock.
+fn tape_end(dir: &Path, name: &str) -> u64 {
+    let dropped = crate::query::dropped_bytes_of(&dir.join(name));
+    let chunks =
+        crate::format::read_index(&crate::format::rings_path(dir, name)).unwrap_or_default();
+    dropped + chunks.last().map(|c| c.uncomp_end()).unwrap_or(0)
+}
+
 /// How many stores a batch may span, and how many entries it may hold, by
 /// default. The entry cap is the destination's batch size; the store cap
 /// bounds a poll's syscalls, since every store in the selection is opened
@@ -86,6 +157,11 @@ pub struct Shipper {
     batch_entries: u64,
     /// Stores excluded for declaring no identity, so each is said once.
     idless: Vec<String>,
+    /// Where a store with no recorded position is picked up.
+    follow_from: FollowFrom,
+    /// See `since_declared`: `None` means the positions file's own
+    /// `created` is the reference.
+    interest_since: Option<String>,
     /// The store a bounded poll stopped in. The next poll starts AFTER
     /// it: the read drains its sources in order under one shared entry
     /// cap, so a store producing faster than the cap drains it would take
@@ -115,13 +191,44 @@ impl Shipper {
             read_only: false,
             batch_entries: BATCH_ENTRIES,
             idless: Vec::new(),
+            follow_from: FollowFrom::default(),
+            interest_since: None,
             stopped_in: None,
         })
+    }
+
+    /// When this consumer's interest BEGAN, which is what `discovery`
+    /// compares a store's birth against.
+    ///
+    /// A follower has a truer answer than its positions file does: the
+    /// file is written at its FIRST RUN, so one declared on Monday and
+    /// started on Friday would count every store born in between as
+    /// older than itself and skip it — the opposite of what `discovery`
+    /// is for. `feed` has no declaration and its file is the only
+    /// answer there is.
+    pub fn since_declared(mut self, when: &str) -> Shipper {
+        if !when.trim().is_empty() {
+            self.interest_since = Some(when.to_string());
+        }
+        self
+    }
+
+    fn interest_since(&self) -> Option<&str> {
+        Some(
+            self.interest_since
+                .as_deref()
+                .unwrap_or(&self.positions.created),
+        )
     }
 
     /// Advance in memory and persist nothing: a preview.
     pub fn read_only(mut self) -> Shipper {
         self.read_only = true;
+        self
+    }
+
+    pub fn with_follow_from(mut self, from: FollowFrom) -> Shipper {
+        self.follow_from = from;
         self
     }
 
@@ -175,8 +282,11 @@ impl Shipper {
         let mut stores: Vec<Store> = Vec::new();
         for m in matches {
             let path = m.dir.join(&m.name);
-            match m.id {
-                Some(id) => stores.push((id, path, m.labels)),
+            match m.id.clone() {
+                Some(id) => {
+                    self.pick_up(&id, &m, &path);
+                    stores.push((id, path, m.labels))
+                }
                 // A cursor is keyed by identity, so a store without one
                 // gets no position back and would be re-read whole on
                 // every poll, forever. Excluded, and said once: nothing
@@ -212,6 +322,57 @@ impl Shipper {
             self.batch_entries,
         )?;
         Ok((buf, stores, matched))
+    }
+
+    /// Seed a store this follower has never read, per `--follow-from`.
+    ///
+    /// Only where there is NO recorded position: once there is one, that
+    /// is where reading resumes and no policy has a say. `Begin` needs
+    /// no seed at all — the absence of a cursor entry already means the
+    /// start of the window — so it is the one that writes nothing.
+    fn pick_up(&mut self, id: &str, m: &crate::select::Match, path: &Path) {
+        if self.recorded(id).is_some() {
+            return;
+        }
+        let from = match self.follow_from {
+            FollowFrom::Begin => return,
+            FollowFrom::End => FollowFrom::End,
+            FollowFrom::Discovery => {
+                // ⚠ PARSED, never compared as strings. Both sides write
+                // RFC 3339 in UTC and neither writes the same precision:
+                // a manifest's `created` is to the second, a positions
+                // file's to the millisecond. Character-wise `Z` > `.`,
+                // so `…:00Z` sorts AFTER `…:00.123Z` and a store born in
+                // the same second as the follower reads as younger than
+                // it. The tests passed on exactly that accident.
+                //
+                // A store whose date is missing or unparsable is treated
+                // as OLDER: it predates the field, or nothing can be
+                // said, and not shipping a history nobody asked for is
+                // the conservative answer.
+                match (
+                    instant(m.created.as_deref()),
+                    instant(self.interest_since()),
+                ) {
+                    (Some(born), Some(mine)) if born > mine => FollowFrom::Begin,
+                    _ => FollowFrom::End,
+                }
+            }
+        };
+        if from == FollowFrom::Begin {
+            return;
+        }
+        let end = tape_end(&m.dir, &m.name);
+        self.positions
+            .advance(id, &path.display().to_string(), end, None, 0, 0);
+        crate::note!(
+            "timberfs: {}: picked up at its end (offset {end}) — {}",
+            m.handle,
+            match self.follow_from {
+                FollowFrom::End => "--follow-from end",
+                _ => "it predates this follower, so its history is not shipped",
+            }
+        );
     }
 
     /// Where a bounded read stopped, so the next one starts after it.
@@ -444,6 +605,9 @@ mod tests {
         )
         .unwrap()
         .with_batch_entries(batch)
+        // These tests are about the loop; `begin` is what makes a store
+        // built a moment ago readable regardless of the clock.
+        .with_follow_from(FollowFrom::Begin)
     }
 
     fn bodies(b: &Batch) -> Vec<String> {
@@ -567,6 +731,94 @@ mod tests {
         uniq.dedup();
         assert_eq!(uniq.len(), shipped.len(), "an entry was delivered twice");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `--follow-from` decides only where a store with NO position is
+    /// picked up, and `discovery` is the one that needs a comparison:
+    /// a store born since this follower ships whole, one that predates
+    /// it ships nothing of its history.
+    #[test]
+    fn follow_from_decides_where_an_unread_store_is_picked_up() {
+        let root = forest("pickup", &[("old", "apache", 4)]);
+
+        // `end` offers none of what is already there.
+        let mut at_end = shipper(&root, "service=apache", 100).with_follow_from(FollowFrom::End);
+        let b = at_end.poll().unwrap();
+        assert_eq!(b.matched, 1);
+        assert!(b.is_empty(), "end offered a history: {:?}", bodies(&b));
+
+        // `begin` offers all of it.
+        let mut at_begin =
+            shipper(&root, "service=apache", 100).with_follow_from(FollowFrom::Begin);
+        assert_eq!(at_begin.poll().unwrap().entries(), 4);
+
+        // `discovery` on a store that predates this follower behaves as
+        // `end`: the store was built before the positions were.
+        let mut found =
+            shipper(&root, "service=apache", 100).with_follow_from(FollowFrom::Discovery);
+        assert!(
+            found.poll().unwrap().is_empty(),
+            "a store older than the follower shipped its history"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⚠ `discovery` compares against when the INTEREST began, which
+    /// for a follower is its declaration and not its positions file. The
+    /// file is written at the first run, so a follower declared on Monday
+    /// and started on Friday would count every store born in between as
+    /// older than itself and ship none of it — measured against a live
+    /// follower before `since_declared` existed.
+    #[test]
+    fn discovery_dates_the_interest_from_the_declaration_not_the_file() {
+        let root = forest("since", &[("born", "apache", 3)]);
+
+        // A positions file written after the store: by its own date the
+        // store is history and `discovery` skips it.
+        let mut later = shipper(&root, "service=apache", 100);
+        later.positions.created = "2030-01-01T00:00:00.000Z".into();
+        let mut later = later.with_follow_from(FollowFrom::Discovery);
+        assert!(later.poll().unwrap().is_empty());
+
+        // The same file, told when the follower was DECLARED: the store
+        // was born since, so it ships whole.
+        let mut declared = shipper(&root, "service=apache", 100);
+        declared.positions.created = "2030-01-01T00:00:00.000Z".into();
+        let mut declared = declared
+            .with_follow_from(FollowFrom::Discovery)
+            .since_declared("2020-01-01T00:00:00.000Z");
+        assert_eq!(declared.poll().unwrap().entries(), 3);
+
+        // An empty declaration date is not an instant, so it changes
+        // nothing rather than reading as the epoch and shipping every
+        // history on the host.
+        let mut blank = shipper(&root, "service=apache", 100);
+        blank.positions.created = "2030-01-01T00:00:00.000Z".into();
+        let mut blank = blank
+            .with_follow_from(FollowFrom::Discovery)
+            .since_declared("");
+        assert!(blank.poll().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⚠ The comparison must be on INSTANTS, not on the strings. A
+    /// manifest writes `created` to the second and a positions file to
+    /// the millisecond, and character-wise `Z` > `.` — so `…:00Z` sorts
+    /// after `…:00.123Z`, and a store born in the same second as the
+    /// follower read as younger than it. Every test here passed on that
+    /// accident before it was fixed.
+    #[test]
+    fn a_store_born_in_the_same_second_is_not_younger_than_the_follower() {
+        let same = "2026-09-02T13:00:00";
+        let store = format!("{same}Z"); // as a manifest writes it
+        let follower = format!("{same}.123Z"); // as a positions file does
+        assert!(
+            store.as_str() > follower.as_str(),
+            "the string trap this exists to catch has gone away; the test has not"
+        );
+        let (born, mine) = (instant(Some(&store)), instant(Some(&follower)));
+        assert!(born.is_some() && mine.is_some());
+        assert!(born < mine, "parsed, the store is the older of the two");
     }
 
     /// A selector that matched nothing must be distinguishable from a

@@ -1,6 +1,6 @@
 use timberfs::{
     append, bark, export, feed, follow, follower, forest, forward, fs, grain, import, incus,
-    incus_intake, list, note, otlp_intake, query, querydoc, rotate, select, sink, store,
+    incus_intake, list, note, otlp_intake, query, querydoc, rotate, select, ship, sink, store,
 };
 
 use std::path::PathBuf;
@@ -465,6 +465,13 @@ enum Command {
         /// exhausted
         #[arg(long, value_name = "DUR", default_value = "1s")]
         poll: String,
+        /// Where a store this has never read is picked up: `discovery`
+        /// ships one born since this began from its beginning and one
+        /// that predates it from its next byte; `begin` ships everything
+        /// either has; `end` ships neither's history
+        #[arg(long, value_name = "WHERE", default_value = "discovery",
+              value_parser = ["begin", "end", "discovery"])]
+        follow_from: String,
         /// Forests to search; default: every configured one
         #[arg(long, value_name = "DIR")]
         forest: Vec<PathBuf>,
@@ -951,6 +958,15 @@ enum FollowerCommand {
         /// none) as the one-term selection `[id=...]` — a store can move
         #[arg(long, value_name = "STORE")]
         store: Option<PathBuf>,
+        /// Where a store this follower has never read is picked up:
+        /// `discovery` (the default unless --retaining) ships one born
+        /// since the follower was declared from its beginning and one
+        /// that predates it from its next byte; `begin` (the default
+        /// WITH --retaining, which promises the data is not lost until
+        /// this follower has it) ships everything; `end` ships no
+        /// history at all
+        #[arg(long, value_name = "WHERE", value_parser = ["begin", "end", "discovery"])]
+        follow_from: Option<String>,
         /// Declare that this follower's position holds the store's head
         /// back: retention keeps what it has not read ON TOP OF what age
         /// and size keep, never as a cap on them — `retain_size` still
@@ -1010,7 +1026,8 @@ enum FollowerCommand {
     /// own command
     Update {
         name: String,
-        /// KEY=VALUE: retaining=true|false, select=EXPR, store=PATH.
+        /// KEY=VALUE: retaining=true|false, select=EXPR, store=PATH,
+        /// follow_from=begin|end|discovery.
         /// The consumer is replaced wholesale with what follows `--`
         #[arg(value_name = "KEY=VALUE")]
         sets: Vec<String>,
@@ -1442,6 +1459,7 @@ fn main() -> anyhow::Result<()> {
             follow,
             batch_size,
             poll,
+            follow_from,
             forest,
             consumer,
         } => {
@@ -1457,6 +1475,10 @@ fn main() -> anyhow::Result<()> {
                 follow,
                 argv: consumer,
                 hello_wait: feed::HELLO_WAIT,
+                follow_from: ship::FollowFrom::parse(&follow_from)?,
+                // No declaration, so the positions file is the only
+                // record of when this interest began.
+                since: None,
             })?;
         }
         Command::Follower { command } => match command {
@@ -1464,6 +1486,7 @@ fn main() -> anyhow::Result<()> {
                 name,
                 select,
                 store,
+                follow_from,
                 retaining,
                 enable,
                 start,
@@ -1474,6 +1497,10 @@ fn main() -> anyhow::Result<()> {
                 follower::CreateOpts {
                     select,
                     store,
+                    follow_from: follow_from
+                        .as_deref()
+                        .map(ship::FollowFrom::parse)
+                        .transpose()?,
                     retaining,
                     enable,
                     start,
@@ -1819,6 +1846,10 @@ mod cli_tests {
     /// anywhere in the page is enough — this catches ABSENCE, which is
     /// the failure nothing else sees.
     ///
+    /// NESTED verbs are walked too: `follower create` is where the
+    /// followers surface lives, and a check that stopped at the top level
+    /// saw none of it.
+    ///
     /// Omissions are allowed but must be stated here, so leaving one out
     /// is a decision somebody made rather than something nobody noticed.
     #[test]
@@ -1830,17 +1861,27 @@ mod cli_tests {
         // `\-\-select`. Compare against the page with those undone.
         let plain = man.replace("\\-", "-");
         let mut missing = Vec::new();
-        for sub in Cli::command().get_subcommands() {
-            let name = sub.get_name().to_string();
-            if name == "help" {
+        let cli = Cli::command();
+        let mut queue: Vec<(String, &clap::Command)> = cli
+            .get_subcommands()
+            .map(|s| (s.get_name().to_string(), s))
+            .collect();
+        while let Some((name, sub)) = queue.pop() {
+            if name.ends_with("help") {
                 continue;
+            }
+            for nested in sub.get_subcommands() {
+                queue.push((format!("{name} {}", nested.get_name()), nested));
             }
             for arg in sub.get_arguments() {
                 let Some(long) = arg.get_long() else { continue };
                 if long == "help" || long == "version" {
                     continue;
                 }
-                if allowed.iter().any(|(s, f, _)| *s == name && *f == long) {
+                if allowed
+                    .iter()
+                    .any(|(s, f, _)| *s == name.as_str() && *f == long)
+                {
                     continue;
                 }
                 if !plain.contains(&format!("--{long}")) {

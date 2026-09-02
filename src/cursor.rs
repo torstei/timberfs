@@ -291,6 +291,16 @@ fn write_atomically(path: &Path, v: &Value) -> anyhow::Result<()> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Positions {
     pub consumer: String,
+    /// When this consumer came into being, as far as this file knows:
+    /// when its places were first written.
+    ///
+    /// It has to SURVIVE a restart, or a store created while the
+    /// consumer was down would count as older than it and be skipped —
+    /// which is the opposite of what `discovery` is for. A FOLLOWER has
+    /// a truer answer still and supplies it (`Shipper::since_declared`),
+    /// this file being written at its first run rather than when it was
+    /// declared.
+    pub created: String,
     pub at: std::collections::BTreeMap<String, At>,
     /// The consumer's last word about ITSELF rather than about a store —
     /// an unreachable endpoint is not per store.
@@ -352,6 +362,7 @@ impl Positions {
     pub fn new(consumer: &str) -> Positions {
         Positions {
             consumer: consumer.to_string(),
+            created: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             at: Default::default(),
             note: None,
             notes: Default::default(),
@@ -452,6 +463,17 @@ impl Positions {
         }
         Ok(Some(Positions {
             consumer,
+            // An older file has none. Empty reads as "before every
+            // store", so `discovery` then sends nothing from the
+            // beginning — the conservative direction for a consumer that
+            // has plainly been running for a while.
+            created: map
+                .remove("created")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_default(),
             at,
             note,
             notes,
@@ -474,6 +496,7 @@ impl Positions {
         }
         let mut map = Map::new();
         map.insert("consumer".into(), Value::String(self.consumer.clone()));
+        map.insert("created".into(), Value::String(self.created.clone()));
         map.insert(
             "updated".into(),
             Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),

@@ -54,6 +54,11 @@ pub struct Opts {
     pub argv: Vec<String>,
     /// How long to wait for the hello.
     pub hello_wait: Duration,
+    /// Where a store this follower has never read is picked up.
+    pub follow_from: crate::ship::FollowFrom,
+    /// When the interest began, if something knows better than the
+    /// positions file — see `Shipper::since_declared`.
+    pub since: Option<String>,
 }
 
 /// What a position file says wrote it: the consumer's own program, so an
@@ -106,6 +111,8 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
         follow,
         argv,
         hello_wait,
+        follow_from,
+        since,
     } = opts;
     let (argv0, args) = argv
         .split_first()
@@ -129,7 +136,11 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
     let reports = spawn_reports(&mut child);
 
     let mut shipper = Shipper::open(&consumer_name(argv0), selector, dirs, positions.as_deref())?
-        .with_batch_entries(batch_entries);
+        .with_batch_entries(batch_entries)
+        .with_follow_from(follow_from);
+    if let Some(when) = since.as_deref() {
+        shipper = shipper.since_declared(when);
+    }
 
     // Nothing is read from a store until the consumer has said it
     // implements this protocol: a position must not move on the word of
@@ -615,6 +626,10 @@ done"#,
             // A consumer that never speaks must not stall the suite;
             // 30s is right in production and wrong here.
             hello_wait: Duration::from_millis(500),
+            // The tests are about the loop, so they take the store as
+            // it stands rather than the default's date comparison.
+            follow_from: crate::ship::FollowFrom::Begin,
+            since: None,
         }
     }
 

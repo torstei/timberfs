@@ -28,13 +28,13 @@
 //!
 //! ```text
 //! /var/lib/timberfs/followers/<name>/
-//!     follower.json    store, type, retaining, config   (the operator writes)
-//!     cursor.json      seq, n, delivered                (the follower writes)
+//!     follower.json    select, retaining, command       (the operator writes)
+//!     positions.json   a place per store it has read    (the follower writes)
 //!     follower.lock    held while it runs               (`run` acquires)
 //! ```
 //!
-//! Declaration and position are SEPARATE FILES because they have separate
-//! owners: a cursor save is a whole-file tmp+rename that deliberately
+//! Declaration and positions are SEPARATE FILES because they have separate
+//! owners: a positions save is a whole-file tmp+rename that deliberately
 //! drops keys it does not own (cursor.rs). One file would make every
 //! position write preserve operator fields, and would race `update`.
 //!
@@ -107,11 +107,6 @@ const CURSOR_FILE: &str = "cursor.json";
 /// re-ship every store.
 const POSITIONS_FILE: &str = "positions.json";
 const LOCK_FILE: &str = "follower.lock";
-
-/// The follower types `run` knows how to exec. One per shipper binary:
-/// the type names a DESTINATION SHAPE, which is also how the tool
-/// boundary is drawn everywhere else here.
-pub const TYPES: &[&str] = &["otlp", "frames"];
 
 pub fn registry_dir() -> PathBuf {
     match std::env::var_os(REGISTRY_ENV) {
@@ -197,7 +192,7 @@ fn no_command(at: &Path, kind: &str) -> anyhow::Error {
     )
 }
 
-/// A follower's declaration: the operator's half of the pair./// A follower's declaration: the operator's half of the pair. Unknown
+/// A follower's declaration: the operator's half of the pair. Unknown
 /// keys are PRESERVED across an `update`, like a `.bark` — a declaration
 /// is a label, not a schema, and a key this version does not know may be
 /// one the next does.
@@ -236,6 +231,13 @@ pub struct Declaration {
     /// declaration's `type` and `endpoint` migrate to the command they
     /// were shorthand for.
     pub command: Vec<String>,
+    /// Where a store this follower has never read is picked up.
+    ///
+    /// `None` means take the default, which DEPENDS on `retaining` — so
+    /// it is derived rather than stored: turning retaining on later must
+    /// change this with it, and a value written at create time would
+    /// silently keep the old answer.
+    pub follow_from: Option<crate::ship::FollowFrom>,
     pub created: String,
     /// Keys this version does not know, kept so an `update` cannot eat
     /// them.
@@ -243,6 +245,17 @@ pub struct Declaration {
 }
 
 impl Declaration {
+    /// The policy in force. `retaining` implies `begin`: it promises
+    /// that data is not lost until this follower has it, so skipping a
+    /// backlog on the first read would contradict the declaration.
+    pub fn picks_up(&self) -> crate::ship::FollowFrom {
+        self.follow_from.unwrap_or(if self.retaining {
+            crate::ship::FollowFrom::Begin
+        } else {
+            crate::ship::FollowFrom::Discovery
+        })
+    }
+
     /// The one store this follows, by identity, when it follows exactly
     /// one — the `id=<x>` case, which is every declaration `--store`
     /// wrote. `None` for a set, where nothing single can be resolved,
@@ -346,11 +359,19 @@ impl Declaration {
         if command.is_empty() {
             return Err(no_command(&path, &legacy_type));
         }
+        let follow_from = match take_str(&mut map, "follow_from") {
+            Some(v) => Some(
+                crate::ship::FollowFrom::parse(&v)
+                    .with_context(|| format!("{}: \"follow_from\"", path.display()))?,
+            ),
+            None => None,
+        };
         Ok(Declaration {
             name: name.to_string(),
             select,
             retaining,
             command,
+            follow_from,
             created: take_str(&mut map, "created").unwrap_or_default(),
             extra: map,
         })
@@ -370,6 +391,12 @@ impl Declaration {
                     .collect(),
             ),
         );
+        if let Some(from) = self.follow_from {
+            map.insert(
+                "follow_from".into(),
+                Value::String(from.as_str().to_string()),
+            );
+        }
         map.insert("created".into(), Value::String(self.created.clone()));
         for (k, v) in &self.extra {
             map.entry(k.clone()).or_insert_with(|| v.clone());
@@ -1180,6 +1207,7 @@ pub struct CreateOpts {
     /// one-term selection.
     pub store: Option<PathBuf>,
     pub retaining: bool,
+    pub follow_from: Option<crate::ship::FollowFrom>,
     pub enable: bool,
     pub start: bool,
     pub dry_run: bool,
@@ -1258,6 +1286,7 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
         select,
         retaining: opts.retaining,
         command: opts.command,
+        follow_from: opts.follow_from,
         created: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         extra: Map::new(),
     };
@@ -1656,7 +1685,7 @@ fn print_retaining(r: &Registered) {
 /// CONSUMER is replaced wholesale with what follows `--`, because a
 /// command is an argv and editing one member of it by key is a shape
 /// that reads correctly right up until the arguments matter.
-const SETTABLE: &[&str] = &["retaining", "select", "store"];
+const SETTABLE: &[&str] = &["retaining", "select", "store", "follow_from"];
 
 /// `timberfs follower update NAME KEY=VALUE...`
 ///
@@ -1696,6 +1725,7 @@ pub fn cmd_update(
                 }
             }
             "select" => decl.select = crate::select::canonical(v)?,
+            "follow_from" => decl.follow_from = Some(crate::ship::FollowFrom::parse(v)?),
             "store" => {
                 let store = crate::forest::resolve_source(Path::new(v))?;
                 let (sdir, sname) = resolve_backing(&store)?;
@@ -1745,6 +1775,8 @@ pub fn cmd_update(
     for k in unsets {
         match k.trim() {
             "retaining" => decl.retaining = false,
+            // Back to the derived default, which depends on retaining.
+            "follow_from" => decl.follow_from = None,
             other => bail!("{other:?} cannot be unset"),
         }
     }
@@ -1940,6 +1972,13 @@ pub fn cmd_run(name: &str) -> anyhow::Result<()> {
         follow: true,
         argv: decl.command.clone(),
         hello_wait: crate::feed::HELLO_WAIT,
+        follow_from: decl.picks_up(),
+        // When the follower was DECLARED, not when its positions file
+        // was first written: one declared before its stores exist is the
+        // case `discovery` is for, and comparing against the file would
+        // skip every store born between the declaration and the first
+        // start.
+        since: Some(decl.created.clone()),
     });
     // Held until the loop is done, so liveness is true for exactly as
     // long as something is following.
@@ -2041,6 +2080,7 @@ mod tests {
                 "--endpoint".into(),
                 "http://127.0.0.1:4318".into(),
             ],
+            follow_from: None,
             created: "2026-08-21T00:00:00Z".into(),
             extra: Map::new(),
         }
