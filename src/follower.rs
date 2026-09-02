@@ -645,8 +645,16 @@ impl Registered {
         if unread == self.covered.len() {
             return "never run".to_string();
         }
+        // ⚠ A store never read has NO position, so it has no distance
+        // from one: its `behind_ms` is measured from zero and reads as
+        // the whole unix epoch. The worst store here is an unread one by
+        // construction — `worst` puts them first, because holding a
+        // whole store outranks any measured backlog — so the phrase has
+        // to be about that and not about a clock.
+        if unread > 0 {
+            return format!("{unread} of {} never read", self.covered.len());
+        }
         match self.worst().and_then(|c| c.standing.as_ref()) {
-            Some(st) if unread > 0 => format!("{} (+{unread} unread)", st.lag_text()),
             Some(st) => st.lag_text(),
             None => "store unreadable".to_string(),
         }
@@ -701,6 +709,7 @@ pub fn read(reg: &Path, name: &str) -> anyhow::Result<Registered> {
     if let Ok(sel) = decl.selector() {
         for m in crate::select::resolve(&[], &sel) {
             let Some(id) = m.id else { continue };
+            let id_for_note = id.clone();
             let path = m.dir.join(&m.name);
             let at = positions.as_ref().and_then(|p| p.at.get(&id));
             let standing = format::read_index(&format::rings_path(&m.dir, &m.name))
@@ -717,7 +726,12 @@ pub fn read(reg: &Path, name: &str) -> anyhow::Result<Registered> {
                 path,
                 standing,
                 read: at.is_some(),
-                note: at.and_then(|a| a.note.clone()),
+                // From the notes map, not from the position: the store
+                // a consumer most needs to explain is one it has never
+                // got past, which has no position at all.
+                note: positions
+                    .as_ref()
+                    .and_then(|p| p.notes.get(&id_for_note).cloned()),
             });
         }
     }
@@ -2308,6 +2322,31 @@ mod tests {
         store::write_lock_info(&held, "\n").unwrap();
         assert_eq!(liveness(&reg, "central"), Liveness::Unknown);
         fs::remove_dir_all(&reg).ok();
+    }
+
+    /// A store never read has no position, so it has no distance from
+    /// one: `behind_ms` is measured from zero and formats as the whole
+    /// unix epoch. The phrase for that must be about the store and not
+    /// about a clock — "20698d behind" is what an operator saw before
+    /// this, on a follower that had simply not started.
+    #[test]
+    fn a_store_never_read_is_not_reported_as_decades_behind() {
+        let mixed = Registered {
+            decl: decl("central", true),
+            places: Places::Held(crate::cursor::Positions::new("c")),
+            live: Liveness::Stopped,
+            covered: vec![
+                covering_one("x", true, false, 76).covered.remove(0),
+                covering_one("y", true, true, 0).covered.remove(0),
+            ],
+        };
+        let text = mixed.lag_text();
+        assert_eq!(text, "1 of 2 never read");
+        // What the time formatter says, which is what must not appear.
+        assert!(
+            !text.contains("behind"),
+            "a distance measured from a zero clock: {text}"
+        );
     }
 
     /// A `Registered` covering a store it has never read, ranked and

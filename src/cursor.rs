@@ -295,6 +295,14 @@ pub struct Positions {
     /// The consumer's last word about ITSELF rather than about a store —
     /// an unreachable endpoint is not per store.
     pub note: Option<Note>,
+    /// Its last word about each store, keyed the same way positions are.
+    ///
+    /// ⚠ A separate map and not a field of `At`, because a note and a
+    /// position have different lifetimes: the store a consumer most needs
+    /// to explain is the one it has never got past, which has no position
+    /// to hang a note on. Keeping them together lost the store's name
+    /// from exactly the note that most needed it.
+    pub notes: std::collections::BTreeMap<String, Note>,
 }
 
 /// Why nothing is moving, in the consumer's own words.
@@ -338,8 +346,6 @@ pub struct At {
     /// been. For a human reading the file; neither decides anything.
     pub wl: u64,
     pub delivered: u64,
-    /// The consumer's last word about THIS store.
-    pub note: Option<Note>,
 }
 
 impl Positions {
@@ -348,6 +354,7 @@ impl Positions {
             consumer: consumer.to_string(),
             at: Default::default(),
             note: None,
+            notes: Default::default(),
         }
     }
 
@@ -374,25 +381,13 @@ impl Positions {
                 self.note = Some(fresh);
                 true
             }
-            Some(id) => match self.at.get_mut(id) {
-                Some(a) => {
-                    if same(&a.note) {
-                        return false;
-                    }
-                    a.note = Some(fresh);
-                    true
+            Some(id) => {
+                if same(&self.notes.get(id).cloned()) {
+                    return false;
                 }
-                // A note about a store with no position yet: kept as the
-                // consumer's own, so the reason is not lost for being
-                // about something nothing has been read from.
-                None => {
-                    if same(&self.note) {
-                        return false;
-                    }
-                    self.note = Some(fresh);
-                    true
-                }
-            },
+                self.notes.insert(id.to_string(), fresh);
+                true
+            }
         }
     }
 
@@ -440,7 +435,6 @@ impl Positions {
                                 .to_string(),
                             wl: o.get("wl").and_then(Value::as_u64).unwrap_or(0),
                             delivered: o.get("delivered").and_then(Value::as_u64).unwrap_or(0),
-                            note: read_note(o.get("note")),
                         },
                     );
                 }
@@ -448,7 +442,20 @@ impl Positions {
             Some(_) => bail!("{}: \"stores\" must be an object", path.display()),
         }
         let note = read_note(map.get("note"));
-        Ok(Some(Positions { consumer, at, note }))
+        let mut notes = std::collections::BTreeMap::new();
+        if let Some(Value::Object(held)) = map.get("notes") {
+            for (id, v) in held {
+                if let Some(n) = read_note(Some(v)) {
+                    notes.insert(id.clone(), n);
+                }
+            }
+        }
+        Ok(Some(Positions {
+            consumer,
+            at,
+            note,
+            notes,
+        }))
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -463,9 +470,6 @@ impl Positions {
             o.insert("path".into(), Value::String(a.path.clone()));
             o.insert("wl".into(), Value::from(a.wl));
             o.insert("delivered".into(), Value::from(a.delivered));
-            if let Some(n) = &a.note {
-                o.insert("note".into(), write_note(n));
-            }
             stores.insert(id.clone(), Value::Object(o));
         }
         let mut map = Map::new();
@@ -476,6 +480,14 @@ impl Positions {
         );
         if let Some(n) = &self.note {
             map.insert("note".into(), write_note(n));
+        }
+        if !self.notes.is_empty() {
+            let held: Map<String, Value> = self
+                .notes
+                .iter()
+                .map(|(id, n)| (id.clone(), write_note(n)))
+                .collect();
+            map.insert("notes".into(), Value::Object(held));
         }
         map.insert("stores".into(), Value::Object(stores));
         write_atomically(path, &Value::Object(map))
@@ -511,7 +523,6 @@ impl Positions {
             path: path.to_string(),
             wl,
             delivered: 0,
-            note: None,
         });
         e.offset = offset;
         e.path = path.to_string();

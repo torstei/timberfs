@@ -325,21 +325,29 @@ One destination means one queue, so a stalled endpoint stalls every store in
 the selection. That is the right coupling — they share the destination — and
 retention is the budget for it, exactly as it is for one store.
 
-## Retention: the unbounded case is allowed
+## Retention: holding everything is allowed, and it is bounded anyway
 
-`--retaining --select '*'` holds back every chunk no follower has read, on
-every store on the host. It is a real configuration and it is not gated.
+`--retaining --select '[]'` holds back every chunk no follower has read, on
+every store on the host that honours it. It is a real configuration and it
+is not gated.
 
 What makes it legible rather than surprising: interest is **additive**, so
-age and size still apply. `retain_unconsumed` with a `retain_size` is
-bounded — the budget wins, and the drop is recorded exactly, naming the
-follower, its position and the chunks it never read. Without one it is
-unbounded, and with `--select '*'` that is the whole host.
+age and size still apply, and the budget wins — the drop is then recorded
+exactly, naming the follower, its position and the chunks it never read.
 
-So the answer is visibility, not refusal. `create --dry-run` and `dry-run`
-print the match count and, for a retaining declaration, the bytes it would
-hold today; `status` reports held bytes per store and in total; `list` shows
-the follower on every store it matches.
+⚠ **The unbounded case does not exist**, which an earlier draft of this
+note had wrong. `retain_unconsumed` WITHOUT a `retain_size` is refused
+where it is declared — "interest only ever holds MORE, so without a budget
+one stalled follower fills the disk and kills the producer" — so a store
+can only honour a follower's interest once somebody has written a number
+next to it. Found by pointing a `--retaining` follower at a store and
+having `set` refuse the store's half of the arrangement.
+
+So the answer is visibility, not refusal. `create` and `create --dry-run`
+print the covered count and name the stores; `status` reports every covered
+store's standing, its note, and whether anything honours the flag at all
+("declared, but no covered store declares retain_unconsumed" is a state
+worth reading).
 
 ## The interest axis is handed the store
 

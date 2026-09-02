@@ -149,6 +149,12 @@ half.
     absent `id` being "about me, not a store" — an unreachable endpoint is
     not per store). Replaced, never accumulated; history is what the
     journal is for.
+  * ⚠ **Kept in its OWN map, not beside the position.** A note and a
+    position have different lifetimes, and the store a consumer most needs
+    to explain is the one it has never got past — which has no position to
+    hang a note on. Keeping them together lost the store's name from
+    exactly the note that needed it most, turning it into the
+    consumer-wide one.
 
 ⚠ **`offset` in a note is an ADDRESS.** `timberview` opens
 `timber://host/<store-id>#offset=N`, so a note naming the entry a consumer
