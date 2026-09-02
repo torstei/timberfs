@@ -177,7 +177,7 @@ does the same at `create`.
 ⚠ An earlier reading of this said remote followers must be ephemeral,
 because the interest axis is host-local so `retaining` could not mean
 anything for one. That reasoning assumed the whole loop ran elsewhere. It
-does not: under [sink-protocol.md](sink-protocol.md) the loop and the
+does not: under [consumer-protocol.md](consumer-protocol.md) the loop and the
 positions are always local and only the destination is a pipe away — over
 `ssh` if you like — so `retaining` works for a remote destination like any
 other.
@@ -207,7 +207,7 @@ on the first run contradicts the declaration.
 ⚠ **Who owns the position moved after this was written.** The loop below is
 right; the process it runs in is not. `timber-otlp --select --positions`
 holds the positions today, and under
-[sink-protocol.md](sink-protocol.md) timberfs holds them and the sink
+[consumer-protocol.md](consumer-protocol.md) timberfs holds them and the consumer
 reports — because the position file is where the retention floor lives, and
 a program that writes it can get retention wrong silently where one that
 reports cannot. The loop, the fairness rotation and the resource grouping

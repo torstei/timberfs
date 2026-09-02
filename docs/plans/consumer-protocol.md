@@ -1,4 +1,4 @@
-# The sink protocol: timberfs holds the position, the sink says how far
+# The consumer protocol: timberfs holds the position, the consumer says how far
 
 **Status: design.** Nothing here is built. What it rests on is: the records
 stream with its per-entry `offset`/`len` and `id`, the per-store positions a
@@ -7,10 +7,16 @@ selection already keeps, and the poll loop that fills them. See
 `timberfs-records(5)` for the stream this extends.
 
 A registered **follower** is the object: a selection, a destination, a
-position per store. Its **sink** is the program it feeds. This note is the
-contract between them.
+position per store. Its **consumer** is the program it feeds. This note is
+the contract between them.
 
-## The position is timberfs's, and a sink reports
+⚠ Not "consumer": `consumer.rs` is already the engine that writes a records stream
+INTO a store, so the word points the other way in this tree. `consumer` is
+what `cursor.rs` has always called this party — `Cursor { consumer }`,
+`struct Consumer`, `consumers_in` — and it is written into every cursor
+file, so it is the vocabulary already in use rather than a new one.
+
+## The position is timberfs's, and a consumer reports
 
 Every position advances on a proof of delivery, and only the thing that
 talks to the destination has one. The shipped answer to that was to let the
@@ -22,8 +28,8 @@ keying, atomic batch advance, fail-closed reads and the RETENTION FLOOR
 live, so a program that writes it can get retention wrong silently. A
 program that only *reports* cannot.
 
-So: timberfs owns the position and runs the loop; a sink says how far to
-move it. One contract for every sink, including the ones we ship.
+So: timberfs owns the position and runs the loop; a consumer says how far to
+move it. One contract for every consumer, including the ones we ship.
 
 ## The watermark means "do not send me these again"
 
@@ -34,14 +40,14 @@ A receiver refusing an entry for being outside its ingestion window is
 refusing it PERMANENTLY. Under a positive-acknowledgement rule — advance
 only on confirmed delivery — one such batch wedges the follower forever. So
 the report cannot be "these succeeded". It is "I am done with everything up
-to here", and what the sink actually did with the data is the sink's
+to here", and what the consumer actually did with the data is the consumer's
 business and its journal's:
 
   * the receiver is down → report nothing → the same entries come again,
     for as long as it takes; the store is the buffer, which is what
     retention is the budget for;
   * an entry is too old, or malformed → report PAST it → never resent, and
-    the sink's log says why;
+    the consumer's log says why;
   * something unexpected — disk full, a garbage response → report nothing.
 
 ⚠ This also disposes of OTLP's `partialSuccess`, which carries a COUNT of
@@ -52,7 +58,7 @@ we have can supply.
 
 ## Two messages, one direction
 
-Sink to timberfs, framed as `timberfs-records(5)` is — RS-marked,
+Consumer to timberfs, framed as `timberfs-records(5)` is — RS-marked,
 US-separated, NUL-terminated — so there is one framing discipline and one
 parser shape at both ends. Nothing travels the other way but the stream
 itself.
@@ -63,16 +69,16 @@ itself.
     note       [ id=<store> ] [ offset=<n> ]  text=<json string>
 
 **No hello, no run.** timberfs refuses rather than silently falling back to
-advancing on write-out, because "every sink implements this" is what makes
-silence unambiguous: a sink that has not reported has not got there.
+advancing on write-out, because "every consumer implements this" is what makes
+silence unambiguous: a consumer that has not reported has not got there.
 
-**The watermark is a number the sink was handed.** An entry record states
+**The watermark is a number the consumer was handed.** An entry record states
 `offset` and `len`, and the runs chain — the end of one entry is the start
-of the next — so a sink's watermark is the last accepted entry's
+of the next — so a consumer's watermark is the last accepted entry's
 `offset + len`, per `id`. Same quantity the `position` record reports:
 there is one kind of position in this protocol.
 
-**And ONE unit, whatever the sink reads: the absolute offset on the
+**And ONE unit, whatever the consumer reads: the absolute offset on the
 store's tape** — what has ever left the store plus where the bytes sit in
 what remains. Retention cannot move it, `remove_head` rebasing the chunk
 offsets down by exactly what it grows `dropped` by, so the number is the
@@ -87,7 +93,7 @@ ends. A receiver can state its coverage in it. ⚠ For a replica only — a
 receiver that numbers its own chunks shares no address, which is what
 `receiving-end.md` means by an ingesting writer numbering its own.
 
-**`hello` may carry initial watermarks**, which is how a sink whose
+**`hello` may carry initial watermarks**, which is how a consumer whose
 destination knows more than we do tells us where to begin. That is exactly
 the frames handshake — the receiver answering with the coverage it holds —
 expressed as the same message, so replication stops being an exception to
@@ -107,21 +113,21 @@ bandwidth, never data.
 So the claim joins a question this design already has rather than adding
 one. Where a store with no position starts is decided in this order:
 
-    a recorded position  >  the sink's claim  >  --follow-from
+    a recorded position  >  the consumer's claim  >  --follow-from
 
 The claim outranks the declared policy because it is specific knowledge
 about THAT store, and yields to a recorded position because that is
 knowledge we own.
 
-**Batching is the sink's own business.** It reports when it likes; timberfs
+**Batching is the consumer's own business.** It reports when it likes; timberfs
 bounds its own reads for its own reasons. Backpressure is the pipe.
 
 ## `note`: because silence is now a legitimate state
 
 Making the watermark mean "do not send me these again" made SILENCE
-meaningful — a sink that has not reported has not got there — so a stalled
+meaningful — a consumer that has not reported has not got there — so a stalled
 follower is a state the design intends. `follower status` can see that it
-is stalled and cannot see WHY, and only the sink knows. `note` is that
+is stalled and cannot see WHY, and only the consumer knows. `note` is that
 half.
 
     note  id=499544f0-…  offset=33724753900
@@ -129,7 +135,7 @@ half.
 
   * **Opaque to timberfs**, displayed verbatim, never parsed — the same
     reason the watermark carries no error codes: a taxonomy here would be a
-    second thing to keep in step with what sinks actually say.
+    second thing to keep in step with what consumers actually say.
   * **Persisted, or it is pointless.** `follower status` is a DIFFERENT
     PROCESS, so an in-memory note is invisible to the thing that needs it.
     It belongs in `positions.json`, which is already atomic, already
@@ -137,7 +143,7 @@ half.
   * ⚠ **Writable when nothing advanced**, which is a real change: positions
     are written when a batch is accepted, so a stalled follower would
     otherwise never write the note explaining why. A note alone justifies a
-    write — deduped by text, so a sink retrying once a second produces one
+    write — deduped by text, so a consumer retrying once a second produces one
     note and one write, not sixty.
   * **Bounded by construction.** One per store, plus one follower-wide (an
     absent `id` being "about me, not a store" — an unreachable endpoint is
@@ -145,9 +151,9 @@ half.
     journal is for.
 
 ⚠ **`offset` in a note is an ADDRESS.** `timberview` opens
-`timber://host/<store-id>#offset=N`, so a note naming the entry a sink
+`timber://host/<store-id>#offset=N`, so a note naming the entry a consumer
 choked on gives `follower status` something an operator can open the log
-AT — that exact entry, in the pager — rather than "go read the sink's
+AT — that exact entry, in the pager — rather than "go read the consumer's
 journal and correlate". It is the same quantity as a watermark and a
 position, which is the point of there being one kind of position here.
 
@@ -161,7 +167,7 @@ meaning different things is a wart to not acquire. It also matches
 **Attribution is unconditional.** `timberfs-records(5)` today omits `src`
 and `id` where "a read of one store attributes nothing, because there is
 nothing to tell apart" — right for a person or a one-off pipe, wrong for a
-protocol: a sink written against a three-store selection would break the
+protocol: a consumer written against a three-store selection would break the
 day someone points it at one. A follower stream runs in the multi-store
 shape whatever matched. A 36-byte id on every entry is the price; if it
 ever bites, the fix is a short per-stream handle assigned in `source`, not
@@ -184,33 +190,33 @@ A JSON string cannot contain a raw control character, so content cannot
 break the framing — by construction rather than by hoping nobody labels a
 store oddly or puts a tab in an error message. The labels are `bark::provenance` — the one place that says what
 counts as a label — so settings (`wal`, `retain`, `index`) are not in it:
-they are operational and not a sink's business.
+they are operational and not a consumer's business.
 
-⚠ **`source` is emitted three times over**, and a sink needs all three:
+⚠ **`source` is emitted three times over**, and a consumer needs all three:
 
-  * at stream start, one per store the selection then matches — so a sink's
+  * at stream start, one per store the selection then matches — so a consumer's
     picture is complete from the first bytes and it reconstructs nothing;
   * when a store JOINS mid-run, the selection being re-resolved every poll;
-  * when a store's LABELS CHANGE, because labels are mutable and a sink
+  * when a store's LABELS CHANGE, because labels are mutable and a consumer
     that looked them up itself would attribute entries to a store's later
     identity.
 
-⚠ **A `source` record is a FLUSH BOUNDARY for that store.** A batching sink
+⚠ **A `source` record is a FLUSH BOUNDARY for that store.** A batching consumer
 can be mid-batch when labels change; adopting them at once would ship
 entries that arrived under the old labels attributed to the new ones,
 silently. Cheap to obey, impossible to guess, and the reason this is
-written down rather than left to three sinks to each infer.
+written down rather than left to three consumers to each infer.
 
-Nothing is emitted when a store LEAVES. The sink stops seeing that id and
-its map entry goes quiet; a routing sink that must close a per-store output
+Nothing is emitted when a store LEAVES. The consumer stops seeing that id and
+its map entry goes quiet; a routing consumer that must close a per-store output
 wants a withdrawal record, which is a thing to add when one exists.
 
 **The polls are spliced into ONE stream.** Each internal read is a complete
-bounded answer, but a sink must see what `query --records --follow` looks
+bounded answer, but a consumer must see what `query --records --follow` looks
 like: `stream-start` once, `source` as stores join, entries indefinitely,
 and NO `stream-end` — whose absence is already this format's honest "still
 live" marker. So timberfs strips the per-poll brackets and does not forward
-its own `position` records: the sink's watermarks are the authority, and two
+its own `position` records: the consumer's watermarks are the authority, and two
 authorities for one number is a bug waiting to be written.
 
 ## The state, and where each part lives
@@ -218,9 +224,9 @@ authorities for one number is a bug waiting to be written.
 | | lives in | survives a restart |
 |---|---|---|
 | positions (tape offset, and the chunk it lands in, per store) | `positions.json` | **yes** — or every store is re-shipped |
-| the sink's last `note`, per store and one for itself | `positions.json` | yes — `status` is another process |
+| the consumer's last `note`, per store and one for itself | `positions.json` | yes — `status` is another process |
 | labels last ANNOUNCED, per store | the loop's memory | no — and must not |
-| the sink's own copy of them | the sink's memory | no — rebuilt from stream start |
+| the consumer's own copy of them | the consumer's memory | no — rebuilt from stream start |
 
 The announced-labels map is what detects a change: the poll resolves the
 selection and already reads each matched store's manifest, so the fresh
@@ -231,31 +237,31 @@ a megabyte at five thousand.
 ⚠ **Not a revision counter in the manifest.** Remembering 8 bytes instead
 of the labels sounds cheaper and can LIE: a hand-edited `.bark`, a restore,
 or a writer that changes labels without bumping leaves the number unchanged
-while the labels moved, and the sink is never told. That is the silent
+while the labels moved, and the consumer is never told. That is the silent
 direction. Comparing the labels cannot be wrong about the labels — the same
 reason the interest axis refuses to gate on an mtime.
 
 ⚠ And not a hash of them either: a collision is a missed announcement,
 which is silent, and the saving is a fraction of a megabyte.
 
-**It does not need persisting because the sink's copy has the same
+**It does not need persisting because the consumer's copy has the same
 lifetime.** Both are born at stream start and die with the stream, so they
 cannot get out of step across a restart. Which is an argument FOR the
-lifecycle below rather than a consequence of it: were the sink to outlive
+lifecycle below rather than a consequence of it: were the consumer to outlive
 the follower, the announced state would have to be persisted and reconciled
 against a consumer that might have missed an update.
 
 ## Lifecycle
 
-The sink is a child of the follower. If the sink dies the follower exits
+The consumer is a child of the follower. If the consumer dies the follower exits
 non-zero and systemd restarts the unit — one lifecycle, one place, and a
 fresh stream every time, rather than a re-spawn that has to decide what a
-half-consumed sink's state meant.
+half-consumed consumer's state meant.
 
-## A sink may be remote, and the transport needs no design
+## A consumer may be remote, and the transport needs no design
 
 The contract is two file descriptors, so a remote destination is
-`-- ssh archive01 my-sink`: the protocol rides its stdin and stdout
+`-- ssh archive01 my-consumer`: the protocol rides its stdin and stdout
 unchanged. The same arrangement timbersh's `cmd` targets use for the same
 reason.
 
@@ -265,9 +271,9 @@ destination is elsewhere, so the host-local interest axis has everything it
 needs. What stays ephemeral is a remote READER — one pulling from another
 host's stores — which is a different thing and not a registered follower.
 
-## The trivial sink we ship
+## The trivial consumer we ship
 
-A sink that runs a command per record, with the exit code as the report:
+A consumer that runs a command per record, with the exit code as the report:
 
     timberfs follower create alert --select '[service=~apache-.*]' \
         --type exec -- /usr/local/bin/page-someone
@@ -282,11 +288,11 @@ skip: with only accept and retry, one poisonous entry stalls the follower
 forever. It is the record-granular form of what the watermark does for a
 batch.
 
-⚠ A fork per record is an honest property of THIS sink, not of the
+⚠ A fork per record is an honest property of THIS consumer, not of the
 protocol. Reach for it for a watcher, a `logger`, an escalation script,
-`/dev/null`; not at fifty thousand lines a second. A long-lived sink
+`/dev/null`; not at fifty thousand lines a second. A long-lived consumer
 reporting watermarks needs no forks at all — which is why the exit-code
-model is one sink rather than the contract.
+model is one consumer rather than the contract.
 
 This is also what makes the **watchers** direction (ROADMAP) a registered,
 resumable thing rather than a shell pipeline: its stated MVP is
@@ -311,12 +317,12 @@ form was said to add is configuration and durability. This is both.
     address above. What is left is that it ships sidecars and a manifest,
     and wants the receiver's own dedup.
   * **A withdrawal record** for a store leaving a selection.
-  * **Per-destination watermarks from one sink** — a routing sink where one
+  * **Per-destination watermarks from one consumer** — a routing consumer where one
     destination is down and the others are not. The message shape already
     allows a watermark per store; what is missing is a reason to.
-  * **`text` granularity is deliberately NOT in the protocol.** A sink must
+  * **`text` granularity is deliberately NOT in the protocol.** A consumer must
     be able to report an address, and raw bytes carry none. Rendering
-    entries as text for a command is the `exec` sink's own business.
+    entries as text for a command is the `exec` consumer's own business.
 
 ## What it costs
 
@@ -327,7 +333,7 @@ resuming means linking `cursor.rs`, i.e. writing our own shipper, and after
 it anyone's script is one" — without letting third parties write the
 position file.
 
-And it reworks the shipped ownership. `timber-otlp` becomes a stdin sink
+And it reworks the shipped ownership. `timber-otlp` becomes a stdin consumer
 that renders, posts and reports, losing its `--select`/`--positions`/
 `--cursor` machinery; the loop moves into a `timberfs` subcommand that owns
 the read, the selection, the fairness rotation and the positions.

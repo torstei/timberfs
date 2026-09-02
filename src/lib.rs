@@ -6,6 +6,7 @@
 
 pub mod append;
 pub mod bark;
+pub mod consumer;
 pub mod cursor;
 pub mod entry;
 pub mod export;

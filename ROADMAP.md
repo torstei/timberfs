@@ -726,10 +726,10 @@ here.
   Design notes:
   [docs/plans/follower-selection.md](docs/plans/follower-selection.md) for
   the declaration and the loop, and
-  [docs/plans/sink-protocol.md](docs/plans/sink-protocol.md) for the
-  boundary it feeds: timberfs holds the position, a sink reports how far to
-  move it, and so a sink can be written in any language and run on another
-  machine. That is also the consumer-driven position the cursor entry above
+  [docs/plans/consumer-protocol.md](docs/plans/consumer-protocol.md) for
+  the boundary it feeds: timberfs holds the position, a consumer reports how
+  far to move it, and so a consumer can be written in any language and run
+  on another machine. That is also the consumer-driven position the cursor entry above
   says is missing — reached without letting a third party write the position
   file.
 - **Splitting downstream of a spool (fan-out by cursor)**: one store as the
