@@ -157,6 +157,13 @@ AT — that exact entry, in the pager — rather than "go read the consumer's
 journal and correlate". It is the same quantity as a watermark and a
 position, which is the point of there being one kind of position here.
 
+⚠ But `status` prints a STORE and an OFFSET, not the URL: the host in such
+an address is whatever name the READER reaches this machine by, and this
+machine does not know it. `gethostname()` is conventionally the short name,
+which is why two hosts in different environments present the same one —
+[receiving-end.md](receiving-end.md)'s door 4. Composing the URL is the
+reader's job; ours is to say which store and where in it.
+
 Named `note` and not `status` because `stream-end` already carries a
 `status` FIELD, whose values are `exhausted`/`limited`. Two `status`es
 meaning different things is a wart to not acquire. It also matches

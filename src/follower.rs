@@ -72,8 +72,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -176,6 +174,46 @@ pub fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `type` and an `endpoint` as the command they were shorthand for.
+///
+/// Both were a taxonomy: one entry per destination protocol, each with a
+/// binary in this tree, so «my destination is not listed» read as «add a
+/// type». A command says what is true instead — a destination is a
+/// program — and these two spellings of the OTLP and frames cases become
+/// the two programs they always ran.
+fn migrate(
+    at: &Path,
+    kind: &str,
+    endpoint: Option<&str>,
+    args: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut argv: Vec<String> = match kind {
+        "otlp" => vec![binary("timber-otlp").display().to_string()],
+        // Not yet a consumer: it opens the store itself and resumes from
+        // the receiver's coverage rather than being fed. Until it speaks
+        // the protocol there is no command to migrate this to, and
+        // saying so beats writing one that cannot run.
+        "frames" => bail!(
+            "declares `type: frames`, which cannot be expressed as a consumer command yet —              `frames-send` reads a store rather than a stream, and resumes from the              receiver's own coverage. Leave it until it speaks the consumer protocol"
+        ),
+        "" => bail!(
+            "{} declares neither a \"command\" nor a \"type\", so there is nothing to run for \
+             it. A follower is fed a program: `-- timber-otlp --endpoint http://...`",
+            at.display()
+        ),
+        other => bail!(
+            "{} declares `type: {other}`, which this timberfs has never run",
+            at.display()
+        ),
+    };
+    if let Some(e) = endpoint {
+        argv.push("--endpoint".to_string());
+        argv.push(e.to_string());
+    }
+    argv.extend(args.iter().cloned());
+    Ok(argv)
+}
+
 /// A follower's declaration: the operator's half of the pair. Unknown
 /// keys are PRESERVED across an `update`, like a `.bark` — a declaration
 /// is a label, not a schema, and a key this version does not know may be
@@ -195,23 +233,26 @@ pub struct Declaration {
     /// every declaration ever written is expressible here and a legacy
     /// `store` member migrates to exactly the store it named.
     pub select: String,
-    /// The store's path when last declared — a HINT, since identity is
-    /// what decides. `run` tries it first and falls back to a forest scan.
-    pub path: String,
-    /// Which binary `run` execs. `type` in the file; `kind` here, `type`
-    /// being a keyword.
-    pub kind: String,
     /// Does this follower hold the store's head back? Declared, so it
     /// cannot be acquired by leaving a file somewhere.
     pub retaining: bool,
-    /// The destination, promoted out of `args` because every follower type
-    /// has one and it is what an operator reads first in `list`.
-    pub endpoint: Option<String>,
-    /// Everything else, verbatim, in the shipper's own spelling. The
-    /// registry deliberately does not re-declare `timber-otlp`'s surface:
-    /// a second spelling of the same flags is a second thing to keep in
-    /// step, and it would drift.
-    pub args: Vec<String>,
+    /// The CONSUMER: a program and its arguments, fed the records and
+    /// asked how far to move the positions.
+    ///
+    /// A list, so nothing makes a quoting round trip on the way to it —
+    /// the same reason a timbersh target's `cmd` is one. Recorded
+    /// verbatim and never inspected: what is not ours to interpret is
+    /// passed on unread, and a create-time check of it could not be
+    /// enforced later anyway (see docs/plans/consumer-protocol.md).
+    ///
+    /// ⚠ This replaced `type` + `endpoint` + `args`. A TYPE per
+    /// destination reads as a taxonomy that grows one entry per protocol
+    /// and implies the answer to "mine is not listed" is a new binary in
+    /// this tree; a command says the truth, which is that a destination
+    /// is a program and timberfs does not need to know which. An older
+    /// declaration's `type` and `endpoint` migrate to the command they
+    /// were shorthand for.
+    pub command: Vec<String>,
     pub created: String,
     /// Keys this version does not know, kept so an `update` cannot eat
     /// them.
@@ -292,38 +333,48 @@ impl Declaration {
         };
         let select = crate::select::canonical(&select)
             .with_context(|| format!("{}: \"select\"", path.display()))?;
-        let kind = take_str(&mut map, "type").unwrap_or_default();
-        if kind.is_empty() {
-            bail!(
-                "{} declares no \"type\", so nothing can be run for it (known: {})",
-                path.display(),
-                TYPES.join(", ")
-            );
-        }
         let retaining = map
             .remove("retaining")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let args = match map.remove("args") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(items)) => items
-                .into_iter()
-                .map(|v| match v {
-                    Value::String(s) => Ok(s),
-                    other => bail!("\"args\" holds {other}, which is not a string"),
-                })
-                .collect::<anyhow::Result<Vec<String>>>()
-                .with_context(|| format!("in {}", path.display()))?,
-            Some(other) => bail!("{}: \"args\" must be an array, got {other}", path.display()),
+        let strings = |m: &mut Map<String, Value>, k: &str| -> anyhow::Result<Vec<String>> {
+            match m.remove(k) {
+                None | Some(Value::Null) => Ok(Vec::new()),
+                Some(Value::Array(items)) => items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::String(s) => Ok(s),
+                        other => bail!("{k:?} holds {other}, which is not a string"),
+                    })
+                    .collect(),
+                Some(other) => bail!("{k:?} must be an array, got {other}"),
+            }
+        };
+        let command =
+            strings(&mut map, "command").with_context(|| format!("in {}", path.display()))?;
+        // A declaration written when a TYPE named the destination: the
+        // type and the endpoint were shorthand for a command line, so
+        // they become one. `path` and `args` go with them.
+        let legacy_args =
+            strings(&mut map, "args").with_context(|| format!("in {}", path.display()))?;
+        let legacy_type = take_str(&mut map, "type").unwrap_or_default();
+        let legacy_endpoint = take_str(&mut map, "endpoint").filter(|e| !e.is_empty());
+        let _ = take_str(&mut map, "path");
+        let command = if !command.is_empty() {
+            command
+        } else {
+            migrate(
+                &path,
+                &legacy_type,
+                legacy_endpoint.as_deref(),
+                &legacy_args,
+            )?
         };
         Ok(Declaration {
             name: name.to_string(),
             select,
-            path: take_str(&mut map, "path").unwrap_or_default(),
-            kind,
             retaining,
-            endpoint: take_str(&mut map, "endpoint").filter(|e| !e.is_empty()),
-            args,
+            command,
             created: take_str(&mut map, "created").unwrap_or_default(),
             extra: map,
         })
@@ -333,16 +384,15 @@ impl Declaration {
         let mut map = Map::new();
         map.insert("name".into(), Value::String(self.name.clone()));
         map.insert("select".into(), Value::String(self.select.clone()));
-        map.insert("path".into(), Value::String(self.path.clone()));
-        map.insert("type".into(), Value::String(self.kind.clone()));
         map.insert("retaining".into(), Value::Bool(self.retaining));
-        match &self.endpoint {
-            Some(e) => map.insert("endpoint".into(), Value::String(e.clone())),
-            None => map.insert("endpoint".into(), Value::Null),
-        };
         map.insert(
-            "args".into(),
-            Value::Array(self.args.iter().cloned().map(Value::String).collect()),
+            "command".into(),
+            Value::Array(
+                self.command
+                    .iter()
+                    .map(|a| Value::String(a.clone()))
+                    .collect(),
+            ),
         );
         map.insert("created".into(), Value::String(self.created.clone()));
         for (k, v) in &self.extra {
@@ -372,138 +422,6 @@ impl Declaration {
         }
         Ok(())
     }
-
-    /// The store this follower reads, as a path a shipper can be handed.
-    ///
-    /// Identity decides and the recorded path is only a hint, so the hint
-    /// is CHECKED rather than trusted: a path that now holds a different
-    /// store is exactly the case a path-keyed registry gets wrong.
-    pub fn resolve_store(&self) -> anyhow::Result<PathBuf> {
-        let Some(anchor) = self.anchor() else {
-            bail!(
-                "follower {} follows the stores matching {:?}, which is a set — there is no \
-                 single store to resolve. `timberfs list --select {:?}` is what it covers",
-                self.name,
-                self.select,
-                self.select
-            );
-        };
-        if !self.path.is_empty() {
-            let p = PathBuf::from(&self.path);
-            if let Ok((dir, name)) = resolve_backing(&p) {
-                if format::rings_path(&dir, &name).exists() {
-                    let bark = crate::bark::load(&dir, &name);
-                    if cursor::store_anchor(&dir, &name, bark.as_ref()) == anchor {
-                        return Ok(p);
-                    }
-                }
-            }
-        }
-        match crate::forest::stores_by_anchor(&anchor).as_slice() {
-            [one] => Ok(one.clone()),
-            [] => bail!(
-                "follower {} follows store {} — not at {} any more, and no configured forest \
-                 holds it. Point it at the store again with `timberfs follower update {} \
-                 store=<path>`",
-                self.name,
-                anchor,
-                if self.path.is_empty() {
-                    "(no recorded path)"
-                } else {
-                    &self.path
-                },
-                self.name
-            ),
-            // ⚠ Load-bearing beyond this message: an `id` names ONE
-            // store's bytes, which is why a duplicate is corruption here
-            // and not a replica. Any future addressable-replica work
-            // (ROADMAP, "Globally addressable chunks") must therefore
-            // travel a SEPARATE lineage key rather than share `id`, or it
-            // turns this refusal — and `cursor::check_store`, which rests
-            // on the same assumption — into a false alarm.
-            several => bail!(
-                "store {} is claimed by several stores, so which one follower {} means cannot \
-                 be decided — a copied .bark gives two stores one identity:\n{}",
-                anchor,
-                self.name,
-                several
-                    .iter()
-                    .map(|p| format!("  {}", p.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ),
-        }
-    }
-
-    /// The argv `run` execs: the shipper, the registry's own cursor path,
-    /// and the operator's arguments last so an explicit flag always wins
-    /// over a derived one.
-    ///
-    /// `--start` is derived from `retaining`, and that is the one
-    /// non-obvious mapping here. `timber-otlp` defaults to `end` — only
-    /// new entries — which for a RETAINING follower would skip on its
-    /// first run exactly the backlog it was registered to protect, and
-    /// then let retention drop it. Retaining says "this data is not lost
-    /// until this follower has it", so `begin` is the only consistent
-    /// reading of it.
-    pub fn argv(&self, cursor: &Path, store: &Path) -> anyhow::Result<Vec<String>> {
-        match self.kind.as_str() {
-            "otlp" => {
-                let mut argv = vec![
-                    binary("timber-otlp").display().to_string(),
-                    "--follow".to_string(),
-                    "--cursor".to_string(),
-                    cursor.display().to_string(),
-                ];
-                if !declares(&self.args, "--start") {
-                    argv.push("--start".to_string());
-                    argv.push(if self.retaining { "begin" } else { "end" }.to_string());
-                }
-                if let (Some(e), false) = (&self.endpoint, declares(&self.args, "--endpoint")) {
-                    argv.push("--endpoint".to_string());
-                    argv.push(e.clone());
-                }
-                argv.extend(self.args.iter().cloned());
-                argv.push(store.display().to_string());
-                Ok(argv)
-            }
-            "frames" => {
-                // The native wire. No `--start`: a frames sender resumes
-                // from the RECEIVER's coverage, which is authoritative, so
-                // there is no local decision about where to begin — and no
-                // way to accidentally re-ship a whole store.
-                let mut argv = vec![
-                    binary("timberfs").display().to_string(),
-                    "frames-send".to_string(),
-                    "--follow".to_string(),
-                    "--cursor".to_string(),
-                    cursor.display().to_string(),
-                ];
-                if let (Some(e), false) = (&self.endpoint, declares(&self.args, "--endpoint")) {
-                    argv.push("--endpoint".to_string());
-                    argv.push(e.clone());
-                }
-                argv.extend(self.args.iter().cloned());
-                argv.push(store.display().to_string());
-                Ok(argv)
-            }
-            other => bail!(
-                "follower {} declares type {other:?}, which this timberfs cannot run \
-                 (known: {})",
-                self.name,
-                TYPES.join(", ")
-            ),
-        }
-    }
-}
-
-/// Is `flag` already spelled in the operator's own arguments, in either
-/// `--flag value` or `--flag=value` form? A derived flag must never be
-/// passed twice — clap would take the first and the operator would be
-/// quietly overridden by a default.
-fn declares(args: &[String], flag: &str) -> bool {
-    let eq = format!("{flag}=");
-    args.iter().any(|a| a == flag || a.starts_with(&eq))
 }
 
 /// The shipper binary: our OWN directory first, then `$PATH`. A dev build
@@ -604,18 +522,56 @@ fn recorded_pid(reg: &Path, name: &str) -> Option<u32> {
 /// is running, and — when its store can be found and read — where that
 /// position stands against the store's chunks.
 #[derive(Clone)]
+/// One store this follower covers, as a view renders it.
+pub struct Covered {
+    pub id: String,
+    pub path: PathBuf,
+    /// Where it stands in that store. `None` when the store's index
+    /// cannot be read — reported as such, never as "caught up".
+    pub standing: Option<Standing>,
+    /// Has this follower read anything from this store at all? A store
+    /// it covers and has never read is the state a registry exists to
+    /// express, and it is not a position of zero.
+    pub read: bool,
+    /// The consumer's last word about this store.
+    pub note: Option<crate::cursor::Note>,
+}
+
+/// A follower's positions, as reading them can turn out.
+///
+/// ⚠ Three states and not two: a file that is MISSING says the follower
+/// has never run, which is the state a registry exists to be able to
+/// express, and one that is UNREADABLE says nothing at all — and must
+/// not be rendered as "nothing consumed", which is the reading that
+/// would let retention drop what it is holding.
+#[derive(Clone)]
+pub enum Places {
+    Never,
+    Unreadable,
+    Held(crate::cursor::Positions),
+}
+
+impl Places {
+    pub fn held(&self) -> Option<&crate::cursor::Positions> {
+        match self {
+            Places::Held(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+/// A registered follower, read: its declaration, its positions, whether
+/// it is running, and where it stands in each store it covers.
+#[derive(Clone)]
 pub struct Registered {
     pub decl: Declaration,
-    /// `None` when it has never delivered anything. Deliberately
-    /// distinguished from a position of zero: "never run" is the state a
-    /// registry exists to be able to express.
-    pub cursor: Option<Cursor>,
+    /// Where it stands, in three states rather than two.
+    pub places: Places,
     pub live: Liveness,
-    /// The store as found now, and the standing of the position in it.
-    /// `None` when the store cannot be resolved or read — reported as
-    /// such, never as "caught up".
-    pub store_path: Option<PathBuf>,
-    pub standing: Option<Standing>,
+    /// Every store the selection matches now, worst first. A selection
+    /// is resolved to build this, which is a forest scan — so it is done
+    /// where a view asks for it and not on the interest axis.
+    pub covered: Vec<Covered>,
 }
 
 impl Registered {
@@ -623,83 +579,161 @@ impl Registered {
         &self.decl.name
     }
 
-    /// The store's handle, for a column: its logical name minus a single
-    /// `.log`, the same shortening `forest` does — so the STORE column of
-    /// `follower list` reads like the HANDLE column of `list`.
-    pub fn store_handle(&self) -> String {
-        let path = self
-            .store_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(&self.decl.path));
-        let name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name.is_empty() {
-            return self.decl.select.clone();
+    /// What it follows, for a column: one store's handle where it names
+    /// one, else the predicate itself.
+    pub fn follows_text(&self) -> String {
+        match self.covered.as_slice() {
+            [one] => {
+                let name = one
+                    .path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    self.decl.select.clone()
+                } else {
+                    name.strip_suffix(".log").unwrap_or(&name).to_string()
+                }
+            }
+            _ => self.decl.select.clone(),
         }
-        name.strip_suffix(".log").unwrap_or(&name).to_string()
     }
 
-    /// Does this follower hold the store's ENTIRE head back? True of a
-    /// retaining follower with no position — which is the point (it
-    /// protects one deployed before it first runs) and the footgun.
-    /// Deliberately not "behind_bytes covers everything": a follower that
-    /// has never run has no measured backlog at all, and treating that as
-    /// zero is exactly the reading that hides it.
+    /// Does this follower hold an ENTIRE store's head back? True of a
+    /// retaining follower covering a store it has never read — which is
+    /// the point (it protects one deployed before it first runs) and the
+    /// footgun. Deliberately not "behind_bytes covers everything": a
+    /// store never read has no measured backlog at all, and treating
+    /// that as zero is exactly the reading that hides it.
     pub fn holds_everything(&self) -> bool {
-        self.decl.retaining && self.cursor.as_ref().and_then(|c| c.seq).is_none()
+        self.decl.retaining && self.covered.iter().any(|c| !c.read)
     }
 
-    pub fn position_text(&self) -> String {
-        match self.cursor.as_ref().and_then(|c| c.seq) {
-            Some(seq) => format!("chunk {seq}"),
-            None => "-".to_string(),
-        }
+    /// Where it stands in ONE store, by identity. What a view about a
+    /// single store needs: `worst` is across the whole selection, which
+    /// for one store's page would name somebody else's backlog.
+    pub fn at(&self, id: &str) -> Option<&Covered> {
+        self.covered.iter().find(|c| c.id == id)
     }
 
-    /// One phrase for how this follower is doing. The order matters: a
-    /// missing store outranks a missing position, which outranks a
-    /// distance — each of those makes the next meaningless.
+    /// The worst standing across the stores it covers: the one that
+    /// decides how much is unread, and so the one an operator needs
+    /// named.
+    pub fn worst(&self) -> Option<&Covered> {
+        self.covered
+            .iter()
+            .find(|c| !c.read)
+            .or_else(|| self.covered.iter().max_by_key(|c| c.behind_bytes()))
+    }
+
+    pub fn behind_bytes(&self) -> u64 {
+        self.covered.iter().map(Covered::behind_bytes).sum()
+    }
+
+    /// One phrase for how this follower is doing, across its whole
+    /// selection. The order matters: a selection that matches nothing
+    /// outranks a store never read, which outranks a distance — each
+    /// makes the next meaningless.
     pub fn lag_text(&self) -> String {
-        if self.store_path.is_none() {
-            return "store gone".to_string();
+        if matches!(self.places, Places::Unreadable) {
+            return "positions unreadable".to_string();
         }
-        match (&self.cursor, &self.standing) {
-            (None, _) => "never run".to_string(),
-            (Some(c), _) if c.delivered == 0 => "never run".to_string(),
-            (Some(_), Some(st)) => st.lag_text(),
-            (Some(_), None) => "store unreadable".to_string(),
+        if self.covered.is_empty() {
+            return "matches nothing".to_string();
+        }
+        let unread = self.covered.iter().filter(|c| !c.read).count();
+        if unread == self.covered.len() {
+            return "never run".to_string();
+        }
+        match self.worst().and_then(|c| c.standing.as_ref()) {
+            Some(st) if unread > 0 => format!("{} (+{unread} unread)", st.lag_text()),
+            Some(st) => st.lag_text(),
+            None => "store unreadable".to_string(),
         }
     }
 }
 
-/// Read one follower: declaration, position, liveness, and its standing
-/// in its store when that can be found. Never fatal past the
-/// declaration — a follower whose store is gone is still a registration,
-/// and hiding it would hide the very thing an operator has to clean up.
+impl Covered {
+    pub fn behind_bytes(&self) -> u64 {
+        self.standing.map(|s| s.behind_bytes).unwrap_or(0)
+    }
+
+    pub fn handle(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        name.strip_suffix(".log").unwrap_or(&name).to_string()
+    }
+}
+
+/// Read one follower: declaration, positions, liveness, and where it
+/// stands in each store its selection covers. Never fatal past the
+/// declaration — a follower whose stores are gone is still a
+/// registration, and hiding it would hide the very thing an operator has
+/// to clean up.
 pub fn read(reg: &Path, name: &str) -> anyhow::Result<Registered> {
     // One place guards every road into the registry: a name is a path
-    // component here, so anything that is not a legal follower name has no
-    // business being joined onto the registry directory.
+    // component here, so anything that is not a legal follower name has
+    // no business being joined onto the registry directory.
     validate_name(name)?;
     let decl = Declaration::load(reg, name)?;
-    let cursor = Cursor::load(&cursor_path(reg, name)).unwrap_or(None);
-    let live = liveness(reg, name);
-    let store_path = decl.resolve_store().ok();
-    let standing = match (&store_path, &cursor) {
-        (Some(p), Some(c)) => resolve_backing(p)
-            .ok()
-            .and_then(|(dir, base)| format::read_index(&format::rings_path(&dir, &base)).ok())
-            .map(|records| cursor::standing(c, &records)),
-        _ => None,
+    let places = match crate::cursor::Positions::load(&positions_path(reg, name)) {
+        Ok(Some(p)) => Places::Held(p),
+        Err(_) => Places::Unreadable,
+        // No positions file. A declaration written before they existed
+        // kept a cursor for the one store it named, and that is still
+        // that store's place until `run` carries it over.
+        Ok(None) => match (decl.anchor(), Cursor::load(&cursor_path(reg, name))) {
+            (Some(anchor), Ok(Some(c))) if c.delivered > 0 => {
+                let mut p = crate::cursor::Positions::new(&c.consumer);
+                p.advance(&anchor, &c.path, 0, c.seq, c.wl, c.delivered);
+                Places::Held(p)
+            }
+            (_, Err(_)) => Places::Unreadable,
+            _ => Places::Never,
+        },
     };
+    let positions = places.held();
+    let live = liveness(reg, name);
+    let mut covered = Vec::new();
+    if let Ok(sel) = decl.selector() {
+        for m in crate::select::resolve(&[], &sel) {
+            let Some(id) = m.id else { continue };
+            let path = m.dir.join(&m.name);
+            let at = positions.as_ref().and_then(|p| p.at.get(&id));
+            let standing = format::read_index(&format::rings_path(&m.dir, &m.name))
+                .ok()
+                .map(|records| {
+                    cursor::standing_at(
+                        at.and_then(|a| a.chunk),
+                        at.map(|a| a.wl).unwrap_or(0),
+                        &records,
+                    )
+                });
+            covered.push(Covered {
+                id,
+                path,
+                standing,
+                read: at.is_some(),
+                note: at.and_then(|a| a.note.clone()),
+            });
+        }
+    }
+    // Worst first, for the same reason `rank` puts the worst follower
+    // first: that store decides how much is unread.
+    covered.sort_by(|a, b| {
+        a.read
+            .cmp(&b.read)
+            .then_with(|| b.behind_bytes().cmp(&a.behind_bytes()))
+            .then_with(|| a.handle().cmp(&b.handle()))
+    });
     Ok(Registered {
         decl,
-        cursor,
+        places,
         live,
-        store_path,
-        standing,
+        covered,
     })
 }
 
@@ -794,7 +828,7 @@ pub fn covering(held: &[Registered], fields: &Map<String, Value>) -> Vec<Registe
 /// question and not "behind_bytes == 0".
 fn rank(followers: &mut [Registered]) {
     followers.sort_by(|a, b| {
-        let bytes = |r: &Registered| r.standing.map(|s| s.behind_bytes).unwrap_or(0);
+        let bytes = Registered::behind_bytes;
         b.holds_everything()
             .cmp(&a.holds_everything())
             .then_with(|| bytes(b).cmp(&bytes(a)))
@@ -1165,16 +1199,18 @@ fn systemctl(verb: &str, name: &str) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 pub struct CreateOpts {
-    /// The store to follow: a path, or a forest handle.
-    pub store: PathBuf,
-    pub kind: String,
-    pub endpoint: Option<String>,
+    /// WHICH stores, as a predicate. `--store` is the sugar that turns
+    /// one store into `[id=<its id>]`, resolved and minted here.
+    pub select: Option<String>,
+    /// The store to follow: a path, or a forest handle. Sugar for a
+    /// one-term selection.
+    pub store: Option<PathBuf>,
     pub retaining: bool,
     pub enable: bool,
     pub start: bool,
     pub dry_run: bool,
-    /// The shipper's own arguments, verbatim (everything after `--`).
-    pub args: Vec<String>,
+    /// The consumer and its arguments, verbatim (everything after `--`).
+    pub command: Vec<String>,
 }
 
 /// `timberfs follower create`: register a follower.
@@ -1183,11 +1219,10 @@ pub struct CreateOpts {
 /// rather than two processes overwriting one position.
 pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
     validate_name(name)?;
-    if !TYPES.contains(&opts.kind.as_str()) {
+    if opts.command.is_empty() {
         bail!(
-            "unknown follower type {:?} (known: {})",
-            opts.kind,
-            TYPES.join(", ")
+            "no consumer to feed: give the program and its arguments after `--`, e.g. \
+             `-- timber-otlp --endpoint http://collector:4318`"
         );
     }
     let reg = registry_dir();
@@ -1201,80 +1236,94 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
         );
     }
 
-    // Identity, not address: a store can move, so the declaration records
-    // the `.bark` id and mints one when the store has none.
-    let store = crate::forest::resolve_source(&opts.store)?;
-    let (sdir, sname) = resolve_backing(&store)?;
-    if !format::rings_path(&sdir, &sname).exists() {
-        bail!(
-            "no timberfs store {sname} in {} — a follower is a position in a store that exists",
-            sdir.display()
-        );
-    }
-    let bark = crate::bark::ensure_identified(&sdir, &sname).with_context(|| {
-        format!(
-            "declaring an identity for {} (needs write access to its backing directory): a \
-             follower records its store by identity, not by path, because a store can move",
-            store.display()
-        )
-    })?;
-    let anchor = cursor::store_anchor(&sdir, &sname, Some(&bark));
-    if anchor.starts_with("path:") {
-        bail!(
-            "{} has no declared identity and one could not be minted — a follower cannot be \
-             anchored to a path, a store being movable",
-            store.display()
-        );
-    }
+    let select = match (&opts.select, &opts.store) {
+        (Some(_), Some(_)) => bail!(
+            "--select names a SET and --store names one store, which is the one-term case of \
+             it: give one of them"
+        ),
+        (None, None) => bail!(
+            "no selection: --select '[k=v]' for the stores a predicate matches, `[]` for every \
+             one, or --store <store> for exactly one"
+        ),
+        (Some(expr), None) => crate::select::canonical(expr)?,
+        // Identity, not address: a store can move, so one named store is
+        // recorded by its `.bark` id, and one minted here when it has
+        // none. A SELECTION mints nothing — a store it merely matched is
+        // not one the operator named.
+        (None, Some(store)) => {
+            let store = crate::forest::resolve_source(store)?;
+            let (sdir, sname) = resolve_backing(&store)?;
+            if !format::rings_path(&sdir, &sname).exists() {
+                bail!(
+                    "no timberfs store {sname} in {} — a follower follows stores that exist",
+                    sdir.display()
+                );
+            }
+            let bark = crate::bark::ensure_identified(&sdir, &sname).with_context(|| {
+                format!(
+                    "declaring an identity for {} (needs write access to its backing \
+                     directory): a follower records its stores by identity, not by path, \
+                     because a store can move",
+                    store.display()
+                )
+            })?;
+            let anchor = cursor::store_anchor(&sdir, &sname, Some(&bark));
+            if anchor.starts_with("path:") {
+                bail!(
+                    "{} has no declared identity and one could not be minted — a follower \
+                     cannot be anchored to a path, a store being movable",
+                    store.display()
+                );
+            }
+            format!("[id={anchor}]")
+        }
+    };
 
     let decl = Declaration {
         name: name.to_string(),
-        // `--store` names ONE store, and naming one store by identity is
-        // the predicate `[id=<it>]`. So there is one member, and the
-        // convenience is the flag rather than a second shape on disk.
-        select: format!("[id={anchor}]"),
-        path: fs::canonicalize(&sdir)
-            .unwrap_or(sdir)
-            .join(&sname)
-            .display()
-            .to_string(),
-        kind: opts.kind,
+        select,
         retaining: opts.retaining,
-        endpoint: opts.endpoint,
-        args: opts.args,
+        command: opts.command,
         created: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         extra: Map::new(),
     };
-    // Built before anything is written, so a bad type or an unrunnable
-    // combination fails at registration rather than at the first start.
-    // Against the declaration's OWN path, not the argument as typed, so
-    // the preview is the command `run` will actually exec.
-    let argv = decl.argv(&cursor_path(&reg, name), Path::new(&decl.path))?;
+
+    // What it covers NOW, which is not what it will cover: a selection is
+    // re-resolved every poll, so this is the operator's check on their
+    // predicate rather than a list the declaration holds.
+    let covers = decl
+        .selector()
+        .map(|sel| crate::select::resolve(&[], &sel))
+        .unwrap_or_default();
+    let (identified, idless): (Vec<_>, Vec<_>) = covers.iter().partition(|m| m.id.is_some());
 
     if opts.dry_run {
         println!(
             "{}",
             serde_json::to_string_pretty(&Value::Object(decl.to_map()))?
         );
-        println!("would run: {}", argv.join(" "));
+        report_coverage(&decl, &identified, &idless);
+        println!("would run: {}", decl.command.join(" "));
         println!("dry run: nothing registered");
         return Ok(());
     }
     decl.save(&reg)?;
     crate::note!(
-        "timberfs: registered follower {name} on {} ({})",
-        decl.path,
-        decl.kind
+        "timberfs: registered follower {name} on {} ({} store(s) now)",
+        decl.select,
+        identified.len()
     );
+    report_coverage(&decl, &identified, &idless);
     // The footgun, in one line, at the moment it is created — the same
-    // one Postgres has with an unused slot. A retaining follower with no
-    // position holds EVERYTHING, which is the point (it protects a
-    // follower deployed before it first runs) and also the trap.
+    // one Postgres has with an unused slot. A retaining follower holds
+    // EVERYTHING of a store it has not read, which is the point (it
+    // protects a follower deployed before it first runs) and also the
+    // trap.
     if decl.retaining {
         crate::note!(
-            "timberfs: {name} is retaining: once a writer honours it, it holds the whole store \
-             until it first runs. `--start` (or `systemctl start {}`) makes the safe path the \
-             easy one",
+            "timberfs: {name} is retaining: once a writer honours it, it holds each covered \
+             store whole until it first reads it. `--start` (or `systemctl start {}`) makes \
+             the safe path the easy one",
             unit_name(name)
         );
     }
@@ -1293,27 +1342,64 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a selection covers today, and what it cannot follow.
+///
+/// ⚠ A selection matching NOTHING is not refused: a follower is
+/// routinely declared before the stores exist — an archive with
+/// `--auto-create` receives a new sender's data and forwards it nowhere
+/// until somebody registers one — so refusing would make the right order
+/// impossible. It is said, not prevented.
+fn report_coverage(
+    decl: &Declaration,
+    identified: &[&crate::select::Match],
+    idless: &[&crate::select::Match],
+) {
+    if identified.is_empty() {
+        crate::note!(
+            "timberfs: {} matches no store with an identity yet — nothing is followed until \
+             one appears, which is a legitimate order to do this in",
+            decl.select
+        );
+    } else if decl.retaining {
+        crate::note!(
+            "timberfs: retaining {} store(s): {}",
+            identified.len(),
+            identified
+                .iter()
+                .take(6)
+                .map(|m| m.handle.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+                + if identified.len() > 6 { ", …" } else { "" }
+        );
+    }
+    if !idless.is_empty() {
+        crate::note!(
+            "timberfs: {} matched store(s) carry no identity, so they are NOT followed: {} \
+             (`timberfs identity <store> --mint` gives one)",
+            idless.len(),
+            idless
+                .iter()
+                .take(6)
+                .map(|m| m.handle.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // list
 // ---------------------------------------------------------------------------
 
-const COLUMNS: [&str; 7] = [
-    "NAME",
-    "STORE",
-    "TYPE",
-    "RETAINING",
-    "POSITION",
-    "LAG",
-    "RUNNING",
-];
+const COLUMNS: [&str; 6] = ["NAME", "FOLLOWS", "STORES", "RETAINING", "LAG", "RUNNING"];
 
 fn row_cells(r: &Registered) -> Vec<String> {
     vec![
         r.name().to_string(),
-        r.store_handle(),
-        r.decl.kind.clone(),
+        r.follows_text(),
+        r.covered.len().to_string(),
         if r.decl.retaining { "yes" } else { "no" }.to_string(),
-        r.position_text(),
         r.lag_text(),
         r.live.text().to_string(),
     ]
@@ -1324,26 +1410,10 @@ pub fn to_json(r: &Registered) -> Value {
     o.insert("name".into(), r.name().into());
     o.insert("select".into(), r.decl.select.clone().into());
     o.insert(
-        "store_path".into(),
-        match &r.store_path {
-            Some(p) => p.display().to_string().into(),
-            None => Value::Null,
-        },
+        "command".into(),
+        Value::Array(r.decl.command.iter().cloned().map(Value::String).collect()),
     );
-    o.insert("declared_path".into(), r.decl.path.clone().into());
-    o.insert("type".into(), r.decl.kind.clone().into());
     o.insert("retaining".into(), r.decl.retaining.into());
-    o.insert(
-        "endpoint".into(),
-        match &r.decl.endpoint {
-            Some(e) => e.clone().into(),
-            None => Value::Null,
-        },
-    );
-    o.insert(
-        "args".into(),
-        Value::Array(r.decl.args.iter().cloned().map(Value::String).collect()),
-    );
     o.insert("created".into(), r.decl.created.clone().into());
     o.insert(
         "running".into(),
@@ -1354,26 +1424,44 @@ pub fn to_json(r: &Registered) -> Value {
         },
     );
     o.insert("unit".into(), unit_name(r.name()).into());
-    // The same keys whether or not there is a position, so a consumer
-    // tests for a VALUE rather than for a key's presence.
-    match &r.cursor {
+    o.insert("lag".into(), r.lag_text().into());
+    o.insert("holds_everything".into(), r.holds_everything().into());
+    // ⚠ `None` is "the positions file could not be read", which is not
+    // "nothing consumed" — so it is null and not an empty object, and a
+    // consumer tests for a value rather than for a key.
+    o.insert(
+        "positions".into(),
+        match &r.places {
+            Places::Never => Value::String("never".into()),
+            Places::Unreadable => Value::String("unreadable".into()),
+            Places::Held(_) => Value::String("held".into()),
+        },
+    );
+    o.insert(
+        "stores".into(),
+        Value::Array(r.covered.iter().map(covered_json).collect()),
+    );
+    Value::Object(o)
+}
+
+/// One covered store. The same keys whether or not it has been read, so
+/// a consumer tests for a VALUE rather than for a key's presence.
+fn covered_json(c: &Covered) -> Value {
+    let mut o = Map::new();
+    o.insert("id".into(), c.id.clone().into());
+    o.insert("path".into(), c.path.display().to_string().into());
+    o.insert("read".into(), c.read.into());
+    match &c.standing {
         None => {
-            for k in ["seq", "n", "delivered", "wl"] {
+            for k in [
+                "consumed_chunks",
+                "behind_chunks",
+                "behind_bytes",
+                "behind_ms",
+                "gap_chunks",
+            ] {
                 o.insert(k.into(), Value::Null);
             }
-        }
-        Some(c) => {
-            o.insert("seq".into(), c.seq.map(Into::into).unwrap_or(Value::Null));
-            o.insert("n".into(), c.n.into());
-            o.insert("delivered".into(), c.delivered.into());
-            o.insert("wl".into(), c.wl.into());
-        }
-    }
-    match &r.standing {
-        None => {
-            o.insert("behind_chunks".into(), Value::Null);
-            o.insert("behind_bytes".into(), Value::Null);
-            o.insert("gap_chunks".into(), Value::Null);
         }
         Some(st) => {
             o.insert("consumed_chunks".into(), st.consumed_chunks.into());
@@ -1386,7 +1474,19 @@ pub fn to_json(r: &Registered) -> Value {
             );
         }
     }
-    o.insert("lag".into(), r.lag_text().into());
+    match &c.note {
+        None => o.insert("note".into(), Value::Null),
+        Some(n) => {
+            let mut nn = Map::new();
+            nn.insert("text".into(), n.text.clone().into());
+            nn.insert(
+                "offset".into(),
+                n.offset.map(Into::into).unwrap_or(Value::Null),
+            );
+            nn.insert("when".into(), n.when.clone().into());
+            o.insert("note".into(), Value::Object(nn))
+        }
+    };
     Value::Object(o)
 }
 
@@ -1450,52 +1550,77 @@ pub fn cmd_status(name: &str, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("follower  {}", r.name());
-    match (&r.store_path, r.decl.anchor()) {
-        (Some(p), Some(id)) => println!("follows   {}  (id {})", p.display(), id),
-        // A selection has no single store to find, so nothing is missing.
-        (_, None) => println!("follows   {}", r.decl.select),
-        (None, Some(id)) => println!(
-            "follows   {id} — NOT FOUND (declared at {})",
-            if r.decl.path.is_empty() {
-                "no path"
-            } else {
-                &r.decl.path
-            }
-        ),
-    }
-    println!("type      {}", r.decl.kind);
-    if let Some(e) = &r.decl.endpoint {
-        println!("endpoint  {e}");
-    }
-    if !r.decl.args.is_empty() {
-        println!("args      {}", r.decl.args.join(" "));
-    }
+    println!("follows   {}", r.decl.select);
+    println!("command   {}", r.decl.command.join(" "));
     print_retaining(&r);
-    match &r.cursor {
-        None => println!("position  none — it has never delivered anything"),
-        Some(c) => {
-            println!(
-                "position  {}, {} entries in; {} delivered",
-                r.position_text(),
-                c.n,
-                c.delivered
-            );
+    match &r.places {
+        Places::Unreadable => println!(
+            "positions UNREADABLE ({}) — which is not \"nothing consumed\": nothing below can \
+             be trusted, and the interest axis fails closed for every store while it lasts",
+            positions_path(&reg, name).display()
+        ),
+        Places::Never => println!("positions none — it has never read anything"),
+        Places::Held(_) => {}
+    }
+    println!("stores    {}", r.covered.len());
+    if r.covered.is_empty() {
+        println!(
+            "          the selection matches nothing right now, which is a legitimate state: \
+             a follower may be declared before its stores exist"
+        );
+    }
+    // Worst first, so the store that decides how much is unread is the
+    // one an operator sees first.
+    for c in &r.covered {
+        let place = match (&c.standing, c.read) {
+            (_, false) => "never read".to_string(),
+            (Some(st), true) => st.lag_text(),
+            (None, true) => "store unreadable".to_string(),
+        };
+        println!("  {:<24} {}", c.handle(), place);
+        if let Some(st) = &c.standing {
+            if let Some(n) = st.gap_chunks {
+                println!(
+                    "  {:<24} GAP — {n} chunk(s) were dropped before it read them; it resumes \
+                     at the oldest one still here",
+                    ""
+                );
+            // ⚠ Not at the live edge: the chunk a position sits INSIDE
+            // counts as unread, because a chunk-granular floor cannot
+            // say a chunk is finished while the position is in it. So a
+            // follower that has read everything still shows its current
+            // chunk as a backlog, and printing that beside "at the live
+            // edge" reads as a contradiction. `info`'s own block has
+            // guarded this since it was written.
+            } else if st.behind_chunks > 0 && !st.at_live_edge() {
+                println!(
+                    "  {:<24} {} unread in {} chunk(s)",
+                    "",
+                    crate::rotate::human_bytes(st.behind_bytes),
+                    st.behind_chunks
+                );
+            }
+        }
+        // The consumer's own words about this store, and the offset is
+        // an ADDRESS — the same one `timberview` opens at, so a note
+        // names a place an operator can go and look.
+        //
+        // ⚠ A store and an offset rather than a `timber://host/...` URL:
+        // the host in such an address is whatever name the READER
+        // reaches this machine by, and this machine does not know it.
+        // `gethostname()` is conventionally the short name, which is why
+        // two hosts in different environments present the same one —
+        // docs/plans/receiving-end.md calls that door 4. Composing the
+        // URL is the reader's job; ours is to say which store and where.
+        if let Some(n) = &c.note {
+            println!("  {:<24} note: {}", "", n.text);
+            if let Some(off) = n.offset {
+                println!("  {:<24}   at offset {off} of {}", "", c.handle());
+            }
         }
     }
-    println!("lag       {}", r.lag_text());
-    if let Some(st) = &r.standing {
-        if let Some(n) = st.gap_chunks {
-            println!(
-                "          GAP — {n} chunk(s) were dropped before it read them; it resumes at \
-                 the oldest one still here"
-            );
-        } else if st.behind_chunks > 0 {
-            println!(
-                "          {} unread in {} chunk(s)",
-                crate::rotate::human_bytes(st.behind_bytes),
-                st.behind_chunks
-            );
-        }
+    if let Some(n) = r.places.held().and_then(|p| p.note.as_ref()) {
+        println!("note      {} ({})", n.text, n.when);
     }
     let holder = match r.live {
         Liveness::Running => store::describe_lock_holder(&lock_path(&reg, name))
@@ -1510,30 +1635,40 @@ pub fn cmd_status(name: &str, json: bool) -> anyhow::Result<()> {
 }
 
 /// What `retaining` currently means for this follower — which depends on
-/// whether the store it follows declares that it honours it. Stating the
+/// whether the stores it covers declare that they honour it. Stating the
 /// flag alone would be a half-truth: a declared interest no writer reads
 /// holds nothing back.
 fn print_retaining(r: &Registered) {
     if !r.decl.retaining {
-        println!("retaining no — it holds nothing back; retention ignores its position");
+        println!("retaining no — it holds nothing back; retention ignores its positions");
         return;
     }
-    let honoured = r
-        .store_path
-        .as_ref()
-        .and_then(|p| resolve_backing(p).ok())
-        .and_then(|(dir, name)| crate::bark::load(&dir, &name))
-        .and_then(|m| m.get("retain_unconsumed").and_then(Value::as_bool))
-        .unwrap_or(false);
-    if honoured {
+    let honouring = r
+        .covered
+        .iter()
+        .filter(|c| {
+            resolve_backing(&c.path)
+                .ok()
+                .and_then(|(dir, name)| crate::bark::load(&dir, &name))
+                .and_then(|m| m.get("retain_unconsumed").and_then(Value::as_bool))
+                .unwrap_or(false)
+        })
+        .count();
+    if honouring == 0 {
         println!(
-            "retaining yes — its position holds the store's head back, until retain_size \
-             overrides it"
+            "retaining yes — declared, but no covered store declares retain_unconsumed, so \
+             nothing honours it yet"
+        );
+    } else if honouring == r.covered.len() {
+        println!(
+            "retaining yes — its positions hold every covered store's head back, until \
+             retain_size overrides it"
         );
     } else {
         println!(
-            "retaining yes — declared, but no writer honours it yet (the store does not declare \
-             retain_unconsumed)"
+            "retaining yes — honoured by {honouring} of {} covered store(s); the rest do not \
+             declare retain_unconsumed",
+            r.covered.len()
         );
     }
 }
@@ -1543,8 +1678,11 @@ fn print_retaining(r: &Registered) {
 // ---------------------------------------------------------------------------
 
 /// The keys `update` will change. `store` takes a path or handle and is
-/// re-resolved to an identity; the rest are scalars.
-const SETTABLE: &[&str] = &["retaining", "endpoint", "type", "store"];
+/// re-resolved to a one-term selection; `select` takes a predicate. The
+/// CONSUMER is replaced wholesale with what follows `--`, because a
+/// command is an argv and editing one member of it by key is a shape
+/// that reads correctly right up until the arguments matter.
+const SETTABLE: &[&str] = &["retaining", "select", "store"];
 
 /// `timberfs follower update NAME KEY=VALUE...`
 ///
@@ -1583,13 +1721,7 @@ pub fn cmd_update(
                     _ => bail!("\"retaining\" is true or false"),
                 }
             }
-            "endpoint" => decl.endpoint = Some(v.to_string()).filter(|e| !e.is_empty()),
-            "type" => {
-                if !TYPES.contains(&v) {
-                    bail!("unknown follower type {v:?} (known: {})", TYPES.join(", "));
-                }
-                decl.kind = v.to_string();
-            }
+            "select" => decl.select = crate::select::canonical(v)?,
             "store" => {
                 let store = crate::forest::resolve_source(Path::new(v))?;
                 let (sdir, sname) = resolve_backing(&store)?;
@@ -1609,22 +1741,25 @@ pub fn cmd_update(
                 // position anchored to the old one, and cursor.rs refuses
                 // to resume across that — say so here rather than let the
                 // shipper fail at its next start.
-                if Some(&anchor) != decl.anchor().as_ref() && before.cursor.is_some() {
+                // Re-pointing a follower at a DIFFERENT store leaves the
+                // old store's position in the file. Harmless — a
+                // position is keyed by identity, so the new store simply
+                // has none and is read from the start — but worth saying,
+                // because the old entry then holds retention for a store
+                // nothing follows any more.
+                if Some(&anchor) != decl.anchor().as_ref()
+                    && before.places.held().is_some_and(|p| !p.at.is_empty())
+                {
                     crate::note!(
-                        "timberfs: warning: {name} has a position in store {} — remove {} to \
-                         start over in the new store, or the shipper will refuse to resume",
-                        decl.select,
-                        cursor_path(&reg, name).display()
+                        "timberfs: {name} keeps its place in the store(s) it used to follow, in \
+                         {} — the new one is read from the start, and a stale entry there \
+                         holds nothing (membership is the selection's, never the file's)",
+                        positions_path(&reg, name).display()
                     );
                 }
                 decl.select = format!("[id={anchor}]");
-                decl.path = fs::canonicalize(&sdir)
-                    .unwrap_or(sdir)
-                    .join(&sname)
-                    .display()
-                    .to_string();
             }
-            "name" | "path" | "created" => {
+            "name" | "created" => {
                 bail!("\"{k}\" is identity, not configuration — it is not settable")
             }
             _ => bail!(
@@ -1635,19 +1770,16 @@ pub fn cmd_update(
     }
     for k in unsets {
         match k.trim() {
-            "endpoint" => decl.endpoint = None,
             "retaining" => decl.retaining = false,
             other => bail!("{other:?} cannot be unset"),
         }
     }
     if let Some(a) = args {
-        decl.args = a;
+        if a.is_empty() {
+            bail!("`--` with nothing after it would leave no consumer to feed");
+        }
+        decl.command = a;
     }
-    // Validated before it is written, exactly as at create: an update that
-    // makes a follower unrunnable must fail now, not at its next start.
-    let store_for_argv = decl.resolve_store().unwrap_or_else(|_| PathBuf::from("?"));
-    decl.argv(&cursor_path(&reg, name), &store_for_argv)?;
-
     if decl == before.decl {
         crate::note!("timberfs: {name} already declares that; nothing written");
         return Ok(());
@@ -1657,17 +1789,22 @@ pub fn cmd_update(
     // not. Setting it back to true will not bring dropped data back.
     let releasing = before.decl.retaining && !decl.retaining;
     if releasing {
-        match (&before.standing, &before.cursor) {
-            (Some(st), Some(c)) if st.consumed_chunks > 0 || st.behind_bytes > 0 => {
-                crate::note!(
-                    "timberfs: {name} releases the head at chunk {} — {} in {} chunk(s) it \
-                     alone was holding become droppable",
-                    c.seq.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
-                    crate::rotate::human_bytes(st.behind_bytes),
-                    st.behind_chunks
-                );
-            }
-            _ => crate::note!("timberfs: {name} releases the head (it held no position)"),
+        let held: u64 = before.behind_bytes();
+        let unread = before.covered.iter().filter(|c| !c.read).count();
+        if held > 0 || unread > 0 {
+            crate::note!(
+                "timberfs: {name} releases the head of {} store(s) — {} it alone was holding \
+                 becomes droppable{}",
+                before.covered.len(),
+                crate::rotate::human_bytes(held),
+                if unread > 0 {
+                    format!(", including {unread} it had never read at all")
+                } else {
+                    String::new()
+                }
+            );
+        } else {
+            crate::note!("timberfs: {name} releases the head (it was holding nothing)");
         }
         crate::note!(
             "timberfs: this does not undo: setting retaining=true again will not bring dropped \
@@ -1725,7 +1862,7 @@ pub fn cmd_delete(name: &str, stop: bool, disable: bool) -> anyhow::Result<()> {
     // stopping the unit of a follower we are about to refuse to delete
     // would be exactly the silent release the refusal exists to prevent.
     if let Some(r) = &r {
-        if r.decl.retaining && r.store_path.is_some() {
+        if r.decl.retaining && !r.covered.is_empty() {
             bail!(
                 "{name} is retaining, so deleting it would silently release the store's head. \
                  Release it deliberately first:\n  \
@@ -1774,14 +1911,17 @@ pub fn cmd_delete(name: &str, stop: bool, disable: bool) -> anyhow::Result<()> {
 // run
 // ---------------------------------------------------------------------------
 
-/// `timberfs follower run NAME`: read the declaration, take the lock, and
-/// EXEC the shipper.
+/// `timberfs follower run NAME`: read the declaration, take the lock,
+/// and RUN THE LOOP — reading the selection, feeding the declared
+/// consumer, and moving the positions as far as it says.
 ///
-/// The lock is acquired HERE and inherited across the exec (its
-/// FD_CLOEXEC is cleared), so the shipper needs no lock code of its own
-/// and the registry's liveness is a property of the registry. flock is
-/// per open file description and survives exec, so the lock the new
-/// process image holds is this one.
+/// ⚠ It no longer EXECs. It used to become the shipper, which is why the
+/// lock's FD_CLOEXEC was cleared: the lock had to survive the exec. Now
+/// the consumer is a CHILD, and clearing it would hand that child a lock
+/// on the follower for its whole life — the grandchild-holds-the-lock
+/// hazard `liveness` exists to detect, created deliberately. So the flag
+/// stays as Rust set it, and the lock dies with this process, which is
+/// what it is a statement about.
 ///
 /// ⚠ The lock never gates retention. A follower that is temporarily down
 /// holds no lock and must still pin the head — that is the entire purpose
@@ -1792,9 +1932,7 @@ pub fn cmd_run(name: &str) -> anyhow::Result<()> {
     validate_name(name)?;
     let reg = registry_dir();
     let decl = Declaration::load(&reg, name)?;
-    let store = decl.resolve_store()?;
-    let cursor = cursor_path(&reg, name);
-    let argv = decl.argv(&cursor, &store)?;
+    let selector = decl.selector()?;
 
     let lpath = lock_path(&reg, name);
     let lock = store::lock_path_exclusive(&lpath)
@@ -1811,23 +1949,86 @@ pub fn cmd_run(name: &str) -> anyhow::Result<()> {
         &lock,
         &format!("follower {name} pid={}\n", std::process::id()),
     )?;
-    // Hand the lock to the process we are about to become. Rust opens
-    // every file O_CLOEXEC, so without this the exec would drop it and
-    // every follower would read as stopped while running.
-    if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, 0) } == -1 {
-        return Err(std::io::Error::last_os_error())
-            .context("clearing FD_CLOEXEC on the follower lock");
-    }
 
-    crate::note!("timberfs: follower {name}: exec {}", argv.join(" "));
-    let err = Command::new(&argv[0]).args(&argv[1..]).exec();
-    // exec only returns on failure.
-    Err(err).with_context(|| {
-        format!(
-            "exec {} for follower {name} (is the timberfs package complete?)",
-            argv[0]
-        )
-    })
+    migrate_cursor(&reg, name, &decl)?;
+    crate::note!(
+        "timberfs: {name} following {} with {}",
+        decl.select,
+        decl.command.join(" ")
+    );
+    let held = lock;
+    let result = crate::feed::run(crate::feed::Opts {
+        selector,
+        dirs: Vec::new(),
+        positions: Some(positions_path(&reg, name)),
+        batch_entries: crate::ship::BATCH_ENTRIES,
+        poll: std::time::Duration::from_secs(1),
+        follow: true,
+        argv: decl.command.clone(),
+        hello_wait: crate::feed::HELLO_WAIT,
+    });
+    // Held until the loop is done, so liveness is true for exactly as
+    // long as something is following.
+    drop(held);
+    result
+}
+
+/// A declaration written before positions existed kept a `cursor.json`
+/// for the one store it named. Seed the positions file from it once, so a
+/// follower that has been shipping for months does not start again from
+/// the beginning.
+///
+/// ⚠ The offset is the START of the chunk the cursor stood in, not the
+/// exact entry: a cursor holds `(seq, n)` and an offset is a byte, and
+/// there is no conversion between them that does not read the store. So
+/// up to one chunk is re-delivered — at-least-once, which is what a
+/// chunk-granular position always did across a restart anyway.
+fn migrate_cursor(reg: &Path, name: &str, decl: &Declaration) -> anyhow::Result<()> {
+    let positions = positions_path(reg, name);
+    if positions.exists() {
+        return Ok(());
+    }
+    let Some(anchor) = decl.anchor() else {
+        return Ok(());
+    };
+    let Some(c) = Cursor::load(&cursor_path(reg, name))? else {
+        return Ok(());
+    };
+    if c.delivered == 0 {
+        return Ok(());
+    }
+    let Some(m) = crate::select::resolve(&[], &decl.selector()?)
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    let records = format::read_index(&format::rings_path(&m.dir, &m.name)).unwrap_or_default();
+    let dropped = crate::query::dropped_bytes_of(&m.dir.join(&m.name));
+    let offset = match c.seq.and_then(|seq| records.iter().find(|r| r.seq == seq)) {
+        Some(chunk) => dropped + chunk.uncomp_start,
+        // Its chunk is gone: retention overtook it, so it resumes at
+        // whatever is now oldest, which is what it would have done
+        // before this too.
+        None => dropped + records.first().map(|r| r.uncomp_start).unwrap_or(0),
+    };
+    let mut held = crate::cursor::Positions::new(&c.consumer);
+    held.advance(
+        &anchor,
+        &m.dir.join(&m.name).display().to_string(),
+        offset,
+        c.seq,
+        c.wl,
+        c.delivered,
+    );
+    held.save(&positions)?;
+    crate::note!(
+        "timberfs: {name}: carried its cursor into {} at offset {offset} (chunk {}) — up to \
+         one chunk may be re-delivered, which is what a restart always did",
+        positions.display(),
+        c.seq.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1860,11 +2061,12 @@ mod tests {
         Declaration {
             name: name.to_string(),
             select: "[id=store-id]".into(),
-            path: "/var/log/timberfs/app/app.log".into(),
-            kind: "otlp".into(),
             retaining,
-            endpoint: Some("http://127.0.0.1:4318".into()),
-            args: vec!["--service".into(), "checkout".into()],
+            command: vec![
+                "timber-otlp".into(),
+                "--endpoint".into(),
+                "http://127.0.0.1:4318".into(),
+            ],
             created: "2026-08-21T00:00:00Z".into(),
             extra: Map::new(),
         }
@@ -1912,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declaration_must_name_a_selection_and_a_type() {
+    fn a_declaration_must_name_a_selection_and_a_consumer() {
         let reg = scratch("incomplete");
         let write = |name: &str, body: &str| {
             fs::create_dir_all(follower_dir(&reg, name)).unwrap();
@@ -1927,11 +2129,11 @@ mod tests {
         // nothing downstream has to cope with one.
         write("bad", r#"{"type":"otlp","select":"host~web01"}"#);
         assert!(Declaration::load(&reg, "bad").is_err());
+        // A store and no command: nothing to run, and the message says
+        // what to give it rather than naming a type list.
         write("notype", r#"{"store":"x"}"#);
-        assert!(Declaration::load(&reg, "notype")
-            .unwrap_err()
-            .to_string()
-            .contains("no \"type\""));
+        let err = Declaration::load(&reg, "notype").unwrap_err().to_string();
+        assert!(err.contains("command"), "{err}");
         write("garbage", "not json");
         assert!(Declaration::load(&reg, "garbage").is_err());
         // Missing is an error too: a follower with no declaration is a
@@ -1940,63 +2142,78 @@ mod tests {
         fs::remove_dir_all(&reg).ok();
     }
 
+    /// A `type` and an `endpoint` were shorthand for a command line, so
+    /// a declaration written before commands reads as the command it
+    /// always ran. Anything else is refused rather than guessed at: a
+    /// declaration whose destination this build cannot express must fail
+    /// where it is READ, not at the next start.
     #[test]
-    fn retaining_ships_from_the_beginning() {
-        // The one derived flag that matters: --start defaults to `end` in
-        // the shipper, which for a retaining follower would skip on its
-        // first run exactly the backlog it exists to protect.
-        let cursor = Path::new("/reg/central/cursor.json");
-        let store = Path::new("/var/log/timberfs/app/app.log");
-        let argv = decl("central", true).argv(cursor, store).unwrap();
-        let joined = argv.join(" ");
-        assert!(joined.contains("--start begin"), "{joined}");
-        let argv = decl("tap", false).argv(cursor, store).unwrap();
-        assert!(argv.join(" ").contains("--start end"));
-    }
-
-    #[test]
-    fn the_operators_own_flags_win_over_derived_ones() {
-        // A derived flag passed twice would be silently overridden by
-        // clap taking the first, so a flag the operator spelled means the
-        // derivation stands down — in either spelling.
-        let cursor = Path::new("/reg/c/cursor.json");
-        let store = Path::new("/s/app.log");
-        let mut d = decl("central", true);
-        d.args = vec!["--start".into(), "end".into()];
-        let argv = d.argv(cursor, store).unwrap();
-        assert_eq!(argv.iter().filter(|a| *a == "--start").count(), 1);
-        assert!(argv.join(" ").ends_with("--start end /s/app.log"));
-
-        d.args = vec!["--endpoint=http://elsewhere:4318".into()];
-        let argv = d.argv(cursor, store).unwrap();
+    fn a_typed_declaration_reads_as_the_command_it_ran() {
+        let reg = scratch("typed");
+        fs::create_dir_all(follower_dir(&reg, "old")).unwrap();
+        fs::write(
+            decl_path(&reg, "old"),
+            r#"{"store":"id-a","type":"otlp","endpoint":"http://c:4318",
+                "args":["--service","checkout"],"retaining":true}"#,
+        )
+        .unwrap();
+        let d = Declaration::load(&reg, "old").unwrap();
+        assert_eq!(d.select, "[id=id-a]");
+        assert!(d.command[0].ends_with("timber-otlp"), "{:?}", d.command);
         assert_eq!(
-            argv.iter().filter(|a| a.starts_with("--endpoint")).count(),
-            1
+            &d.command[1..],
+            ["--endpoint", "http://c:4318", "--service", "checkout"]
         );
-    }
 
-    #[test]
-    fn argv_ends_with_the_store_and_carries_the_registry_cursor() {
-        let cursor = Path::new("/reg/central/cursor.json");
-        let store = Path::new("/var/log/timberfs/app/app.log");
-        let argv = decl("central", true).argv(cursor, store).unwrap();
-        assert!(argv[0].ends_with("timber-otlp"), "{:?}", argv[0]);
-        assert_eq!(argv.last().unwrap(), "/var/log/timberfs/app/app.log");
-        assert!(argv.contains(&"--follow".to_string()));
-        let i = argv.iter().position(|a| a == "--cursor").unwrap();
-        assert_eq!(argv[i + 1], "/reg/central/cursor.json");
-    }
+        // frames is not a consumer yet, and saying so beats writing a
+        // command that cannot run.
+        fs::create_dir_all(follower_dir(&reg, "repl")).unwrap();
+        fs::write(
+            decl_path(&reg, "repl"),
+            r#"{"store":"id-b","type":"frames","endpoint":"archive:4319"}"#,
+        )
+        .unwrap();
+        let err = Declaration::load(&reg, "repl").unwrap_err().to_string();
+        assert!(err.contains("frames"), "{err}");
 
-    #[test]
-    fn an_unknown_type_cannot_be_run() {
-        let mut d = decl("central", true);
-        d.kind = "kafka".into();
-        let err = d
-            .argv(Path::new("/c"), Path::new("/s"))
-            .unwrap_err()
-            .to_string();
+        fs::create_dir_all(follower_dir(&reg, "kafka")).unwrap();
+        fs::write(
+            decl_path(&reg, "kafka"),
+            r#"{"store":"id-c","type":"kafka"}"#,
+        )
+        .unwrap();
+        let err = Declaration::load(&reg, "kafka").unwrap_err().to_string();
         assert!(err.contains("kafka"), "{err}");
-        assert!(err.contains("otlp"), "{err}");
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    /// A declaration with neither a command nor a type has nothing to
+    /// run, which is a broken registration and not an empty policy.
+    #[test]
+    fn a_declaration_with_no_command_is_refused() {
+        let reg = scratch("nocmd");
+        fs::create_dir_all(follower_dir(&reg, "empty")).unwrap();
+        fs::write(decl_path(&reg, "empty"), r#"{"select":"[]"}"#).unwrap();
+        let err = Declaration::load(&reg, "empty").unwrap_err().to_string();
+        assert!(err.contains("command"), "{err}");
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    /// The command survives a round trip as an ARGV, not as a string: a
+    /// consumer's argument holding a space must not become two.
+    #[test]
+    fn a_command_round_trips_as_a_list() {
+        let reg = scratch("cmdlist");
+        let mut d = decl("central", false);
+        d.command = vec![
+            "ssh".into(),
+            "archive01".into(),
+            "my-consumer --flag 'a b'".into(),
+        ];
+        d.save(&reg).unwrap();
+        let back = Declaration::load(&reg, "central").unwrap();
+        assert_eq!(back.command, d.command);
+        fs::remove_dir_all(&reg).ok();
     }
 
     #[test]
@@ -2093,44 +2310,78 @@ mod tests {
         fs::remove_dir_all(&reg).ok();
     }
 
-    #[test]
-    fn a_retaining_follower_that_never_ran_outranks_every_backlog() {
-        // It holds the WHOLE store, not a tail of it, and has no measured
-        // backlog at all — so ranking on bytes alone would sort the
-        // worst case last.
-        let reg = scratch("holdsall");
-        let mut fresh = decl("fresh", true);
-        fresh.select = "[id=id]".into();
-        fresh.save(&reg).unwrap();
-        let mut behind = decl("behind", true);
-        behind.select = "[id=id]".into();
-        behind.save(&reg).unwrap();
-        Cursor {
-            seq: Some(3),
-            ..Cursor::new("behind", "id", "/p")
+    /// A `Registered` covering a store it has never read, ranked and
+    /// asked about directly — no filesystem, because the rule is about
+    /// the ranking and not about where the facts came from.
+    fn covering_one(name: &str, retaining: bool, read: bool, behind: u64) -> Registered {
+        let mut d = decl(name, retaining);
+        d.select = "[id=id]".into();
+        Registered {
+            decl: d,
+            places: if read {
+                Places::Held(crate::cursor::Positions::new(name))
+            } else {
+                Places::Never
+            },
+            live: Liveness::Stopped,
+            covered: vec![Covered {
+                id: "id".into(),
+                path: PathBuf::from("/var/log/timberfs/app/app.log"),
+                standing: Some(crate::cursor::Standing {
+                    consumed_chunks: 0,
+                    behind_chunks: 1,
+                    behind_bytes: behind,
+                    behind_ms: 0,
+                    gap_chunks: None,
+                }),
+                read,
+                note: None,
+            }],
         }
-        .save(&cursor_path(&reg, "behind"))
-        .unwrap();
-        let mine = for_store(&reg, &store_fields("id", &[]));
-        assert_eq!(
-            mine.iter().map(|r| r.name()).collect::<Vec<_>>(),
-            ["fresh", "behind"]
-        );
-        assert!(mine[0].holds_everything());
-        assert!(!mine[1].holds_everything());
-        fs::remove_dir_all(&reg).ok();
     }
 
     #[test]
-    fn a_registered_follower_with_no_position_reads_as_never_run() {
+    fn a_retaining_follower_that_never_read_a_store_outranks_every_backlog() {
+        // It holds the WHOLE store, not a tail of it, and has no
+        // measured backlog at all — so ranking on bytes alone would sort
+        // the worst case last.
+        let mut both = vec![
+            covering_one("behind", true, true, 9_000_000),
+            covering_one("fresh", true, false, 0),
+        ];
+        rank(&mut both);
+        assert_eq!(
+            both.iter().map(|r| r.name()).collect::<Vec<_>>(),
+            ["fresh", "behind"]
+        );
+        assert!(both[0].holds_everything());
+        assert!(!both[1].holds_everything());
+
+        // And a follower covering NOTHING holds nothing: there is no
+        // store to hold, whatever the flag says.
+        let mut empty = covering_one("idle", true, false, 0);
+        empty.covered.clear();
+        assert!(!empty.holds_everything());
+        assert_eq!(empty.lag_text(), "matches nothing");
+    }
+
+    /// A selection that matches nothing outranks every other reading:
+    /// "never run" would suggest a store waiting to be read, and there
+    /// is none. Both are legitimate states a registry must be able to
+    /// tell apart.
+    #[test]
+    fn a_selection_that_matches_nothing_says_so_rather_than_never_run() {
         let reg = scratch("neverrun");
         decl("central", true).save(&reg).unwrap();
         let r = read(&reg, "central").unwrap();
-        // The store does not exist here, and that outranks the position:
-        // each of these makes the next meaningless.
-        assert_eq!(r.lag_text(), "store gone");
-        assert_eq!(r.position_text(), "-");
-        assert!(r.cursor.is_none());
+        assert_eq!(r.lag_text(), "matches nothing");
+        assert!(r.covered.is_empty());
+        assert!(
+            matches!(r.places, Places::Never),
+            "no positions file is NEVER RUN, which is not the same as unreadable"
+        );
+        // And nothing is held: there is no store to hold.
+        assert!(!r.holds_everything());
         fs::remove_dir_all(&reg).ok();
     }
 

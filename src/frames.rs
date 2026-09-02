@@ -927,42 +927,40 @@ mod tests {
         assert!(!cur.exists(), "no acknowledgement, no position");
     }
 
+    /// `frames` was a follower TYPE, and is not expressible as a
+    /// consumer command: `frames-send` reads a store rather than a
+    /// stream, and resumes from the RECEIVER's coverage rather than from
+    /// a position timberfs holds. So a declaration naming it is refused
+    /// where it is read, by name, instead of being migrated into a
+    /// command line that cannot run.
+    ///
+    /// ⚠ Its way in is the consumer protocol's own hello, which may
+    /// carry the coverage a destination already holds — see
+    /// docs/plans/consumer-protocol.md. Until then this refusal is the
+    /// honest answer.
     #[test]
-    fn a_follower_of_type_frames_runs_frames_send() {
-        // What the systemd unit executes. No `--start`: a frames sender
-        // resumes from the receiver's coverage, so there is no local
-        // decision about where to begin -- and no way to re-ship a store
-        // by getting it wrong.
-        let decl = crate::follower::Declaration {
-            name: "ship".to_string(),
-            select: "[id=an-id]".to_string(),
-            path: "/var/log/timberfs/app/app.log".to_string(),
-            kind: "frames".to_string(),
-            endpoint: Some("archive:4319".to_string()),
-            retaining: true,
-            args: vec![],
-            created: String::new(),
-            extra: serde_json::Map::new(),
-        };
-        let argv = decl
-            .argv(
-                Path::new("/reg/ship/cursor.json"),
-                Path::new("/var/log/timberfs/app/app.log"),
-            )
-            .unwrap();
-        assert!(argv[0].ends_with("timberfs"), "{argv:?}");
-        assert_eq!(argv[1], "frames-send");
-        assert!(argv.contains(&"--follow".to_string()), "{argv:?}");
-        assert!(argv.contains(&"--cursor".to_string()), "{argv:?}");
+    fn a_frames_declaration_is_refused_rather_than_migrated() {
+        let reg = std::env::temp_dir().join(format!(
+            "timberfs-framesdecl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let dir = crate::follower::follower_dir(&reg, "ship");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            crate::follower::decl_path(&reg, "ship"),
+            br#"{"store":"an-id","type":"frames","endpoint":"archive:4319"}"#,
+        )
+        .unwrap();
+        let err = crate::follower::Declaration::load(&reg, "ship")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("frames"), "{err}");
         assert!(
-            argv.contains(&"archive:4319".to_string()),
-            "the endpoint is passed through: {argv:?}"
+            err.contains("coverage"),
+            "it should say WHY, not just refuse: {err}"
         );
-        assert!(
-            !argv.contains(&"--start".to_string()),
-            "a frames sender has no start to choose: {argv:?}"
-        );
-        assert_eq!(argv.last().unwrap(), "/var/log/timberfs/app/app.log");
+        let _ = std::fs::remove_dir_all(&reg);
     }
 
     #[test]

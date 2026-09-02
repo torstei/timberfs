@@ -2561,12 +2561,24 @@ impl StoreSummary {
     /// measured for it. Legacy cursors can never be in that state (a
     /// cursor found in a directory declares no interest at all), so they
     /// compare on bytes alone.
-    pub fn worst_lag(&self) -> Option<String> {
+    pub fn worst_lag<'a>(&'a self) -> Option<String> {
+        // This store's place in each follower, not the follower's worst
+        // across its whole selection — that would name another store's
+        // backlog on this store's page.
+        let here = |r: &'a crate::follower::Registered| -> Option<&'a crate::follower::Covered> {
+            self.id.as_deref().and_then(|id| r.at(id))
+        };
         let followers = self.followers.iter().map(|r| {
+            let c = here(r);
             (
-                r.holds_everything(),
-                r.standing.map_or(0, |s| s.behind_bytes),
-                r.lag_text(),
+                self.retain_unconsumed && r.decl.retaining && c.is_some_and(|c| !c.read),
+                c.map_or(0, |c| c.behind_bytes()),
+                c.map(|c| match (&c.standing, c.read) {
+                    (_, false) => "never read".to_string(),
+                    (Some(st), true) => st.lag_text(),
+                    (None, true) => "store unreadable".to_string(),
+                })
+                .unwrap_or_else(|| "not covered".to_string()),
             )
         });
         let legacy = self
@@ -2806,6 +2818,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     // and nothing holds a position in a snapshot.
     let mut consumers: Option<crate::cursor::Survey> = None;
     let mut followers: Vec<crate::follower::Registered> = Vec::new();
+    let mut store_id: Option<String> = None;
     // Pair-only, and deliberately: `export` numbers a bundle's chunks from
     // 0 because it selects a window out of the MIDDLE, so a bundle's
     // numbering carries no history and reporting one would be a lie.
@@ -2931,6 +2944,9 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         );
         consumers = s.consumers;
         followers = s.followers;
+        // This store's identity, so a follower's line on this page is
+        // about this store and not its worst one elsewhere.
+        store_id = s.id.clone();
         (
             s.chunks,
             s.logical_bytes,
@@ -3072,7 +3088,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             );
         }
         if !bundled {
-            print_followers(&followers, compressed);
+            print_followers(store_id.as_deref(), &followers, compressed);
         }
         print_numbering(numbering);
         if let Some(sv) = &consumers {
@@ -3166,21 +3182,31 @@ fn print_numbering(numbering: Option<Numbering>) {
 /// leads with them: they are the reason a store is large, and until
 /// PR-next's `retain_unconsumed` lands they are also the reason it is
 /// NOT, which is worth being honest about in one place.
-fn print_followers(followers: &[crate::follower::Registered], compressed: u64) {
+fn print_followers(id: Option<&str>, followers: &[crate::follower::Registered], compressed: u64) {
     if followers.is_empty() {
         return;
+    }
+    // This store's place in each follower — see `worst_lag`.
+    fn here<'a>(
+        id: Option<&str>,
+        r: &'a crate::follower::Registered,
+    ) -> Option<&'a crate::follower::Covered> {
+        id.and_then(|id| r.at(id))
     }
     let retaining: Vec<&crate::follower::Registered> =
         followers.iter().filter(|r| r.decl.retaining).collect();
     // What no retention honouring these followers could drop: the
-    // furthest-behind retaining one's backlog — or the whole store, when
-    // one of them has never run, since it holds everything.
-    let held = if retaining.iter().any(|r| r.holds_everything()) {
+    // furthest-behind retaining one's backlog HERE — or the whole store,
+    // when one of them has never read it, since it then holds all of it.
+    let held = if retaining
+        .iter()
+        .any(|r| here(id, r).is_some_and(|c| !c.read))
+    {
         compressed
     } else {
         retaining
             .iter()
-            .map(|r| r.standing.map_or(0, |s| s.behind_bytes))
+            .map(|r| here(id, r).map_or(0, |c| c.behind_bytes()))
             .max()
             .unwrap_or(0)
     };
@@ -3205,8 +3231,16 @@ fn print_followers(followers: &[crate::follower::Registered], compressed: u64) {
         .unwrap_or(0)
         .max(8);
     for r in followers {
-        let mut detail = r.lag_text();
-        if let Some(st) = &r.standing {
+        let c = here(id, r);
+        let mut detail = match c {
+            None => "not covered".to_string(),
+            Some(c) if !c.read => "never read".to_string(),
+            Some(c) => match &c.standing {
+                Some(st) => st.lag_text(),
+                None => "store unreadable".to_string(),
+            },
+        };
+        if let Some(st) = c.and_then(|c| c.standing.as_ref()) {
             if st.gap_chunks.is_none() && st.behind_chunks > 0 && !st.at_live_edge() {
                 detail = format!(
                     "{detail}, {} unread in {} chunk(s)",
@@ -3220,9 +3254,12 @@ fn print_followers(followers: &[crate::follower::Registered], compressed: u64) {
             r.name(),
             if r.decl.retaining { "retaining, " } else { "" },
             detail,
-            match &r.cursor {
-                Some(c) if c.delivered > 0 => format!("; {} delivered", c.delivered),
-                _ => String::new(),
+            // How many stores it covers, when it covers more than this
+            // one: a follower's name on this page is not the whole of it.
+            if r.covered.len() > 1 {
+                format!("; 1 of {} stores", r.covered.len())
+            } else {
+                String::new()
             },
             r.live.word(),
             width = width
@@ -3776,7 +3813,7 @@ fn store_id_of(h: &SourceHandle) -> Option<Vec<u8>> {
 /// Harmless: the understatement is a constant, every later drop is
 /// counted, and a position only ever has to be comparable with others
 /// from the same store.
-fn dropped_bytes_of(input: &Path) -> u64 {
+pub fn dropped_bytes_of(input: &Path) -> u64 {
     let Ok((dir, name)) = resolve_backing(input) else {
         return 0;
     };

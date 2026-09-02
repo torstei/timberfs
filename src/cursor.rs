@@ -722,6 +722,26 @@ impl Standing {
 /// Windows are mostly-sorted, so both extremes are found by scanning
 /// (48 B per chunk) — the same choice `summarize_store` makes.
 pub fn standing(c: &Cursor, records: &[ChunkRecord]) -> Standing {
+    standing_at(c.seq, c.wl, records)
+}
+
+/// The same, from a position that is not a `Cursor`: a `Positions` entry
+/// holds the chunk and the write time without the rest of a cursor's
+/// shape, and a view must not have to fabricate one to be rendered.
+pub fn standing_at(seq: Option<u64>, wl: u64, records: &[ChunkRecord]) -> Standing {
+    let c = Cursor {
+        consumer: String::new(),
+        store: String::new(),
+        path: String::new(),
+        seq,
+        n: 0,
+        wl,
+        delivered: 0,
+    };
+    standing_inner(&c, records)
+}
+
+fn standing_inner(c: &Cursor, records: &[ChunkRecord]) -> Standing {
     let consumed_chunks = consumed_prefix(records, c.seq);
     let behind_bytes = match (records.get(consumed_chunks), records.last()) {
         (Some(next), Some(last)) => last.comp_end().saturating_sub(next.comp_start),

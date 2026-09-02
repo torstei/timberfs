@@ -930,27 +930,27 @@ enum ForestCommand {
 
 #[derive(Subcommand)]
 enum FollowerCommand {
-    /// Register a follower of a store. The name is host-unique and is
-    /// also the systemd instance (`timberfs-follower@<name>`), so it is
-    /// what gets typed into `systemctl status` — refused if taken, so a
-    /// collision is a registration error rather than two processes
-    /// overwriting one position
+    /// Register a follower: a selection, a consumer to feed it to, and
+    /// whether its positions hold retention back. The name is
+    /// host-unique and is also the systemd instance
+    /// (`timberfs-follower@<name>`), so it is what gets typed into
+    /// `systemctl status` — refused if taken, so a collision is a
+    /// registration error rather than two processes overwriting one
+    /// position
     Create {
         /// The follower's name: [A-Za-z0-9_.-], host-unique
         name: String,
-        /// The store to follow: a path, or a forest handle. Recorded by
-        /// IDENTITY (its .bark id, minted here if it has none), not by
-        /// path — a store can move
+        /// WHICH stores to follow: the predicate `list --select` takes.
+        /// `[]` is every store, which is a thing to have written rather
+        /// than a flag to leave out. Re-resolved on every poll, so a
+        /// store that appears later is picked up with no change here
+        #[arg(long, value_name = "EXPR", conflicts_with = "store")]
+        select: Option<String>,
+        /// One store instead of a predicate: a path or a forest handle,
+        /// recorded by IDENTITY (its .bark id, minted here if it has
+        /// none) as the one-term selection `[id=...]` — a store can move
         #[arg(long, value_name = "STORE")]
-        store: PathBuf,
-        /// What runs it: `otlp` execs timber-otlp (entries, over OTLP);
-        /// `frames` execs `timberfs frames-send` (chunks verbatim, over the
-        /// native wire, to a `frames-intake`)
-        #[arg(long = "type", value_name = "TYPE", default_value = "otlp")]
-        kind: String,
-        /// Where it ships to (the shipper's --endpoint)
-        #[arg(long, value_name = "URL")]
-        endpoint: Option<String>,
+        store: Option<PathBuf>,
         /// Declare that this follower's position holds the store's head
         /// back: retention keeps what it has not read ON TOP OF what age
         /// and size keep, never as a cap on them — `retain_size` still
@@ -971,12 +971,15 @@ enum FollowerCommand {
         /// registering nothing
         #[arg(long)]
         dry_run: bool,
-        /// Everything after `--` is passed to the shipper verbatim, in
-        /// its own spelling: `-- --service checkout --compress gzip`.
-        /// Deliberately not re-declared here — a second spelling of the
-        /// same flags is a second thing to keep in step
-        #[arg(last = true, value_name = "ARGS")]
-        args: Vec<String>,
+        /// The CONSUMER and its arguments, after `--`: the program fed
+        /// the records, which reports how far to move the positions.
+        /// `-- timber-otlp --endpoint http://collector:4318`, or
+        /// `-- ssh archive01 my-consumer` for a destination on another
+        /// machine. A list, so nothing makes a quoting round trip; and
+        /// recorded verbatim, since what is not ours to interpret is
+        /// passed on unread
+        #[arg(last = true, value_name = "CONSUMER")]
+        command: Vec<String>,
     },
     /// Every registered follower: name, store, type, whether it retains,
     /// its position, how far behind it is, and whether it is running
@@ -1007,8 +1010,8 @@ enum FollowerCommand {
     /// own command
     Update {
         name: String,
-        /// KEY=VALUE: retaining=true|false, endpoint=URL, type=TYPE,
-        /// store=PATH
+        /// KEY=VALUE: retaining=true|false, select=EXPR, store=PATH.
+        /// The consumer is replaced wholesale with what follows `--`
         #[arg(value_name = "KEY=VALUE")]
         sets: Vec<String>,
         /// Remove a key (repeatable): --unset endpoint
@@ -1017,9 +1020,8 @@ enum FollowerCommand {
         /// Preview the new declaration without writing it
         #[arg(long)]
         dry_run: bool,
-        /// Replace the shipper's arguments wholesale with what follows
-        /// `--`
-        #[arg(last = true, value_name = "ARGS")]
+        /// Replace the CONSUMER wholesale with what follows `--`
+        #[arg(last = true, value_name = "CONSUMER")]
         args: Vec<String>,
     },
     /// Unregister a follower. Refused while it is `retaining` (release
@@ -1035,10 +1037,11 @@ enum FollowerCommand {
         #[arg(long)]
         disable: bool,
     },
-    /// Read a follower's declaration and EXEC its shipper — what the
-    /// systemd template runs. A dispatcher, not a supervisor: the
-    /// process is replaced, so systemd keeps the lifecycle, the restarts
-    /// and the journal
+    /// Read a follower's declaration and RUN it — what the systemd
+    /// template runs: the selection is read, its consumer is fed, and
+    /// each store's position moves as far as that consumer says it got.
+    /// The consumer is a child, so systemd keeps the lifecycle, the
+    /// restarts and the journal
     Run { name: String },
 }
 
@@ -1459,25 +1462,23 @@ fn main() -> anyhow::Result<()> {
         Command::Follower { command } => match command {
             FollowerCommand::Create {
                 name,
+                select,
                 store,
-                kind,
-                endpoint,
                 retaining,
                 enable,
                 start,
                 dry_run,
-                args,
+                command,
             } => follower::cmd_create(
                 &name,
                 follower::CreateOpts {
+                    select,
                     store,
-                    kind,
-                    endpoint,
                     retaining,
                     enable,
                     start,
                     dry_run,
-                    args,
+                    command,
                 },
             )?,
             FollowerCommand::List { store, names, json } => {
