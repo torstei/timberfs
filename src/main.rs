@@ -444,10 +444,12 @@ enum Command {
         /// flag to leave out
         #[arg(long, value_name = "EXPR")]
         select: String,
-        /// Where each matched store's position is kept, so a restart
-        /// resumes rather than re-sends. Omitted, they live only as long
-        /// as this process — a temporary watch
-        #[arg(long, value_name = "PATH")]
+        /// ONE FILE holding every matched store's place, keyed by store
+        /// identity, so a restart resumes rather than re-sends. Written
+        /// whole on every advance, so a batch spanning several stores
+        /// moves all of them or none. Omitted, the places live only as
+        /// long as this process — a temporary watch
+        #[arg(long, value_name = "FILE")]
         positions: Option<PathBuf>,
         /// Keep going as entries arrive. Without it the selection is
         /// drained once and this exits — a durable one-shot, durable

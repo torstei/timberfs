@@ -1134,10 +1134,40 @@ takes.
 is every store, which is a thing to have written rather than a flag to
 leave out.
 .TP
-.BI \-\-positions " PATH"
-Where each matched store's position is kept, so a restart resumes rather
-than re-sends. Omitted, they live only as long as this process \(em a
-temporary watch.
+.BI \-\-positions " FILE"
+ONE FILE \(em not a directory \(em holding every matched store's place,
+keyed by store identity. Written whole on every advance, so a batch
+spanning several stores moves all of them or none; omitted, the places
+live only as long as this process, which is a temporary watch. It is
+plain JSON, and readable on purpose:
+.RS
+.PP
+.EX
+{
+  "consumer": "my\-consumer",       # the program that was being fed
+  "updated": "2026\-09\-02T11:24:21.979Z",
+  "note": { ... },                 # its last word about ITSELF
+  "stores": {
+    "7e74be8a\-\&...": {
+      "offset": 33724753900,       # resume just here, on the store's tape
+      "chunk": 412,                # the retention floor: below this is consumed
+      "path": "/var/log/timberfs/web01/web01.log",
+      "wl": 1788348169616,         # when the newest entry taken arrived
+      "delivered": 84213,
+      "note": { ... }              # its last word about THIS store
+    }
+  }
+}
+.EE
+.PP
+.B offset
+is the position and
+.B chunk
+is what retention reads; the rest is for a person. Rewinding by editing
+.B offset
+is the supported edit, and a store dropped from the file is read from the
+beginning again.
+.RE
 .TP
 .BR \-f ", " \-\-follow
 Keep going as entries arrive. Without it the selection is drained once

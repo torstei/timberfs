@@ -31,7 +31,7 @@ So there is no store `--store` can name that `--select` cannot.
 
     /var/lib/timberfs/followers/<name>/
         follower.json    select, type, endpoint, retaining, args
-        positions.json   { "<store-id>": {offset, chunk, wl, delivered}, … }
+        positions.json   { "<store-id>": {offset, chunk, wl, delivered, note?}, … }
                          (`select` is stored canonically: `[]`, `[id=…]`, `[k=v,…]`)
         follower.lock    held while it runs
 

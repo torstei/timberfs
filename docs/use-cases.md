@@ -325,7 +325,7 @@ times and drifting fifty ways. `timberfs feed` takes a **predicate** instead:
 
 ```sh
 timberfs feed --follow --select '[]' \
-    --positions /var/lib/timberfs/collector.positions \
+    --positions /var/lib/timberfs/collector.positions.json \
     -- my-consumer
 ```
 

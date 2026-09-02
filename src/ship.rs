@@ -223,16 +223,18 @@ impl Shipper {
     }
 
     /// Move one store's position, as a consumer's watermark says to.
+    #[allow(clippy::too_many_arguments)]
     pub fn acknowledge(
         &mut self,
         id: &str,
         path: &str,
         offset: u64,
         chunk: Option<u64>,
+        wl: u64,
         delivered: u64,
     ) {
         self.positions
-            .advance(id, path, offset, chunk, 0, delivered);
+            .advance(id, path, offset, chunk, wl, delivered);
     }
 
     /// Record a consumer's note, and say whether anything changed — so a

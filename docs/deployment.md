@@ -999,7 +999,7 @@ and free to drift. `timberfs feed` is pointed at a predicate instead:
 
 ```sh
 timberfs feed --follow --select '[service=~apache-.*]' \
-    --positions /var/lib/timberfs/collector.positions \
+    --positions /var/lib/timberfs/collector.positions.json \
     -- my-consumer
 ```
 

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -56,8 +56,16 @@ pub struct Opts {
     pub hello_wait: Duration,
 }
 
-/// What the name in a position file says wrote it.
-const CONSUMER: &str = "feed";
+/// What a position file says wrote it: the consumer's own program, so an
+/// operator reading one learns what was feeding it. The verb's name
+/// would be the same string for every feed on the host, which answers
+/// nothing.
+fn consumer_name(argv0: &str) -> String {
+    Path::new(argv0)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| argv0.to_string())
+}
 
 /// How the loop waits, which is all `feed` needs of `Opts`.
 struct Pacing {
@@ -72,11 +80,20 @@ struct Tracked {
     /// consumer's copy dies with the stream, so persisting ours could
     /// only make the two disagree.
     announced: Option<Map<String, Value>>,
-    /// Entries forwarded and not yet acknowledged, as (end offset, the
-    /// chunk it came from). A watermark names bytes; the retention floor
-    /// wants the chunk containing them, and this is where the answer was
-    /// seen. Bounded by the batch size.
-    pending: Vec<(u64, Option<u64>)>,
+    /// Entries forwarded and not yet acknowledged. A watermark names
+    /// bytes; what the position file records beside it — the chunk for
+    /// the retention floor, the write time for a person reading it —
+    /// was stated by the answer when those bytes went out, and this is
+    /// where it is kept until the consumer says it took them. Bounded by
+    /// the batch size.
+    pending: Vec<Pending>,
+}
+
+struct Pending {
+    /// Just past this entry, which is what a watermark for it looks like.
+    end: u64,
+    chunk: Option<u64>,
+    wl: u64,
 }
 
 pub fn run(opts: Opts) -> anyhow::Result<()> {
@@ -111,7 +128,7 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
     let mut sink = child.stdin.take().expect("piped stdin");
     let reports = spawn_reports(&mut child);
 
-    let mut shipper = Shipper::open(CONSUMER, selector, dirs, positions.as_deref())?
+    let mut shipper = Shipper::open(&consumer_name(argv0), selector, dirs, positions.as_deref())?
         .with_batch_entries(batch_entries);
 
     // Nothing is read from a store until the consumer has said it
@@ -374,7 +391,11 @@ fn splice(
                     bail!("an entry record states no offset and length to acknowledge");
                 };
                 if let Some(t) = tracked.get_mut(id) {
-                    t.pending.push((offset + len, frame.number("chunk")));
+                    t.pending.push(Pending {
+                        end: offset + len,
+                        chunk: frame.number("chunk"),
+                        wl: frame.number("wl").unwrap_or(0),
+                    });
                 }
                 last_delivering = Some(id.to_string());
                 sink.write_all(frame.bytes)?;
@@ -426,10 +447,12 @@ fn drain(
                 // The chunk containing the last acknowledged byte, from
                 // what the answer said when those entries went out.
                 let mut chunk = None;
+                let mut wl = 0u64;
                 let mut delivered = 0u64;
-                t.pending.retain(|(end, c)| {
-                    if *end <= offset {
-                        chunk = (*c).max(chunk);
+                t.pending.retain(|p| {
+                    if p.end <= offset {
+                        chunk = p.chunk.max(chunk);
+                        wl = wl.max(p.wl);
                         delivered += 1;
                         false
                     } else {
@@ -437,7 +460,7 @@ fn drain(
                     }
                 });
                 let path = t.path.clone();
-                shipper.acknowledge(&id, &path, offset, chunk, delivered);
+                shipper.acknowledge(&id, &path, offset, chunk, wl, delivered);
                 moved = true;
             }
             Ok(Ok(Report::Note { id, offset, text })) => {
@@ -584,6 +607,30 @@ done"#,
         // Nothing twice.
         run(opts(&root, Some(&pos), shell_consumer(&root, &out, true))).unwrap();
         assert_eq!(lines(&out).len(), 5, "a second run re-sent entries");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A position file is read by a person as well as by timberfs, so
+    /// every field in it has to mean something. Two did not: `consumer`
+    /// held the verb's name, identical for every feed on the host, and
+    /// `wl` was always zero because this path never carried the write
+    /// time an entry record states.
+    #[test]
+    fn a_position_file_says_what_wrote_it_and_when_it_got_there() {
+        let _forking = crate::store::fork_guard();
+        let root = forest("fields", &[("web01", 2)]);
+        let out = root.join("got.txt");
+        let pos = root.join("positions.json");
+        run(opts(&root, Some(&pos), shell_consumer(&root, &out, true))).unwrap();
+
+        let held = crate::cursor::Positions::load(&pos).unwrap().unwrap();
+        assert_eq!(
+            held.consumer, "bash",
+            "the consumer's program, not the verb's name"
+        );
+        let at = held.at.values().next().expect("one store");
+        assert!(at.wl > 0, "the write time an entry stated was thrown away");
+        assert!(at.delivered > 0 && at.offset > 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

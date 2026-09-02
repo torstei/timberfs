@@ -453,10 +453,14 @@ timberfs trim app
 
 ```sh
 # every apache store on the host, to a program that speaks the consumer protocol
-timberfs feed --follow --select '[service=~apache-.*]'     --positions /var/lib/timberfs/collector.positions     -- my-consumer
+timberfs feed --follow --select '[service=~apache-.*]' \
+    --positions /var/lib/timberfs/collector.positions.json \
+    -- my-consumer
 
 # a destination on another machine: the contract is two file descriptors
-timberfs feed --follow --select '[]' --positions /var/lib/timberfs/all.positions     -- ssh archive01 my-consumer
+timberfs feed --follow --select '[]' \
+    --positions /var/lib/timberfs/all.positions.json \
+    -- ssh archive01 my-consumer
 ```
 
 One process whatever the store count, and a store created tomorrow is picked up
