@@ -282,6 +282,35 @@ stops moving, so a `retaining` follower holds everything from there — which
 is the promise, with `retain_size` as the backstop — and its data waits until
 the trouble is fixed, at which point it resumes from exactly where it stopped.
 
+## The command is recorded, not inspected
+
+A follower declares a COMMAND, and `create` does not check it. Not as a
+convenience — the check would be worse than its absence:
+
+  * it cannot be enforced later. The binary can be deleted, replaced or
+    have its exec bit removed after registration, so a create-time check
+    covers one case and reassures about every other;
+  * every way of getting it wrong already fails loudly at start. A missing
+    binary is a spawn error, `/bin/false` is «the consumer exited exit
+    status: 1», and a program that says no hello is refused by name;
+  * it would make `create` a command with SIDE EFFECTS — it would run a
+    program the operator named — and `--dry-run` would then have to
+    either skip it, and be unfaithful, or perform it, and be a dry run
+    that executes something;
+  * and it buys nothing the documented incantation does not: `--enable
+    --start` reveals a broken command at once.
+
+⚠ Including the retention consequence, which is an ACCEPTABLE failure and
+not an argument for checking: a `retaining` follower whose command is
+broken never runs, and one that has never run holds everything. That is
+the state the flag exists to express — it protects a follower deployed
+before it first runs — and `list` reports it, `holds_everything` being a
+first-class question for exactly this reason.
+
+So the command is recorded verbatim, the same rule the registry already
+applies to a shipper's flags and `visena-timberfs` to a query document:
+what is not ours to interpret is passed on unread.
+
 ## Lifecycle
 
 The consumer is a child of the follower. If the consumer dies the follower exits
