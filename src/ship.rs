@@ -33,6 +33,11 @@ pub type Store = (String, PathBuf, Map<String, Value>);
 ///
 /// It decides one thing and only for a store with no recorded position:
 /// once there is one, that is where reading resumes and this has no say.
+/// How far apart two `created` stamps may be and still be one moment.
+/// A manifest and a declaration are both written to whole seconds, so
+/// that is the resolution of the question, not a tuning knob.
+const SLACK: chrono::TimeDelta = chrono::TimeDelta::seconds(1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FollowFrom {
     /// The oldest byte the store still holds: everything it has.
@@ -350,11 +355,20 @@ impl Shipper {
                 // as OLDER: it predates the field, or nothing can be
                 // said, and not shipping a history nobody asked for is
                 // the conservative answer.
+                //
+                // ⚠ Within SLACK the store counts as younger, because
+                // neither side's resolution can settle it: a manifest
+                // and a declaration both write whole seconds, so a
+                // follower declared and started in one breath shares a
+                // stamp with every store created in that second — and
+                // `>` alone then skipped each of them silently. Erring
+                // the other way costs nothing: a store born that close
+                // to this follower has a history a second long.
                 match (
                     instant(m.created.as_deref()),
                     instant(self.interest_since()),
                 ) {
-                    (Some(born), Some(mine)) if born > mine => FollowFrom::Begin,
+                    (Some(born), Some(mine)) if born + SLACK >= mine => FollowFrom::Begin,
                     _ => FollowFrom::End,
                 }
             }
@@ -753,9 +767,12 @@ mod tests {
         assert_eq!(at_begin.poll().unwrap().entries(), 4);
 
         // `discovery` on a store that predates this follower behaves as
-        // `end`: the store was built before the positions were.
-        let mut found =
-            shipper(&root, "service=apache", 100).with_follow_from(FollowFrom::Discovery);
+        // `end`. ⚠ The gap has to be a real one: a store created in the
+        // same second as the follower counts as younger (see SLACK), and
+        // this store's manifest was written a moment ago.
+        let mut found = shipper(&root, "service=apache", 100)
+            .with_follow_from(FollowFrom::Discovery)
+            .since_declared("2038-01-01T00:00:00Z");
         assert!(
             found.poll().unwrap().is_empty(),
             "a store older than the follower shipped its history"
@@ -819,6 +836,31 @@ mod tests {
         let (born, mine) = (instant(Some(&store)), instant(Some(&follower)));
         assert!(born.is_some() && mine.is_some());
         assert!(born < mine, "parsed, the store is the older of the two");
+        // ⚠ And yet it is picked up from its BEGINNING, because a second
+        // is the resolution of the question: both stamps say the same
+        // second, so which came first is not knowable, and a silent skip
+        // is the wrong way to be wrong. A store born this close to the
+        // follower has a second of history at most.
+        assert!(born.unwrap() + SLACK >= mine.unwrap());
+    }
+
+    /// The slack is ONE second, not an era: a store from yesterday still
+    /// ships no history under `discovery`, which is the whole point of
+    /// the default.
+    #[test]
+    fn the_slack_does_not_swallow_a_real_age_difference() {
+        let root = forest("slack", &[("old", "apache", 3)]);
+        let mut s = shipper(&root, "service=apache", 100)
+            .with_follow_from(FollowFrom::Discovery)
+            .since_declared("2030-01-01T00:00:00Z");
+        // The store's manifest was written now, which is decades before
+        // that: no history.
+        assert!(s.poll().unwrap().is_empty());
+        // And two seconds is already outside it.
+        let born = instant(Some("2026-09-02T15:13:24Z")).unwrap();
+        let mine = instant(Some("2026-09-02T15:13:26Z")).unwrap();
+        assert!(born + SLACK < mine);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A selector that matched nothing must be distinguishable from a
