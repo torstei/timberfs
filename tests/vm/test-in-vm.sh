@@ -3406,11 +3406,11 @@ otlp_roundtrip_over_json_and_gzip() {
     diff -u /tmp/rtj.a /tmp/rtj.b
 }
 
-# P6: the follower registry. A follower is a REGISTERED reader of a store --
-# a name, a type, a `retaining` flag and a durable position -- and
-# timberfs-follower@.service runs it by name, `timberfs follower run %i`
-# reading the declaration and EXEC'ing the shipper. These tests use the OTLP
-# intake above as the receiver, so a real store really is shipped.
+# P6: the follower registry. A follower is a REGISTERED reader of a SELECTION
+# of stores -- a name, the predicate, a consumer to feed them to, a
+# `retaining` flag and a position per store -- and timberfs-follower@.service
+# runs it by name. These tests use the OTLP intake above as the receiver, so a
+# real store really is shipped, through the real timber-otlp consumer.
 FOLLOWER_REG=/var/lib/timberfs/followers
 FOLLOWER_SRC="$PIPE_BACKING/vmsrc.log"
 
@@ -3420,42 +3420,49 @@ follower_registry_declares_and_refuses() {
     printf '2026-08-01T10:00:01Z INFO followed one\n2026-08-01T10:00:02Z INFO followed two\n' \
         | timberfs append --into "$FOLLOWER_SRC" --quiet --flush-age 1 || return 1
 
-    timberfs follower create vmfollow --store "$FOLLOWER_SRC" --type otlp \
-        --endpoint http://127.0.0.1:4318 --retaining \
-        -- --service vmfollowed > /tmp/f.create 2>&1 || { cat /tmp/f.create; return 1; }
+    timberfs follower create vmfollow --store "$FOLLOWER_SRC" --retaining \
+        -- timber-otlp --endpoint http://127.0.0.1:4318 --service vmfollowed \
+        > /tmp/f.create 2>&1 || { cat /tmp/f.create; return 1; }
 
-    # The store is recorded by IDENTITY, minted by create when it had none --
-    # a path would not do, a store being movable.
+    # One store is the one-term SELECTION `[id=...]`, recorded by identity
+    # and minted by create when the store had none -- a path would not do, a
+    # store being movable. The consumer is recorded VERBATIM, as a list, so
+    # nothing makes a quoting round trip.
     local sid
     sid=$(jq -r .id "$FOLLOWER_SRC.bark")
     [ -n "$sid" ] && [ "$sid" != null ] || return 1
-    jq -e --arg id "$sid" '.store == $id and .type == "otlp" and .retaining == true
-                           and .args == ["--service", "vmfollowed"]' \
+    jq -e --arg id "$sid" '.select == "[id=" + $id + "]" and .retaining == true
+                           and .command == ["timber-otlp", "--endpoint",
+                                            "http://127.0.0.1:4318",
+                                            "--service", "vmfollowed"]' \
         "$FOLLOWER_REG/vmfollow/follower.json" >/dev/null \
         || { cat "$FOLLOWER_REG/vmfollow/follower.json"; return 1; }
     # The footgun is stated where it is created, not discovered later.
-    grep -q 'holds the whole store until it first runs' /tmp/f.create \
+    grep -q 'holds each covered store whole until it first reads it' /tmp/f.create \
         || { cat /tmp/f.create; return 1; }
 
     # A taken name is a REGISTRATION error -- never two processes overwriting
     # one position, which is the whole reason the registry exists.
-    timberfs follower create vmfollow --store "$FOLLOWER_SRC" > /tmp/f.dup 2>&1 && return 1
+    timberfs follower create vmfollow --store "$FOLLOWER_SRC" -- true > /tmp/f.dup 2>&1 && return 1
     grep -q 'already exists' /tmp/f.dup || { cat /tmp/f.dup; return 1; }
     # A name that would need systemd-escape is refused, not escaped: the name
     # in `systemctl status` must be the name that was typed.
-    timberfs follower create 'vm@follow' --store "$FOLLOWER_SRC" > /tmp/f.bad 2>&1 && return 1
+    timberfs follower create 'vm@follow' --store "$FOLLOWER_SRC" -- true > /tmp/f.bad 2>&1 && return 1
     grep -q 'systemd-escape' /tmp/f.bad || { cat /tmp/f.bad; return 1; }
-    # An unrunnable type fails at registration, not at the first start.
-    timberfs follower create vmkafka --store "$FOLLOWER_SRC" --type kafka > /tmp/f.type 2>&1 && return 1
-    grep -q 'unknown follower type' /tmp/f.type || { cat /tmp/f.type; return 1; }
-    [ ! -d "$FOLLOWER_REG/vmkafka" ] || return 1
+    # A consumer is REQUIRED: a follower with nothing to feed would advance
+    # its positions on write-out, which is the one thing it must not do.
+    timberfs follower create vmnone --store "$FOLLOWER_SRC" > /tmp/f.none 2>&1 && return 1
+    [ ! -d "$FOLLOWER_REG/vmnone" ] || return 1
 
     # status says what retaining currently DOES, rather than letting a
     # declared interest read as an enforced one.
     timberfs follower status vmfollow > /tmp/f.status 2>&1 || return 1
-    grep -q 'no writer honours it yet' /tmp/f.status || { cat /tmp/f.status; return 1; }
-    grep -q 'never delivered' /tmp/f.status || { cat /tmp/f.status; return 1; }
+    grep -q 'nothing honours it yet' /tmp/f.status || { cat /tmp/f.status; return 1; }
+    grep -q 'never read' /tmp/f.status || { cat /tmp/f.status; return 1; }
     grep -q 'running   no' /tmp/f.status || { cat /tmp/f.status; return 1; }
+    # And the consumer it would run, so an operator reads it here rather than
+    # in the unit file.
+    grep -q 'command   timber-otlp' /tmp/f.status || { cat /tmp/f.status; return 1; }
 
     # And it refuses to be deleted while retaining, naming the two-step.
     timberfs follower delete vmfollow > /tmp/f.del 2>&1 && return 1
@@ -3463,18 +3470,16 @@ follower_registry_declares_and_refuses() {
     [ -d "$FOLLOWER_REG/vmfollow" ]
 }
 
-follower_unit_execs_the_shipper() {
+follower_unit_feeds_the_consumer() {
     # The headline: systemd runs `timberfs follower run vmfollow`, which
-    # reads the declaration and EXECs timber-otlp with --follow, the
-    # registry's own cursor, and --start begin derived from `retaining` --
-    # so the backlog the follower was registered to protect is shipped
-    # rather than skipped.
+    # resolves the selection, spawns timber-otlp and feeds it -- and because
+    # `retaining` implies --follow-from begin, the backlog the follower was
+    # registered to protect is shipped rather than skipped.
     systemctl enable --now timberfs-follower@vmfollow || return 1
-    # Generous, and deliberately so: end to end this is the shipper's own
-    # reader starting, a batch timeout, the POST, and the receiver's
-    # flush-and-fsync before its ack -- ~13s on an idle laptop for the
-    # cursor test next door, and more on a busy VM. A fixed short wait is
-    # a race the VM loses whenever it is busy.
+    # Generous, and deliberately so: end to end this is the consumer
+    # starting, a batch timeout, the POST, and the receiver's flush-and-fsync
+    # before its ack -- ~13s on an idle laptop, and more on a busy VM. A
+    # fixed short wait is a race the VM loses whenever it is busy.
     local i
     for i in $(seq 1 40); do
         timberfs query "$(otlp_store vmfollowed)" 2>/dev/null | grep -q 'followed two' && break
@@ -3482,34 +3487,42 @@ follower_unit_execs_the_shipper() {
     done
     timberfs query "$(otlp_store vmfollowed)" 2>/dev/null | grep -q 'followed two' || {
         journalctl -u timberfs-follower@vmfollow --no-pager | tail -30
-        cat "$FOLLOWER_REG/vmfollow/cursor.json" 2>&1
+        cat "$FOLLOWER_REG/vmfollow/positions.json" 2>&1
         return 1
     }
-    # Both entries, from the beginning: --start end would have shipped none.
+    # Both entries, from the beginning: --follow-from end would have shipped
+    # neither.
     timberfs query "$(otlp_store vmfollowed)" > /tmp/f.recv 2>/dev/null
     grep -q 'followed one' /tmp/f.recv || { cat /tmp/f.recv; return 1; }
 
-    # The unit's main process IS the shipper: exec, not fork -- a
-    # dispatcher, not a supervisor.
+    # The consumer is a CHILD of the unit's main process, not an exec of it:
+    # timberfs holds the positions and needs to outlive nothing but its own
+    # loop, so `follower run` stays the main process and timber-otlp hangs
+    # off it. That is what makes one process serve many stores.
     local main
     main=$(systemctl show -p MainPID --value timberfs-follower@vmfollow)
-    tr '\0' ' ' < "/proc/$main/cmdline" | grep -q 'timber-otlp' \
+    tr '\0' ' ' < "/proc/$main/cmdline" | grep -q 'follower run vmfollow' \
         || { tr '\0' ' ' < "/proc/$main/cmdline"; return 1; }
-    tr '\0' ' ' < "/proc/$main/cmdline" | grep -q -- '--start begin' \
-        || { tr '\0' ' ' < "/proc/$main/cmdline"; return 1; }
+    pgrep -P "$main" -a | grep -q 'timber-otlp' \
+        || { pgrep -P "$main" -a; return 1; }
 
-    # StateDirectory= made the registry directory, and the position landed
-    # in it, anchored to the same store the declaration names.
+    # StateDirectory= made the registry directory, and the position landed in
+    # it, keyed by the same store identity the selection names -- an absolute
+    # tape offset, and the chunk beside it is the retention floor.
     jq -e --arg id "$(jq -r .id "$FOLLOWER_SRC.bark")" \
-        '.store == $id and .delivered >= 2' \
-        "$FOLLOWER_REG/vmfollow/cursor.json" >/dev/null \
-        || { cat "$FOLLOWER_REG/vmfollow/cursor.json"; return 1; }
+        '.stores[$id].offset > 0 and .stores[$id].delivered >= 2
+         and (.stores[$id].chunk | type) == "number"' \
+        "$FOLLOWER_REG/vmfollow/positions.json" >/dev/null \
+        || { cat "$FOLLOWER_REG/vmfollow/positions.json"; return 1; }
+    # And it names the CONSUMER that wrote it, not the verb: every feed on
+    # the host would say the same thing otherwise.
+    jq -e '.consumer == "timber-otlp"' "$FOLLOWER_REG/vmfollow/positions.json" >/dev/null \
+        || { cat "$FOLLOWER_REG/vmfollow/positions.json"; return 1; }
 }
 
 follower_liveness_and_collision() {
-    # Liveness comes from the lock, which `run` takes and the exec inherits
-    # -- so the shipper needs no lock code and a second run of one follower
-    # is refused rather than allowed to overwrite its position.
+    # Liveness comes from the lock, which `run` takes -- so a second run of
+    # one follower is refused rather than allowed to overwrite its positions.
     timberfs follower list > /tmp/f.list 2>&1 || return 1
     head -1 /tmp/f.list | grep -q 'RUNNING' || { cat /tmp/f.list; return 1; }
     grep -E '^vmfollow[[:space:]]' /tmp/f.list | grep -q 'yes$' || { cat /tmp/f.list; return 1; }
@@ -3518,7 +3531,7 @@ follower_liveness_and_collision() {
     timberfs follower run vmfollow > /tmp/f.race 2>&1 && return 1
     grep -q 'already running' /tmp/f.race || { cat /tmp/f.race; return 1; }
     # And it named the live holder, from the lock file's own record.
-    grep -q 'timber-otlp' /tmp/f.race || { cat /tmp/f.race; return 1; }
+    grep -q 'pid' /tmp/f.race || { cat /tmp/f.race; return 1; }
 
     # A refusal must leave NOTHING behind, --stop/--disable included:
     # stopping the unit of a follower we then decline to delete would be
@@ -3543,7 +3556,7 @@ follower_store_side_view() {
     # FOLLOWERS column, with the registered follower named.
     timberfs info "$FOLLOWER_SRC" > /tmp/f.info 2>&1 || return 1
     grep -q 'followers 1 registered, 1 retaining' /tmp/f.info || { cat /tmp/f.info; return 1; }
-    grep -qE '^ +vmfollow +retaining,' /tmp/f.info || { cat /tmp/f.info; return 1; }
+    grep -qE '^ +vmfollow +' /tmp/f.info || { cat /tmp/f.info; return 1; }
     # Always an array for a pair, never null: the registry knows every
     # follower of every store, so empty would mean empty.
     timberfs info --json "$FOLLOWER_SRC" \
@@ -3557,9 +3570,104 @@ follower_store_side_view() {
     grep -E '[[:space:]]vmsrc[[:space:]]' /tmp/f.slist | grep -q '1, ' || { cat /tmp/f.slist; return 1; }
 }
 
+follower_selection_picks_up_a_store_that_appears() {
+    # What the selection is FOR: a store created after the follower was
+    # declared joins it on the next poll, with no unit and no edit -- and
+    # `discovery`, the default, ships it from its beginning because it was
+    # born since the follower was.
+    rm -rf "$FOLLOWER_REG"/vmsel "$OTLP_ROOT"/vmsel-* "$PIPE_BACKING"/sel*.log*
+    timberfs follower create vmsel --select '[class=vmsel]' --enable --start \
+        -- timber-otlp --endpoint http://127.0.0.1:4318 > /tmp/s.create 2>&1 \
+        || { cat /tmp/s.create; return 1; }
+    # Declared before any store matches, which is a legitimate order.
+    grep -q 'matches no store' /tmp/s.create || { cat /tmp/s.create; return 1; }
+
+    local n
+    for n in one two; do
+        timberfs create --wal "$PIPE_BACKING/sel$n.log" \
+            --set class=vmsel --set service="vmsel-$n" >/dev/null 2>&1 || return 1
+        printf '2026-08-01T11:00:00Z INFO from sel%s\n' "$n" \
+            | timberfs append --into "$PIPE_BACKING/sel$n.log" --quiet --flush-age 1 || return 1
+    done
+
+    local i
+    for i in $(seq 1 40); do
+        timberfs query "$(otlp_store vmsel-two)" 2>/dev/null | grep -q 'from seltwo' && break
+        sleep 1
+    done
+    # BOTH stores, from one process and one unit -- and each under its own
+    # resource, or they would have landed in one store at the receiver.
+    timberfs query "$(otlp_store vmsel-one)" 2>/dev/null | grep -q 'from selone' || {
+        journalctl -u timberfs-follower@vmsel --no-pager | tail -30; return 1; }
+    timberfs query "$(otlp_store vmsel-two)" 2>/dev/null | grep -q 'from seltwo' || {
+        journalctl -u timberfs-follower@vmsel --no-pager | tail -30; return 1; }
+
+    # Two positions in ONE file, keyed by identity.
+    jq -e '.stores | length == 2' "$FOLLOWER_REG/vmsel/positions.json" >/dev/null \
+        || { cat "$FOLLOWER_REG/vmsel/positions.json"; return 1; }
+    timberfs follower status vmsel > /tmp/s.status 2>&1 || return 1
+    grep -q 'stores    2' /tmp/s.status || { cat /tmp/s.status; return 1; }
+
+    systemctl disable --now timberfs-follower@vmsel >/dev/null 2>&1
+    timberfs follower delete vmsel >/dev/null 2>&1
+}
+
+follower_feeds_a_shell_consumer() {
+    # The protocol is a protocol, not an interface: three printf's and a read
+    # loop is a conforming consumer, and its watermark moves the position.
+    # If this breaks, `timberfs-records(5)` is lying to everyone who reads it.
+    local d=/tmp/shellconsumer
+    rm -rf "$d"; mkdir -p "$d"
+    cat > "$d/consumer.sh" <<'CONSUMER'
+#!/bin/bash
+printf '\036hello\037v=1\037reads=records\000'
+while IFS= read -r -d '' rec; do
+    case "${rec%%$'\037'*}" in
+    $'\036'entry)
+        id=$(printf '%s' "$rec" | tr '\037' '\n' | sed -n 's/^id=//p')
+        off=$(printf '%s' "$rec" | tr '\037' '\n' | sed -n 's/^offset=//p')
+        len=$(printf '%s' "$rec" | tr '\037' '\n' | sed -n 's/^len=//p')
+        printf '\036progress\037id=%s\037offset=%s\000' "$id" "$((off + len))"
+        ;;
+    esac
+    printf '%s\n' "$rec" >> /tmp/shellconsumer/seen
+done
+printf '\036note\037text="the shell consumer is done"\000'
+CONSUMER
+    chmod +x "$d/consumer.sh"
+
+    timberfs create --wal "$PIPE_BACKING/shellc.log" --set class=shellc >/dev/null 2>&1 || return 1
+    printf '2026-08-01T12:00:00Z INFO shell one\n2026-08-01T12:00:01Z INFO shell two\n' \
+        | timberfs append --into "$PIPE_BACKING/shellc.log" --quiet --flush-age 1 || return 1
+
+    # One-shot: drained once and it exits, durable because the positions are.
+    timberfs feed --select '[class=shellc]' --positions "$d/p.json" \
+        --follow-from begin -- "$d/consumer.sh" > /tmp/f.shell 2>&1 \
+        || { cat /tmp/f.shell; return 1; }
+    local sid
+    sid=$(jq -r .id "$PIPE_BACKING/shellc.log.bark")
+    jq -e --arg id "$sid" '.stores[$id].delivered == 2 and .stores[$id].offset > 0' \
+        "$d/p.json" >/dev/null || { cat "$d/p.json"; return 1; }
+    # Its note was RECORDED, so a stalled consumer's reason outlives the line
+    # it was printed on.
+    jq -e '.note.text == "the shell consumer is done"' "$d/p.json" >/dev/null \
+        || { cat "$d/p.json"; return 1; }
+    # A re-run ships nothing: the positions are the point.
+    timberfs feed --select '[class=shellc]' --positions "$d/p.json" \
+        -- "$d/consumer.sh" >/dev/null 2>&1 || return 1
+    jq -e --arg id "$sid" '.stores[$id].delivered == 2' "$d/p.json" >/dev/null \
+        || { cat "$d/p.json"; return 1; }
+
+    # And a consumer that never says hello is refused rather than fed: a
+    # position must not move on the word of something that never said so.
+    timberfs feed --select '[class=shellc]' --positions "$d/q.json" \
+        -- /bin/cat > /tmp/f.mute 2>&1 && return 1
+    grep -q 'hello' /tmp/f.mute || { cat /tmp/f.mute; return 1; }
+}
+
 follower_retirement_is_two_commands() {
     # Retiring one is two commands because the destructive act deserves its
-    # own. `update retaining=false` releases the head and says the part that
+    # own. `update retaining=false` releases the heads and says the part that
     # is easy to miss: the FLAG toggles, its EFFECT does not.
     timberfs follower update vmfollow retaining=false > /tmp/f.release 2>&1 || return 1
     grep -q 'releases the head' /tmp/f.release || { cat /tmp/f.release; return 1; }
@@ -3573,6 +3681,12 @@ follower_retirement_is_two_commands() {
     # An update that changes nothing writes nothing.
     timberfs follower update vmfollow retaining=false > /tmp/f.noop 2>&1 || return 1
     grep -q 'already declares that' /tmp/f.noop || { cat /tmp/f.noop; return 1; }
+
+    # The consumer is replaced wholesale by a `--` tail, and validated before
+    # it is written.
+    timberfs follower update vmfollow -- timber-otlp --endpoint http://127.0.0.1:4318 \
+        >/dev/null 2>&1 || return 1
+    jq -e '.command | length == 3' "$FOLLOWER_REG/vmfollow/follower.json" >/dev/null || return 1
 
     # Then delete is bookkeeping -- and takes the unit down with it.
     timberfs follower delete vmfollow --stop --disable > /tmp/f.gone 2>&1 || {
@@ -3595,32 +3709,11 @@ follower_unit_installed() {
         && grep -q 'StateDirectory=timberfs/followers/%i' \
             /lib/systemd/system/timberfs-follower@.service \
         && test -f /usr/share/doc/timberfs/examples/timberfs-follower.conf.example \
-        && zcat /usr/share/man/man1/timberfs.1.gz | grep -q 'follower create NAME'
+        && zcat /usr/share/man/man1/timberfs.1.gz | grep -q 'follower create NAME' \
+        && zcat /usr/share/man/man5/timberfs-records.5.gz \
+            | grep -q 'THE CONSUMER PROTOCOL' \
+        && ! test -f /lib/systemd/system/timberfs-otlp@.service
 }
-
-run_test "otlp-intake: enable socket, unit activates" otlp_intake_setup
-run_test "otlp-intake: undeclared stream 503s until the operator creates it" otlp_intake_undeclared_refused_until_created
-run_test "otlp-intake: non-OTLP encodings, signals and methods refused by name" otlp_intake_refuses_the_right_things
-run_test "otlp-intake: --auto-create --index drop-in" otlp_intake_enable_auto_create
-run_test "otlp-intake: a native record becomes a stamped, greppable line" otlp_intake_renders_a_native_record
-run_test "otlp-intake: a sender's clock skew does not stall the chunk flush" otlp_intake_flush_age_survives_a_senders_clock_skew
-run_test "otlp-intake: store path is the route value, handle-resolvable" otlp_intake_store_path_is_the_route_value
-run_test "otlp-intake: trace id rides the token index" otlp_intake_trace_id_is_indexed
-run_test "otlp-intake: resource attributes seed the manifest, wal live" otlp_intake_seeds_the_resource
-run_test "otlp-intake: service restart, sender retries, still lands" otlp_intake_restart_survives
-run_test "otlp-intake: a foreign sender's protobuf decodes" otlp_intake_accepts_a_foreign_protobuf_sender
-run_test "otlp-intake: gzipped bodies inflate, both encodings" otlp_intake_inflates_gzip
-run_test "otlp: store shipped out and received back is byte for byte" otlp_roundtrip_is_byte_for_byte
-run_test "otlp: the same roundtrip over json + gzip" otlp_roundtrip_over_json_and_gzip
-run_test "timber-otlp: --dry-run renders one LogRecord per entry" timber_otlp_dry_run_shape
-run_test "timber-otlp: cursor resumes after a kill, no duplicates" timber_otlp_cursor_resumes_without_duplicates
-run_test "chunk numbers: dense, survive a head-drop, v1 index migrates on open" chunk_numbers_and_v1_migration
-run_test "records: entries carry chunk=, --from-chunk resumes and seeks" records_carry_the_chunk_number
-run_test "consumers: list/info show lag and held bytes; a dropped position is a GAP" consumer_view_and_gap
-# P7: retain_unconsumed -- the third retention axis. A retaining follower's
-# position holds the store's head back, additively with age and size, and
-# when the size budget overrides it the loss is recorded exactly.
-RU_STORE="$PIPE_BACKING/vmunconsumed.log"
 
 declared_booleans_are_booleans() {
     # `--set index=true` writing "index": "true" declares a key every
@@ -3662,6 +3755,24 @@ retain_unconsumed_needs_its_backstop() {
     [ ! -e "$PIPE_BACKING/vmbackstop2.log.rings" ] || return 1
 }
 
+# A position written by hand, exactly as a consumer's report leaves one, so
+# the interest axis can be exercised without a live receiver. The offset is
+# the absolute one on the store's tape; `chunk` beside it is what retention
+# reads, which is why it is RECORDED rather than derived.
+write_position() {
+    local out=$1 store=$2 chunk=$3 delivered=$4
+    python3 - "$(jq -r .id "$store.bark")" "$store" "$out" "$chunk" "$delivered" << 'PYEOF'
+import json, sys
+sid, store, out, chunk, delivered = sys.argv[1:6]
+json.dump({"consumer": "timber-otlp",
+           "created": "2000-01-01T00:00:00.000Z",
+           "stores": {sid: {"offset": 1, "chunk": int(chunk),
+                            "path": store, "wl": 1,
+                            "delivered": int(delivered)}}},
+          open(out, "w"))
+PYEOF
+}
+
 retain_unconsumed_holds_then_releases() {
     # The headline. A retaining follower with NO position holds
     # EVERYTHING -- which is the point, since that is a follower deployed
@@ -3677,25 +3788,18 @@ retain_unconsumed_holds_then_releases() {
     done
     [ "$(timberfs index "$RU_STORE" | grep -cE '^ +[0-9]')" = 5 ] || return 1
 
-    timberfs follower create vmru --store "$RU_STORE" --type otlp \
-        --endpoint http://127.0.0.1:4318 --retaining >/dev/null 2>&1 || return 1
+    timberfs follower create vmru --store "$RU_STORE" --retaining \
+        -- timber-otlp --endpoint http://127.0.0.1:4318 >/dev/null 2>&1 || return 1
     # Registered, never run: the store must not shrink by a single chunk.
     printf '2026-08-02T09:00:06 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
         > /tmp/ru.hold 2>&1
     grep -q 'retention dropped' /tmp/ru.hold && { cat /tmp/ru.hold; return 1; }
     [ "$(timberfs index "$RU_STORE" | grep -cE '^ +[0-9]')" = 6 ] || return 1
     # And info says who is holding it, and how much.
-    timberfs info "$RU_STORE" | grep -q 'retaining, never run' || { timberfs info "$RU_STORE"; return 1; }
+    timberfs info "$RU_STORE" | grep -q 'never read' || { timberfs info "$RU_STORE"; return 1; }
 
-    # A position at chunk 3, exactly as the shipper writes one.
-    local sid
-    sid=$(jq -r .id "$RU_STORE.bark")
-    python3 - "$sid" "$RU_STORE" "$FOLLOWER_REG/vmru/cursor.json" << 'PYEOF' || return 1
-import json, sys
-sid, store, out = sys.argv[1:4]
-json.dump({"consumer": "timber-otlp", "store": sid, "path": store,
-           "seq": 3, "n": 1, "wl": 1, "delivered": 4}, open(out, "w"))
-PYEOF
+    # A position at chunk 3, exactly as a consumer's report leaves one.
+    write_position "$FOLLOWER_REG/vmru/positions.json" "$RU_STORE" 3 4 || return 1
     printf '2026-08-02T09:00:07 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
         > /tmp/ru.drop 2>&1
     grep -q 'retention dropped 3 chunk(s)' /tmp/ru.drop || { cat /tmp/ru.drop; return 1; }
@@ -3705,12 +3809,7 @@ PYEOF
         || { timberfs index "$RU_STORE"; return 1; }
     # No hysteresis: one more consumed chunk goes on the next tick, where
     # the age axis would wait for a tenth of the file.
-    python3 - "$sid" "$RU_STORE" "$FOLLOWER_REG/vmru/cursor.json" << 'PYEOF' || return 1
-import json, sys
-sid, store, out = sys.argv[1:4]
-json.dump({"consumer": "timber-otlp", "store": sid, "path": store,
-           "seq": 4, "n": 1, "wl": 1, "delivered": 5}, open(out, "w"))
-PYEOF
+    write_position "$FOLLOWER_REG/vmru/positions.json" "$RU_STORE" 4 5 || return 1
     printf '2026-08-02T09:00:08 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
         > /tmp/ru.one 2>&1
     grep -q 'retention dropped 1 chunk(s)' /tmp/ru.one || { cat /tmp/ru.one; return 1; }
@@ -3728,18 +3827,13 @@ retain_unconsumed_fails_closed() {
     # A position past everything the store has ever written: provably a
     # wrong anchor or a hand-edit, where a future TIMESTAMP could only
     # ever have been suspicious.
-    python3 - "$sid" "$RU_STORE" "$FOLLOWER_REG/vmru/cursor.json" << 'PYEOF' || return 1
-import json, sys
-sid, store, out = sys.argv[1:4]
-json.dump({"consumer": "x", "store": sid, "path": store,
-           "seq": 99999, "n": 1, "wl": 1, "delivered": 9}, open(out, "w"))
-PYEOF
+    write_position "$FOLLOWER_REG/vmru/positions.json" "$RU_STORE" 99999 9 || return 1
     printf '2026-08-02T09:01:00 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
         > /tmp/ru.fc1 2>&1
     grep -q 'retention dropped' /tmp/ru.fc1 && { cat /tmp/ru.fc1; return 1; }
 
     # A position that cannot be read is not a position.
-    echo '{ not json' > "$FOLLOWER_REG/vmru/cursor.json"
+    echo '{ not json' > "$FOLLOWER_REG/vmru/positions.json"
     printf '2026-08-02T09:01:01 INFO tick\n' | timberfs append --into "$RU_STORE" --quiet \
         > /tmp/ru.fc2 2>&1
     grep -q 'retention dropped' /tmp/ru.fc2 && { cat /tmp/ru.fc2; return 1; }
@@ -3766,19 +3860,12 @@ retain_unconsumed_cap_overrides_and_records_it() {
     local store="$PIPE_BACKING/vmoverride.log"
     rm -rf "$FOLLOWER_REG"/vmover "$store".*
     timberfs create --retain-size 1G --retain-unconsumed "$store" >/dev/null 2>&1 || return 1
-    timberfs follower create vmover --store "$store" --type otlp \
-        --endpoint http://127.0.0.1:4318 --retaining >/dev/null 2>&1 || return 1
+    timberfs follower create vmover --store "$store" --retaining \
+        -- timber-otlp --endpoint http://127.0.0.1:4318 >/dev/null 2>&1 || return 1
     seq 1 4000 | sed 's/^/2026-08-02T10:00:00 INFO padding /' \
         | timberfs append --into "$store" --quiet --chunk-size 4096 2>/dev/null || return 1
-    local sid
-    sid=$(jq -r .id "$store.bark")
     # Stuck at the very first chunk, holding everything after it.
-    python3 - "$sid" "$store" "$FOLLOWER_REG/vmover/cursor.json" << 'PYEOF' || return 1
-import json, sys
-sid, store, out = sys.argv[1:4]
-json.dump({"consumer": "timber-otlp", "store": sid, "path": store,
-           "seq": 0, "n": 1, "wl": 1, "delivered": 1}, open(out, "w"))
-PYEOF
+    write_position "$FOLLOWER_REG/vmover/positions.json" "$store" 0 1 || return 1
     # A budget below what is already on disk, so the cap has to bite.
     timberfs set "$store" retain_size=3K >/dev/null 2>&1 || return 1
     printf '2026-08-02T10:01:00 INFO tick\n' | timberfs append --into "$store" --quiet \
@@ -3803,16 +3890,9 @@ trim_is_the_one_shot_for_an_idle_store() {
         printf '2026-08-03T09:00:0%s INFO trim line %s\n' "$i" "$i" \
             | timberfs append --into "$store" --quiet 2>/dev/null || return 1
     done
-    timberfs follower create vmtrim --store "$store" --type otlp \
-        --endpoint http://127.0.0.1:4318 --retaining >/dev/null 2>&1 || return 1
-    local sid
-    sid=$(jq -r .id "$store.bark")
-    python3 - "$sid" "$store" "$FOLLOWER_REG/vmtrim/cursor.json" << 'PYEOF' || return 1
-import json, sys
-sid, store, out = sys.argv[1:4]
-json.dump({"consumer": "timber-otlp", "store": sid, "path": store,
-           "seq": 3, "n": 1, "wl": 1, "delivered": 4}, open(out, "w"))
-PYEOF
+    timberfs follower create vmtrim --store "$store" --retaining \
+        -- timber-otlp --endpoint http://127.0.0.1:4318 >/dev/null 2>&1 || return 1
+    write_position "$FOLLOWER_REG/vmtrim/positions.json" "$store" 3 4 || return 1
     # The preview changes nothing and names what interest would take.
     timberfs trim "$store" --dry-run > /tmp/tr.dry 2>&1 || return 1
     grep -q 'interest would drop 3 of 5' /tmp/tr.dry || { cat /tmp/tr.dry; return 1; }
@@ -3882,10 +3962,12 @@ retain_unconsumed_views_agree() {
         || { cat "$PIPE_BACKING/vmarchive.log.bark"; return 1; }
 }
 
-run_test "follower: create records the store by identity, and refuses the rest" follower_registry_declares_and_refuses
-run_test "follower: the unit execs the shipper and ships from the beginning" follower_unit_execs_the_shipper
-run_test "follower: liveness from the inherited lock; a second run is refused" follower_liveness_and_collision
+run_test "follower: create records the selection by identity, and refuses the rest" follower_registry_declares_and_refuses
+run_test "follower: the unit feeds its consumer, from the beginning" follower_unit_feeds_the_consumer
+run_test "follower: liveness from the lock; a second run is refused" follower_liveness_and_collision
 run_test "follower: info grows a followers block, list a FOLLOWERS column" follower_store_side_view
+run_test "follower: a store that appears later joins the selection" follower_selection_picks_up_a_store_that_appears
+run_test "feed: a shell script is a conforming consumer" follower_feeds_a_shell_consumer
 run_test "follower: retiring one is update-then-delete, and says what it frees" follower_retirement_is_two_commands
 run_test "follower: unit, conf example and man page installed" follower_unit_installed
 run_test "bark: create --set declares booleans as booleans, like set" declared_booleans_are_booleans
@@ -4094,16 +4176,22 @@ import_segment_merge() {
 }
 
 frames_follower_ships_and_releases_the_head() {
-    # The whole point of a retaining follower on the native wire: retention
+    # The whole point of retaining interest on the native wire: retention
     # holds the head back until the far end has it, the ack advances the
     # cursor, and only then may the prefix go. A byte-window ack cadence
     # starved this loop -- a quiet store was never acked, so its cursor
     # never advanced and nothing was ever released.
+    #
+    # ⚠ Deliberately NOT a registered follower: frames want the `chunks`
+    # diet, which the feed loop refuses rather than serving wrongly, so
+    # frames replication is `frames-send --follow --cursor` and declares its
+    # interest with the superseded `cursors=<dir>` key. When the chunks diet
+    # lands this becomes a follower and this test with it.
     local d=/tmp/framesfol
-    rm -rf $d; mkdir -p $d/node $d/archive $d/reg
-    export TIMBERFS_FOLLOWERS=$d/reg
+    rm -rf $d; mkdir -p $d/node $d/archive $d/cursors
     timberfs create $d/node/src.log --set service=folwire >/dev/null 2>&1 || return 1
-    timberfs set $d/node/src.log retain_size=1M retain_unconsumed=true >/dev/null || return 1
+    timberfs set $d/node/src.log retain_size=1M retain_unconsumed=true \
+        cursors=$d/cursors >/dev/null || return 1
     local c i
     for c in 1 2 3 4; do
         for i in $(seq 1 200); do
@@ -4111,14 +4199,13 @@ frames_follower_ships_and_releases_the_head() {
         done | timberfs append --into $d/node/src.log --quiet 2>/dev/null
     done
 
-    # Nothing to release yet: with no position the follower's interest
-    # drops nothing, and the budget is deliberately generous so THIS axis
-    # is what the test exercises rather than the size backstop. (Interest
-    # is additive -- it only ever drops the consumed prefix, and a small
-    # budget would empty the store as it was written, before any of this.)
+    # Nothing to release yet: with no cursor the interest drops nothing, and
+    # the budget is deliberately generous so THIS axis is what the test
+    # exercises rather than the size backstop. (Interest is additive -- it
+    # only ever drops the consumed prefix, and a small budget would empty the
+    # store as it was written, before any of this.)
     timberfs trim $d/node/src.log 2>&1 | grep -q "nothing to trim" || {
         timberfs trim $d/node/src.log
-        unset TIMBERFS_FOLLOWERS
         return 1
     }
 
@@ -4126,36 +4213,30 @@ frames_follower_ships_and_releases_the_head() {
         --route service --auto-create --replica >$d/intake.log 2>&1 &
     local pid=$!
     sleep 1
-    timberfs follower create --store $d/node/src.log ship \
-        --type frames --endpoint 127.0.0.1:4320 --retaining >/dev/null 2>&1 || {
-        kill $pid; unset TIMBERFS_FOLLOWERS; return 1
-    }
-    timeout 5 timberfs follower run ship >$d/run.log 2>&1
+    timeout 5 timberfs frames-send $d/node/src.log --endpoint 127.0.0.1:4320 \
+        --follow --cursor $d/cursors/src.cursor >$d/run.log 2>&1
     kill $pid 2>/dev/null
     sleep 1
 
     # The cursor holds the FAR END's acknowledged position, and the lag
     # renders as caught up rather than decades behind (wl unset).
     jq -e '.consumer == "frames-send" and .seq == 3 and .n == 0 and .wl > 0' \
-        $d/reg/ship/cursor.json > /dev/null || {
-        cat $d/reg/ship/cursor.json
-        unset TIMBERFS_FOLLOWERS
+        $d/cursors/src.cursor > /dev/null || {
+        cat $d/cursors/src.cursor
         return 1
     }
-    timberfs follower list 2>&1 | grep -q "at the live edge" || {
-        timberfs follower list
-        unset TIMBERFS_FOLLOWERS
+    # The store's own view finds it, through the key it declared.
+    timberfs info $d/node/src.log 2>&1 | grep -q "frames-send" || {
+        timberfs info $d/node/src.log
         return 1
     }
 
-    # And now the shipped prefix may go: the budget is 1K, so the interest
+    # And now the shipped prefix may go: the budget is 1M, so the interest
     # floor is what decides, and it releases everything below chunk 3.
     timberfs trim $d/node/src.log 2>&1 | grep -q "chunks 0\.\.2" || {
         timberfs trim $d/node/src.log
-        unset TIMBERFS_FOLLOWERS
         return 1
     }
-    unset TIMBERFS_FOLLOWERS
     timberfs info $d/archive/folwire.log/folwire.log | grep -q "4 chunk(s)"
 }
 
@@ -4486,7 +4567,7 @@ export_bundle_roundtrip() {
 run_test "import: shipped segment merges verbatim, idempotently" import_segment_merge
 run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
 run_test "frames wire: a store replicates over a socket byte for byte" frames_wire_replicates_a_store_byte_for_byte
-run_test "frames wire: a retaining follower ships, then the head releases" frames_follower_ships_and_releases_the_head
+run_test "frames wire: a shipped prefix releases the head" frames_follower_ships_and_releases_the_head
 run_test "frames fleet: two nodes, one archive, and the routing mistake" frames_fleet_two_nodes_one_archive
 run_test "frames unit: installed by the package, and documented" frames_unit_installed
 run_test "frames unit: socket activates, undeclared stream refused" frames_unit_socket_activates
