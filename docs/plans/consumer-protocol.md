@@ -264,6 +264,21 @@ lifecycle below rather than a consequence of it: were the consumer to outlive
 the follower, the announced state would have to be persisted and reconciled
 against a consumer that might have missed an update.
 
+## Filtering goes on the far side of the reporter
+
+A watermark means "do not send me these again", not "these were
+delivered" — so a consumer may DROP whatever it likes, as long as it
+reports past what it dropped. That is the same rule that makes a
+permanently-refused entry work, and it means filtering is safe wherever
+the party doing it is also the party reporting.
+
+⚠ What is not safe is a filter UPSTREAM of the reporter. A
+`timber-filter … | timber-otlp` between the feeder and the consumer drops
+entries the consumer then never sees and never acknowledges, so the
+position never advances past them and the same entries arrive for ever.
+The filter belongs after — inside the consumer, or beyond the
+destination — never between.
+
 ## One store in trouble must not cost the others
 
 A consumer that will not take one store's entries — refused by its
@@ -343,6 +358,20 @@ of this got wrong. The loop and the positions are local; only the
 destination is elsewhere, so the host-local interest axis has everything it
 needs. What stays ephemeral is a remote READER — one pulling from another
 host's stores — which is a different thing and not a registered follower.
+
+## A followed stream's EOF is not truncation
+
+`timberfs-records(5)` treats end-of-input without a `stream-end` as
+truncation, and it is right to: for a bounded answer that absence means
+the producer died. But a FOLLOWED stream carries no `stream-end` by
+design — its absence is the format's own «still live» marker — so a
+consumer reading one to the end would report the feeder's ordinary
+shutdown as a broken stream.
+
+`stream-start` says which kind of stream this is (`follow=1`), so the
+distinction is read from the wire rather than assumed. A consumer that
+gets this wrong fails at exit rather than at work, which is why it is
+worth stating: the failure looks like a bug in the feeder.
 
 ## The trivial consumer we ship
 

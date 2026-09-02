@@ -174,47 +174,30 @@ pub fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A `type` and an `endpoint` as the command they were shorthand for.
+/// What to say about a declaration that names a TYPE, or nothing.
 ///
-/// Both were a taxonomy: one entry per destination protocol, each with a
-/// binary in this tree, so «my destination is not listed» read as «add a
-/// type». A command says what is true instead — a destination is a
-/// program — and these two spellings of the OTLP and frames cases become
-/// the two programs they always ran.
-fn migrate(
-    at: &Path,
-    kind: &str,
-    endpoint: Option<&str>,
-    args: &[String],
-) -> anyhow::Result<Vec<String>> {
-    let mut argv: Vec<String> = match kind {
-        "otlp" => vec![binary("timber-otlp").display().to_string()],
-        // Not yet a consumer: it opens the store itself and resumes from
-        // the receiver's coverage rather than being fed. Until it speaks
-        // the protocol there is no command to migrate this to, and
-        // saying so beats writing one that cannot run.
-        "frames" => bail!(
-            "declares `type: frames`, which cannot be expressed as a consumer command yet —              `frames-send` reads a store rather than a stream, and resumes from the              receiver's own coverage. Leave it until it speaks the consumer protocol"
-        ),
-        "" => bail!(
-            "{} declares neither a \"command\" nor a \"type\", so there is nothing to run for \
-             it. A follower is fed a program: `-- timber-otlp --endpoint http://...`",
-            at.display()
-        ),
-        other => bail!(
-            "{} declares `type: {other}`, which this timberfs has never run",
-            at.display()
-        ),
+/// Nothing is migrated. A type named a destination shape and implied
+/// that a new destination meant a new binary in this tree; a command
+/// says the truth, which is that a destination is a program. Turning
+/// `type: otlp` into `timber-otlp --endpoint …` was tried and is worse
+/// than refusing: that program was rewritten by the same change, so an
+/// upgraded host would have got a declaration that HANGS until the
+/// hello times out. An error naming the one command that fixes it is
+/// the better failure.
+fn no_command(at: &Path, kind: &str) -> anyhow::Error {
+    let what = match kind {
+        "" => "declares no \"command\"".to_string(),
+        other => format!("declares `type: {other}`, which no longer means anything"),
     };
-    if let Some(e) = endpoint {
-        argv.push("--endpoint".to_string());
-        argv.push(e.to_string());
-    }
-    argv.extend(args.iter().cloned());
-    Ok(argv)
+    anyhow::anyhow!(
+        "{} {what}. A follower is fed a PROGRAM, and that program says how far to move each \
+         store's position — so give it one:\n  \
+         timberfs follower update <name> -- timber-otlp --endpoint http://collector:4318",
+        at.display()
+    )
 }
 
-/// A follower's declaration: the operator's half of the pair. Unknown
+/// A follower's declaration: the operator's half of the pair./// A follower's declaration: the operator's half of the pair. Unknown
 /// keys are PRESERVED across an `update`, like a `.bark` — a declaration
 /// is a label, not a schema, and a key this version does not know may be
 /// one the next does.
@@ -352,24 +335,17 @@ impl Declaration {
         };
         let command =
             strings(&mut map, "command").with_context(|| format!("in {}", path.display()))?;
-        // A declaration written when a TYPE named the destination: the
-        // type and the endpoint were shorthand for a command line, so
-        // they become one. `path` and `args` go with them.
-        let legacy_args =
-            strings(&mut map, "args").with_context(|| format!("in {}", path.display()))?;
+        // Taken out rather than left in `extra`, so an `update` does
+        // not carry them forward: a `type`, an `endpoint`, a `path` and
+        // an `args` are what a command replaced, and keeping them would
+        // leave a declaration describing two arrangements at once.
+        let _ = strings(&mut map, "args");
         let legacy_type = take_str(&mut map, "type").unwrap_or_default();
-        let legacy_endpoint = take_str(&mut map, "endpoint").filter(|e| !e.is_empty());
+        let _ = take_str(&mut map, "endpoint");
         let _ = take_str(&mut map, "path");
-        let command = if !command.is_empty() {
-            command
-        } else {
-            migrate(
-                &path,
-                &legacy_type,
-                legacy_endpoint.as_deref(),
-                &legacy_args,
-            )?
-        };
+        if command.is_empty() {
+            return Err(no_command(&path, &legacy_type));
+        }
         Ok(Declaration {
             name: name.to_string(),
             select,
@@ -422,22 +398,6 @@ impl Declaration {
         }
         Ok(())
     }
-}
-
-/// The shipper binary: our OWN directory first, then `$PATH`. A dev build
-/// must exec its SIBLING — otherwise `target/debug/timberfs follower run`
-/// silently drives the installed shipper, which is a different version
-/// against the same registry.
-fn binary(name: &str) -> PathBuf {
-    if let Ok(me) = std::env::current_exe() {
-        if let Some(dir) = me.parent() {
-            let sibling = dir.join(name);
-            if sibling.is_file() {
-                return sibling;
-            }
-        }
-    }
-    PathBuf::from(name)
 }
 
 /// Is a follower's process live? From the lock, never from systemd: a
@@ -2156,48 +2116,35 @@ mod tests {
         fs::remove_dir_all(&reg).ok();
     }
 
-    /// A `type` and an `endpoint` were shorthand for a command line, so
-    /// a declaration written before commands reads as the command it
-    /// always ran. Anything else is refused rather than guessed at: a
-    /// declaration whose destination this build cannot express must fail
-    /// where it is READ, not at the next start.
+    /// A TYPE is not migrated into a command, and the reason is the
+    /// failure it would have caused: `type: otlp` would become
+    /// `timber-otlp --endpoint …`, and that program was rewritten by the
+    /// same change into a consumer — so an upgraded host would have got
+    /// a declaration that HANGS until the hello times out. Every kind is
+    /// refused by name, with the one command that fixes it.
     #[test]
-    fn a_typed_declaration_reads_as_the_command_it_ran() {
+    fn a_type_is_refused_by_name_and_never_migrated() {
         let reg = scratch("typed");
-        fs::create_dir_all(follower_dir(&reg, "old")).unwrap();
-        fs::write(
-            decl_path(&reg, "old"),
-            r#"{"store":"id-a","type":"otlp","endpoint":"http://c:4318",
-                "args":["--service","checkout"],"retaining":true}"#,
-        )
-        .unwrap();
-        let d = Declaration::load(&reg, "old").unwrap();
-        assert_eq!(d.select, "[id=id-a]");
-        assert!(d.command[0].ends_with("timber-otlp"), "{:?}", d.command);
-        assert_eq!(
-            &d.command[1..],
-            ["--endpoint", "http://c:4318", "--service", "checkout"]
-        );
-
-        // frames is not a consumer yet, and saying so beats writing a
-        // command that cannot run.
-        fs::create_dir_all(follower_dir(&reg, "repl")).unwrap();
-        fs::write(
-            decl_path(&reg, "repl"),
-            r#"{"store":"id-b","type":"frames","endpoint":"archive:4319"}"#,
-        )
-        .unwrap();
-        let err = Declaration::load(&reg, "repl").unwrap_err().to_string();
-        assert!(err.contains("frames"), "{err}");
-
-        fs::create_dir_all(follower_dir(&reg, "kafka")).unwrap();
-        fs::write(
-            decl_path(&reg, "kafka"),
-            r#"{"store":"id-c","type":"kafka"}"#,
-        )
-        .unwrap();
-        let err = Declaration::load(&reg, "kafka").unwrap_err().to_string();
-        assert!(err.contains("kafka"), "{err}");
+        for (name, body) in [
+            (
+                "otlp",
+                r#"{"store":"id-a","type":"otlp","endpoint":"http://c:4318"}"#,
+            ),
+            (
+                "repl",
+                r#"{"store":"id-b","type":"frames","endpoint":"archive:4319"}"#,
+            ),
+            ("kafka", r#"{"store":"id-c","type":"kafka"}"#),
+        ] {
+            fs::create_dir_all(follower_dir(&reg, name)).unwrap();
+            fs::write(decl_path(&reg, name), body).unwrap();
+            let err = Declaration::load(&reg, name).unwrap_err().to_string();
+            assert!(err.contains("type"), "{name}: {err}");
+            assert!(
+                err.contains("follower update"),
+                "{name}: it should name the fix: {err}"
+            );
+        }
         fs::remove_dir_all(&reg).ok();
     }
 
@@ -2604,7 +2551,7 @@ mod tests {
         fs::create_dir_all(follower_dir(&reg, "old")).unwrap();
         fs::write(
             decl_path(&reg, "old"),
-            r#"{"store":"id-a","type":"otlp","retaining":true}"#,
+            r#"{"store":"id-a","retaining":true,"command":["/bin/true"]}"#,
         )
         .unwrap();
         let d = Declaration::load(&reg, "old").unwrap();

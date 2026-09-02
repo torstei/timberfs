@@ -23,6 +23,14 @@ pub struct EntryRec {
     /// ⚠ A position, not a fact about the entry: unlike `wf`/`wl` it is
     /// NOT carried into a destination store (see `sink.rs`).
     pub chunk: Option<u64>,
+    /// Where this run of bytes BEGINS on the store's tape. With
+    /// `payload.len()` it states both ends, and the runs CHAIN — so
+    /// `offset + len` is the watermark a consumer reports for this
+    /// entry, a number it was handed rather than one it computes.
+    ///
+    /// `None` only for a stream that states none. Every answer timberfs
+    /// gives does.
+    pub offset: Option<u64>,
     /// Which store this entry came from, in a MULTI-SOURCE stream: the
     /// path (`src`) and the identity (`id`). Both absent in a
     /// single-source stream, which names its source once in
@@ -228,6 +236,7 @@ impl<R: BufRead> Reader<R> {
                         wf,
                         wl,
                         chunk,
+                        offset: get("offset").and_then(|v| v.parse().ok()),
                         src: get("src").cloned(),
                         id: get("id").cloned(),
                         payload,
@@ -349,6 +358,9 @@ mod tests {
         assert_eq!(entries[0].id.as_deref(), Some("aaa"));
         assert_eq!(entries[0].src.as_deref(), Some("/l/a.log"));
         assert_eq!(entries[0].chunk, Some(4));
+        // The watermark a consumer reports is this plus the payload's
+        // length: both ends of what was served, from the wire.
+        assert_eq!(entries[0].offset, Some(0));
         assert_eq!(entries[1].id.as_deref(), Some("bbb"));
         // Read from the live edge, so no chunk holds it yet — which does
         // not make it unattributed.

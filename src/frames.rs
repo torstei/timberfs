@@ -927,26 +927,23 @@ mod tests {
         assert!(!cur.exists(), "no acknowledgement, no position");
     }
 
-    /// `frames` was a follower TYPE, and is not expressible as a
-    /// consumer command: `frames-send` reads a store rather than a
-    /// stream, and resumes from the RECEIVER's coverage rather than from
-    /// a position timberfs holds. So a declaration naming it is refused
-    /// where it is read, by name, instead of being migrated into a
-    /// command line that cannot run.
+    /// `frames` was a follower TYPE. Types are gone — a follower is fed
+    /// a program — and `frames-send` is not one of those programs yet:
+    /// it reads a store rather than a stream, and resumes from the
+    /// RECEIVER's coverage rather than from a position timberfs holds.
     ///
     /// ⚠ Its way in is the consumer protocol's own hello, which may
     /// carry the coverage a destination already holds — see
-    /// docs/plans/consumer-protocol.md. Until then this refusal is the
-    /// honest answer.
+    /// docs/plans/consumer-protocol.md. Until then a declaration naming
+    /// it is refused where it is READ, with the command that fixes it.
     #[test]
-    fn a_frames_declaration_is_refused_rather_than_migrated() {
+    fn a_frames_type_is_refused_with_the_fix_named() {
         let reg = std::env::temp_dir().join(format!(
             "timberfs-framesdecl-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        let dir = crate::follower::follower_dir(&reg, "ship");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(crate::follower::follower_dir(&reg, "ship")).unwrap();
         std::fs::write(
             crate::follower::decl_path(&reg, "ship"),
             br#"{"store":"an-id","type":"frames","endpoint":"archive:4319"}"#,
@@ -957,8 +954,8 @@ mod tests {
             .to_string();
         assert!(err.contains("frames"), "{err}");
         assert!(
-            err.contains("coverage"),
-            "it should say WHY, not just refuse: {err}"
+            err.contains("follower update"),
+            "it should name the fix, not just refuse: {err}"
         );
         let _ = std::fs::remove_dir_all(&reg);
     }
