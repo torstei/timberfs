@@ -397,6 +397,39 @@ pub enum IdentitySide {
 }
 
 /// What the two sides say about a store's identity.
+/// The identity of the PAIR, which is the store: what the manifest
+/// declares, else what the index carries.
+///
+/// Both sides hold it — `save` mints into the manifest and the next open
+/// mirrors it into the `.rings` header — so a manifest that is lost or
+/// restored without its store leaves the identity intact, and
+/// `ensure_identified` recovers rather than mints. Every reader that
+/// decides whether a store can be SELECTED, CURSORED or FOLLOWED must
+/// therefore ask this and not the manifest alone: reading one side makes
+/// the same store answer differently depending on which files survived.
+///
+/// `None` means the pair carries no identity anywhere, which is
+/// `identity`'s own verdict of «this pair is not a store» — what a plain
+/// `append` leaves behind until something mints one.
+pub fn identity_of(dir: &Path, name: &str) -> Option<String> {
+    if let Some(id) = try_load(dir, name)
+        .ok()
+        .flatten()
+        .and_then(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
+    {
+        return Some(id);
+    }
+    carried_identity(dir, name)
+}
+
+/// The identity the `.rings` header carries, if any.
+pub fn carried_identity(dir: &Path, name: &str) -> Option<String> {
+    fs::read(format::rings_path(dir, name))
+        .ok()
+        .and_then(|b| format::header_store_id(&b))
+        .map(|id| format::uuid_text(&id))
+}
+
 fn identity_sides(dir: &Path, name: &str) -> anyhow::Result<(Option<String>, Option<String>)> {
     let manifest = try_load(dir, name)
         .with_context(|| {
@@ -409,11 +442,7 @@ fn identity_sides(dir: &Path, name: &str) -> anyhow::Result<(Option<String>, Opt
         .get("id")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let index = fs::read(format::rings_path(dir, name))
-        .ok()
-        .and_then(|b| format::header_store_id(&b))
-        .map(|id| format::uuid_text(&id));
-    Ok((manifest, index))
+    Ok((manifest, carried_identity(dir, name)))
 }
 
 /// Report or repair a store's identity. A store's id is not a setting, so
@@ -531,11 +560,7 @@ fn mint_missing_identity(dir: &Path, name: &str) -> anyhow::Result<Option<&'stat
     }
     // The pair may already carry one where the manifest was lost — the
     // pair is the store, so that is the identity, not a fresh mint.
-    let rings = format::rings_path(dir, name);
-    let carried = fs::read(&rings)
-        .ok()
-        .and_then(|b| format::header_store_id(&b))
-        .map(|id| format::uuid_text(&id));
+    let carried = carried_identity(dir, name);
     let mut map = existing;
     let what = if let Some(id) = carried {
         map.insert("id".to_string(), Value::String(id));

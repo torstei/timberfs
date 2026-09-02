@@ -300,11 +300,15 @@ pub fn resolve(dirs: &[std::path::PathBuf], sel: &Selector) -> Vec<Match> {
             let fields = selectable(&bark, &handle);
             if sel.matches(&fields) {
                 let labels = crate::bark::provenance(&bark);
+                // The PAIR's identity, not the manifest's: a store whose
+                // bark was lost still has one, and excluding it would
+                // make a selection depend on which files survived.
+                let id = crate::bark::identity_of(&dir, &name);
                 out.push(Match {
                     handle,
                     dir,
                     name,
-                    id: bark.get("id").and_then(Value::as_str).map(str::to_string),
+                    id,
                     labels,
                 });
             }

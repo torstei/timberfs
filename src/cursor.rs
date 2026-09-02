@@ -508,6 +508,11 @@ pub fn store_anchor(dir: &Path, name: &str, bark: Option<&Map<String, Value>>) -
     bark.and_then(|m| m.get("id"))
         .and_then(Value::as_str)
         .map(str::to_string)
+        // The pair is the store, so a lost manifest does not lose the
+        // identity: the `.rings` header mirrors it. Without this a store
+        // whose bark went missing would silently change name, orphaning
+        // every follower and cursor that referred to it.
+        .or_else(|| crate::bark::carried_identity(dir, name))
         .unwrap_or_else(|| {
             format!(
                 "path:{}",

@@ -143,6 +143,14 @@ pub struct SourceHandle {
     /// here — not at the grain load — is what makes the comparison in
     /// `select_chunks` cover the rings read too.
     pub seq_at_open: Option<u64>,
+    /// The PAIR's identity: what the manifest declares, else what the
+    /// index carries. Read at open, because every answer that states an
+    /// id — the per-entry attribution, the `position` a consumer resumes
+    /// from — must give one store one name whichever of its files
+    /// survived. A manifest-only reading makes a store whose bark was
+    /// lost uncursorable, which for a poll loop means re-shipping it
+    /// whole, forever.
+    pub store_id: Option<String>,
 }
 
 pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
@@ -191,11 +199,19 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
         for r in &mut records {
             r.comp_start += trunk_base;
         }
+        // A bundle carries no `.rings` header to fall back on: what its
+        // manifest member says is all there is.
+        let store_id = bark
+            .as_ref()
+            .and_then(|b| b.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         return Ok(SourceHandle {
             records,
             file,
             bark,
             seq_at_open: None,
+            store_id,
         });
     }
     let (dir, base) = resolve_backing(input)?;
@@ -218,11 +234,13 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
     let file = File::open(format::trunk_path(&dir, &base))
         .with_context(|| format!("opening {}", format::trunk_path(&dir, &base).display()))?;
     let bark = crate::bark::load(&dir, &base);
+    let store_id = crate::bark::identity_of(&dir, &base);
     Ok(SourceHandle {
         records,
         file,
         bark,
         seq_at_open,
+        store_id,
     })
 }
 
@@ -1100,10 +1118,8 @@ fn query_entries<W: Write>(
         // and the answer that produced it named the store that way.
         let dropped = dropped_bytes_of(f);
         let resume_at = source
-            .bark
-            .as_ref()
-            .and_then(|b| b.get("id"))
-            .and_then(|v| v.as_str())
+            .store_id
+            .as_deref()
             .and_then(|id| cursor.get(id))
             .copied();
         let framing = crate::entry::Framing {
@@ -1225,13 +1241,7 @@ fn query_entries<W: Write>(
             // and what a position is recorded against. A path names a
             // store only within one response; everything durable — a
             // follower's declaration, a cursor, `list --json` — uses this.
-            if let Some(id) = s
-                .handle
-                .bark
-                .as_ref()
-                .and_then(|b| b.get("id"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(id) = s.handle.store_id.as_deref() {
                 write!(out, "\x1fid={id}")?;
             }
             write!(
@@ -1390,13 +1400,7 @@ fn query_entries<W: Write>(
         // of the window, which on a fleet is most of the cost.
         for (f, s) in files.iter().zip(&srcs) {
             write!(out, "\x1eposition\x1fpath={}", f.display())?;
-            if let Some(id) = s
-                .handle
-                .bark
-                .as_ref()
-                .and_then(|b| b.get("id"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(id) = s.handle.store_id.as_deref() {
                 write!(out, "\x1fid={id}")?;
             }
             // Just past the last entry DELIVERED — or, where this store
@@ -2088,14 +2092,9 @@ fn write_chunks_framed<W: Write>(
             has,
             any,
         )?;
-        // The manifest's id as text; `store_id_of` hands back bytes for the
+        // The pair's id as text; `store_id_of` hands back bytes for the
         // entry sink, which writes them straight out.
-        let id: Option<String> = source
-            .bark
-            .as_ref()
-            .and_then(|b| b.get("id"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let id: Option<String> = source.store_id.clone();
         total_chunks += source.records.len();
         write!(out, "\x1esource\x1fpath={}", f.display())?;
         if let Some(id) = &id {
@@ -2456,9 +2455,11 @@ pub struct StoreSummary {
     /// Bytes currently buffered in the `.sap` sidecar (header excluded),
     /// not yet folded into a chunk — a read-only stat, never replayed.
     pub sap_pending_bytes: Option<u64>,
-    /// The store's durable identity, when it declares one. A store written
-    /// by a plain `append` has no manifest and so no id — which is why a
-    /// catalogue must be able to say "none" rather than assume.
+    /// The store's durable identity: what its manifest declares, else
+    /// what its index carries — the PAIR is the store. `None` only where
+    /// neither side has one, which is what a plain `append` leaves until
+    /// something mints one, and is `identity`'s own verdict of "not a
+    /// store". A catalogue must be able to say so rather than assume.
     pub id: Option<String>,
     pub created: Option<String>,
     /// The id of the store these entries came FROM, when they arrived over
@@ -2670,7 +2671,9 @@ pub fn summarize_store(
         index_declared,
         wal_declared,
         sap_pending_bytes,
-        id: get("id"),
+        // The pair's, so `list` and `info` name a store the same way a
+        // selection and a position do.
+        id: crate::bark::identity_of(dir, name),
         created: get("created"),
         origin_id: bark.and_then(crate::bark::origin_id),
         declared_name: get("name"),
@@ -3730,11 +3733,7 @@ fn store_value(
 /// The store's declared id, as bytes for a record field. Absent for a
 /// store with no manifest, which a plain `append` writes.
 fn store_id_of(h: &SourceHandle) -> Option<Vec<u8>> {
-    h.bark
-        .as_ref()
-        .and_then(|b| b.get("id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.as_bytes().to_vec())
+    h.store_id.as_ref().map(|s| s.as_bytes().to_vec())
 }
 
 /// What has left this store over its life, uncompressed. Added to a

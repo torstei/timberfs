@@ -310,6 +310,12 @@ mod tests {
                     .unwrap();
                 f.flush_chunk(&cfg).unwrap();
             }
+            // The index mirrors the manifest's identity at OPEN, so a
+            // store identified after it was opened carries it on one side
+            // only until the next writer arrives. Reopen, as any restart
+            // does, so these stores are shaped like deployed ones.
+            drop(st);
+            Store::open(&dir, cfg).unwrap();
         }
         root
     }
@@ -487,8 +493,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A store with no identity cannot hold a position, so following it
-    /// would re-ship it whole on every poll forever. It is excluded.
+    /// The PAIR is the store, so a lost manifest does not lose the
+    /// identity — the `.rings` header mirrors it. Such a store stays
+    /// selectable and followable, and keeps the SAME id it had: reading
+    /// the manifest alone would make a selection, a position and a
+    /// listing depend on which of a store's files happened to survive.
+    #[test]
+    fn a_store_whose_manifest_is_lost_keeps_its_identity() {
+        let root = forest("lostbark", &[("web", "apache", 3)]);
+        let before = shipper(&root, "service=apache", 100).poll().unwrap();
+        let id = before.slices[0].id.clone();
+        assert!(!id.is_empty());
+
+        // The labels go with the manifest, so select on the name — which
+        // is what is left of a store whose bark is gone.
+        std::fs::remove_file(crate::format::bark_path(&root.join("web"), "web.log")).unwrap();
+        let after = shipper(&root, "web", 100).poll().unwrap();
+        assert_eq!(after.slices.len(), 1, "still one store");
+        assert_eq!(after.slices[0].id, id, "and still the same store");
+        assert_eq!(after.entries(), 3, "and readable, and cursorable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A store with no identity on EITHER side cannot hold a position, so
+    /// following it would re-ship it whole on every poll forever. It is
+    /// excluded.
     #[test]
     fn a_store_with_no_identity_is_not_followed() {
         let root = forest("idless", &[("web", "apache", 2)]);

@@ -22,9 +22,16 @@ follower is the one-term case: `--store applogs` is sugar for
 One shape rather than two, so `run`, `list`, `status` and the interest axis
 each keep one code path.
 
+⚠ The collapse holds only because a store always HAS an id — see «the pair
+is the store» below. The case that looked like it would break it, a store
+anchored `path:<canonical>` and so not nameable by a predicate, is a pair
+with no identity on either side, which `identity` calls «not a store» and
+which `follower create` already mints one for before registering anything.
+So there is no store `--store` can name that `--select` cannot.
+
     /var/lib/timberfs/followers/<name>/
         follower.json    select, type, endpoint, retaining, args
-        positions.json   { "<store-id>": {offset, wl, delivered}, ... }
+        positions.json   { "<store-id>": {offset, chunk, wl, delivered}, … }
         follower.lock    held while it runs
 
 `positions.json` is one file rather than a directory of cursors because a
@@ -48,13 +55,13 @@ A store that leaves the selection keeps its entry — bringing it back should
 resume, not re-ship a history — and membership is decided by the selection,
 never by what the file happens to hold, so a stale entry holds no retention.
 
-⚠ **A store with no identity cannot be followed.** The cursor is keyed by the
-`.bark` id, so a store that declares none gets no `position` record and no
-resume: a poll loop would re-ship it in full on every poll, forever. Such a
-store is therefore excluded from the selection with a note naming
-`timberfs identity <store> --mint`, which is the remedy. Nothing shipped
-beats shipping the same store endlessly, and a reader has no business
-minting an identity into someone else's manifest.
+⚠ **A pair with no identity cannot be followed**, and that is the whole of
+the exclusion: a position is keyed by identity, so such a pair gets no
+`position` record and no resume, and a poll loop would re-ship it in full
+every poll, forever. It is excluded with a note naming
+`timberfs identity <store> --mint`. Nothing shipped beats shipping the same
+pair endlessly, and a reader has no business minting an identity into someone
+else's manifest.
 
 ## Why there is no follower group
 
@@ -101,6 +108,36 @@ An operator checks a selector against the fleet with the shell
 poll document the follower will send, which is the same document either can
 be handed — the follower states what it will ask rather than being described.
 
+## The pair is the store, and identity is asked of the pair
+
+Both sides hold a store's id: `bark::save` mints it into the manifest and the
+next open mirrors it into the `.rings` header, which is why
+`ensure_identified` RECOVERS an identity rather than minting a new one. So a
+manifest that is lost, or a store restored without it, has not lost its
+identity — and `identity` says so, exit 0, «index only».
+
+Every reader that decides whether a store can be SELECTED, CURSORED or
+FOLLOWED must therefore ask the pair, not the manifest. Reading one side
+makes a store's name depend on which of its files survived: measured before
+this was fixed, such a store showed `ID -` in `list`, emitted no `id` on its
+`source` and `position` records — so no cursor could name it and a poll loop
+would re-ship it whole, forever — and its anchor silently changed from its
+uuid to `path:<canonical>`, orphaning every follower and cursor that referred
+to it.
+
+`bark::identity_of` is that accessor, and `select::resolve`,
+`cursor::store_anchor`, `query::open_source` and `summarize_store` go through
+it. ⚠ Still reading the manifest alone: the frames sender's origin id,
+`timber-otlp`'s `timberfs.store.id` resource attribute on the single-store
+path, and the lineage `export` and `incus` record. Each takes a manifest map
+rather than a path, so each is its own small change.
+
+**A pair carrying no identity on either side is not a store**, which is
+`identity`'s own verdict and its exit 1 — it is what a plain `append` or a
+bare `create` leaves behind. It is listed (a catalogue must be able to say
+«none») and it is not followable, because a position keyed by identity has
+nothing to be keyed by.
+
 ## Short ids are a CLI convenience, never persisted
 
 A general rule, not a follower one. The eight characters a listing prints are
@@ -113,6 +150,37 @@ forwarding a store nobody chose, or refusing to run.
 timbersh already observes it: one expansion point, through which the terms a
 `create logview` stores also pass, so a saved view is exact. A declaration
 does the same at `create`.
+
+## A follower is local; a remote selection is ephemeral
+
+The shipping loop works over the wire — the same document, the same per-store
+cursor — so one process can pull a selection from a host it is not running
+on. That is an investigation or a temporary watch, not a registration: the
+interest axis is host-local, so `retaining` could not mean anything for a
+remote follower, and a flag that reads as a promise while holding nothing is
+worse than no flag.
+
+So the registry declares LOCAL followers, and a remote selection is something
+`timber-otlp --select` does directly. Which is why a selection may run
+without `--positions`, at the live end, keeping its places in memory and
+forgetting them on exit: that is the shape of watching production while
+looking into something, and refusing it would only push people into leaving
+a state file behind on a machine they were visiting.
+
+## Where a store's first appearance starts is declared
+
+`--start begin|end`, per follower, because it depends and the person setting
+it up is the one who knows: a store created a moment ago and a thirty-day
+store that has just been relabelled into the selection are the same
+observation to the loop and opposite intentions to the operator. `begin`
+falls out of the mechanism (no position means the start of the window);
+`end` is the two-read join `tail` already performs — ask `kind: "stores"`
+for where each tape ends and seed the position there.
+
+The default: `end`, except that `retaining` implies `begin`, which is the
+rule the single-store path already applies and for its reason — retaining
+says the data is not lost until this follower has it, so skipping the backlog
+on the first run contradicts the declaration.
 
 ## The consumer is a poll loop
 
@@ -238,24 +306,14 @@ the follower on every store it matches.
 
 ## Open
 
-- Where a store's first appearance starts, as a declared default: its
-  beginning (what the cursor's absence already means) or its end (the
-  two-read join). A selection widened by a label edit ships an old store's
-  whole history under the first.
-- How the interest axis gets a store's LABELS. It needs them to evaluate a
-  selector where today it matches an anchor, and its whole shape rests on
-  reading the registry and nothing else — so either the retention tick hands
-  them in (one manifest read it has already made, but a signature change at
-  every call site in the retention path) or the axis reads them itself. The
-  floor half is settled: the position records the chunk, so nothing there
-  reads a rings file. Caching a resolved membership is not on the table for
-  the reason the tick already refuses to gate on the registry's mtime.
-- Whether a declaration holds `store` XOR `select` or only `select`. One
-  shape collapses a branch in four readers, but a store anchored by
-  `path:<canonical>` — one that declares no identity — cannot be written as
-  a predicate on `id`, so the collapse would lose the case `--store` exists
-  to serve. Two members, with `--store` unchanged in meaning, costs about
-  three branches and no migration.
-- Whether a follower may select stores it cannot retain — a selection read
-  over the wire, from a host that is not the one holding them. The interest
-  axis is host-local, so a remote follower can ship but cannot hold.
+- The plumbing that GETS a store's labels to the interest axis. Not the
+  semantics: a selector is evaluated against labels that were true at some
+  moment, and a bounded staleness is the same thing as the label having been
+  changed a moment later — so a cache is fine and the axis's job is to *get*
+  the labels, however that comes to be implemented. Nor is there a guarantee
+  worth attempting on the other side: labels are mutable and followers
+  depend on them, so relabelling a store can always cost data, and a design
+  that pretends otherwise buys a limitation and no safety. What is left is
+  the signature: the tick has the store, so it either hands the labels in or
+  hands in the pair and lets the axis ask. The floor half is settled — the
+  position records the chunk, so nothing converts an offset.
