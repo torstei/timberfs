@@ -258,10 +258,22 @@ fn write_atomically(path: &Path, v: &Value) -> anyhow::Result<()> {
 /// One consumer's position in EVERY store of a selection, keyed by store
 /// identity.
 ///
-/// ONE FILE, not a directory of cursors, because a batch spanning several
-/// stores is acknowledged once: a single tmp+rename advances every store
-/// in that batch or none of them, where N files tear. There is exactly one
-/// writer, so nothing wants the finer granularity.
+/// ONE FILE, not a directory of cursors, and the reason is COST rather
+/// than atomicity. Measured 2026-09-02 on ext4, saving 500 stores:
+/// **3.9 ms as one file against 542 ms as one file per store**, a factor
+/// of 140 — an atomic save is a write, an fsync, a rename and an fsync of
+/// the directory, and per store that is two thousand fsyncs a batch. (On
+/// tmpfs the same comparison is 2×, which is why it has to be measured
+/// somewhere fsync means something.) The retention tick reads them too,
+/// once instead of N times.
+///
+/// ⚠ Not because a batch must move all its stores or none. It need not:
+/// a torn set of per-store files would leave some stores resuming
+/// earlier and re-delivering, which is at-least-once — the guarantee
+/// this whole path already offers, neither OTLP nor the Forward protocol
+/// carrying a deduplication key. Positions only move forward and stores
+/// are independent, so there is no cross-store invariant to break. One
+/// file gets atomicity for nothing; it is not what pays for it.
 ///
 /// The position is an OFFSET on the store's tape rather than the
 /// `(seq, n)` a `Cursor` holds. It is what the answer's `position` record

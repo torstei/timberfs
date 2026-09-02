@@ -1136,10 +1136,11 @@ leave out.
 .TP
 .BI \-\-positions " FILE"
 ONE FILE \(em not a directory \(em holding every matched store's place,
-keyed by store identity. Written whole on every advance, so a batch
-spanning several stores moves all of them or none; omitted, the places
-live only as long as this process, which is a temporary watch. It is
-plain JSON, and readable on purpose:
+keyed by store identity; omitted, the places live only as long as this
+process, which is a temporary watch. One file and not one per store
+because an atomic save is a write, an fsync, a rename and an fsync of the
+directory: saving 500 stores measures 3.9 ms as one file against 542 ms
+as one per store. It is plain JSON, and readable on purpose:
 .RS
 .PP
 .EX

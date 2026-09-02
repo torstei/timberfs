@@ -318,8 +318,8 @@ Persist the position here (requires
 .BI \-\-positions " PATH"
 Where a selection keeps its positions: ONE file holding each matched
 store's place, keyed by store identity, so a restart resumes every one
-of them. One write per batch, so a batch spanning several stores
-advances all of them or none. Required with
+of them. One file and not one per store because an atomic save costs two
+fsyncs, which per store is thousands a batch. Required with
 .B \-\-select
 unless
 .BR \-\-dry\-run ,

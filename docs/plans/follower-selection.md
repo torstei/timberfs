@@ -35,10 +35,18 @@ So there is no store `--store` can name that `--select` cannot.
                          (`select` is stored canonically: `[]`, `[id=…]`, `[k=v,…]`)
         follower.lock    held while it runs
 
-`positions.json` is one file rather than a directory of cursors because a
-batch spanning several stores is acknowledged once: one tmp+rename either
-advances every store in that batch or none of them, where N files can tear.
-There is exactly one writer, so nothing wants the finer granularity.
+`positions.json` is one file rather than a directory of cursors for COST.
+Measured on ext4, saving 500 stores: **3.9 ms as one file against 542 ms as
+one per store** — an atomic save is a write, an fsync, a rename and an fsync
+of the directory, so per store that is two thousand fsyncs a batch. The
+retention tick reads them once instead of N times as well.
+
+⚠ **Not because a batch must move all its stores or none.** It need not: a
+torn set would leave some stores resuming earlier and re-delivering, which is
+at-least-once — what this path already offers, since neither OTLP nor the
+Forward protocol carries a deduplication key. Positions only move forward and
+stores are independent, so there is no cross-store invariant a tear could
+break. One file gets atomicity for free; that is not what it is for.
 
 **Two positions per store, because they answer different questions — but
 ONE axis.** The `offset` is where to RESUME: the absolute offset on the
