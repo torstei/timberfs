@@ -72,6 +72,21 @@ of the next — so a sink's watermark is the last accepted entry's
 `offset + len`, per `id`. Same quantity the `position` record reports:
 there is one kind of position in this protocol.
 
+**And ONE unit, whatever the sink reads: the absolute offset on the
+store's tape** — what has ever left the store plus where the bytes sit in
+what remains. Retention cannot move it, `remove_head` rebasing the chunk
+offsets down by exactly what it grows `dropped` by, so the number is the
+count of bytes ever written before that point. A CHUNK boundary is simply
+an offset that happens to land on one; `view … at chunk N` and
+`at offset N` have always been two views of the same axis.
+
+⚠ It is therefore also a SHARED address across a replica: chunks move
+verbatim so their uncompressed lengths match, and replica mode preserves
+numbering, so `dropped + uncomp_start` is the same absolute number at both
+ends. A receiver can state its coverage in it. ⚠ For a replica only — a
+receiver that numbers its own chunks shares no address, which is what
+`receiving-end.md` means by an ingesting writer numbering its own.
+
 **`hello` may carry initial watermarks**, which is how a sink whose
 destination knows more than we do tells us where to begin. That is exactly
 the frames handshake — the receiver answering with the coverage it holds —
@@ -202,7 +217,7 @@ authorities for one number is a bug waiting to be written.
 
 | | lives in | survives a restart |
 |---|---|---|
-| positions (offset, chunk, per store) | `positions.json` | **yes** — or every store is re-shipped |
+| positions (tape offset, and the chunk it lands in, per store) | `positions.json` | **yes** — or every store is re-shipped |
 | the sink's last `note`, per store and one for itself | `positions.json` | yes — `status` is another process |
 | labels last ANNOUNCED, per store | the loop's memory | no — and must not |
 | the sink's own copy of them | the sink's memory | no — rebuilt from stream start |
@@ -280,15 +295,21 @@ form was said to add is configuration and durability. This is both.
 
 ## Deferred, and named rather than implied
 
-  * **`chunks` granularity.** A chunk record carries `uncomp_start` —
-    logical bytes, not the tape — so a chunks sink's watermark is a chunk
-    NUMBER. `Positions.At` already holds both an offset and a chunk, so the
-    file is ready; resuming a SELECTION by chunk is not, the document's
-    `cursor` being offsets and `from_chunk` one number for every source at
-    once. Accepted in the `hello` grammar and refused with "not served
-    yet", rather than pretended.
-  * **`frames` joining the protocol**, which follows the above: its
-    initial-watermark hello is expressible, its granularity is not yet.
+  * **`chunks` granularity** — and it is the EASIER payload, not the
+    harder one, which an earlier draft of this had backwards. Resuming by
+    offset has no partial case for a chunk: it is wholly before the
+    position or it is not, where an entry needed the mid-chunk skip. Three
+    small things are missing, each mirroring the entries path: the TAPE
+    offset on the `chunk` record (keeping `uncomp_start`, which a consumer
+    reassembling frames needs); `write_chunks_framed` taking the cursor map
+    it currently has no parameter for; and `position` records from the
+    chunks path, which emits none — one per store EXAMINED, or the next
+    page rescans the quiet ones. ⚠ Which is also why a chunks query can
+    only be SEEKED (`from_chunk`) and not paged today, and why only a
+    records answer carries a completeness marker.
+  * **`frames` joining the protocol.** Not a unit problem — see the shared
+    address above. What is left is that it ships sidecars and a manifest,
+    and wants the receiver's own dedup.
   * **A withdrawal record** for a store leaving a selection.
   * **Per-destination watermarks from one sink** — a routing sink where one
     destination is down and the others are not. The message shape already

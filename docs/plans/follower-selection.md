@@ -40,13 +40,16 @@ batch spanning several stores is acknowledged once: one tmp+rename either
 advances every store in that batch or none of them, where N files can tear.
 There is exactly one writer, so nothing wants the finer granularity.
 
-**Two positions per store, because they answer different questions.** The
-`offset` is where to RESUME: what the answer's `position` record carries, so
-no conversion can disagree with the wire, and valid inside the write-ahead
-segment, which a chunk number is not — a chunk-granular position stands still
-at the live edge, so a restart re-delivers everything written since the last
-flush. The `chunk` is the RETENTION FLOOR: chunks strictly below it are fully
-consumed. It is recorded, not derived, because the answer states it on every
+**Two positions per store, because they answer different questions — but
+ONE axis.** The `offset` is where to RESUME: the absolute offset on the
+store's tape, which is what the answer's `position` record carries, so no
+conversion can disagree with the wire, and which is valid inside the
+write-ahead segment where a chunk number is not — a chunk-granular position
+stands still at the live edge, so a restart re-delivers everything written
+since the last flush. The `chunk` is the RETENTION FLOOR: chunks strictly
+below it are fully consumed. They are not different units: a chunk boundary
+IS an offset, and `dropped + uncomp_start` is how an entry's own base is
+computed. It is recorded, not derived, because the answer states it on every
 entry that has one — deriving it would make the interest axis read a rings
 file to convert an offset, which is exactly what it must not do. It stays
 where it was while entries arrive only from the live edge, which is the
