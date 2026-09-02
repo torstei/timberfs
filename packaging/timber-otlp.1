@@ -254,8 +254,12 @@ instead of one named store. Comma-separated terms are ANDed;
 .BR key=*text " and " key!*text
 (regexes anchored at both ends), a BARE WORD is the store's name matched
 anywhere in it, and
-.B *
-is every store in every configured forest. The same predicate
+.B []
+\(em the predicate with no terms \(em is every store in every configured
+forest. The wrapping brackets are optional and are how a predicate is
+written in
+.BR timbersh (1),
+so the one tested there pastes in here. The same predicate
 .B timberfs list \-\-select
 takes, so a selection can be listed before it is configured. Requires
 .B \-\-positions
@@ -369,8 +373,8 @@ without touching this:
 .PP
 .RS
 .EX
-timberfs list \-\-select 'service=~apache\-.*'      # what it will ship
-timber\-otlp \-\-follow \-\-select 'service=~apache\-.*' \\
+timberfs list \-\-select '[service=~apache\-.*]'    # what it will ship
+timber\-otlp \-\-follow \-\-select '[service=~apache\-.*]' \\
     \-\-positions /var/lib/timberfs/collector.positions \\
     \-\-endpoint http://collector:4318
 .EE

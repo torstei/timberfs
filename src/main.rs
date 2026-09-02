@@ -468,14 +468,16 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// Select stores by their manifest: `--select
-        /// 'type=console,host=web01'`. Comma-separated terms are ANDed;
+        /// '[type=console,host=web01]'`. Comma-separated terms are ANDed;
         /// `key=value`, `key!=value`, `key=~regex`, `key!~regex`,
         /// `key=*text` (a literal anywhere in the value) and `key!*text`
         /// (regexes anchored at both ends); a BARE WORD is the name,
         /// matched anywhere in it. An absent label reads as the empty
-        /// string, so `key!=` selects the stores that declare it. `*` is
-        /// every store, as an omitted --select is. Quote a value that
-        /// must contain a comma
+        /// string, so `key!=` selects the stores that declare it. The
+        /// wrapping brackets are optional here and are how a predicate
+        /// is written in timbersh, so one pastes into the other; `[]` is
+        /// the predicate with no terms, which is every store, as an
+        /// omitted --select is. Quote a value that must contain a comma
         #[arg(long, value_name = "EXPR")]
         select: Option<String>,
         /// Print each store's whole id instead of the leading 8

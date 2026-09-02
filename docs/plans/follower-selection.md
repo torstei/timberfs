@@ -32,6 +32,7 @@ So there is no store `--store` can name that `--select` cannot.
     /var/lib/timberfs/followers/<name>/
         follower.json    select, type, endpoint, retaining, args
         positions.json   { "<store-id>": {offset, chunk, wl, delivered}, … }
+                         (`select` is stored canonically: `[]`, `[id=…]`, `[k=v,…]`)
         follower.lock    held while it runs
 
 `positions.json` is one file rather than a directory of cursors because a
@@ -101,6 +102,23 @@ here, and they are one change:
 - **The typo guard that makes it safe.** Once a bare word is legal,
   `service~api` becomes a name search rather than an error. A term holding
   any of `=~!*` with no operator this build knows is refused.
+- **The wrapping `[…]`, and with it `[]`.** The brackets are a DELIMITER — a
+  statement must know where the predicate ends, and on a command line the
+  argument boundary already says so — so an expression may carry them or
+  not, and what timbersh renders is what a declaration can hold.
+
+`[]` is the one that earns its keep beyond paste-ability: **a predicate with
+no terms is «every store», SAID**, where an empty string is nothing written
+at all and is refused. A read may reasonably default to every store when
+asked for no predicate (`list` with no `--select`); a DECLARATION may not,
+because "follows everything on this host" has to be a sentence somebody
+wrote. So a declaration stores the canonical bracketed form — `[]`,
+`[id=<uuid>]`, `[service=~apache-.*]` — which reads like the shell, and a
+missing `select` member stays an error rather than a default.
+
+⚠ The cost, documented rather than discovered: `[` and `]` are no longer
+literal at the EDGES of a whole expression, so a store named `[foo]` is
+selected as `name=*[foo]`. Inside a value they are untouched.
 
 An operator checks a selector against the fleet with the shell
 (`select stores from [service=~apache-.*];`) and against one host with

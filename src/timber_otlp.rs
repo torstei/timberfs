@@ -99,11 +99,13 @@ struct Cli {
     dry_run: bool,
 
     /// Ship every store a predicate matches instead of one named store:
-    /// `--select 'service=~apache-.*'`, `--select '*'` for the whole
-    /// forest, or a bare word for a name. The selection is re-resolved
-    /// every poll, so a store that appears is picked up and one that
-    /// stops matching is dropped. Each store keeps its own position and
-    /// its own resource attributes, and one request carries them all
+    /// `--select '[service=~apache-.*]'`, `--select '[]'` for the whole
+    /// forest, or a bare word for a name. The brackets are optional and
+    /// are how a predicate is written in timbersh, so one pastes into
+    /// the other. The selection is re-resolved every poll, so a store
+    /// that appears is picked up and one that stops matching is dropped.
+    /// Each store keeps its own position and its own resource
+    /// attributes, and one request carries them all
     #[arg(long, value_name = "EXPR", conflicts_with_all = ["store", "cursor", "from", "to", "start"], help_heading = HEAD_WHAT)]
     select: Option<String>,
     /// Where a selection's positions live: one file holding each matched

@@ -1156,11 +1156,30 @@ label reads as the empty string, so
 .B key=
 selects the stores that do NOT declare it and
 .B key!=
-the ones that do.
-.B *
-is every store, as an omitted
+the ones that do. Quote a value that must contain a comma.
+.PP
+The whole expression may be WRAPPED in
+.BR [ \&...\& ] ,
+which is how a predicate is written and rendered in
+.BR timbersh (1)
+\(em so the one tested there is the one that pastes in here. The
+brackets are a delimiter: a statement must know where the predicate
+ends, and on a command line the argument boundary already says so.
+.PP
+.B []
+is therefore the predicate carrying NO terms, which is every store, as
+an omitted
 .B \-\-select
-is. Quote a value that must contain a comma.
+is (and as
+.BR * ,
+the older spelling, still is). It is not the same as nothing: an empty
+.I EXPR
+is refused. A read may default to every store when asked for no
+predicate; a DECLARATION may not, because \(lqfollows everything on this
+host\(rq has to be something somebody wrote \(em see
+.B timberfs follower
+and
+.BR timber\-otlp (1).
 .RS
 .PP
 It matches the WHOLE manifest, not labels alone \(em a name, an id and a

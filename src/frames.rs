@@ -935,7 +935,7 @@ mod tests {
         // by getting it wrong.
         let decl = crate::follower::Declaration {
             name: "ship".to_string(),
-            select: "id=an-id".to_string(),
+            select: "[id=an-id]".to_string(),
             path: "/var/log/timberfs/app/app.log".to_string(),
             kind: "frames".to_string(),
             endpoint: Some("archive:4319".to_string()),

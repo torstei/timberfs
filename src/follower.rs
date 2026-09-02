@@ -278,15 +278,19 @@ impl Declaration {
         // declaration says which stores it follows in one place.
         let legacy = take_str(&mut map, "store").unwrap_or_default();
         let select = match take_str(&mut map, "select") {
+            // Not defaulted. An absent selection is a declaration that
+            // does not say what it follows; `[]` is one that says «every
+            // store», and the two must never be one value.
             Some(s) if !s.trim().is_empty() => s,
-            _ if !legacy.is_empty() => format!("id={legacy}"),
+            _ if !legacy.is_empty() => format!("[id={legacy}]"),
             _ => bail!(
-                "{} names no \"select\" — a follower follows the stores a predicate matches, \
-                 and one store is the predicate `id=<its id>`",
+                "{} names no \"select\" — a follower follows the stores a predicate matches. \
+                 One store is `[id=<its id>]`; every store is `[]`, which is a thing to have \
+                 written rather than a member to leave out",
                 path.display()
             ),
         };
-        crate::select::Selector::parse(&select)
+        let select = crate::select::canonical(&select)
             .with_context(|| format!("{}: \"select\"", path.display()))?;
         let kind = take_str(&mut map, "type").unwrap_or_default();
         if kind.is_empty() {
@@ -1226,9 +1230,9 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
     let decl = Declaration {
         name: name.to_string(),
         // `--store` names ONE store, and naming one store by identity is
-        // the predicate `id=<it>`. So there is one member, and the
+        // the predicate `[id=<it>]`. So there is one member, and the
         // convenience is the flag rather than a second shape on disk.
-        select: format!("id={anchor}"),
+        select: format!("[id={anchor}]"),
         path: fs::canonicalize(&sdir)
             .unwrap_or(sdir)
             .join(&sname)
@@ -1613,7 +1617,7 @@ pub fn cmd_update(
                         cursor_path(&reg, name).display()
                     );
                 }
-                decl.select = format!("id={anchor}");
+                decl.select = format!("[id={anchor}]");
                 decl.path = fs::canonicalize(&sdir)
                     .unwrap_or(sdir)
                     .join(&sname)
@@ -1855,7 +1859,7 @@ mod tests {
     fn decl(name: &str, retaining: bool) -> Declaration {
         Declaration {
             name: name.to_string(),
-            select: "id=store-id".into(),
+            select: "[id=store-id]".into(),
             path: "/var/log/timberfs/app/app.log".into(),
             kind: "otlp".into(),
             retaining,
@@ -2022,13 +2026,13 @@ mod tests {
     fn for_store_filters_by_identity_and_ranks_the_worst_first() {
         let reg = scratch("bystore");
         let mut a = decl("ahead", true);
-        a.select = "id=id-a".into();
+        a.select = "[id=id-a]".into();
         a.save(&reg).unwrap();
         let mut b = decl("behind", true);
-        b.select = "id=id-a".into();
+        b.select = "[id=id-a]".into();
         b.save(&reg).unwrap();
         let mut other = decl("elsewhere", true);
-        other.select = "id=id-b".into();
+        other.select = "[id=id-b]".into();
         other.save(&reg).unwrap();
         let mine = for_store(&reg, &store_fields("id-a", &[]));
         let names: Vec<&str> = mine.iter().map(|r| r.name()).collect();
@@ -2094,10 +2098,10 @@ mod tests {
         // worst case last.
         let reg = scratch("holdsall");
         let mut fresh = decl("fresh", true);
-        fresh.select = "id=id".into();
+        fresh.select = "[id=id]".into();
         fresh.save(&reg).unwrap();
         let mut behind = decl("behind", true);
-        behind.select = "id=id".into();
+        behind.select = "[id=id]".into();
         behind.save(&reg).unwrap();
         Cursor {
             seq: Some(3),
@@ -2131,7 +2135,7 @@ mod tests {
     /// A retaining follower of `store`, standing at `at`.
     fn retaining(reg: &Path, name: &str, store: &str, at: Option<u64>) {
         let mut d = decl(name, true);
-        d.select = format!("id={store}");
+        d.select = format!("[id={store}]");
         d.save(reg).unwrap();
         if let Some(seq) = at {
             Cursor {
@@ -2151,7 +2155,7 @@ mod tests {
         // A non-retaining follower of the same store decides nothing: the
         // flag is what expresses interest, not the presence of a position.
         let mut tap = decl("tap", false);
-        tap.select = "id=id".into();
+        tap.select = "[id=id]".into();
         tap.save(&reg).unwrap();
         Cursor {
             seq: Some(0),
@@ -2275,7 +2279,7 @@ mod tests {
     fn a_selection_holds_every_store_it_covers_at_its_own_position() {
         let reg = scratch("selectionfloor");
         let mut d = decl("central", true);
-        d.select = "service=apache".into();
+        d.select = "[service=apache]".into();
         d.save(&reg).unwrap();
         let mut held = cursor::Positions::new("central");
         held.advance("id-a", "/p/a", 100, Some(7), 0, 1);
@@ -2312,7 +2316,7 @@ mod tests {
         )
         .unwrap();
         let d = Declaration::load(&reg, "old").unwrap();
-        assert_eq!(d.select, "id=id-a");
+        assert_eq!(d.select, "[id=id-a]");
         assert_eq!(d.anchor().as_deref(), Some("id-a"));
 
         // And its position is still its position: a `cursor.json` belongs
@@ -2341,7 +2345,7 @@ mod tests {
     fn a_store_with_no_identity_holds_nothing_back() {
         let reg = scratch("noid");
         let mut d = decl("central", true);
-        d.select = "*".into();
+        d.select = "[]".into();
         d.save(&reg).unwrap();
         let mut fields = Map::new();
         fields.insert("name".into(), Value::String("plain".into()));

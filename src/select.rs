@@ -6,7 +6,8 @@
 //! Grammar — one expression, comma-separated conjunction:
 //!
 //! ```text
-//! *              every store
+//! []             every store — a predicate with no terms
+//! *              the same, and the older spelling of it
 //! text           the NAME contains text  (`name=*text`)
 //! key=value      the label equals value
 //! key!=value     it does not
@@ -15,6 +16,20 @@
 //! key=*text      it CONTAINS text, anywhere in the value
 //! key!*text      it does not
 //! ```
+//!
+//! An expression may be wrapped in `[…]`, which is how a predicate is
+//! written and rendered in `timbersh` — so the one an operator tested
+//! there is the one a declaration can hold, and a stored selection reads
+//! like the shell. The brackets are a DELIMITER, needed in a statement
+//! because it must know where the predicate ends and unnecessary on a
+//! command line, where the argument boundary says so.
+//!
+//! `[]` is therefore not the same as nothing. It is a predicate carrying
+//! no terms — «every store», said — where an empty string is nothing
+//! written at all and is refused. A read may reasonably default to every
+//! store when asked for no predicate (`list` with no `--select`); a
+//! DECLARATION may not, because "follows everything on this host" has to
+//! be a sentence somebody wrote.
 //!
 //! A bare word is the name because that is what a person types when they
 //! know which log they want and not how it is labelled. It is `=*` and
@@ -90,14 +105,23 @@ impl Selector {
 
     pub fn parse(expr: &str) -> anyhow::Result<Self> {
         let expr = expr.trim();
-        if expr.is_empty() {
-            bail!("empty selector: use `*` to select every store");
-        }
-        if expr == "*" {
-            return Ok(Selector::all());
+        // The brackets are a delimiter, so they come off before anything
+        // is read — and whether they were there decides what EMPTY means.
+        let (inner, bracketed) = match expr.strip_prefix('[').and_then(|e| e.strip_suffix(']')) {
+            Some(inner) => (inner.trim(), true),
+            None => (expr, false),
+        };
+        if inner.is_empty() || inner == "*" {
+            if bracketed || expr == "*" {
+                return Ok(Selector::all());
+            }
+            bail!(
+                "empty selector: `[]` is the predicate that selects every store, where \
+                 nothing at all is nothing asked for"
+            );
         }
         let mut terms = Vec::new();
-        for part in split_terms(expr)? {
+        for part in split_terms(inner)? {
             terms.push(parse_term(&part)?);
         }
         Ok(Selector { terms })
@@ -139,6 +163,26 @@ impl Selector {
             _ => None,
         }
     }
+}
+
+/// One spelling for a selection, for anything that STORES or renders
+/// one: bracketed, as a predicate is written and read everywhere else,
+/// so every store is `[]` in a file as well as on a screen.
+///
+/// Validated by parsing, so a stored selection is one that can be read
+/// back — and idempotent, so canonicalising a canonical form is a no-op.
+pub fn canonical(expr: &str) -> anyhow::Result<String> {
+    let sel = Selector::parse(expr)?;
+    if sel.is_all() {
+        return Ok("[]".to_string());
+    }
+    let inner = expr.trim();
+    let inner = inner
+        .strip_prefix('[')
+        .and_then(|e| e.strip_suffix(']'))
+        .unwrap_or(inner)
+        .trim();
+    Ok(format!("[{inner}]"))
 }
 
 /// A label's value as text. Free-form keys may hold a non-string, and a
@@ -354,6 +398,63 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
             .collect()
+    }
+
+    /// `[]` is a predicate that was WRITTEN and constrains nothing,
+    /// where an empty string is nothing written at all. A read may
+    /// default to every store; a declaration may not, so the two must
+    /// not be one value.
+    #[test]
+    fn the_empty_predicate_is_every_store_and_nothing_at_all_is_refused() {
+        let l = labels(&[("host", "web01")]);
+        for every in ["[]", "[ ]", "*", "[*]"] {
+            let sel = Selector::parse(every).unwrap();
+            assert!(sel.is_all(), "{every}");
+            assert!(sel.matches(&l), "{every}");
+            assert!(
+                sel.matches(&Map::new()),
+                "{every} against an unlabelled store"
+            );
+        }
+        for nothing in ["", "   "] {
+            let err = Selector::parse(nothing).unwrap_err().to_string();
+            assert!(err.contains("`[]`"), "{err}");
+        }
+    }
+
+    /// The brackets are a DELIMITER: what timbersh renders is what a
+    /// declaration can hold, and both spellings are one selector.
+    #[test]
+    fn a_bracketed_expression_is_the_same_selector() {
+        let l = labels(&[("service", "apache"), ("host", "web01")]);
+        for expr in ["service=apache,host=web01", "[service=apache,host=web01]"] {
+            assert!(Selector::parse(expr).unwrap().matches(&l), "{expr}");
+        }
+        // Only a WHOLE expression is unwrapped, so brackets inside a
+        // value are untouched.
+        let odd = labels(&[("name", "a[1]b")]);
+        assert!(Selector::parse("name=*[1]").unwrap().matches(&odd));
+        assert!(Selector::parse("[name=*[1]]").unwrap().matches(&odd));
+    }
+
+    /// One stored spelling, so a file reads like a screen — and every
+    /// store is `[]` in both.
+    #[test]
+    fn the_canonical_form_is_bracketed_and_idempotent() {
+        for (given, want) in [
+            ("service=apache", "[service=apache]"),
+            ("[service=apache]", "[service=apache]"),
+            ("apache", "[apache]"),
+            ("*", "[]"),
+            ("[]", "[]"),
+        ] {
+            assert_eq!(canonical(given).unwrap(), want, "{given}");
+            assert_eq!(canonical(want).unwrap(), want, "{want} is canonical");
+        }
+        assert!(
+            canonical("host~web01").is_err(),
+            "a stored selector must parse"
+        );
     }
 
     #[test]
