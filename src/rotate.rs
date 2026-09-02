@@ -168,8 +168,8 @@ pub fn cmd_trim(store: &Path, dry_run: bool) -> anyhow::Result<()> {
         .and_then(|f| format::read_header_next_seq(&f))
         .unwrap_or(0)
         .max(records.last().map(|c| c.seq + 1).unwrap_or(0));
-    let anchor = crate::follower::anchor_of(&dir, &name);
-    let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+    let fields = crate::follower::subject_of(&dir, &name);
+    let held = crate::follower::TickInterest::default().floor(&policy, &fields, next_seq);
     if policy.unconsumed {
         match (&held.holder, held.floor) {
             (Some(h), Some(f)) => crate::note!(
@@ -238,7 +238,7 @@ pub fn cmd_trim(store: &Path, dry_run: bool) -> anyhow::Result<()> {
     // floor is only a statement about the store as it is at the moment of
     // the drop.
     let next_seq = st.next_seq(&name).unwrap_or(next_seq);
-    let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+    let held = crate::follower::TickInterest::default().floor(&policy, &fields, next_seq);
     match st.enforce_retention(&name, policy.max_age_ms, policy.max_comp_bytes, held.floor)? {
         None => println!("nothing to trim: every chunk is within the declared policy"),
         Some(stats) => {

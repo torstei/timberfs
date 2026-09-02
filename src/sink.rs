@@ -221,10 +221,10 @@ pub fn cmd_records_sink(
                 st.lock().unwrap().sync_wal_declarations();
                 match crate::bark::declared_retention(&dir, &name) {
                     Ok(policy) if policy.is_some() => {
-                        let anchor = crate::follower::anchor_of(&dir, &name);
+                        let fields = crate::follower::subject_of(&dir, &name);
                         let next_seq = st.lock().unwrap().next_seq(&name).unwrap_or(0);
                         let held = crate::follower::TickInterest::default()
-                            .floor(&policy, &anchor, next_seq);
+                            .floor(&policy, &fields, next_seq);
                         match st.lock().unwrap().enforce_retention(
                             &name,
                             policy.max_age_ms,
@@ -451,9 +451,9 @@ pub fn cmd_records_sink(
     // as it ran; this is the final pass, and the only one for an import.)
     match crate::bark::declared_retention(&dir, &name) {
         Ok(policy) if policy.is_some() => {
-            let anchor = crate::follower::anchor_of(&dir, &name);
+            let fields = crate::follower::subject_of(&dir, &name);
             let next_seq = st.lock().unwrap().next_seq(&name).unwrap_or(0);
-            let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+            let held = crate::follower::TickInterest::default().floor(&policy, &fields, next_seq);
             if let Some(stats) = st.lock().unwrap().enforce_retention(
                 &name,
                 policy.max_age_ms,

@@ -304,16 +304,36 @@ print the match count and, for a retaining declaration, the bytes it would
 hold today; `status` reports held bytes per store and in total; `list` shows
 the follower on every store it matches.
 
+## The interest axis is handed the store
+
+The axis used to be given a store's ANCHOR and compare it to each retaining
+follower's; it is now given the store's FIELDS — its labels, its name, its
+identity — and matches each follower's selector against them. Everything else
+about it is unchanged: it reads the registry and nothing else, an unreadable
+declaration (now: or an unparsable selector) fails closed for every store,
+and the floor is the minimum over the retaining followers that cover this
+store, with «has never read it» holding all of it.
+
+Handed IN rather than fetched, and the caller is already the right place: the
+tick's `LivePolicy` stats the manifest once a second and re-reads only when
+it changed, so the fields ride the reparse the policy already pays for. A
+label change IS a manifest change, and so is the mint that gives a store an
+identity, so the one stat catches every way the answer can move.
+
+⚠ **No transactional reading is attempted, deliberately.** A selector is
+matched against labels that were true at some moment, and a bounded staleness
+is indistinguishable from the label having been changed a moment later. Nor
+is there anything to guarantee on the other side: labels are mutable and
+followers depend on them, so relabelling a store can always cost data. A
+design that tried to prevent that would buy a limitation and no safety —
+which is also what leaves the *implementation* of "get this store's labels"
+free to become a cache or an index later, behind the same question.
+
+Positions carry the floor, so nothing here converts an offset, and a
+`cursor.json` still answers for the one store a legacy declaration named.
+
 ## Open
 
-- The plumbing that GETS a store's labels to the interest axis. Not the
-  semantics: a selector is evaluated against labels that were true at some
-  moment, and a bounded staleness is the same thing as the label having been
-  changed a moment later — so a cache is fine and the axis's job is to *get*
-  the labels, however that comes to be implemented. Nor is there a guarantee
-  worth attempting on the other side: labels are mutable and followers
-  depend on them, so relabelling a store can always cost data, and a design
-  that pretends otherwise buys a limitation and no safety. What is left is
-  the signature: the tick has the store, so it either hands the labels in or
-  hands in the pair and lets the axis ask. The floor half is settled — the
-  position records the chunk, so nothing converts an offset.
+Nothing blocking. What is left is the operator surface: `follower create
+--select`, `run` exec'ing the selection shipper with `--positions` and
+`--start`, and `list`/`status` rendering a set rather than a store.

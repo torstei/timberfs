@@ -360,9 +360,9 @@ where
                 let dir = store_dir(&root, name);
                 match crate::bark::declared_retention(&dir, name) {
                     Ok(policy) if policy.is_some() => {
-                        let anchor = crate::follower::anchor_of(&dir, name);
+                        let fields = crate::follower::subject_of(&dir, name);
                         let next_seq = intake.lock().unwrap().next_seq(name).unwrap_or(0);
-                        let held = interest.floor(&policy, &anchor, next_seq);
+                        let held = interest.floor(&policy, &fields, next_seq);
                         let res = intake.lock().unwrap().enforce_retention(
                             name,
                             policy.max_age_ms,

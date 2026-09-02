@@ -102,6 +102,12 @@ pub const UNIT_TEMPLATE: &str = "timberfs-follower@";
 
 const DECL_FILE: &str = "follower.json";
 const CURSOR_FILE: &str = "cursor.json";
+/// A selection's places, one per store it has read. Separate from
+/// `cursor.json` rather than a new shape inside it: the two are different
+/// documents, and a reader must never mistake a single-store cursor for
+/// an empty set of positions, which would read as "nothing consumed" and
+/// re-ship every store.
+const POSITIONS_FILE: &str = "positions.json";
 const LOCK_FILE: &str = "follower.lock";
 
 /// The follower types `run` knows how to exec. One per shipper binary:
@@ -122,6 +128,10 @@ pub fn follower_dir(reg: &Path, name: &str) -> PathBuf {
 
 pub fn decl_path(reg: &Path, name: &str) -> PathBuf {
     follower_dir(reg, name).join(DECL_FILE)
+}
+
+pub fn positions_path(reg: &Path, name: &str) -> PathBuf {
+    follower_dir(reg, name).join(POSITIONS_FILE)
 }
 
 pub fn cursor_path(reg: &Path, name: &str) -> PathBuf {
@@ -176,10 +186,15 @@ pub struct Declaration {
     /// the file too, so a human reading it alone knows whose it is — and
     /// so a copied directory can be caught.
     pub name: String,
-    /// What the store is identified BY: its `.bark` id. The same anchor a
-    /// cursor holds (`cursor::store_anchor`), so a store recognises its
-    /// own followers by exactly the rule its own consumers wrote.
-    pub store: String,
+    /// WHICH stores this follows, as a selector — the same predicate
+    /// `list --select` and the query document take.
+    ///
+    /// One store is the one-term case `id=<its id>`, which is what
+    /// `--store` writes: a follower has always recorded its store by
+    /// IDENTITY and `create` has always refused a path-anchored one, so
+    /// every declaration ever written is expressible here and a legacy
+    /// `store` member migrates to exactly the store it named.
+    pub select: String,
     /// The store's path when last declared — a HINT, since identity is
     /// what decides. `run` tries it first and falls back to a forest scan.
     pub path: String,
@@ -204,6 +219,23 @@ pub struct Declaration {
 }
 
 impl Declaration {
+    /// The one store this follows, by identity, when it follows exactly
+    /// one — the `id=<x>` case, which is every declaration `--store`
+    /// wrote. `None` for a set, where nothing single can be resolved,
+    /// named in an error, or given a legacy cursor.
+    pub fn anchor(&self) -> Option<String> {
+        crate::select::Selector::parse(&self.select)
+            .ok()
+            .and_then(|s| s.sole_id().map(str::to_string))
+    }
+
+    /// The selection, parsed. A declaration that cannot be parsed was
+    /// refused at load, so this is infallible in practice and still
+    /// returns the error rather than panicking on a hand-edit race.
+    pub fn selector(&self) -> anyhow::Result<crate::select::Selector> {
+        crate::select::Selector::parse(&self.select)
+    }
+
     /// Read the declaration of `name`. A missing or unreadable one is an
     /// error, never a default: a follower with no declaration is not a
     /// follower whose retention interest is "nothing", it is a registry
@@ -241,14 +273,21 @@ impl Declaration {
                 );
             }
         }
-        let store = take_str(&mut map, "store").unwrap_or_default();
-        if store.is_empty() {
-            bail!(
-                "{} names no \"store\" — a follower is a position in ONE store, recorded by \
-                 identity",
+        // The legacy member named ONE store by identity, so it is the
+        // one-term selector for that store. Read, never rewritten: a
+        // declaration says which stores it follows in one place.
+        let legacy = take_str(&mut map, "store").unwrap_or_default();
+        let select = match take_str(&mut map, "select") {
+            Some(s) if !s.trim().is_empty() => s,
+            _ if !legacy.is_empty() => format!("id={legacy}"),
+            _ => bail!(
+                "{} names no \"select\" — a follower follows the stores a predicate matches, \
+                 and one store is the predicate `id=<its id>`",
                 path.display()
-            );
-        }
+            ),
+        };
+        crate::select::Selector::parse(&select)
+            .with_context(|| format!("{}: \"select\"", path.display()))?;
         let kind = take_str(&mut map, "type").unwrap_or_default();
         if kind.is_empty() {
             bail!(
@@ -275,7 +314,7 @@ impl Declaration {
         };
         Ok(Declaration {
             name: name.to_string(),
-            store,
+            select,
             path: take_str(&mut map, "path").unwrap_or_default(),
             kind,
             retaining,
@@ -289,7 +328,7 @@ impl Declaration {
     fn to_map(&self) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("name".into(), Value::String(self.name.clone()));
-        map.insert("store".into(), Value::String(self.store.clone()));
+        map.insert("select".into(), Value::String(self.select.clone()));
         map.insert("path".into(), Value::String(self.path.clone()));
         map.insert("type".into(), Value::String(self.kind.clone()));
         map.insert("retaining".into(), Value::Bool(self.retaining));
@@ -336,25 +375,34 @@ impl Declaration {
     /// is CHECKED rather than trusted: a path that now holds a different
     /// store is exactly the case a path-keyed registry gets wrong.
     pub fn resolve_store(&self) -> anyhow::Result<PathBuf> {
+        let Some(anchor) = self.anchor() else {
+            bail!(
+                "follower {} follows the stores matching {:?}, which is a set — there is no \
+                 single store to resolve. `timberfs list --select {:?}` is what it covers",
+                self.name,
+                self.select,
+                self.select
+            );
+        };
         if !self.path.is_empty() {
             let p = PathBuf::from(&self.path);
             if let Ok((dir, name)) = resolve_backing(&p) {
                 if format::rings_path(&dir, &name).exists() {
                     let bark = crate::bark::load(&dir, &name);
-                    if cursor::store_anchor(&dir, &name, bark.as_ref()) == self.store {
+                    if cursor::store_anchor(&dir, &name, bark.as_ref()) == anchor {
                         return Ok(p);
                     }
                 }
             }
         }
-        match crate::forest::stores_by_anchor(&self.store).as_slice() {
+        match crate::forest::stores_by_anchor(&anchor).as_slice() {
             [one] => Ok(one.clone()),
             [] => bail!(
                 "follower {} follows store {} — not at {} any more, and no configured forest \
                  holds it. Point it at the store again with `timberfs follower update {} \
                  store=<path>`",
                 self.name,
-                self.store,
+                anchor,
                 if self.path.is_empty() {
                     "(no recorded path)"
                 } else {
@@ -372,7 +420,7 @@ impl Declaration {
             several => bail!(
                 "store {} is claimed by several stores, so which one follower {} means cannot \
                  be decided — a copied .bark gives two stores one identity:\n{}",
-                self.store,
+                anchor,
                 self.name,
                 several
                     .iter()
@@ -551,6 +599,7 @@ fn recorded_pid(reg: &Path, name: &str) -> Option<u32> {
 /// A registered follower, read: its declaration, its position, whether it
 /// is running, and — when its store can be found and read — where that
 /// position stands against the store's chunks.
+#[derive(Clone)]
 pub struct Registered {
     pub decl: Declaration,
     /// `None` when it has never delivered anything. Deliberately
@@ -583,7 +632,7 @@ impl Registered {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         if name.is_empty() {
-            return self.decl.store.clone();
+            return self.decl.select.clone();
         }
         name.strip_suffix(".log").unwrap_or(&name).to_string()
     }
@@ -685,40 +734,50 @@ pub fn read_all(reg: &Path) -> anyhow::Result<Registry> {
     Ok(Registry { followers, broken })
 }
 
-/// Every follower that holds a position in the store `anchor` identifies.
+/// Every follower whose selection covers the store described by
+/// `fields` — its manifest, its name and the pair's identity, as
+/// `select::selectable_of` reads them.
 ///
-/// A scan of the registry filtered by store id, rather than a read of one
-/// per-store directory — the cost of recording the relation once, on the
-/// side that knows it. Cheap in practice: declarations are small and
-/// change rarely.
-pub fn for_store(reg: &Path, anchor: &str) -> Vec<Registered> {
-    let held = read_all(reg).map(|r| r.followers).unwrap_or_default();
-    let mut mine: Vec<Registered> = held
-        .into_iter()
-        .filter(|r| r.decl.store == anchor)
-        .collect();
+/// A scan of the registry, rather than a read of one per-store directory:
+/// the relation is recorded once, by the side that knows it. Cheap in
+/// practice — declarations are small and change rarely — but note the
+/// shape changed with selection: this is a MATCH per follower where it
+/// used to be a comparison, so a caller asking about many stores reads
+/// the registry once with `all` and matches per store.
+pub fn for_store(reg: &Path, fields: &Map<String, Value>) -> Vec<Registered> {
+    let mut mine = covering(&all(reg), fields);
     rank(&mut mine);
     mine
 }
 
-/// The whole registry grouped by store anchor — read ONCE, for a command
-/// that then asks about many stores. `list` over a fleet would otherwise
-/// rescan the registry per store, and every scan reads every follower's
-/// rings to place its position.
+/// The whole registry, read ONCE, for a command that then asks about many
+/// stores: `list` over a fleet would otherwise rescan it per store, and
+/// every scan reads every follower's rings to place its position.
 ///
 /// Deliberately not cached behind the module: a long-running writer must
 /// see a registration made a second ago, so who re-reads and when stays
 /// the caller's decision rather than a hidden one.
-pub fn by_store(reg: &Path) -> HashMap<String, Vec<Registered>> {
-    let mut out: HashMap<String, Vec<Registered>> = HashMap::new();
-    let followers = read_all(reg).map(|r| r.followers).unwrap_or_default();
-    for r in followers {
-        out.entry(r.decl.store.clone()).or_default().push(r);
-    }
-    for group in out.values_mut() {
-        rank(group);
-    }
-    out
+pub fn all(reg: &Path) -> Vec<Registered> {
+    read_all(reg).map(|r| r.followers).unwrap_or_default()
+}
+
+/// Those of `held` whose selection covers this store, ranked. A follower
+/// whose declaration will not parse covers nothing HERE — the interest
+/// axis is where an unreadable declaration has to fail closed, and it
+/// does; a listing that refused to render would just hide the rest.
+pub fn covering(held: &[Registered], fields: &Map<String, Value>) -> Vec<Registered> {
+    let mut mine: Vec<Registered> = held
+        .iter()
+        .filter(|r| {
+            r.decl
+                .selector()
+                .map(|sel| sel.matches(fields))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    rank(&mut mine);
+    mine
 }
 
 /// Furthest behind first: that follower decides how much of the store is
@@ -782,9 +841,17 @@ impl Interest {
     }
 }
 
-/// One retaining follower, as the interest axis sees it: a name and a
-/// position, and nothing else.
-type Retaining = (String, Option<u64>);
+/// One retaining follower, as the interest axis sees it: what it covers,
+/// and where it stands in each store it has read.
+struct Retaining {
+    name: String,
+    selector: crate::select::Selector,
+    /// Store identity -> the chunk it has consumed up to. A store with no
+    /// entry has never been read by this follower, so it holds all of it
+    /// — the same rule as a follower that has never run, applied per
+    /// store, and the state a registry exists to be able to express.
+    at: HashMap<String, Option<u64>>,
+}
 
 /// The interest axis for every store, from ONE read of the registry — for
 /// a writer that then asks about each store it holds.
@@ -801,16 +868,21 @@ type Retaining = (String, Option<u64>);
 /// cover. The scan it saves is one `read_dir` plus two small reads per
 /// follower, page-cached, once per tick for all stores at once.
 pub struct InterestIndex {
-    /// Store anchor -> its retaining followers. `None` means fail closed
-    /// for EVERY store: see `read`.
-    per_store: Option<HashMap<String, Vec<Retaining>>>,
+    /// Every retaining follower. `None` means fail closed for EVERY
+    /// store: see `read`.
+    ///
+    /// Not grouped by store any more, because a selection cannot be: the
+    /// question "which followers hold this store" is answered by matching
+    /// each selector against the store, which is why the axis is now
+    /// handed the store's fields rather than its anchor.
+    retaining: Option<Vec<Retaining>>,
 }
 
 impl InterestIndex {
     /// Fail closed for every store, without reading anything — what a
     /// caller uses when it has no registry to consult.
     pub fn closed() -> InterestIndex {
-        InterestIndex { per_store: None }
+        InterestIndex { retaining: None }
     }
 
     /// Read the registry.
@@ -829,12 +901,12 @@ impl InterestIndex {
             // held. Distinct from unreadable — this is a fact, not a gap.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return InterestIndex {
-                    per_store: Some(HashMap::new()),
+                    retaining: Some(Vec::new()),
                 }
             }
             Err(_) => return InterestIndex::closed(),
         };
-        let mut per_store: HashMap<String, Vec<Retaining>> = HashMap::new();
+        let mut retaining: Vec<Retaining> = Vec::new();
         for entry in entries {
             let Ok(entry) = entry else {
                 return InterestIndex::closed();
@@ -857,31 +929,54 @@ impl InterestIndex {
             if !decl.retaining {
                 continue;
             }
-            // A position that cannot be read is not a position: the
-            // follower holds everything until it can be read again.
-            let at = match Cursor::load(&cursor_path(reg, &name)) {
-                Ok(c) => c.and_then(|c| c.seq),
-                Err(_) => None,
+            // A selector that will not parse might have covered any
+            // store, so it fails closed for all of them — the same rule
+            // as an unreadable declaration, for the same reason.
+            let Ok(selector) = decl.selector() else {
+                return InterestIndex::closed();
             };
-            per_store.entry(decl.store).or_default().push((name, at));
+            let Some(at) = positions_of(reg, &name, &decl) else {
+                return InterestIndex::closed();
+            };
+            retaining.push(Retaining { name, selector, at });
         }
         InterestIndex {
-            per_store: Some(per_store),
+            retaining: Some(retaining),
         }
     }
 
-    /// What the store `anchor` may drop by interest. `next_seq` is the
-    /// number the store will give its NEXT chunk — everything it has ever
-    /// written is below it.
-    pub fn for_store(&self, anchor: &str, next_seq: u64) -> Interest {
-        let Some(per_store) = &self.per_store else {
+    /// What the store described by `fields` may drop by interest.
+    /// `next_seq` is the number the store will give its NEXT chunk —
+    /// everything it has ever written is below it.
+    ///
+    /// `fields` is what a selector matches on, handed IN: the caller is
+    /// the store and has just read its own manifest for its retention
+    /// policy, so the axis stays a function of what it is given.
+    pub fn for_store(&self, fields: &Map<String, Value>, next_seq: u64) -> Interest {
+        let Some(all) = &self.retaining else {
             return Interest::default();
         };
-        let Some(followers) = per_store.get(anchor) else {
+        // A store's identity is what a position is keyed by, so a store
+        // that has none can hold nothing back — there is no position that
+        // could name it. Such a pair is not a store (see `bark`).
+        let id = fields.get("id").and_then(Value::as_str);
+        let followers: Vec<(&String, Option<u64>)> = all
+            .iter()
+            .filter(|r| r.selector.matches(fields))
+            .map(|r| {
+                (
+                    &r.name,
+                    // No entry for this store: never read, holds all of
+                    // it. Same for a store with no identity to look up.
+                    id.and_then(|i| r.at.get(i).copied()).flatten(),
+                )
+            })
+            .collect();
+        if followers.is_empty() {
             // Nothing retains this store: the axis holds nothing, and
             // there is nobody to name in a loss record.
             return Interest::default();
-        };
+        }
         let retaining = followers.len();
         // The minimum over the set, with two ways to be zero. A follower
         // that has never run holds everything, and one claiming a chunk
@@ -889,12 +984,12 @@ impl InterestIndex {
         // newly PROVABLE, where a future timestamp was indistinguishable
         // from clock skew. Both mean: drop nothing, and name that one.
         let mut floor: Option<u64> = None;
-        for (name, at) in followers {
+        for (name, at) in &followers {
             match at {
                 None => {
                     return Interest {
                         floor: None,
-                        holder: Some(name.clone()),
+                        holder: Some((*name).clone()),
                         holder_at: None,
                         retaining,
                     }
@@ -902,7 +997,7 @@ impl InterestIndex {
                 Some(seq) if *seq >= next_seq => {
                     return Interest {
                         floor: None,
-                        holder: Some(name.clone()),
+                        holder: Some((*name).clone()),
                         holder_at: Some(*seq),
                         retaining,
                     }
@@ -918,7 +1013,7 @@ impl InterestIndex {
             followers
                 .iter()
                 .find(|(_, at)| *at == Some(f))
-                .map(|(n, _)| n.clone())
+                .map(|(n, _)| (*n).clone())
         });
         Interest {
             floor,
@@ -929,14 +1024,45 @@ impl InterestIndex {
     }
 }
 
-/// The anchor a store's followers are matched by. Derived, not cached
-/// here: it can change exactly once, when `follower create` mints an
-/// identity for a store that had none, and a tick that cached the
-/// pre-minting value would then find no followers — the harmless
-/// direction, but the axis would silently never start working. Callers
-/// pair it with the policy, which is re-read on the same manifest change.
-pub fn anchor_of(dir: &Path, name: &str) -> String {
-    cursor::store_anchor(dir, name, crate::bark::load(dir, name).as_ref())
+/// Where one retaining follower stands in each store it has read:
+/// identity -> the chunk consumed up to.
+///
+/// `positions.json` is a selection's places; a `cursor.json` is the one
+/// store an older declaration named, so its position belongs to that
+/// store. `None` means neither could be READ — which is not a position,
+/// and the follower holds everything until it can be read again.
+fn positions_of(
+    reg: &Path,
+    name: &str,
+    decl: &Declaration,
+) -> Option<HashMap<String, Option<u64>>> {
+    let mut out = HashMap::new();
+    let positions = positions_path(reg, name);
+    if positions.exists() {
+        let held = cursor::Positions::load(&positions).ok()?;
+        for (id, at) in held.map(|p| p.at).unwrap_or_default() {
+            out.insert(id, at.chunk);
+        }
+        return Some(out);
+    }
+    let cursor = match Cursor::load(&cursor_path(reg, name)) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    // No file at all is a follower that has never run: no entry for any
+    // store, so it holds every store it covers. That is the state a
+    // registry exists to express, and it is not a failure.
+    if let (Some(c), Some(anchor)) = (cursor, decl.anchor()) {
+        out.insert(anchor, c.seq);
+    }
+    Some(out)
+}
+
+/// The fields a store's followers are matched against. Derived, not
+/// cached here: a label change is a manifest change, and callers pair
+/// this with the retention policy, which is re-read on the same stat.
+pub fn subject_of(dir: &Path, name: &str) -> Map<String, Value> {
+    crate::select::selectable_of(dir, name)
 }
 
 /// The interest axis for ONE retention tick: the registry is read at most
@@ -954,7 +1080,7 @@ impl TickInterest {
     pub fn floor(
         &mut self,
         policy: &crate::bark::Retention,
-        anchor: &str,
+        fields: &Map<String, Value>,
         next_seq: u64,
     ) -> Interest {
         if !policy.unconsumed {
@@ -962,7 +1088,7 @@ impl TickInterest {
         }
         self.index
             .get_or_insert_with(|| InterestIndex::read(&registry_dir()))
-            .for_store(anchor, next_seq)
+            .for_store(fields, next_seq)
     }
 }
 
@@ -1099,7 +1225,10 @@ pub fn cmd_create(name: &str, opts: CreateOpts) -> anyhow::Result<()> {
 
     let decl = Declaration {
         name: name.to_string(),
-        store: anchor,
+        // `--store` names ONE store, and naming one store by identity is
+        // the predicate `id=<it>`. So there is one member, and the
+        // convenience is the flag rather than a second shape on disk.
+        select: format!("id={anchor}"),
         path: fs::canonicalize(&sdir)
             .unwrap_or(sdir)
             .join(&sname)
@@ -1189,7 +1318,7 @@ fn row_cells(r: &Registered) -> Vec<String> {
 pub fn to_json(r: &Registered) -> Value {
     let mut o = Map::new();
     o.insert("name".into(), r.name().into());
-    o.insert("store".into(), r.decl.store.clone().into());
+    o.insert("select".into(), r.decl.select.clone().into());
     o.insert(
         "store_path".into(),
         match &r.store_path {
@@ -1267,9 +1396,13 @@ pub fn cmd_list(store: Option<&Path>, names_only: bool, json: bool) -> anyhow::R
     if let Some(s) = store {
         let path = crate::forest::resolve_source(s)?;
         let (dir, name) = resolve_backing(&path)?;
-        let bark = crate::bark::load(&dir, &name);
-        let anchor = cursor::store_anchor(&dir, &name, bark.as_ref());
-        followers.retain(|r| r.decl.store == anchor);
+        let fields = subject_of(&dir, &name);
+        followers.retain(|r| {
+            r.decl
+                .selector()
+                .map(|sel| sel.matches(&fields))
+                .unwrap_or(false)
+        });
     }
     if names_only {
         // What shell completion consumes: bare names, no header, no
@@ -1313,11 +1446,12 @@ pub fn cmd_status(name: &str, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("follower  {}", r.name());
-    match &r.store_path {
-        Some(p) => println!("store     {}  (id {})", p.display(), r.decl.store),
-        None => println!(
-            "store     {} — NOT FOUND (declared at {})",
-            r.decl.store,
+    match (&r.store_path, r.decl.anchor()) {
+        (Some(p), Some(id)) => println!("follows   {}  (id {})", p.display(), id),
+        // A selection has no single store to find, so nothing is missing.
+        (_, None) => println!("follows   {}", r.decl.select),
+        (None, Some(id)) => println!(
+            "follows   {id} — NOT FOUND (declared at {})",
             if r.decl.path.is_empty() {
                 "no path"
             } else {
@@ -1471,15 +1605,15 @@ pub fn cmd_update(
                 // position anchored to the old one, and cursor.rs refuses
                 // to resume across that — say so here rather than let the
                 // shipper fail at its next start.
-                if anchor != decl.store && before.cursor.is_some() {
+                if Some(&anchor) != decl.anchor().as_ref() && before.cursor.is_some() {
                     crate::note!(
                         "timberfs: warning: {name} has a position in store {} — remove {} to \
                          start over in the new store, or the shipper will refuse to resume",
-                        decl.store,
+                        decl.select,
                         cursor_path(&reg, name).display()
                     );
                 }
-                decl.store = anchor;
+                decl.select = format!("id={anchor}");
                 decl.path = fs::canonicalize(&sdir)
                     .unwrap_or(sdir)
                     .join(&sname)
@@ -1707,10 +1841,21 @@ mod tests {
         dir
     }
 
+    /// A store as the interest axis and a listing see it: what a
+    /// selector matches against.
+    fn store_fields(id: &str, labels: &[(&str, &str)]) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("id".into(), Value::String(id.to_string()));
+        for (k, v) in labels {
+            m.insert(k.to_string(), Value::String(v.to_string()));
+        }
+        m
+    }
+
     fn decl(name: &str, retaining: bool) -> Declaration {
         Declaration {
             name: name.to_string(),
-            store: "store-id".into(),
+            select: "id=store-id".into(),
             path: "/var/log/timberfs/app/app.log".into(),
             kind: "otlp".into(),
             retaining,
@@ -1763,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declaration_must_name_a_store_and_a_type() {
+    fn a_declaration_must_name_a_selection_and_a_type() {
         let reg = scratch("incomplete");
         let write = |name: &str, body: &str| {
             fs::create_dir_all(follower_dir(&reg, name)).unwrap();
@@ -1773,7 +1918,11 @@ mod tests {
         assert!(Declaration::load(&reg, "nostore")
             .unwrap_err()
             .to_string()
-            .contains("no \"store\""));
+            .contains("no \"select\""));
+        // A selector that will not parse is refused where it is READ, so
+        // nothing downstream has to cope with one.
+        write("bad", r#"{"type":"otlp","select":"host~web01"}"#);
+        assert!(Declaration::load(&reg, "bad").is_err());
         write("notype", r#"{"store":"x"}"#);
         assert!(Declaration::load(&reg, "notype")
             .unwrap_err()
@@ -1873,20 +2022,20 @@ mod tests {
     fn for_store_filters_by_identity_and_ranks_the_worst_first() {
         let reg = scratch("bystore");
         let mut a = decl("ahead", true);
-        a.store = "id-a".into();
+        a.select = "id=id-a".into();
         a.save(&reg).unwrap();
         let mut b = decl("behind", true);
-        b.store = "id-a".into();
+        b.select = "id=id-a".into();
         b.save(&reg).unwrap();
         let mut other = decl("elsewhere", true);
-        other.store = "id-b".into();
+        other.select = "id=id-b".into();
         other.save(&reg).unwrap();
-        let mine = for_store(&reg, "id-a");
+        let mine = for_store(&reg, &store_fields("id-a", &[]));
         let names: Vec<&str> = mine.iter().map(|r| r.name()).collect();
         // No stores on disk, so every standing is empty and the ranking
         // falls back to the name — this is about WHICH followers are ours.
         assert_eq!(names, ["ahead", "behind"]);
-        assert!(for_store(&reg, "id-c").is_empty());
+        assert!(for_store(&reg, &store_fields("id-c", &[])).is_empty());
         fs::remove_dir_all(&reg).ok();
     }
 
@@ -1945,10 +2094,10 @@ mod tests {
         // worst case last.
         let reg = scratch("holdsall");
         let mut fresh = decl("fresh", true);
-        fresh.store = "id".into();
+        fresh.select = "id=id".into();
         fresh.save(&reg).unwrap();
         let mut behind = decl("behind", true);
-        behind.store = "id".into();
+        behind.select = "id=id".into();
         behind.save(&reg).unwrap();
         Cursor {
             seq: Some(3),
@@ -1956,7 +2105,7 @@ mod tests {
         }
         .save(&cursor_path(&reg, "behind"))
         .unwrap();
-        let mine = for_store(&reg, "id");
+        let mine = for_store(&reg, &store_fields("id", &[]));
         assert_eq!(
             mine.iter().map(|r| r.name()).collect::<Vec<_>>(),
             ["fresh", "behind"]
@@ -1982,7 +2131,7 @@ mod tests {
     /// A retaining follower of `store`, standing at `at`.
     fn retaining(reg: &Path, name: &str, store: &str, at: Option<u64>) {
         let mut d = decl(name, true);
-        d.store = store.to_string();
+        d.select = format!("id={store}");
         d.save(reg).unwrap();
         if let Some(seq) = at {
             Cursor {
@@ -2002,7 +2151,7 @@ mod tests {
         // A non-retaining follower of the same store decides nothing: the
         // flag is what expresses interest, not the presence of a position.
         let mut tap = decl("tap", false);
-        tap.store = "id".into();
+        tap.select = "id=id".into();
         tap.save(&reg).unwrap();
         Cursor {
             seq: Some(0),
@@ -2011,7 +2160,7 @@ mod tests {
         .save(&cursor_path(&reg, "tap"))
         .unwrap();
 
-        let held = InterestIndex::read(&reg).for_store("id", 100);
+        let held = InterestIndex::read(&reg).for_store(&store_fields("id", &[]), 100);
         assert_eq!(held.floor, Some(4));
         assert_eq!(held.holder.as_deref(), Some("behind"));
         assert_eq!(held.retaining, 2, "the tap is not one of them");
@@ -2025,7 +2174,7 @@ mod tests {
         let reg = scratch("neverran");
         retaining(&reg, "ahead", "id", Some(9));
         retaining(&reg, "fresh", "id", None);
-        let held = InterestIndex::read(&reg).for_store("id", 100);
+        let held = InterestIndex::read(&reg).for_store(&store_fields("id", &[]), 100);
         assert_eq!(held.floor, None, "one of them holds everything");
         assert_eq!(held.holder.as_deref(), Some("fresh"));
         assert_eq!(held.holder_at, None);
@@ -2042,12 +2191,12 @@ mod tests {
         // whose it is.
         let reg = scratch("impossible");
         retaining(&reg, "bogus", "id", Some(500));
-        let held = InterestIndex::read(&reg).for_store("id", 10);
+        let held = InterestIndex::read(&reg).for_store(&store_fields("id", &[]), 10);
         assert_eq!(held.floor, None);
         assert_eq!(held.holder.as_deref(), Some("bogus"));
         assert_eq!(held.holder_at, Some(500));
         // One below next_seq is a legal position, and drops accordingly.
-        let ok = InterestIndex::read(&reg).for_store("id", 501);
+        let ok = InterestIndex::read(&reg).for_store(&store_fields("id", &[]), 501);
         assert_eq!(ok.floor, Some(500));
         fs::remove_dir_all(&reg).ok();
     }
@@ -2062,11 +2211,11 @@ mod tests {
 
         // No registry at all.
         let absent = InterestIndex::read(Path::new("/nonexistent/timberfs-followers"));
-        assert_eq!(absent.for_store("id", 100).floor, None);
+        assert_eq!(absent.for_store(&store_fields("id", &[]), 100).floor, None);
 
         // A registry with nothing in it, and one with nothing for us.
         retaining(&reg, "elsewhere", "other-store", Some(3));
-        let held = InterestIndex::read(&reg).for_store("id", 100);
+        let held = InterestIndex::read(&reg).for_store(&store_fields("id", &[]), 100);
         assert_eq!(held.floor, None);
         assert_eq!(held.holder, None, "nobody to name, so no loss record");
 
@@ -2074,15 +2223,25 @@ mod tests {
         // everything: an unreadable position is not a position.
         retaining(&reg, "torn", "id", None);
         fs::write(cursor_path(&reg, "torn"), "{ not json").unwrap();
-        assert_eq!(InterestIndex::read(&reg).for_store("id", 100).floor, None);
+        assert_eq!(
+            InterestIndex::read(&reg)
+                .for_store(&store_fields("id", &[]), 100)
+                .floor,
+            None
+        );
 
         // An unreadable DECLARATION fails closed for every store, not just
         // its own: it might have been a retaining follower of any of them,
         // and there is no way to know which.
         fs::write(decl_path(&reg, "torn"), "{ not json").unwrap();
         let broken = InterestIndex::read(&reg);
-        assert_eq!(broken.for_store("id", 100).floor, None);
-        assert_eq!(broken.for_store("other-store", 100).floor, None);
+        assert_eq!(broken.for_store(&store_fields("id", &[]), 100).floor, None);
+        assert_eq!(
+            broken
+                .for_store(&store_fields("other-store", &[]), 100)
+                .floor,
+            None
+        );
         fs::remove_dir_all(&reg).ok();
     }
 
@@ -2096,7 +2255,8 @@ mod tests {
             max_comp_bytes: Some(1024),
             ..Default::default()
         };
-        assert_eq!(tick.floor(&off, "id", 100), Interest::default());
+        let fields = store_fields("id", &[]);
+        assert_eq!(tick.floor(&off, &fields, 100), Interest::default());
         assert!(tick.index.is_none(), "nothing declared it, so nothing read");
 
         let on = crate::bark::Retention {
@@ -2104,8 +2264,93 @@ mod tests {
             unconsumed: true,
             ..Default::default()
         };
-        tick.floor(&on, "id", 100);
+        tick.floor(&on, &fields, 100);
         assert!(tick.index.is_some(), "declared, so read once");
+    }
+
+    /// One retaining declaration holds back every store its selector
+    /// covers, each at its own position — the whole point of a selection,
+    /// and the case an anchor comparison could not express.
+    #[test]
+    fn a_selection_holds_every_store_it_covers_at_its_own_position() {
+        let reg = scratch("selectionfloor");
+        let mut d = decl("central", true);
+        d.select = "service=apache".into();
+        d.save(&reg).unwrap();
+        let mut held = cursor::Positions::new("central");
+        held.advance("id-a", "/p/a", 100, Some(7), 0, 1);
+        held.advance("id-b", "/p/b", 100, Some(2), 0, 1);
+        held.save(&positions_path(&reg, "central")).unwrap();
+        let index = InterestIndex::read(&reg);
+
+        let apache = |id: &str| store_fields(id, &[("service", "apache")]);
+        assert_eq!(index.for_store(&apache("id-a"), 100).floor, Some(7));
+        assert_eq!(index.for_store(&apache("id-b"), 100).floor, Some(2));
+        // Covered but never read: it holds the whole store, exactly as a
+        // follower that has never run does.
+        let fresh = index.for_store(&apache("id-c"), 100);
+        assert_eq!(fresh.floor, None);
+        assert_eq!(fresh.holder.as_deref(), Some("central"));
+        // Not covered: nothing holds it, and there is nobody to name.
+        let other = index.for_store(&store_fields("id-d", &[("service", "postgres")]), 100);
+        assert_eq!(other.floor, None);
+        assert_eq!(other.holder, None);
+        assert_eq!(other.retaining, 0);
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    /// A declaration written before selections named ONE store in a
+    /// `store` member, and `create` always refused a path-anchored one —
+    /// so it is exactly the predicate `id=<it>` and keeps its cursor.
+    #[test]
+    fn a_legacy_declaration_reads_as_the_store_it_named() {
+        let reg = scratch("legacy");
+        fs::create_dir_all(follower_dir(&reg, "old")).unwrap();
+        fs::write(
+            decl_path(&reg, "old"),
+            r#"{"store":"id-a","type":"otlp","retaining":true}"#,
+        )
+        .unwrap();
+        let d = Declaration::load(&reg, "old").unwrap();
+        assert_eq!(d.select, "id=id-a");
+        assert_eq!(d.anchor().as_deref(), Some("id-a"));
+
+        // And its position is still its position: a `cursor.json` belongs
+        // to the one store the declaration named.
+        Cursor {
+            seq: Some(5),
+            ..Cursor::new("old", "id-a", "/p")
+        }
+        .save(&cursor_path(&reg, "old"))
+        .unwrap();
+        let index = InterestIndex::read(&reg);
+        assert_eq!(
+            index.for_store(&store_fields("id-a", &[]), 100).floor,
+            Some(5)
+        );
+        assert_eq!(
+            index.for_store(&store_fields("id-b", &[]), 100).holder,
+            None
+        );
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    /// A store with no identity can hold nothing back: a position is
+    /// keyed by identity, so there is none that could name it.
+    #[test]
+    fn a_store_with_no_identity_holds_nothing_back() {
+        let reg = scratch("noid");
+        let mut d = decl("central", true);
+        d.select = "*".into();
+        d.save(&reg).unwrap();
+        let mut fields = Map::new();
+        fields.insert("name".into(), Value::String("plain".into()));
+        let held = InterestIndex::read(&reg).for_store(&fields, 100);
+        // Covered by `*`, and still nothing to hold: the follower cannot
+        // have a position in a store that cannot be addressed.
+        assert_eq!(held.floor, None);
+        assert_eq!(held.holder.as_deref(), Some("central"));
+        fs::remove_dir_all(&reg).ok();
     }
 
     #[test]

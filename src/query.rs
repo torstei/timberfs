@@ -2879,8 +2879,8 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             name = base.clone();
         }
         location = dir.display().to_string();
-        let anchor = crate::cursor::store_anchor(&dir, &base, handle.bark.as_ref());
-        let declared = crate::follower::for_store(&crate::follower::registry_dir(), &anchor);
+        let fields = crate::follower::subject_of(&dir, &base);
+        let declared = crate::follower::for_store(&crate::follower::registry_dir(), &fields);
         let s = summarize_store(&dir, &base, records, handle.bark.as_ref(), declared);
         // Classified before anything is moved out of the summary.
         numbering = Some(Numbering {

@@ -127,6 +127,18 @@ impl Selector {
     pub fn is_all(&self) -> bool {
         self.terms.is_empty()
     }
+
+    /// The one store this names, when it names exactly one by identity:
+    /// `id=<x>` and nothing else. That predicate is a NAME rather than a
+    /// search — it can match at most one store — so a caller that needs
+    /// the single store a selection is about can have it, and one that
+    /// gets `None` is looking at a set.
+    pub fn sole_id(&self) -> Option<&str> {
+        match self.terms.as_slice() {
+            [t] if t.key == "id" && t.op == Op::Eq => Some(&t.value),
+            _ => None,
+        }
+    }
 }
 
 /// A label's value as text. Free-form keys may hold a non-string, and a
@@ -260,6 +272,24 @@ pub fn selectable(bark: &Map<String, Value>, handle: &str) -> Map<String, Value>
     fields
 }
 
+/// What a selector matches ONE store on, read from disk: everything its
+/// manifest declares, its name, and the PAIR's identity.
+///
+/// The identity comes last and unconditionally because it is the one
+/// field that is not the manifest's alone — the index mirrors it — and a
+/// follower that names a store by `id` must keep matching it when the
+/// manifest is lost. Everything else is what the manifest says, so a
+/// store with no manifest is matchable by name and by id and nothing
+/// else, which is all it declares.
+pub fn selectable_of(dir: &std::path::Path, name: &str) -> Map<String, Value> {
+    let bark = crate::bark::load(dir, name).unwrap_or_default();
+    let mut fields = selectable(&bark, crate::forest::handle_of_logical(name));
+    if let Some(id) = crate::bark::identity_of(dir, name) {
+        fields.insert("id".to_string(), Value::String(id));
+    }
+    fields
+}
+
 /// One store a selector matched: enough to open it, and the labels it
 /// matched on so a caller can say WHY it matched.
 #[derive(Debug)]
@@ -297,13 +327,10 @@ pub fn resolve(dirs: &[std::path::PathBuf], sel: &Selector) -> Vec<Match> {
                 continue;
             };
             let bark = crate::bark::load(&dir, &name).unwrap_or_default();
-            let fields = selectable(&bark, &handle);
+            let fields = selectable_of(&dir, &name);
             if sel.matches(&fields) {
                 let labels = crate::bark::provenance(&bark);
-                // The PAIR's identity, not the manifest's: a store whose
-                // bark was lost still has one, and excluding it would
-                // make a selection depend on which files survived.
-                let id = crate::bark::identity_of(&dir, &name);
+                let id = fields.get("id").and_then(Value::as_str).map(str::to_string);
                 out.push(Match {
                     handle,
                     dir,

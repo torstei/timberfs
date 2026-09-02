@@ -423,11 +423,24 @@ pub fn identity_of(dir: &Path, name: &str) -> Option<String> {
 }
 
 /// The identity the `.rings` header carries, if any.
+///
+/// The HEADER, not the file: a store's index runs to megabytes and this
+/// is asked once per store on a selection and once per retention tick, so
+/// reading it whole would make identity cost the size of the log. A short
+/// read is not an error — a v1 header stops before the field, which
+/// `header_store_id` already reads as "carries none".
 pub fn carried_identity(dir: &Path, name: &str) -> Option<String> {
-    fs::read(format::rings_path(dir, name))
-        .ok()
-        .and_then(|b| format::header_store_id(&b))
-        .map(|id| format::uuid_text(&id))
+    let mut buf = [0u8; format::RINGS_HEADER_LEN as usize];
+    let mut f = fs::File::open(format::rings_path(dir, name)).ok()?;
+    let mut got = 0usize;
+    while got < buf.len() {
+        match std::io::Read::read(&mut f, &mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(_) => return None,
+        }
+    }
+    format::header_store_id(&buf[..got]).map(|id| format::uuid_text(&id))
 }
 
 fn identity_sides(dir: &Path, name: &str) -> anyhow::Result<(Option<String>, Option<String>)> {
