@@ -280,6 +280,24 @@ fn write_atomically(path: &Path, v: &Value) -> anyhow::Result<()> {
 pub struct Positions {
     pub consumer: String,
     pub at: std::collections::BTreeMap<String, At>,
+    /// The consumer's last word about ITSELF rather than about a store —
+    /// an unreachable endpoint is not per store.
+    pub note: Option<Note>,
+}
+
+/// Why nothing is moving, in the consumer's own words.
+///
+/// Kept here rather than only logged because `follower status` is
+/// ANOTHER PROCESS: a stalled follower's reason has to outlive the line
+/// it was printed on, or the one place an operator looks cannot show it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    pub text: String,
+    /// The entry it is about, when it is about one. An ADDRESS: the same
+    /// offset `timberview` opens at, so a note names a place a person
+    /// can go and look.
+    pub offset: Option<u64>,
+    pub when: String,
 }
 
 /// Where one store stands.
@@ -308,6 +326,8 @@ pub struct At {
     /// been. For a human reading the file; neither decides anything.
     pub wl: u64,
     pub delivered: u64,
+    /// The consumer's last word about THIS store.
+    pub note: Option<Note>,
 }
 
 impl Positions {
@@ -315,6 +335,52 @@ impl Positions {
         Positions {
             consumer: consumer.to_string(),
             at: Default::default(),
+            note: None,
+        }
+    }
+
+    /// Record a consumer's note, and say whether anything changed.
+    ///
+    /// Deduped by TEXT, so a consumer retrying once a second produces one
+    /// note and one write rather than sixty. `None` for the store means
+    /// the note is about the consumer itself.
+    pub fn take_note(&mut self, id: Option<&str>, offset: Option<u64>, text: &str) -> bool {
+        let fresh = Note {
+            text: text.to_string(),
+            offset,
+            when: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        };
+        let same = |old: &Option<Note>| {
+            old.as_ref()
+                .is_some_and(|n| n.text == fresh.text && n.offset == fresh.offset)
+        };
+        match id {
+            None => {
+                if same(&self.note) {
+                    return false;
+                }
+                self.note = Some(fresh);
+                true
+            }
+            Some(id) => match self.at.get_mut(id) {
+                Some(a) => {
+                    if same(&a.note) {
+                        return false;
+                    }
+                    a.note = Some(fresh);
+                    true
+                }
+                // A note about a store with no position yet: kept as the
+                // consumer's own, so the reason is not lost for being
+                // about something nothing has been read from.
+                None => {
+                    if same(&self.note) {
+                        return false;
+                    }
+                    self.note = Some(fresh);
+                    true
+                }
+            },
         }
     }
 
@@ -362,13 +428,15 @@ impl Positions {
                                 .to_string(),
                             wl: o.get("wl").and_then(Value::as_u64).unwrap_or(0),
                             delivered: o.get("delivered").and_then(Value::as_u64).unwrap_or(0),
+                            note: read_note(o.get("note")),
                         },
                     );
                 }
             }
             Some(_) => bail!("{}: \"stores\" must be an object", path.display()),
         }
-        Ok(Some(Positions { consumer, at }))
+        let note = read_note(map.get("note"));
+        Ok(Some(Positions { consumer, at, note }))
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -383,6 +451,9 @@ impl Positions {
             o.insert("path".into(), Value::String(a.path.clone()));
             o.insert("wl".into(), Value::from(a.wl));
             o.insert("delivered".into(), Value::from(a.delivered));
+            if let Some(n) = &a.note {
+                o.insert("note".into(), write_note(n));
+            }
             stores.insert(id.clone(), Value::Object(o));
         }
         let mut map = Map::new();
@@ -391,6 +462,9 @@ impl Positions {
             "updated".into(),
             Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
         );
+        if let Some(n) = &self.note {
+            map.insert("note".into(), write_note(n));
+        }
         map.insert("stores".into(), Value::Object(stores));
         write_atomically(path, &Value::Object(map))
     }
@@ -425,6 +499,7 @@ impl Positions {
             path: path.to_string(),
             wl,
             delivered: 0,
+            note: None,
         });
         e.offset = offset;
         e.path = path.to_string();
@@ -435,6 +510,29 @@ impl Positions {
         e.wl = e.wl.max(wl);
         e.delivered += delivered;
     }
+}
+
+fn read_note(v: Option<&Value>) -> Option<Note> {
+    let o = v?.as_object()?;
+    Some(Note {
+        text: o.get("text").and_then(Value::as_str)?.to_string(),
+        offset: o.get("offset").and_then(Value::as_u64),
+        when: o
+            .get("when")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn write_note(n: &Note) -> Value {
+    let mut o = Map::new();
+    o.insert("text".into(), Value::String(n.text.clone()));
+    if let Some(off) = n.offset {
+        o.insert("offset".into(), Value::from(off));
+    }
+    o.insert("when".into(), Value::String(n.when.clone()));
+    Value::Object(o)
 }
 
 /// Skips what a resumed stream re-delivers. `--from-chunk` seeks to a whole

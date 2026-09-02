@@ -1915,6 +1915,30 @@ pub fn lock_file_exclusive(dir: &Path, name: &str) -> io::Result<Option<File>> {
 /// The same lock on an arbitrary path. The per-file helpers are this with
 /// the path spelled by the store layout; the follower registry's lock
 /// lives outside any backing directory and spells its own.
+/// Serialises tests that FORK against tests that assert a lock is free.
+///
+/// ⚠ A fact about a test binary, not about timberfs. `Command::spawn`
+/// forks, and between fork and exec the child holds a duplicate of every
+/// descriptor this process has open — flock'd ones included, an flock
+/// belonging to the open file description rather than to the process.
+/// CLOEXEC closes them at exec, so the window is microseconds wide and a
+/// probe landing inside it reports a lock whose holder has already let
+/// go. Measured: three failures in twenty full runs once the first
+/// forking tests existed, none in twenty runs before them.
+///
+/// Deliberately not worked around in the product. The window is inherent
+/// to fork+exec, and what distinguishes an inherited descriptor from a
+/// live holder is the RECORDED PID, which is why followers record one.
+#[cfg(test)]
+pub static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take it, poison and all: a test that panicked while holding it has
+/// nothing to protect any more.
+#[cfg(test)]
+pub fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+    FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn lock_path_exclusive(path: &Path) -> io::Result<Option<File>> {
     try_flock(open_lock_file(path)?, libc::LOCK_EX)
 }

@@ -317,6 +317,33 @@ chunk(s) were dropped before it read them`) rather than restarting silently from
 whatever is now oldest — the same fact from the other side, inferred rather than
 exact.
 
+## Forward a whole fleet of stores to one place
+
+A host with fifty stores and one collector used to mean fifty declarations,
+fifty units and fifty processes, with the collector's address written out fifty
+times and drifting fifty ways. `timberfs feed` takes a **predicate** instead:
+
+```sh
+timberfs feed --follow --select '[]' \
+    --positions /var/lib/timberfs/collector.positions \
+    -- my-consumer
+```
+
+One process, whatever the store count, and a store created tomorrow is picked up
+with no configuration change — the selection is re-resolved on every poll. Each
+store keeps its own position, so nothing is re-sent and a restart resumes all of
+them.
+
+What the consumer is, is not timberfs's business. It speaks a protocol small
+enough for a shell script — hello, then a watermark per store meaning *do not
+send me these again* — so a destination timberfs has never heard of is a program
+somebody writes, and one on another machine is `-- ssh archive01 my-consumer`,
+the contract being two file descriptors.
+
+⚠ The position stays with timberfs, and a consumer only reports: that file is
+where the retention floor lives, so a program that could write it could get
+retention wrong silently, where one that reports cannot.
+
 ## Hand an investigation to someone else
 
 A filtered slice, with its provenance, as one self-describing file — queryable

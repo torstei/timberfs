@@ -864,7 +864,11 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             entry_preds,
             max_chunks,
             cursor,
-            no_filename,
+            if no_filename {
+                Attribution::Never
+            } else {
+                Attribution::Auto
+            },
             show_write_time,
             null_sep,
             records,
@@ -904,6 +908,30 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
     )
 }
 
+/// Whether an answer names the store each entry came from.
+///
+/// `Auto` is what a person wants: one store attributes nothing, because
+/// there is nothing to tell apart. `Always` is what a PROTOCOL wants — a
+/// consumer is written once and the store count is not its business, so
+/// a stream that attributed conditionally would work against a selection
+/// of three and break on a selection of one. `Never` is `--no-filename`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attribution {
+    Auto,
+    Always,
+    Never,
+}
+
+impl Attribution {
+    fn multi(&self, sources: usize) -> bool {
+        match self {
+            Attribution::Auto => sources > 1,
+            Attribution::Always => true,
+            Attribution::Never => false,
+        }
+    }
+}
+
 /// Read a set of stores FORWARD from where a previous read left each one:
 /// the whole tape from `cursor` on, entries only, bounded to `max`
 /// entries.
@@ -934,7 +962,9 @@ pub fn read_forward<W: Write>(
         None,
         None,
         cursor,
-        false,
+        // A consumer of this stream is written once and the store count
+        // is not its business.
+        Attribution::Always,
         false,
         false,
         true,
@@ -1007,7 +1037,7 @@ fn query_entries<W: Write>(
     entry_preds: Option<crate::grep::Preds>,
     max_chunks: Option<u64>,
     cursor: &std::collections::BTreeMap<String, u64>,
-    no_filename: bool,
+    attribution: Attribution,
     show_write_time: bool,
     null_sep: bool,
     records: bool,
@@ -1037,7 +1067,7 @@ fn query_entries<W: Write>(
         /// the edge is not in it.
         live: crate::live::LiveTail,
     }
-    let multi = files.len() > 1 && !no_filename;
+    let multi = attribution.multi(files.len());
     // A predicate the token index answers, rather than one judged on the
     // entry: the difference decides whether the live edge can be part of
     // the answer (see the `live` field below).
@@ -4056,7 +4086,7 @@ mod paging_tests {
             None,
             None,
             cursor,
-            false,
+            Attribution::Auto,
             false,
             false,
             true, // records
@@ -4473,7 +4503,7 @@ mod paging_tests {
             None,
             None,
             &Default::default(),
-            true,
+            Attribution::Never,
             false,
             false,
             true,
@@ -4565,10 +4595,10 @@ mod deadline_tests {
             None,
             None,
             &Default::default(),
-            false, // no_filename: several stores, so they are labelled
-            false, // show_write_time
-            false, // null_sep
-            true,  // records
+            Attribution::Auto, // several stores, so they are labelled
+            false,             // show_write_time
+            false,             // null_sep
+            true,              // records
             None,
             Default::default(),
             budget,
@@ -4752,7 +4782,7 @@ mod served_bytes_tests {
                 None,
                 None,
                 &Default::default(),
-                true,  // no_filename
+                Attribution::Never,
                 false, // show_write_time
                 false, // null_sep
                 true,  // records
@@ -4816,7 +4846,7 @@ mod served_bytes_tests {
             None,
             None,
             &Default::default(),
-            true,  // no_filename
+            Attribution::Never,
             false, // show_write_time
             false, // null_sep
             true,  // records

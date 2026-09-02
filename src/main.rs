@@ -1,6 +1,6 @@
 use timberfs::{
-    append, bark, export, follow, follower, forest, forward, fs, grain, import, incus,
-    incus_intake, list, note, otlp_intake, query, querydoc, rotate, sink, store,
+    append, bark, export, feed, follow, follower, forest, forward, fs, grain, import, incus,
+    incus_intake, list, note, otlp_intake, query, querydoc, rotate, select, sink, store,
 };
 
 use std::path::PathBuf;
@@ -431,6 +431,44 @@ enum Command {
     Follower {
         #[command(subcommand)]
         command: FollowerCommand,
+    },
+    /// Feed a CONSUMER: read every store a predicate matches, hand the
+    /// records to a program, and move each store's position as far as
+    /// that program says it got. timberfs owns the position — the
+    /// consumer reports, and a report is the only thing that advances
+    /// one. Any program that speaks the consumer protocol will do,
+    /// including a shell script; see the consumer protocol
+    Feed {
+        /// Which stores: the predicate `list --select` takes. `[]` is
+        /// every store, which is a thing to have written rather than a
+        /// flag to leave out
+        #[arg(long, value_name = "EXPR")]
+        select: String,
+        /// Where each matched store's position is kept, so a restart
+        /// resumes rather than re-sends. Omitted, they live only as long
+        /// as this process — a temporary watch
+        #[arg(long, value_name = "PATH")]
+        positions: Option<PathBuf>,
+        /// Keep going as entries arrive. Without it the selection is
+        /// drained once and this exits — a durable one-shot, durable
+        /// because the positions are
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Maximum entries handed over before the consumer's reports are
+        /// collected
+        #[arg(long, value_name = "N", default_value = "512")]
+        batch_size: u64,
+        /// How long to wait before asking again, once an answer was
+        /// exhausted
+        #[arg(long, value_name = "DUR", default_value = "1s")]
+        poll: String,
+        /// Forests to search; default: every configured one
+        #[arg(long, value_name = "DIR")]
+        forest: Vec<PathBuf>,
+        /// The consumer and its arguments, after `--`. A list, so
+        /// nothing makes a quoting round trip: `-- ssh archive01 my-sink`
+        #[arg(last = true, value_name = "CONSUMER")]
+        consumer: Vec<String>,
     },
     /// Show a store's vital signs on one screen: identity, lineage,
     /// data and compression, time covered, index sizes and coverage,
@@ -1392,6 +1430,29 @@ fn main() -> anyhow::Result<()> {
             ForestCommand::List { names, json } => forest::cmd_list(json, names)?,
             ForestCommand::Remove { name, dry_run } => forest::cmd_remove(&name, dry_run)?,
         },
+        Command::Feed {
+            select,
+            positions,
+            follow,
+            batch_size,
+            poll,
+            forest,
+            consumer,
+        } => {
+            if batch_size == 0 {
+                anyhow::bail!("--batch-size must be at least 1");
+            }
+            feed::run(feed::Opts {
+                selector: select::Selector::parse(&select)?,
+                dirs: forest,
+                positions,
+                batch_entries: batch_size,
+                poll: std::time::Duration::from_millis(append::parse_duration_ms(&poll)?.max(1)),
+                follow,
+                argv: consumer,
+                hello_wait: feed::HELLO_WAIT,
+            })?;
+        }
         Command::Follower { command } => match command {
             FollowerCommand::Create {
                 name,

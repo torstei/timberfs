@@ -446,6 +446,39 @@ timberfs trim app
 
 > The older `cursors=<dir>` key still works and is reported as superseded.
 
+## Feeding any consumer (`timberfs feed`)
+
+`timber-otlp` is pointed at one store. `timberfs feed` is pointed at a
+**selection**, and hands the records to a program:
+
+```sh
+# every apache store on the host, to a program that speaks the consumer protocol
+timberfs feed --follow --select '[service=~apache-.*]'     --positions /var/lib/timberfs/collector.positions     -- my-consumer
+
+# a destination on another machine: the contract is two file descriptors
+timberfs feed --follow --select '[]' --positions /var/lib/timberfs/all.positions     -- ssh archive01 my-consumer
+```
+
+One process whatever the store count, and a store created tomorrow is picked up
+without touching the command. `[]` is the predicate with no terms — every store
+— which is a thing to have written rather than a flag to leave out.
+
+**timberfs owns the position; the consumer says how far to move it.** A consumer
+says hello, is fed `timberfs-records(5)`, and answers with a watermark per store
+meaning *do not send me these again* — so a receiver that is down gets the same
+entries again, while an entry refused for being too old is reported past and
+never re-sent. A `note` says why nothing is moving, and is kept where
+`follower status` can show it. No hello, no run.
+
+It is small enough to implement in a shell script, which is the point of it
+being a protocol rather than a trait:
+
+```sh
+printf '\036hello\037v=1\037reads=records\000'
+# ... read a record, do something with it ...
+printf '\036progress\037id=%s\037offset=%s\000' "$id" "$((offset + len))"
+```
+
 ## Replicating to another timberfs (`frames-send`)
 
 OTLP above ships **entries** to anything that speaks the protocol. When the far

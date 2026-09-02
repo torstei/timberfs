@@ -991,6 +991,41 @@ be gone thirty days). The cursor is written only after the receiver accepts a
 batch, so an interrupted send is re-delivered rather than skipped
 (at-least-once); `Restart=always` is therefore safe. Details: `man timber-otlp`.
 
+### Shipping a SELECTION out — `timberfs feed`
+
+The template above is one instance per store, which is one declaration, one
+unit and one process per store, with the destination written out once per store
+and free to drift. `timberfs feed` is pointed at a predicate instead:
+
+```sh
+timberfs feed --follow --select '[service=~apache-.*]' \
+    --positions /var/lib/timberfs/collector.positions \
+    -- my-consumer
+```
+
+One process whatever the store count. The selection is re-resolved on every
+poll, so a store created later is picked up with no configuration change and one
+that stops matching stops being read; each store keeps its own position, so
+nothing is re-sent and a restart resumes all of them.
+
+**timberfs owns the positions and the consumer reports** how far to move them —
+that file is where the retention floor lives, so a program able to write it
+could get retention wrong silently, where one that reports cannot. A consumer
+says hello, is fed `timberfs-records(5)`, and answers with a watermark per store
+meaning *do not send me these again*: a receiver that is down gets the same
+entries again, an entry refused for being too old is reported past and never
+re-sent, and a `note` records why nothing is moving. **No hello, no run** —
+timberfs refuses rather than guessing that a silent program is keeping up.
+
+⚠ The consumer is a child, and they live and die together: if it exits, this
+exits non-zero and the unit restarts. So `Restart=always` is right here for the
+same reason it is above.
+
+A destination on another machine needs no transport configured — the contract is
+two file descriptors, so `-- ssh archive01 my-consumer` is the whole of it. And
+because the protocol is three `printf`s and a read loop, a consumer can be a
+shell script; `man timberfs` has the shape.
+
 ### `timberfs-follower@.service` — a shipper declared once, run by name
 
 Prefer this to `timberfs-otlp@` for anything long-lived. Same shipper, but the

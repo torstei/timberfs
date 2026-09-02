@@ -2045,6 +2045,7 @@ mod tests {
 
     #[test]
     fn liveness_comes_from_the_lock_and_survives_a_cursor_rewrite() {
+        let _no_forks = crate::store::fork_guard();
         let reg = scratch("liveness");
         decl("central", true).save(&reg).unwrap();
         assert_eq!(liveness(&reg, "central"), Liveness::Stopped);
@@ -2071,6 +2072,7 @@ mod tests {
 
     #[test]
     fn an_inherited_lock_is_not_a_running_follower() {
+        let _no_forks = crate::store::fork_guard();
         // The failure this exists for: `timber-otlp` spawns `timberfs
         // query --records --follow` to read the store, that child
         // inherits the lock, and it can outlive its parent — leaving the

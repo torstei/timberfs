@@ -1124,6 +1124,58 @@ The same handle found in two forests shows up as two rows \(em
 .B list
 is how an ambiguity that handle resolution would refuse to guess at
 becomes visible, not something it hides.
+.SS feed
+.TP
+.BI \-\-select " EXPR"
+Which stores to read: the predicate
+.B list \-\-select
+takes.
+.B []
+is every store, which is a thing to have written rather than a flag to
+leave out.
+.TP
+.BI \-\-positions " PATH"
+Where each matched store's position is kept, so a restart resumes rather
+than re-sends. Omitted, they live only as long as this process \(em a
+temporary watch.
+.TP
+.BR \-f ", " \-\-follow
+Keep going as entries arrive. Without it the selection is drained once
+and this exits: a durable one-shot, durable because the positions are.
+.TP
+.BI \-\-batch\-size " N"
+Maximum entries handed to the consumer before its reports are collected
+(default 512).
+.TP
+.BI \-\-poll " DUR"
+How long to wait before asking again, once an answer was exhausted
+(default 1s).
+.TP
+.BI \-\-forest " DIR"
+Forests to search (repeatable); default: every configured one.
+.RS
+.PP
+Everything after
+.B \-\-
+is the CONSUMER and its arguments \(em a list, so nothing makes a quoting
+round trip:
+.B \-\- ssh archive01 my\-consumer
+reaches a destination on another machine with no transport to configure,
+the contract being two file descriptors.
+.PP
+timberfs owns the position; the consumer REPORTS how far to move it, and
+a report is the only thing that advances one. A consumer says hello, is
+fed
+.BR timberfs\-records (5),
+and answers with a watermark per store meaning \(lqdo not send me these
+again\(rq \(em so a receiver that is down gets the same entries again,
+while an entry refused for being too old is reported past and never
+resent. No hello, no run.
+.PP
+Small enough to implement in a shell script, which is the point of it
+being a protocol at all.
+.RE
+.SS list
 .TP
 .BI \-\-select " EXPR"
 List only the stores whose manifest satisfies

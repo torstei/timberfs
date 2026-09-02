@@ -27,7 +27,7 @@ use crate::records::{EntryRec, Reader, Rec};
 use crate::select::Selector;
 
 /// A store in a selection: its identity, where it is, and its labels.
-type Store = (String, PathBuf, Map<String, Value>);
+pub type Store = (String, PathBuf, Map<String, Value>);
 
 /// How many stores a batch may span, and how many entries it may hold, by
 /// default. The entry cap is the destination's batch size; the store cap
@@ -134,9 +134,28 @@ impl Shipper {
         &self.positions
     }
 
-    /// Resolve the selection and read one batch. Reads nothing when the
-    /// selector matches no store with an identity.
+    /// Resolve the selection and read one batch, parsed into slices —
+    /// for a caller that consumes entries in this process.
     pub fn poll(&mut self) -> anyhow::Result<Batch> {
+        let (buf, stores, matched) = self.poll_raw()?;
+        if stores.is_empty() {
+            return Ok(Batch {
+                slices: Vec::new(),
+                more: false,
+                matched,
+            });
+        }
+        self.take(&buf, stores, matched)
+    }
+
+    /// The same read, UNPARSED: the answer's own bytes, the stores it
+    /// covered, and how many the selector matched.
+    ///
+    /// For a caller that FORWARDS records to a consumer rather than
+    /// consuming them here — what it passes on is the producer's bytes,
+    /// so nothing drifts between what timberfs wrote and what the
+    /// consumer reads.
+    pub fn poll_raw(&mut self) -> anyhow::Result<(Vec<u8>, Vec<Store>, usize)> {
         let matches = crate::select::resolve(&self.dirs, &self.selector);
         let matched = matches.len();
         let mut stores: Vec<Store> = Vec::new();
@@ -165,13 +184,8 @@ impl Shipper {
         }
         rotate_past(&mut stores, self.stopped_in.as_deref());
         if stores.is_empty() {
-            return Ok(Batch {
-                slices: Vec::new(),
-                more: false,
-                matched,
-            });
+            return Ok((Vec::new(), stores, matched));
         }
-
         let files: Vec<PathBuf> = stores.iter().map(|(_, p, _)| p.clone()).collect();
         let mut buf = Vec::new();
         crate::query::read_forward(
@@ -180,7 +194,61 @@ impl Shipper {
             &self.positions.cursor(),
             self.batch_entries,
         )?;
-        self.take(&buf, stores, matched)
+        Ok((buf, stores, matched))
+    }
+
+    /// Where a bounded read stopped, so the next one starts after it.
+    /// Set by whoever interpreted the answer — `take` for a parsed
+    /// batch, a forwarder for a spliced one — because only they know
+    /// which store the cap cut off.
+    pub fn stopped_in(&mut self, id: Option<String>) {
+        self.stopped_in = id;
+    }
+
+    /// A store's recorded position, or `None` where there is none — what
+    /// decides whether a consumer's claimed watermark is honoured.
+    pub fn recorded(&self, id: &str) -> Option<u64> {
+        self.positions.at.get(id).map(|a| a.offset)
+    }
+
+    /// Seed a store this consumer's destination already holds. Refused
+    /// where a position is recorded: a claim is a hint, and knowledge we
+    /// own outranks it (see consumer.rs).
+    pub fn seed(&mut self, id: &str, path: &str, offset: u64) -> bool {
+        if self.recorded(id).is_some() {
+            return false;
+        }
+        self.positions.advance(id, path, offset, None, 0, 0);
+        true
+    }
+
+    /// Move one store's position, as a consumer's watermark says to.
+    pub fn acknowledge(
+        &mut self,
+        id: &str,
+        path: &str,
+        offset: u64,
+        chunk: Option<u64>,
+        delivered: u64,
+    ) {
+        self.positions
+            .advance(id, path, offset, chunk, 0, delivered);
+    }
+
+    /// Record a consumer's note, and say whether anything changed — so a
+    /// caller knows whether the file is worth rewriting.
+    pub fn take_note(&mut self, id: Option<&str>, offset: Option<u64>, text: &str) -> bool {
+        self.positions.take_note(id, offset, text)
+    }
+
+    /// Persist. Called when a watermark moved something, and also when a
+    /// note arrived and nothing moved — a stalled follower must be able
+    /// to record WHY it is stalled, which is the whole point of the note.
+    pub fn persist(&mut self) -> anyhow::Result<()> {
+        match (&self.positions_path, self.read_only) {
+            (Some(path), false) => self.positions.save(path),
+            _ => Ok(()),
+        }
     }
 
     /// The destination has the batch: advance and persist. One

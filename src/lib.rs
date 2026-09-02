@@ -10,6 +10,7 @@ pub mod consumer;
 pub mod cursor;
 pub mod entry;
 pub mod export;
+pub mod feed;
 pub mod follow;
 pub mod follower;
 pub mod forest;

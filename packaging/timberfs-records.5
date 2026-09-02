@@ -134,6 +134,14 @@ carries
 an entry needs attributing \(em a read of one store attributes nothing,
 because there is nothing to tell apart.
 .PP
+⚠ Except in a stream written for a PROGRAM to consume, where both are
+ALWAYS present however many stores matched. A consumer is written once
+and the store count is not its business, so a conditional attribution
+would work against a selection of three and break on a selection of one.
+That is the stream
+.B timberfs feed
+hands its consumer.
+.PP
 Both, rather than the path alone, because this is a PIPELINE format: a
 stage that drops or rewrites
 .B source
