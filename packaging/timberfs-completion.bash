@@ -57,6 +57,11 @@ _timberfs() {
             COMPREPLY=($(compgen -W "$follower_verbs" -- "$cur"))
             return 0
         fi
+        # --follow-from is three words wherever it appears.
+        if [ "$prev" = --follow-from ]; then
+            COMPREPLY=($(compgen -W "begin end discovery" -- "$cur"))
+            return 0
+        fi
         # --store takes a store, which is where handles belong.
         if [ "$prev" = --store ]; then
             local handles
@@ -72,6 +77,12 @@ _timberfs() {
             ;;
         *) COMPREPLY=() ;;
         esac
+        return 0
+    fi
+
+    # --follow-from takes one of three words, not a path.
+    if [ "$prev" = --follow-from ]; then
+        COMPREPLY=($(compgen -W "begin end discovery" -- "$cur"))
         return 0
     fi
 
@@ -96,7 +107,7 @@ _timberfs() {
         --payload-key | --route | --max-body | --query | --select | --cursor | \
         --rotated | --socket | --project | --key | --prefix | --only | --endpoint | \
         --keep | --drain-every | --idle | --timeout | --from-chunk | --wait-for-writer | \
-        --deadline | --positions | --batch-size)
+        --deadline | --positions | --batch-size | --follow-from)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;

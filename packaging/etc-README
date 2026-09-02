@@ -8,14 +8,18 @@ Each <instance>.conf defines the environment for one timberfs mount:
 
 Then: systemctl enable --now timberfs@<instance>
 
-Each otlp-<instance>.conf defines one OTLP shipper — a store, and the
-OTLP/HTTP receiver its entries are posted to:
+follower-<instance>.conf holds SECRETS for one follower (timberfs-follower@),
+and nothing else — which stores it reads and what consumes them live in its
+declaration, written once with `timberfs follower create`. The registry is
+world-readable so that `follower list` and `info` work without write access,
+which is no place for a bearer token:
 
-    STORE=/var/log/timberfs-backing/applogs/app.log
-    ENDPOINT=http://127.0.0.1:4318
-    EXTRA_OPTS=--service applogs
+    OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer sekrit
 
-Then: systemctl enable --now timberfs-otlp@<instance>
+follower.conf holds the defaults for every follower. Declare one with:
+
+    timberfs follower create collector --select '[service=~apache-.*]' \
+        --enable --start -- timber-otlp --endpoint http://127.0.0.1:4318
 
 text.conf and text-<instance>.conf configure the plain-text FIFO intake —
 for a producer that can only log to a path (Apache, nginx). text.conf holds

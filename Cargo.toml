@@ -84,10 +84,11 @@ producer's logs into a store over a FIFO, and two socket-activated network \
 intakes — timberfs-forward speaking the Fluentd Forward protocol (Docker's \
 fluentd log driver, Fluent Bit, Fluentd) and timberfs-otlp speaking \
 OTLP/HTTP (any OpenTelemetry SDK or Collector) — so those producers log \
-straight into a store. In the other direction, timberfs-otlp@.service ships \
-a store to an OTLP/HTTP receiver, and timberfs-follower@.service runs a \
-REGISTERED follower of a store: a named consumer with a durable position, \
-declared once with `timberfs follower create` and thereafter managed by name. \
+straight into a store. In the other direction, \
+timberfs-follower@.service runs a REGISTERED follower: a selection of stores \
+fed to a consumer that reports how far each position may move, declared once \
+with `timberfs follower create` and thereafter managed by name — one unit per \
+destination rather than one per store. \
 timberfs-frames.socket/.service receive the NATIVE replication wire, where \
 compressed chunks move verbatim and the store on this host is byte-identical \
 to its source."""
@@ -128,13 +129,11 @@ assets = [
     ["packaging/timberfs-frames.service", "lib/systemd/system/timberfs-frames.service", "644"],
     ["packaging/timberfs-forward.socket", "lib/systemd/system/timberfs-forward.socket", "644"],
     ["packaging/timberfs-forward.service", "lib/systemd/system/timberfs-forward.service", "644"],
-    ["packaging/timberfs-otlp@.service", "lib/systemd/system/timberfs-otlp@.service", "644"],
     ["packaging/timberfs-otlp.socket", "lib/systemd/system/timberfs-otlp.socket", "644"],
     ["packaging/timberfs-otlp.service", "lib/systemd/system/timberfs-otlp.service", "644"],
     ["packaging/timberfs-incus.service", "lib/systemd/system/timberfs-incus.service", "644"],
     ["packaging/timberfs-tmpfiles.conf", "usr/lib/tmpfiles.d/timberfs.conf", "644"],
     ["packaging/timberfs.conf.example", "usr/share/doc/timberfs/examples/timberfs.conf.example", "644"],
-    ["packaging/timberfs-otlp.conf.example", "usr/share/doc/timberfs/examples/timberfs-otlp.conf.example", "644"],
     ["packaging/timberfs-text.conf.example", "usr/share/doc/timberfs/examples/timberfs-text.conf.example", "644"],
     ["packaging/timberfs-follow.conf.example", "usr/share/doc/timberfs/examples/timberfs-follow.conf.example", "644"],
     ["packaging/timberfs-follower.conf.example", "usr/share/doc/timberfs/examples/timberfs-follower.conf.example", "644"],

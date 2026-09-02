@@ -20,12 +20,12 @@ _timberfs_follower_names() {
 _timberfs_follower_verbs() {
     local -a verbs
     verbs=(
-        'create:register a follower of a store'
+        'create:register a follower: a selection, and a consumer to feed it'
         'list:list every registered follower'
-        'status:show one follower'\''s declaration and position'
+        'status:show one follower'\''s declaration and its position per store'
         'update:change a follower'\''s declaration'
         'delete:unregister a follower'
-        'run:exec a follower'\''s shipper (what the systemd template runs)'
+        'run:run a follower (what the systemd template runs)'
     )
     _describe -t commands 'timberfs follower subcommand' verbs
 }
@@ -47,7 +47,7 @@ _timberfs_commands() {
         'trim:enforce a store'\''s declared retention once, now'
         'rotate:move or drop chunks written before a cutoff'
         'feed:read a selection and hand the records to a consumer'
-        'follower:manage the registered followers of a store'
+        'follower:manage the registered followers'
         'forward-intake:receive the Fluentd Forward protocol over TCP'
         'otlp-intake:receive OTLP/HTTP logs from OpenTelemetry senders'
     )
@@ -70,9 +70,18 @@ _timberfs() {
             _alternative 'handles:store handle:_timberfs_handles' 'files:file:_files'
             return
         fi
+        if [[ ${words[CURRENT-1]} == --follow-from ]]; then
+            _values 'where' begin end discovery
+            return
+        fi
         case ${words[3]} in
         status | update | delete | run) _timberfs_follower_names ;;
         esac
+        return
+    fi
+
+    if [[ ${words[CURRENT-1]} == --follow-from ]]; then
+        _values 'where' begin end discovery
         return
     fi
 

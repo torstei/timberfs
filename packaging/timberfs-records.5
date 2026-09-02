@@ -388,6 +388,123 @@ lands within a poll interval of the timeline without claiming to.
 The ordering a bounded read gives holds for THAT answer only. A later
 page resolves the store predicate again, and a store that has appeared
 since carries entries older than the ones already delivered.
+.SH THE CONSUMER PROTOCOL
+A consumer fed by
+.B timberfs feed
+or by a registered follower reads this stream on
+.B standard input
+and answers on
+.BR "standard output" .
+Its messages use the framing above \(em RS-marked, US-separated,
+NUL-terminated \(em so there is one framing discipline at both ends and
+one parser shape to write. Nothing travels the other way but the stream
+itself.
+.PP
+.RS
+.nf
+hello     v=1  reads=records  [ holds=<json object> ]
+progress  id=<store>  offset=<n>
+note      [ id=<store> ]  [ offset=<n> ]  text=<json string>
+.fi
+.RE
+.PP
+.B No hello, no run.
+Nothing is read from a store until the consumer has said it implements
+this: a position must not move on the word of something that never said
+so, and \(lqevery consumer implements this\(rq is what makes silence
+unambiguous.
+.B reads
+is
+.B records
+or
+.BR chunks .
+.TP
+.B progress
+is a WATERMARK, meaning \(lqdo not send me these again\(rq \(em never
+\(lqthese were delivered\(rq. That distinction is the whole protocol: a
+consumer whose destination is DOWN reports nothing and is handed the same
+entries again, while one whose destination REFUSED them (too old,
+malformed, permanently rejected) reports past them and is not. No error
+taxonomy crosses the boundary, because what a destination's answer meant
+is knowable in the consumer and nowhere else.
+.IP
+The number is one the consumer was handed: an
+.B entry
+record states
+.B offset
+and
+.BR len ,
+and the runs chain, so a watermark is the last accepted entry's
+.BR "offset + len" ,
+per
+.BR id .
+.B ONE unit whatever it reads:
+the absolute offset on the store's tape \(em what has ever left the store
+plus where the bytes sit in what remains. Retention cannot move it, and a
+chunk boundary is simply an offset that lands on one.
+.TP
+.B note
+is free text about why nothing is moving, which timberfs RECORDS beside
+the position rather than only logging \(em
+.B "timberfs follower status"
+is another process, and a stalled consumer's reason has to outlive the
+line it was printed on. With an
+.B id
+it is about that store, without one about the consumer itself. Deduped by
+text, so a consumer retrying once a second produces one note.
+.IP
+.B text
+is a JSON string, and
+.B holds
+a JSON object, for the reason the grammar above gives: a value may
+contain neither NUL nor US, and free text can contain both. That is the
+same encoding
+.BR labels =
+uses.
+.TP
+.B holds
+on the hello is what the consumer ALREADY has, as
+.BR "{\(dq<store-id>\(dq: <offset>}" .
+A HINT, not a proof: it is honoured only where timberfs has nothing
+recorded for that store, since a number cannot demonstrate that the bytes
+are held and honouring one over a recorded position would silently skip
+what was never delivered. Where a store has no position it costs nothing
+and saves everything \(em a rebuilt follower pointed at a receiver already
+holding terabytes must not re-ship them. So where an unread store starts
+is decided in this order:
+.IP
+.RS
+.nf
+a recorded position  >  the consumer's claim  >  \-\-follow\-from
+.fi
+.RE
+.PP
+Batching is the consumer's own business: it reports when it likes, and
+backpressure is the pipe. Timberfs bounds its own reads for its own
+reasons, and PARKS a store with anything unacknowledged \(em so one store
+in trouble costs the others nothing, and the depth is one outstanding
+batch per store.
+.PP
+The protocol is small enough to implement in a shell script, which is the
+point of it being a protocol rather than an interface:
+.PP
+.RS
+.EX
+printf '\\036hello\\037v=1\\037reads=records\\000'
+while IFS= read -r -d '' rec; do
+    # ... an entry record states id, offset and len ...
+    printf '\\036progress\\037id=%s\\037offset=%s\\000' "$id" "$((off + len))"
+done
+.EE
+.RE
+.PP
+A FOLLOWED stream has no end, so a consumer's input closing is an
+ordinary shutdown rather than a truncation:
+.B stream-start
+says
+.B follow=1
+where that is the case. A consumer that exits non-zero is reported as the
+CAUSE of whatever else failed, a broken pipe being the symptom.
 .SH VERSIONING
 The stream is versioned by the
 .B v
