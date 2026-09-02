@@ -1634,7 +1634,16 @@ matches with that store's position and lag, anything the consumer had to
 SAY about a store (its last note, kept with the position so it survives a
 restart of both ends), whether anything is honouring its
 .B retaining
-flag, and whether it is running. That last line is read from the
+flag, and whether it is running.
+.IP
+It also accounts for every recorded PLACE, not only the covered ones: the
+positions file holds one per store this follower has ever read, so a
+.B places
+line names those left over and how many of their stores are no longer on
+disk at all. Nothing prunes them, and that is deliberate \(em a place is
+what makes a store rejoining the selection resume instead of re-ship.
+Whether a store is covered is the selector's answer and cannot be read off
+the file, which is why this is said here rather than recorded there. That last line is read from the
 follower's
 .BR lock ,
 not from systemd: a lock is released by the kernel on process death, so

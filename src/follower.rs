@@ -670,6 +670,35 @@ impl Registered {
         self.covered.iter().map(Covered::behind_bytes).sum()
     }
 
+    /// Recorded places for stores this follower no longer covers, each
+    /// with whether its backing is still on disk.
+    ///
+    /// ⚠ These are not visible anywhere else, and there are three states
+    /// in that file rather than one: covered, left the selection, and
+    /// gone from disk. A place is KEPT when a store leaves — bringing it
+    /// back resumes rather than re-ships — so they accumulate for as
+    /// long as the selection churns, and nothing prunes them. Whether a
+    /// store is covered is the SELECTOR's answer and cannot be read off
+    /// the file, so this is derived here rather than recorded there.
+    pub fn uncovered(&self) -> Vec<(String, bool)> {
+        let Some(p) = self.places.held() else {
+            return Vec::new();
+        };
+        p.at.iter()
+            .filter(|(id, _)| !self.covered.iter().any(|c| &c.id == *id))
+            .map(|(id, at)| {
+                // ⚠ The recorded path is the store's LOGICAL name, which
+                // is never a file — the pair is `<name>.rings` and
+                // `<name>.trunk`. Testing the logical path answers false
+                // for a perfectly live store.
+                let here = !at.path.is_empty()
+                    && resolve_backing(Path::new(&at.path))
+                        .is_ok_and(|(dir, name)| format::rings_path(&dir, &name).exists());
+                (id.clone(), here)
+            })
+            .collect()
+    }
+
     /// One phrase for how this follower is doing, across its whole
     /// selection. The order matters: a selection that matches nothing
     /// outranks a store never read, which outranks a distance — each
@@ -1507,6 +1536,23 @@ pub fn to_json(r: &Registered) -> Value {
     o.insert("unit".into(), unit_name(r.name()).into());
     o.insert("lag".into(), r.lag_text().into());
     o.insert("holds_everything".into(), r.holds_everything().into());
+    // Recorded places for stores no longer covered. An ARRAY always, so
+    // a consumer reads the same shape whether there are any or not, and
+    // `on_disk` separates "left the selection" from "deleted".
+    o.insert(
+        "uncovered".into(),
+        Value::Array(
+            r.uncovered()
+                .into_iter()
+                .map(|(id, here)| {
+                    let mut e = Map::new();
+                    e.insert("id".into(), id.into());
+                    e.insert("on_disk".into(), here.into());
+                    Value::Object(e)
+                })
+                .collect(),
+        ),
+    );
     // ⚠ `None` is "the positions file could not be read", which is not
     // "nothing consumed" — so it is null and not an empty object, and a
     // consumer tests for a value rather than for a key.
@@ -1699,6 +1745,27 @@ pub fn cmd_status(name: &str, json: bool) -> anyhow::Result<()> {
                 println!("  {:<24}   at offset {off} of {}", "", c.handle());
             }
         }
+    }
+    // Every recorded place is accounted for, not just the covered ones:
+    // the file holds a place per store this has EVER read, so a reader
+    // comparing `stores` against it would otherwise find more entries
+    // than are explained anywhere.
+    let stale = r.uncovered();
+    if !stale.is_empty() {
+        let gone = stale.iter().filter(|(_, here)| !here).count();
+        println!(
+            "places    {} more, for store(s) this no longer covers{}",
+            stale.len(),
+            if gone > 0 {
+                format!(" — {gone} of them no longer on disk at all")
+            } else {
+                String::new()
+            }
+        );
+        println!(
+            "          each keeps its place, so a store that comes back into the selection \
+             resumes rather than re-ships; nothing prunes them"
+        );
     }
     if let Some(n) = r.places.held().and_then(|p| p.note.as_ref()) {
         println!("note      {} ({})", n.text, n.when);
@@ -2330,6 +2397,69 @@ mod tests {
         // Missing is an error too: a follower with no declaration is a
         // registry that cannot be trusted to answer, not an empty policy.
         assert!(Declaration::load(&reg, "absent").is_err());
+        fs::remove_dir_all(&reg).ok();
+    }
+
+    /// ⚠ The positions file holds a place per store the follower has EVER
+    /// read, and nothing prunes it — so a reader comparing `stores`
+    /// against that file finds entries nothing explains. Three states live
+    /// in there and only one of them is `covered`; the other two are
+    /// derived here, because whether a store is covered is the SELECTOR's
+    /// answer and a changed selector does not touch the file.
+    #[test]
+    fn every_recorded_place_is_accounted_for_not_just_the_covered_ones() {
+        let reg = scratch("uncovered");
+        let root = std::env::temp_dir().join(format!("tfs-unc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let live = root.join("live");
+        fs::create_dir_all(&live).unwrap();
+        // A pair on disk, so `on_disk` has something true to report. The
+        // recorded path is the store's LOGICAL name, which is never a
+        // file — testing it directly answers false for a live store.
+        fs::write(live.join("a.log.rings"), b"").unwrap();
+        fs::write(live.join("a.log.trunk"), b"").unwrap();
+
+        let mut held = crate::cursor::Positions::new("c");
+        held.advance(
+            "kept-and-here",
+            &live.join("a.log").display().to_string(),
+            10,
+            Some(0),
+            1,
+            1,
+        );
+        held.advance("kept-but-gone", "/nonexistent/b.log", 20, Some(0), 1, 1);
+        held.advance("covered", "/wherever/c.log", 30, Some(0), 1, 1);
+        let r = Registered {
+            decl: decl("f", false),
+            places: Places::Held(held),
+            live: Liveness::Stopped,
+            covered: vec![Covered {
+                id: "covered".into(),
+                path: PathBuf::from("/wherever/c.log"),
+                standing: None,
+                read: true,
+                note: None,
+            }],
+        };
+        let mut unc = r.uncovered();
+        unc.sort();
+        assert_eq!(
+            unc,
+            vec![
+                ("kept-and-here".to_string(), true),
+                ("kept-but-gone".to_string(), false)
+            ],
+            "the covered store must not be listed, and the pair decides on_disk"
+        );
+        // Unreadable places say nothing about anything, so they list none
+        // rather than listing every store as uncovered.
+        let blind = Registered {
+            places: Places::Unreadable,
+            ..r
+        };
+        assert!(blind.uncovered().is_empty());
+        let _ = fs::remove_dir_all(&root);
         fs::remove_dir_all(&reg).ok();
     }
 

@@ -823,6 +823,40 @@ here.
   filesystem path (`tail`/`less`/`grep` on `/mnt/app/app.log` as it fills). Pairs
   naturally with the live sidecar above; retention's tail-rewrite is the
   coherency case to handle.
+- **`follower prune`, and telling apart the reasons a place is not
+  advancing.** A follower keeps a place for every store it has ever read,
+  because a store that leaves the selection must RESUME if it comes back
+  rather than re-ship — so places accumulate for as long as the selection
+  churns (an incus host where `[]` picks up every container leaves one per
+  container ever seen) and nothing prunes them. Measured: ~195 bytes each,
+  and since the file is rewritten whole, a one-shot feed delivering ONE
+  entry costs 0.063 s against 1 live place, 0.155 s against 20k dead ones
+  and 0.647 s against 100k (19 MiB). Slow, bounded, and not urgent.
+  `status`/`list` now ACCOUNT for them (PR #156) — covered, left the
+  selection, gone from disk — which was the part that surprised; the verb
+  to clear them is what is left. Operator-initiated, refusing while
+  running, previewing like `trim`.
+  ⛔ **NOT automatic pruning on save.** An un-match can be transient — a
+  manifest mid-rewrite, a forest not yet mounted, a label edit in flight —
+  and dropping a place then means a full re-ship at best and, under
+  `--follow-from end`, a silent skip.
+  ⚠ **`--inactive-for DUR` needs a stamp that does not exist**, and two
+  candidates were worked out and deliberately not built. A persisted
+  *status* would be a cached derivation and stale from the moment a filter
+  changed (a changed selector does not touch the file), so it is out.
+  `advanced` (when this follower last moved this place) and `lastMatched`
+  (when it last resolved into the selection) are timestamped OBSERVATIONS
+  and legitimate — `wl` is not a substitute, being the STORE's clock, so a
+  covered-but-quiet store has an ancient one. But `lastMatched` only
+  discriminates if written on a TIMER: piggybacked on saves it collapses
+  into `advanced`, because a stuck store is not saving, which is exactly
+  the row where the two needed to differ. That makes the positions file
+  something written when nothing has happened — a new class of write, and
+  the reason this waits for a real question rather than a speculative one.
+  The residual it would answer: a store two hours behind and a store two
+  years behind look alike, and *slow reception*, *recently added* and
+  *the filter changed* are not separable from a lag figure. `note` covers
+  a consumer that SAYS why; a merely slow one says nothing.
 - **An unreadable manifest should report its EFFECTS, not just its cause.**
   Today a `.bark` that does not parse is warned about on stderr — naming the
   syntax error — and every command still exits 0. What it actually costs is
