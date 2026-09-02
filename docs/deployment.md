@@ -897,8 +897,7 @@ once; `--follow` keeps shipping as chunks seal, on the same connection, which is
 what a service unit should run:
 
 ```sh
-timberfs set apache-error retain_size=5G retain_unconsumed=true \
-    cursors=/var/lib/timberfs
+timberfs set apache-error retain_size=5G cursors=/var/lib/timberfs
 timberfs frames-send apache-error --endpoint archive:4319 --follow \
     --cursor /var/lib/timberfs/apache-error.frames
 ```
@@ -906,15 +905,18 @@ timberfs frames-send apache-error --endpoint archive:4319 --follow \
 It takes no start position: it resumes from the **receiver's** position, which is
 authoritative, so re-running ships nothing rather than re-sending, and there is
 no local decision to get wrong. The `--cursor` is not that resume point — it
-records what the far end has acknowledged, so `retain_unconsumed` knows what has
-left this box, and retention then releases a prefix only once the far end has it.
+records what the far end has acknowledged, so a store declaring `cursors=<dir>`
+can **report** it (`timberfs info`, `timberfs list`).
 
-⚠ **The follower registry does not run this yet.** A follower feeds its consumer
+⚠ **Reporting, and not a retention hold.** `retain_unconsumed` reads the
+follower **registry** and nothing else — a file lying in a directory
+deliberately cannot change what may be dropped (see FOLLOWERS in `man
+timberfs`) — and frames cannot be a follower yet: a follower feeds its consumer
 `timberfs-records(5)` entries, and frames want the `chunks` diet, which timberfs
 refuses rather than serving wrongly (there is no per-store position on that path
-— see `docs/plans/consumer-protocol.md`). So frames replication is a unit of
-your own for now, and its retention interest is declared with the superseded
-`cursors=<dir>` key rather than as a registered follower.
+— see `docs/plans/consumer-protocol.md`). So **an edge store replicating by
+frames is bounded by `retain`/`retain_size` alone** until that lands; size it
+for the outage worth surviving, as you would with no consumer at all.
 
 There is no TLS: a private network, or a tunnel. And only *sealed* chunks
 ship, so a replica trails its source by one chunk flush — the live edge

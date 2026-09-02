@@ -450,9 +450,9 @@ app.log: retain_size (50.0 GiB) reached with follower central at chunk 4200
 
 That's owed, not optional. With finite disk, bounded loss is a choice already
 made — the alternative is blocking the producer — so what's owed is precise
-accounting, and the writer holds both halves of the comparison right there. The
-shipper's `GAP` warning is the same fact inferred later, from the other side,
-bounded only by timestamps; this one is exact.
+accounting, and the writer holds both halves of the comparison right there.
+`follower status`'s `GAP` is the same fact read back afterwards, from the
+position's side; this one is written as it happens.
 
 Retention only ever runs inside a live **writer**, so a store whose producer went
 quiet keeps its data — including data already shipped off the box. `timberfs

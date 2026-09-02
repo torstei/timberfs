@@ -285,7 +285,10 @@ rather than a unit per store to remember to add. `--retaining` implies
 The native wire carries the same shape from the other end — `timberfs
 frames-send --follow --cursor` against a `frames-intake`, which resumes from the
 *receiver's* position, so there is no local decision about where to begin and no
-way to re-ship a store by getting one wrong.
+way to re-ship a store by getting one wrong. ⚠ But it cannot hold retention back
+yet: `retain_unconsumed` reads the follower registry, and frames want the
+`chunks` diet a follower does not serve, so a frames edge store is bounded by
+`retain_size` alone.
 
 Now the two requirements that hold at once on an edge box are both satisfied.
 Keep as little log data there as possible — a breach reaches less of it, and
