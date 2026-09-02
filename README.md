@@ -294,105 +294,125 @@ vocabulary, one line each, with a pointer to wherever it is explained.
 
 ## Shipping onward (`timber-otlp`)
 
-A store is not a dead end. `timber-otlp` reads a store's entry stream and posts
-it to any OTLP/HTTP receiver — an OpenTelemetry Collector, or a backend that
-speaks OTLP directly — one LogRecord per **entry**, so a stack trace arrives as
-one record rather than forty:
+A store is not a dead end. Declare a **follower** — which stores, and what
+consumes them — and its records go to any OTLP/HTTP receiver, one LogRecord per
+**entry**, so a stack trace arrives as one record rather than forty:
 
 ```sh
-# ship as it arrives, resumably across restarts
-timber-otlp --follow --cursor /var/lib/timberfs/app.otlp \
-    --endpoint http://collector:4318 backing/app.log
-
-# replay an incident window into a fresh backend
-timber-otlp --from '2026-08-11 14:00' --to '2026-08-11 15:00' \
-    --endpoint http://new-backend:4318 backing/app.log
+timberfs list --select '[service=~apache-.*]'     # what it will ship
+timberfs follower create collector \
+    --select '[service=~apache-.*]' --enable --start \
+    -- timber-otlp --endpoint http://collector:4318
 ```
 
-It is a reader, so an unreachable receiver can stall the shipper and nothing
-else — the appender never notices. **The store is the send buffer**: where a
-collector's queue is sized by guessing, retention is the disconnection budget
-(`retain 30d` means the receiver can be gone for thirty days), and any window
-can be re-shipped afterwards, which a collector cannot do because it retains
-nothing.
+One process and one unit per **destination**, whatever the store count — the
+predicate is re-resolved on every poll, so a container that starts tomorrow is
+picked up with no new unit and no edit. `timberfs feed` is the same loop with
+the declaration on the command line, for trying a consumer out:
+
+```sh
+timberfs feed --follow --select '[service=~apache-.*]' \
+    -- timber-otlp --endpoint http://collector:4318
+```
+
+Every consumer is a **child process**, so an unreachable receiver stalls its own
+follower and nothing else — the appender never notices. **The store is the send
+buffer**: where a collector's queue is sized by guessing, retention is the
+disconnection budget (`retain 30d` means the receiver can be gone for thirty
+days), and any window can be re-shipped afterwards, which a collector cannot do
+because it retains nothing. A replay is a bounded query piped in, being a
+deliberate act rather than a mode:
+
+```sh
+timberfs query backing/app.log --records \
+    --from '2026-08-11 14:00' --to '2026-08-11 15:00' \
+  | timber-otlp --endpoint http://new-backend:4318
+```
 
 The two OTLP time fields land on timberfs's two axes: `timeUnixNano` gets the
 entry's own logline stamp, `observedTimeUnixNano` the write time it arrived at.
-The position is persisted in a cursor file on the write axis (the only
-monotonic one), so a restart resumes instead of re-sending; delivery is
-at-least-once, as OTLP itself is. `--dry-run` prints exactly what would be
-posted. Protobuf by default (`--encoding json` for a readable wire,
-`--compress gzip` over a network); plaintext HTTP only — terminate TLS in a
-collector beside it. Details: `man timber-otlp`.
+One request carries a `ResourceLogs` group **per store**, each with that store's
+own `service.name`, so a selection of four hundred stores is never flattened
+into whichever one the stream opened with. Delivery is at-least-once, as OTLP
+itself is. `--dry-run` prints exactly what would be posted. Protobuf by default
+(`--encoding json` for a readable wire, `--compress gzip` over a network);
+plaintext HTTP only — terminate TLS in a collector beside it. Details: `man
+timber-otlp`.
 
 ### Followers: who is reading, and how far behind
 
 Retention acts on the head of a store and nothing coordinates it with a
-consumer's progress, so a shipper down longer than the retention window comes
-back to find the chunk its cursor points at already dropped. That is reported
-rather than absorbed: the shipper warns on resume with the size of the hole,
-instead of quietly restarting from whatever is now oldest.
-
-The same fact is visible from the store's side — *before* it becomes loss — for
-every **registered follower**. A follower is a declared object: a name, a type,
-a `retaining` flag and a durable position.
-
-```sh
-timberfs follower create central --store app --type otlp \
-    --endpoint http://collector.internal:4318 --retaining --enable --start
-```
+consumer's progress, so a follower down longer than the retention window comes
+back to find the chunk its position points at already dropped. That is reported
+rather than absorbed — and reported from the store's side, *before* it becomes
+loss, for every **registered follower**. A follower is a declared object: a
+name, a selection of stores, a consumer to feed them to, a `retaining` flag and
+a durable position **per store**.
 
 ```
 $ timberfs follower list
-NAME     STORE  TYPE  RETAINING  POSITION     LAG            RUNNING
-central  app    otlp  yes        chunk 4831   6d 2h behind   yes
-audit    app    otlp  yes        -            never run      no
+NAME       SELECT                  STORES  RETAINING  WORST LAG      RUNNING
+collector  [service=~apache-.*]    12      yes        6d 2h behind   yes
+audit      [class=audit]           3       yes        never read     no
 
-$ timberfs info app
-  …
-  followers 2 registered, 2 retaining; 1.4 GiB of 1.4 GiB held
-            audit     retaining, never run  [no]
-            central   retaining, 6d 2h behind, 1.2 GiB unread in 4831 chunk(s); 41.2k delivered  [yes]
+$ timberfs follower status collector
+collector  12 store(s)  retaining  running (pid 4711)
+  select   [service=~apache-.*]
+  consumer timber-otlp --endpoint http://collector:4318
+  apache-web01   chunk 4831   6d 2h behind   1.2 GiB unread   41.2k delivered
+  apache-web02   chunk 9902   at the live edge                88.1k delivered
+  apache-web03   —            never read
+                 "418 I am a teapot" (2026-09-01 14:02)
 ```
 
 The held figure is the number to act on: a store is large because somebody is
-behind, and this names which. `audit` leads it because a retaining follower with
-**no position holds everything** — which is the point (it is what protects a
-follower deployed before it first runs) and equally the footgun, the same one an
-unused Postgres replication slot has.
+behind, and this names which. `audit` leads that in `list` because a retaining
+follower with **no position holds everything** — which is the point (it is what
+protects a follower deployed before it first runs) and equally the footgun, the
+same one an unused Postgres replication slot has.
 
 That parallel is not decoration. A follower *is* a replication slot: an
-operator-chosen name unique per host, the registration recording which store it
-belongs to, and an unused one pinning data forever with a size budget as the
-backstop. timberfs stays a log with interest-based truncation, not a work queue
-— position-based and at-least-once, no per-entry ack, no redelivery, no
+operator-chosen name unique per host, the registration recording what it reads,
+and an unused one pinning data forever with a size budget as the backstop.
+timberfs stays a log with interest-based truncation, not a work queue —
+position-based and at-least-once, no per-entry ack, no redelivery, no
 dead-letter.
+
+**Which stores, not which store.** That is the whole reason a follower has a
+selection: one forwarder per destination, rather than one systemd unit and one
+process per store. There is deliberately no *add a store to this follower*
+verb — the answer is to label the store, or to widen the predicate — and no
+follower *group*, because a group over a selection is a second way to say the
+same thing. A store joining the selection is picked up per `--follow-from`:
+`discovery` (the default) reads one born since the follower was declared from
+its beginning and one that predates it from its next byte, `begin` reads
+everything, `end` reads no history at all. `--retaining` implies `begin`, having
+promised the data is not lost until this follower has it.
+
+Each store is remembered by identity (its `.bark` id, minted by `--store` when
+it has none) — a store can move, and a path can come to hold a different store.
+A store with no identity is not followed, and `follower status` says so rather
+than silently reading fewer stores than it matched.
 
 The registry is one directory per follower, and the file split follows
 ownership:
 
 ```
-/var/lib/timberfs/followers/central/
-    follower.json   store, type, retaining, config   (the operator writes)
-    cursor.json     seq, n, delivered                (the follower writes)
-    follower.lock   held while it runs               (`run` acquires)
+/var/lib/timberfs/followers/collector/
+    follower.json    select, retaining, command    (the operator writes)
+    positions.json   a place per store it has read  (the follower writes)
+    follower.lock    held while it runs             (`run` acquires)
 ```
 
-The follower records **its** store, by identity (the `.bark` id, minted on
-`create`) — so a store keeps no follower list, and there is no reverse index to
-fall out of sync. Nor is a path enough: a store can move, and a path can come to
-hold a different store.
-
-systemd runs them, and timberfs only dispatches: `timberfs-follower@central`'s
-`ExecStart` is `timberfs follower run central`, which reads the declaration and
-**execs** the right shipper, replacing its own process. No per-instance `.conf`
-holding a store and an endpoint — that is what the registry is for — and no
-daemon of ours in the middle. Retiring one is deliberately two commands, because
-the destructive act deserves its own:
+systemd runs them: `timberfs-follower@collector`'s `ExecStart` is `timberfs
+follower run collector`, which resolves the selection, spawns the consumer and
+feeds it. No per-instance `.conf` holding a store and an endpoint — that is what
+the registry is for. Retiring one is deliberately two commands, because the
+destructive act deserves its own:
 
 ```sh
-timberfs follower update central retaining=false   # releases the head, and says what
-timberfs follower delete central --stop --disable  # bookkeeping
+timberfs follower update collector retaining=false   # releases the heads, and says what
+timberfs follower delete collector --stop --disable  # bookkeeping
 ```
 
 `update retaining=false` quantifies what it frees and says the part that is easy
@@ -448,11 +468,12 @@ timberfs trim app
 
 ## Feeding any consumer (`timberfs feed`)
 
-`timber-otlp` is pointed at one store. `timberfs feed` is pointed at a
-**selection**, and hands the records to a program:
+`timber-otlp` is one consumer. Any program that reads the record stream and
+reports back is another, and `timberfs feed` is the loop that runs one without
+a declaration:
 
 ```sh
-# every apache store on the host, to a program that speaks the consumer protocol
+# every apache store on the host, to a program that speaks the protocol
 timberfs feed --follow --select '[service=~apache-.*]' \
     --positions /var/lib/timberfs/collector.positions.json \
     -- my-consumer
@@ -465,23 +486,34 @@ timberfs feed --follow --select '[]' \
 
 One process whatever the store count, and a store created tomorrow is picked up
 without touching the command. `[]` is the predicate with no terms — every store
-— which is a thing to have written rather than a flag to leave out.
+— which is a thing to have written rather than a flag to leave out. Without
+`--positions` the places live only as long as the process, which is a temporary
+watch; a follower always has one, in its registry directory.
 
 **timberfs owns the position; the consumer says how far to move it.** A consumer
 says hello, is fed `timberfs-records(5)`, and answers with a watermark per store
 meaning *do not send me these again* — so a receiver that is down gets the same
 entries again, while an entry refused for being too old is reported past and
-never re-sent. A `note` says why nothing is moving, and is kept where
-`follower status` can show it. No hello, no run.
+never re-sent. A `note` says why nothing is moving, and is kept where `follower
+status` can show it. No hello, no run.
 
 It is small enough to implement in a shell script, which is the point of it
 being a protocol rather than a trait:
 
 ```sh
 printf '\036hello\037v=1\037reads=records\000'
-# ... read a record, do something with it ...
-printf '\036progress\037id=%s\037offset=%s\000' "$id" "$((offset + len))"
+while IFS= read -r -d '' rec; do
+    # ... an entry record states id, offset and len ...
+    printf '\036progress\037id=%s\037offset=%s\000' "$id" "$((off + len))"
+done
+printf '\036note\037text="%s"\000' 'the receiver said 418'
 ```
+
+A `note`'s text — and a hello's `holds` — is JSON, because a record value may
+contain neither NUL nor US and free text can contain both. `man
+timberfs-records` is the reference; the store's own labels arrive with the
+entries as a `source` record, so a consumer needs no access to the store it is
+being fed.
 
 ## Replicating to another timberfs (`frames-send`)
 
@@ -508,8 +540,8 @@ of its own and cannot re-send.
 With `--replica` the destination also keeps the sender's chunk numbers and
 records its origin, so a chunk answers to the same address at both ends; without
 it, the destination renumbers and claims no origin. The two travel together or
-not at all. As a registered follower it is `--type frames`, and then retention
-releases a prefix only once the far end has acknowledged it.
+not at all. Declared as a follower — `-- timberfs frames-send --endpoint …` —
+retention releases a prefix only once the far end has acknowledged it.
 
 Frames replicate, records merge: interleaving two sources into one store needs
 decoding, which is the entries path's job. See **REPLICATION** in
@@ -658,22 +690,21 @@ sudo dpkg -i target/debian/timberfs_*.deb
 ```
 
 The package installs `/usr/bin/timberfs`, `timber-filter`, `timber-otlp` and
-eight systemd unit families: `timberfs@<instance>` (a template) to mount a
+seven systemd unit families: `timberfs@<instance>` (a template) to mount a
 store at boot, a socket-activated `timberfs-log@<instance>` (also a template)
 to stream a records producer into a store without a mount, its plain-text
 sibling `timberfs-text@<instance>` for a producer that can only log to a path
 (Apache's `CustomLog`/`ErrorLog`, nginx's `access_log`), `timberfs-follow@<instance>`
 to read a file a producer keeps writing (no coupling to that producer at all),
-socket-activated
-`timberfs-forward` and `timberfs-otlp` (not templated — both multiplex every
-stream over one listener) for the two network intakes above, and
-`timberfs-otlp@<instance>` (a template, one per store) to ship a store onward —
-plus `timberfs-follower@<instance>`, which is the one to prefer for that last
-job: it runs a *registered* follower, so the store, the type and the endpoint
-come from the declaration rather than from a per-instance `.conf`.
+socket-activated `timberfs-forward` and `timberfs-otlp` (not templated — both
+multiplex every stream over one listener) for the two network intakes above,
+and — in the other direction — `timberfs-follower@<instance>`, which runs a
+*registered* follower: which stores and what consumes them come from the
+declaration rather than from a per-instance `.conf`, so it is one unit per
+destination and not one per store.
 
 See **[Deploying timberfs](docs/deployment.md)** for the directory layout, all
-eight unit families, the ownership/permission model, and
+seven unit families, the ownership/permission model, and
 self-restart-on-upgrade.
 
 ## Roadmap

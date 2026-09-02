@@ -217,11 +217,10 @@ caller cannot fix. See `man timberfs` (QUERY CEILINGS).
 
 ## systemd units
 
-Seven independent families ship with the package: one mount, four intakes
-(FIFO, Forward, OTLP and the native replication wire) and two shippers —
-`timberfs-otlp@`, configured per instance in `/etc/timberfs`, and
-`timberfs-follower@`, which takes its configuration from the follower
-registry instead. Prefer the latter for anything long-lived.
+Six independent families ship with the package: one mount, four intakes
+(FIFO, Forward, OTLP and the native replication wire) and one shipper,
+`timberfs-follower@`, which takes its configuration from the follower registry
+— one instance per DESTINATION, not one per store.
 
 The three protocol intakes take data from *other* systems and compress it
 here; `timberfs-frames` takes it from another timberfs and copies the
@@ -894,20 +893,28 @@ hosts sharing a short hostname, silently appends a second tape to the first
 while the manifest describes only one of them.
 
 On the sending host, `timberfs frames-send STORE --endpoint archive:4319` ships
-once; as a registered follower it is `--type frames`, which is what a service
-unit should run:
+once; `--follow` keeps shipping as chunks seal, on the same connection, which is
+what a service unit should run:
 
 ```sh
-timberfs set apache-error retain_size=5G retain_unconsumed=true
-timberfs follower create --store apache-error ship-apache-error \
-    --type frames --endpoint archive:4319 --retaining --enable --start
+timberfs set apache-error retain_size=5G retain_unconsumed=true \
+    cursors=/var/lib/timberfs
+timberfs frames-send apache-error --endpoint archive:4319 --follow \
+    --cursor /var/lib/timberfs/apache-error.frames
 ```
 
-A frames follower takes no `--start`: it resumes from the **receiver's**
-position, which is authoritative, so re-running ships nothing rather than
-re-sending, and there is no local decision to get wrong. With `--retaining`
-plus `retain_unconsumed`, retention here releases a prefix only once the far
-end has acknowledged it.
+It takes no start position: it resumes from the **receiver's** position, which is
+authoritative, so re-running ships nothing rather than re-sending, and there is
+no local decision to get wrong. The `--cursor` is not that resume point — it
+records what the far end has acknowledged, so `retain_unconsumed` knows what has
+left this box, and retention then releases a prefix only once the far end has it.
+
+⚠ **The follower registry does not run this yet.** A follower feeds its consumer
+`timberfs-records(5)` entries, and frames want the `chunks` diet, which timberfs
+refuses rather than serving wrongly (there is no per-store position on that path
+— see `docs/plans/consumer-protocol.md`). So frames replication is a unit of
+your own for now, and its retention interest is declared with the superseded
+`cursors=<dir>` key rather than as a registered follower.
 
 There is no TLS: a private network, or a tunnel. And only *sealed* chunks
 ship, so a replica trails its source by one chunk flush — the live edge
@@ -966,47 +973,24 @@ Three things worth knowing before you enable it:
 OTLP should, into `timberfs-otlp.socket` above. The console is for what arrives
 when the application's logger is already dead.
 
-### Shipping a store out — `timberfs-otlp@.service`
+### Shipping stores out — `timberfs feed`
 
-The other direction: read one store's entry stream and post it to an OTLP/HTTP
-receiver. **A template, one instance per store** — the cursor is a position in
-*one* store, and a stalled receiver must not hold up an unrelated one.
-Configure the instance in `/etc/timberfs/otlp-<instance>.conf`:
-
-```ini
-STORE=/var/log/timberfs-backing/applogs/app.log
-ENDPOINT=http://127.0.0.1:4318
-EXTRA_OPTS=--service checkout --resource deployment.environment=prod
-```
-
-```sh
-systemctl enable --now timberfs-otlp@applogs
-```
-
-It runs `timber-otlp --follow --cursor /var/lib/timberfs/otlp-<instance>.cursor`.
-Being a **reader**, it cannot hurt the store or the appender: an unreachable
-receiver stalls the shipper and nothing else, and the store is the send buffer
-— retention is the disconnection budget (`retain 30d` means the receiver can
-be gone thirty days). The cursor is written only after the receiver accepts a
-batch, so an interrupted send is re-delivered rather than skipped
-(at-least-once); `Restart=always` is therefore safe. Details: `man timber-otlp`.
-
-### Shipping a SELECTION out — `timberfs feed`
-
-The template above is one instance per store, which is one declaration, one
-unit and one process per store, with the destination written out once per store
-and free to drift. `timberfs feed` is pointed at a predicate instead:
+The other direction: read the stores a predicate matches and hand the records to
+a program, which reports how far each position may move.
 
 ```sh
 timberfs feed --follow --select '[service=~apache-.*]' \
     --positions /var/lib/timberfs/collector.positions.json \
-    -- my-consumer
+    -- timber-otlp --endpoint http://127.0.0.1:4318
 ```
 
 One process whatever the store count. The selection is re-resolved on every
 poll, so a store created later is picked up with no configuration change and one
 that stops matching stops being read; each store keeps its own position, so
-nothing is re-sent and a restart resumes all of them.
+nothing is re-sent and a restart resumes all of them. Where a store this has
+never read is picked up is `--follow-from`: `discovery` (the default) ships one
+born since the feeder began from its beginning and one that predates it from its
+next byte, `begin` ships everything, `end` ships no history.
 
 **timberfs owns the positions and the consumer reports** how far to move them —
 that file is where the retention floor lives, so a program able to write it
@@ -1017,40 +1001,48 @@ entries again, an entry refused for being too old is reported past and never
 re-sent, and a `note` records why nothing is moving. **No hello, no run** —
 timberfs refuses rather than guessing that a silent program is keeping up.
 
+Being a **reader**, it cannot hurt the store or the appender: an unreachable
+receiver stalls its own follower and nothing else, and the store is the send
+buffer — retention is the disconnection budget (`retain 30d` means the receiver
+can be gone thirty days). A position moves only after the consumer reports, so
+an interrupted send is re-delivered rather than skipped (at-least-once).
+
 ⚠ The consumer is a child, and they live and die together: if it exits, this
-exits non-zero and the unit restarts. So `Restart=always` is right here for the
-same reason it is above.
+exits non-zero and the unit restarts. So `Restart=always` is right for the unit
+below.
 
 A destination on another machine needs no transport configured — the contract is
 two file descriptors, so `-- ssh archive01 my-consumer` is the whole of it. And
 because the protocol is three `printf`s and a read loop, a consumer can be a
-shell script; `man timberfs` has the shape.
+shell script; `man timberfs-records` has the shape. `timber-otlp` is the one we
+ship for OTLP/HTTP receivers: `man timber-otlp`.
 
-### `timberfs-follower@.service` — a shipper declared once, run by name
+### `timberfs-follower@.service` — a selection declared once, run by name
 
-Prefer this to `timberfs-otlp@` for anything long-lived. Same shipper, but the
-store, the type and the endpoint live in a **declaration** rather than in a
-per-instance `.conf`, so there is one place that answers "what follows this
-store", validated when it is written instead of at the next restart:
+The unit form of the above, and the one to prefer for anything long-lived: which
+stores and what consumes them live in a **declaration** rather than on a command
+line or in a per-instance `.conf`, so there is one place that answers "what is
+reading these stores", validated when it is written instead of at the next
+restart:
 
 ```sh
-timberfs follower create applogs \
-    --store /var/log/timberfs-backing/applogs/app.log \
-    --type otlp --endpoint http://127.0.0.1:4318 \
-    --retaining --enable --start \
-    -- --service checkout --resource deployment.environment=prod
+timberfs follower create collector \
+    --select '[service=~apache-.*]' --retaining --enable --start \
+    -- timber-otlp --endpoint http://127.0.0.1:4318 \
+       --resource deployment.environment=prod
 ```
 
-`ExecStart` is `timberfs follower run %i`, which reads that declaration and
-**execs** `timber-otlp` — a dispatcher, not a supervisor, so systemd keeps the
-lifecycle, the restarts and the journal, and timberfs adds no daemon. The
-`--follow`, `--cursor` and `--endpoint` flags come from the registry; `--start`
-is derived from `retaining` (`begin`, so a retaining follower's first run does
-not skip the backlog it exists to protect). Anything after `--` reaches the
-shipper verbatim.
+`ExecStart` is `timberfs follower run %i`, which resolves the selection, spawns
+the consumer and feeds it — so systemd keeps the lifecycle, the restarts and the
+journal, and timberfs adds no daemon of its own. The consumer's argument list is
+recorded verbatim and passed on unread; it is not verified at registration, so a
+path that does not exist, a binary deleted afterwards and `/bin/false` all fail
+identically at the next start, in the journal. `--follow-from` defaults to
+`begin` under `--retaining`, which promises the data is not lost until this
+follower has it.
 
 The unit's `StateDirectory=` is `/var/lib/timberfs/followers/%i`, holding the
-declaration, the position and the lock. **Those permissions are load-bearing**:
+declaration, the positions and the lock. **Those permissions are load-bearing**:
 a position in there decides what a store's retention may drop, so on a store
 declaring `retain_unconsumed`, anything that can write one can destroy data.
 0755 keeps it observable by anyone and writable only by the follower — so a
@@ -1066,7 +1058,7 @@ spelling every OTel SDK uses).
 
 > Not to be confused with `timberfs-follow@` — one letter, opposite direction.
 > That one is an *intake* (`timberfs import --follow`), reading a producer's file
-> **into** a store. This one reads a store **out**.
+> **into** a store. This one reads stores **out**.
 
 ### Watching the disconnection budget
 

@@ -71,15 +71,16 @@ myapp 2>&1 | timberfs append --into backing/app.log
 #    a mount if it insists on a real path
 timberfs mount /var/log/myapp-backing /var/log/myapp
 
-# 2. ship the store, resumably across restarts
-timber-otlp --follow --cursor /var/lib/timberfs/app.otlp \
-    --endpoint http://collector:4318 backing/app.log
+# 2. ship it, resumably across restarts
+timberfs follower create collector --select '[name=app]' --enable --start \
+    -- timber-otlp --endpoint http://collector:4318
 ```
 
 The shipper reads the standard `OTEL_EXPORTER_OTLP_ENDPOINT` /
-`OTEL_EXPORTER_OTLP_HEADERS` environment, takes `--service` and `--resource
-k=v` for the resource attributes (defaulting to the store's `.bark`), and
-`packaging/timberfs-otlp@.service` makes it one systemd instance per store.
+`OTEL_EXPORTER_OTLP_HEADERS` environment and takes `--service` and `--resource
+k=v` for the resource attributes, defaulting to each store's own labels — so one
+follower over a predicate covers every app on the box, each answering for
+itself, and `packaging/timberfs-follower@.service` runs it by name.
 `--dry-run` prints exactly what would be posted.
 
 *Why not the Collector's `filelog` receiver:* three things the store already
@@ -237,8 +238,9 @@ tier, a queue behind one) can sit in the middle or replace either end.
 timberfs otlp-intake --forest default
 
 # on each edge host
-timber-otlp --follow --cursor /var/lib/timberfs/edge.cursor \
-    --endpoint http://central:4318 --compress gzip backing/app.log
+timberfs feed --follow --select '[]' \
+    --positions /var/lib/timberfs/edge.positions.json \
+    -- timber-otlp --endpoint http://central:4318 --compress gzip
 ```
 
 Plaintext HTTP only: loopback or a private network, or terminate TLS in a
@@ -265,18 +267,23 @@ records its origin, so a chunk answers to the same address on both hosts. Only
 another timberfs can be on the far end, and only *sealed* chunks ship, so the
 centre trails the edge by one chunk flush.
 
-Register the shipper as a **retaining follower** and the edge store stops being
-a hoard. It gets run by name, with no flags of its own, and its position holds
-the head back:
+Declare a **retaining follower** and the edge store stops being a hoard. It gets
+run by name, and its positions hold the heads back:
 
 ```sh
-timberfs follower create central --store backing/app.log \
-    --endpoint http://central:4318 --retaining --enable --start -- --compress gzip
+timberfs follower create central --select '[]' \
+    --retaining --enable --start \
+    -- timber-otlp --endpoint http://central:4318 --compress gzip
 timberfs set backing/app.log retain_size=20G retain_unconsumed=true
 ```
 
-The same shape carries the native wire — `--type frames --endpoint central:4319`
-— and there it takes no `--start` at all: a frames sender resumes from the
+`--select []` is every store on the box, which on an edge machine is usually
+what is meant: one forwarder holding everything back until the centre has it,
+rather than a unit per store to remember to add. `--retaining` implies
+`--follow-from begin`, so nothing a store already holds is skipped.
+
+The native wire carries the same shape from the other end — `timberfs
+frames-send --follow --cursor` against a `frames-intake`, which resumes from the
 *receiver's* position, so there is no local decision about where to begin and no
 way to re-ship a store by getting one wrong.
 

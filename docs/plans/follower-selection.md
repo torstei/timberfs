@@ -1,6 +1,6 @@
 # Follower selection: one declaration, many stores
 
-**Status: design.** Nothing here is built. The reader half it rests on is:
+**Status: built** (branch `feature/follower-selection`). The reader half it rests on is:
 a selection resolved per read, a position per store keyed by store id, the
 `position` records that carry them back, and a resumed read that includes the
 live edge. See [paging.md](paging.md) for that half and

@@ -541,8 +541,8 @@ here.
   follower:
   ```
   /var/lib/timberfs/followers/<name>/
-      follower.json    store, type, retaining, config   (operator writes)
-      cursor.json      seq, n, delivered                (follower writes)
+      follower.json    select, retaining, command       (operator writes)
+      positions.json   a place per store it has read    (follower writes)
       follower.lock    held while it runs               (`run` acquires)
   ```
   The declaration and the position have different OWNERS and that is why
@@ -667,7 +667,7 @@ here.
   back to true will not bring the data back, and the follower resumes at a
   position that may now be gapped. `--dry-run` fits here, as on `rotate`.
   `delete` refuses while `retaining=true` (set it false first) and while
-  the follower is RUNNING, which the held `cursor.json` reveals — deleting
+  the follower is RUNNING, which the held lock reveals — deleting
   under a live process would leave it writing an unlinked file, silently
   doing nothing. Both refusals are about deliberateness rather than
   prevention (`update && delete` is still one line), so no `--force`: the
@@ -707,22 +707,40 @@ here.
   from an idle one), and any priority or weighting among followers
   (`retaining` is the only tier, and it is a declared property rather than
   a consequence of where a file happens to sit).
-- **A follower of a SET of stores**: forwarding N stores to one destination
-  is N declarations, N units and N processes today, with the destination
-  stated N times. So the subject of a follower becomes a SELECTION — the
-  same `[]` predicate `list --select` and the query document already take —
-  and a single-store follower is the one-term case `id=<the store's id>`.
-  One process serves the whole set: a request carries a position per store
-  and an answer returns one, so the reason the earlier design gave for one
-  child shipper per store (each store's own chunk axis) no longer holds.
-  What it costs: `positions.json` in place of `cursor.json`, the interest
-  axis evaluating selectors against each store rather than matching an
-  anchor, OTLP's `resourceLogs` carrying one group per store, and one
-  frames connection per store from one process until the wire is
-  multiplexed. Deliberately NOT a new object — no member of the set is ever
-  named, enabled or locked — which leaves "follower group" free for the
-  thing that has members: several processes sharing one selection, each
+- **A follower of a SET of stores** (built): forwarding N stores to one
+  destination was N declarations, N units and N processes, with the
+  destination stated N times. So the subject of a follower became a
+  SELECTION — the same `[]` predicate `list --select` and the query
+  document already take — and a single-store follower is the one-term case
+  `id=<the store's id>`, which is what `--store` writes. One process serves
+  the whole set. Deliberately NOT a new object — no member of the set is
+  ever named, enabled or locked — which leaves "follower group" free for
+  the thing that has members: several processes sharing one selection, each
   taking a shard.
+  It cost `positions.json` in place of `cursor.json`, the interest axis
+  evaluating selectors against labels HANDED to it rather than matching an
+  anchor, and OTLP's `resourceLogs` carrying one group per store.
+  Three things building it settled that the note did not have.
+  **The `--type` axis went away entirely.** A type named a shipper binary
+  to exec, which made a destination shape into a closed set and a flag; a
+  follower now records a CONSUMER — a command, verbatim, unverified — and
+  every follower speaks one protocol. What a destination's answer MEANT is
+  knowable in the consumer and nowhere else, so nothing but a position and
+  a sentence comes back (`timberfs-records(5)`, THE CONSUMER PROTOCOL).
+  **A store with anything unacknowledged is PARKED**, or one store in
+  trouble costs every store beside it: a read starting at an unmoved
+  position re-sends what is already in flight, filling the shared entry
+  cap on every poll. Measured at 99% of a core without the park and 0%
+  with it.
+  **`--follow-from` had to exist**, because a store JOINING a selection is
+  now routine — a relabel, a new container — and neither answer is right
+  for both cases: `end` skips a short-lived container's whole log, `begin`
+  floods on a relabel. `discovery` reads a store born since the follower
+  was declared from its beginning and one that predates it from its next
+  byte; `--retaining` implies `begin`.
+  What is left: the `chunks` diet, so `frames-send` can be a consumer too
+  (see `docs/plans/consumer-protocol.md` for the three small things
+  missing), and a withdrawal record for a store leaving a selection.
   Design notes:
   [docs/plans/follower-selection.md](docs/plans/follower-selection.md) for
   the declaration and the loop, and

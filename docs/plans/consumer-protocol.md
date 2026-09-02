@@ -1,6 +1,6 @@
 # The consumer protocol: timberfs holds the position, the consumer says how far
 
-**Status: design.** Nothing here is built. What it rests on is: the records
+**Status: built**, except the `chunks` diet (see the deferred list). What it rests on is: the records
 stream with its per-entry `offset`/`len` and `id`, the per-store positions a
 selection already keeps, and the poll loop that fills them. See
 [follower-selection.md](follower-selection.md) for those, and
