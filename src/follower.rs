@@ -1906,6 +1906,13 @@ pub fn cmd_update(
              data back, and {name} then resumes at a position that may be gapped"
         );
     }
+    // A CHANGED SELECTION moves heads too, per store, and this was the
+    // one edit that said nothing about it — where `retaining=false`
+    // quantifies its release and `create --retaining` names what it
+    // holds. A silent acquire fills a disk; a silent release drops data.
+    if decl.select != before.decl.select {
+        report_membership_change(&before, &decl);
+    }
     if dry_run {
         println!(
             "{}",
@@ -1927,6 +1934,85 @@ pub fn cmd_update(
         );
     }
     Ok(())
+}
+
+/// What a changed selection does to the stores on either side of it.
+///
+/// Said for every follower, because which stores are read is the point of
+/// a selection — and for a RETAINING one the leavers' bytes are quantified,
+/// since that release is the same one `update retaining=false` is careful
+/// to put a number on.
+///
+/// ⚠ A leaver KEEPS its recorded place: membership is the selection's,
+/// never the file's, so bringing it back resumes rather than re-ships. Said
+/// here because the opposite is the natural guess, and guessing wrong means
+/// an operator avoids an edit that was safe.
+fn report_membership_change(before: &Registered, decl: &Declaration) {
+    let Ok(sel) = decl.selector() else { return };
+    let after = crate::select::resolve(&decl.sweeps(), &sel);
+    let (was, now): (Vec<&str>, Vec<&str>) = (
+        before.covered.iter().map(|c| c.id.as_str()).collect(),
+        after.iter().filter_map(|m| m.id.as_deref()).collect(),
+    );
+    let joining: Vec<&crate::select::Match> = after
+        .iter()
+        .filter(|m| m.id.as_deref().is_some_and(|i| !was.contains(&i)))
+        .collect();
+    let leaving: Vec<&Covered> = before
+        .covered
+        .iter()
+        .filter(|c| !now.contains(&c.id.as_str()))
+        .collect();
+    if joining.is_empty() && leaving.is_empty() {
+        crate::note!(
+            "timberfs: {} still covers the same {} store(s)",
+            decl.name,
+            after.len()
+        );
+        return;
+    }
+    if !joining.is_empty() {
+        // The handle, not the file name: `Covered::handle` strips `.log`
+        // for the leavers, and one message must not spell a store two ways.
+        let names: Vec<&str> = joining.iter().map(|m| m.handle.as_str()).collect();
+        crate::note!(
+            "timberfs: {} now also covers {} store(s): {}{}",
+            decl.name,
+            joining.len(),
+            names.join(", "),
+            if decl.retaining {
+                " — and holds each of them whole until it has read it"
+            } else {
+                ""
+            }
+        );
+    }
+    if !leaving.is_empty() {
+        let names: Vec<String> = leaving.iter().map(|c| c.handle()).collect();
+        crate::note!(
+            "timberfs: {} no longer covers {} store(s): {}",
+            decl.name,
+            leaving.len(),
+            names.join(", ")
+        );
+        if before.decl.retaining && decl.retaining {
+            let freed: u64 = leaving.iter().map(|c| c.behind_bytes()).sum();
+            let unread = leaving.iter().filter(|c| !c.read).count();
+            crate::note!(
+                "timberfs: that releases their heads — {} it was holding becomes droppable{}",
+                crate::rotate::human_bytes(freed),
+                if unread > 0 {
+                    format!(", including {unread} it had never read at all")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        crate::note!(
+            "timberfs: each keeps its recorded place, so bringing it back into the selection \
+             resumes rather than re-ships"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

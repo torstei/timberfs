@@ -780,6 +780,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// ⚠ A store that LEAVES the selection keeps its recorded place, and
+    /// bringing it back RESUMES rather than re-ships. That falls out of
+    /// the file being loaded whole and saved whole — an unmatched store is
+    /// never touched, so its entry rides along through every rewrite — and
+    /// it is the opposite of the natural guess ("it is all one document,
+    /// so a rewrite drops it"), which is why it is pinned here rather than
+    /// left to the comment in cursor.rs.
+    #[test]
+    fn a_store_that_leaves_the_selection_keeps_its_place() {
+        let root = forest("rejoin", &[("a", "keep", 3), ("b", "other", 2)]);
+        // `shipper()` uses the forest's own positions.json, so all three
+        // views below share one file — which is the point.
+        // Read `a` to its end, under a selection that matches only it.
+        let mut on_a = shipper(&root, "service=keep", 100);
+        let batch = on_a.poll().unwrap();
+        let id = batch.slices[0].id.clone();
+        on_a.accept(&batch).unwrap();
+        let at = on_a.recorded(&id).expect("a place for a");
+        assert!(at > 0);
+
+        // Now a selection that excludes it, and a full save on the other
+        // store — the rewrite that the natural guess says loses `a`.
+        let mut on_b = shipper(&root, "service=other", 100);
+        let batch = on_b.poll().unwrap();
+        assert_eq!(batch.matched, 1, "the new selection covers only b");
+        on_b.accept(&batch).unwrap();
+
+        // Reopened on the ORIGINAL selection, `a` is where it was, and a
+        // poll offers nothing: it resumed, it did not re-ship.
+        let mut back = shipper(&root, "service=keep", 100);
+        assert_eq!(
+            back.recorded(&id),
+            Some(at),
+            "the departed store's place did not survive a save it was not part of"
+        );
+        assert!(
+            back.poll().unwrap().is_empty(),
+            "rejoining re-shipped a history it had already taken"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// ⚠ `discovery` compares against when the INTEREST began, which
     /// for a follower is its declaration and not its positions file. The
     /// file is written at the first run, so a follower declared on Monday

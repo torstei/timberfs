@@ -1671,14 +1671,27 @@ not \(em setting it back to
 will not bring dropped data back, and the follower then resumes at a
 position that may be gapped.
 .IP
-Widening
+.IP
+Changing
 .B select
-is the other edit to make deliberately: a store that joins the selection
-is picked up per
+is the other edit to make deliberately, and it says what it moved: which
+stores now join, which no longer match, and \(em for a retaining follower
+\(em how much the leavers' heads release, the same figure
+.B retaining=false
+puts a number on. A store that JOINS is picked up per
 .BR follow\-from ,
 so on a
 .B begin
 follower it arrives with its whole history.
+.IP
+⚠ A store that LEAVES keeps its recorded place, so bringing it back into
+the selection RESUMES rather than re-ships. Membership is the selection's
+and never the file's: the places are loaded whole and saved whole, so an
+unmatched store is simply never touched, and its entry holds no retention
+while it sits there. If a rejoin SHOULD re-read from the start, remove
+that store's entry (see THE FILES ARE NOT THE INTERFACE) \(em
+.B \-\-follow\-from
+decides only where a store with NO recorded place begins.
 .TP
 .B timberfs follower delete NAME [\-\-stop] [\-\-disable]
 Unregister a follower: bookkeeping, once the heads have been released.
