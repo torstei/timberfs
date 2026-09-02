@@ -180,6 +180,12 @@ pub fn cmd_trim(store: &Path, dry_run: bool) -> anyhow::Result<()> {
                 "timberfs: {name}: {h} retains everything (it has no usable position), so \
                  interest drops nothing"
             ),
+            // ⚠ Blind is not the same answer, though it holds the same
+            // amount back: the registry could not be read, so EVERY
+            // store on this host is pinned on this axis until it can be.
+            (None, _) if held.blind => crate::note!(
+                "timberfs: {name}: the follower registry could not be read, so interest holds                  everything back on every store here — `timberfs follower list` names the one                  at fault"
+            ),
             (None, _) => crate::note!(
                 "timberfs: {name}: nothing retains this store, so interest drops nothing"
             ),
