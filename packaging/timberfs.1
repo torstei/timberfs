@@ -157,8 +157,12 @@ root (e.g. the systemd unit) does not.
 .I DEST
 makes an empty log with its properties declared up front in a
 .B .bark
-manifest \(em one flat, optional, human-editable JSON object beside the
-pair.
+manifest \(em one flat, optional JSON object beside the pair, plain enough
+to read by eye.
+.B timberfs set
+is how it CHANGES: validated and atomic, where a hand-edit is neither, and
+a manifest a hand-edit leaves unreadable costs more than the edit saved
+(see THE FILES ARE NOT THE INTERFACE).
 .B \-\-index
 declares the token index, database-style: once declared, EVERY writer
 maintains the
@@ -1140,7 +1144,8 @@ keyed by store identity; omitted, the places live only as long as this
 process, which is a temporary watch. One file and not one per store
 because an atomic save is a write, an fsync, a rename and an fsync of the
 directory: saving 500 stores measures 3.9 ms as one file against 542 ms
-as one per store. It is plain JSON, and readable on purpose:
+as one per store. Plain JSON, so it can be READ \(em machine-owned state,
+so it is not edited (see THE FILES ARE NOT THE INTERFACE):
 .RS
 .PP
 .EX
@@ -1164,10 +1169,9 @@ as one per store. It is plain JSON, and readable on purpose:
 .B offset
 is the position and
 .B chunk
-is what retention reads; the rest is for a person. Rewinding by editing
-.B offset
-is the supported edit, and a store dropped from the file is read from the
-beginning again.
+is what retention reads; the rest is for a person. ⚠ Those two move
+TOGETHER: to make a store be read again, stop the reader and remove its
+entry, which is coherent where editing one of the pair is not.
 .RE
 .TP
 .BR \-f ", " \-\-follow
@@ -2269,6 +2273,72 @@ Values are kept EXACTLY as declared. A dotted key such as
 is not flattened: that is a consumer's requirement (Loki's label names
 forbid the dot; timberfs does not) and doing it here would lose the key the
 operator actually wrote, and silently merge two keys that flatten alike.
+.SH THE FILES ARE NOT THE INTERFACE
+Everything beside a store is plain text, and reading it by eye is a
+supported and useful thing to do. CHANGING it is what the verbs are for,
+and the reason is not tidiness: an editor cannot validate, cannot write
+atomically, and cannot know which fields move together.
+.TP
+.B .bark
+is a store's CONFIGURATION \(em labels, retention, the index and wal
+declarations.
+.B timberfs set
+changes it (and
+.B set \-\-unset
+removes a key): validated, atomic, and re-read by live writers within a
+second, so nothing needs restarting.
+.IP
+⚠ What a bad hand-edit costs is more than the edit saved. A manifest that
+does not parse is reported and then IGNORED, and a store's identity
+survives \(em it is in the
+.B .rings
+header too \(em but its LABELS do not, because that is the only place they
+live. So the store silently leaves every label-based selection: a
+follower matching
+.B [service=~apache\-.*]
+stops following it, while
+.B []
+and
+.B [id=\&...]
+still do, and its declared retention stops being enforced. Two of the
+things that decide whether data is shipped and whether it is kept, from
+one missing brace.
+.TP
+.B positions.json
+is a follower's STATE, written by the follower. Not configuration, whatever
+the file extension suggests: it holds a resume point
+.RB ( offset )
+and a retention floor
+.RB ( chunk )
+that mean different things and MUST move together. Editing one is a lie
+about the other \(em rewinding
+.B offset
+to re-ship a window while
+.B chunk
+stands still leaves retention free to drop exactly the window being
+re-shipped.
+.IP
+To make a follower read a store again: STOP it, remove that store's entry
+(or the whole file), start it. Removing the entry is coherent where an
+edit is not, because absence moves both fields at once \(em nothing is
+consumed, so retention holds everything and the read restarts per
+.BR \-\-follow\-from .
+Stopping first is not advice: a live follower holds its places in memory
+and writes them back on its next acknowledgement, so a file removed
+underneath it comes back with the position that was already there, and
+nothing says so.
+.TP
+.BR .grain ", " .rings ", " .trunk " and " .sap
+are derived or are the data itself.
+.B reindex
+rebuilds the first;
+.B identity
+repairs a lost id. Nothing else there is meant to be written by anything
+but a writer.
+.PP
+The same rule the forest config already states: the file stays readable
+and stays the thing that gets read, but nothing has to be edited to get
+the result.
 .SH RETENTION
 Retention is a property of the LOG, declared in its manifest, on THREE
 axes:
@@ -2362,6 +2432,11 @@ directory per follower:
     follower.lock    held while it runs             (`run` acquires)
 .fi
 .RE
+.PP
+All three are readable and none is edited by hand \(em see
+.B THE FILES ARE NOT THE INTERFACE
+for what a bad edit to each costs, and for the coherent way to make a
+follower read a store again.
 .PP
 The declaration and the positions are separate files because they have
 separate OWNERS: a positions save is a whole-file replace that

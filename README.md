@@ -404,6 +404,14 @@ ownership:
     follower.lock    held while it runs             (`run` acquires)
 ```
 
+"The operator writes" means *through the verbs* — all three are readable and
+none is edited by hand. `follower.json` is configuration and `follower update`
+changes it; `positions.json` is **state**, and its `offset` (resume point) and
+`chunk` (retention floor) mean different things and move together, so editing
+one is a lie about the other. To make a follower read a store again: stop it,
+remove that store's entry, start it — absence moves both fields at once, where
+an edit moves one. `man timberfs`, **THE FILES ARE NOT THE INTERFACE**.
+
 systemd runs them: `timberfs-follower@collector`'s `ExecStart` is `timberfs
 follower run collector`, which resolves the selection, spawns the consumer and
 feeds it. No per-instance `.conf` holding a store and an endpoint — that is what

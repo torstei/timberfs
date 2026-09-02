@@ -39,9 +39,12 @@ use serde_json::{Map, Value};
 
 use crate::format::ChunkRecord;
 
-/// One consumer's position, as persisted. The file is a flat JSON object
-/// so an operator can rewind by editing `seq` (the supported edit) — but
-/// it is machine-owned state: unknown keys are ignored, not preserved.
+/// One consumer's position, as persisted. A flat JSON object so it can be
+/// READ — but machine-owned STATE, not configuration: unknown keys are
+/// ignored rather than preserved, and the resume point travels with a
+/// retention floor that means something else, so editing one field is a
+/// lie about the other. Removing an entry is the coherent reset, since
+/// absence moves both at once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cursor {
     /// Who wrote it, for the operator staring at a state directory.

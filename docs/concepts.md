@@ -14,7 +14,7 @@ with the sections named below.
 
 ---
 
-**`.bark`** — the manifest: one flat, human-editable JSON object holding a
+**`.bark`** — the manifest: one flat JSON object holding a
 store's *declared* facts (identity, settings, retention, provenance, lineage).
 Travels with the store, survives head-drops, ships inside bundles.
 → [design](design.md#the-bark-manifest)
@@ -85,8 +85,10 @@ destination, not one per store.
 `timberfs(1)` **FOLLOWERS**
 
 **follower registry** — `/var/lib/timberfs/followers/<name>/`, one directory per
-follower, split by ownership: `follower.json` the operator writes,
-`positions.json` the follower writes, `follower.lock` held while it runs.
+follower, split by ownership: `follower.json` the operator writes (through
+`follower update`), `positions.json` the follower writes, `follower.lock` held
+while it runs. Readable by eye; changed by the verbs, never by an editor —
+`timberfs(1)` **THE FILES ARE NOT THE INTERFACE**.
 → [README](../README.md#followers-who-is-reading-and-how-far-behind)
 
 **forest** — a directory searched for stores by a short **handle**, so `timberfs
@@ -198,7 +200,8 @@ choice already made.
 its tape (what has ever left the store, plus where the bytes sit in what
 remains), so retention cannot move it. A follower keeps one per store it has
 read, in `positions.json` in its registry directory; the recorded chunk beside
-it is the retention floor.
+it is the retention floor. The two move TOGETHER, which is why the file is state
+rather than configuration: a reset removes an entry, it does not edit one.
 → [README](../README.md#followers-who-is-reading-and-how-far-behind)
 
 **predicate** — `timber-filter`'s matchers, applied per entry: `--has` (whole

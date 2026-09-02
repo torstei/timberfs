@@ -823,6 +823,20 @@ here.
   filesystem path (`tail`/`less`/`grep` on `/mnt/app/app.log` as it fills). Pairs
   naturally with the live sidecar above; retention's tail-rewrite is the
   coherency case to handle.
+- **An unreadable manifest should report its EFFECTS, not just its cause.**
+  Today a `.bark` that does not parse is warned about on stderr — naming the
+  syntax error — and every command still exits 0. What it actually costs is
+  invisible: identity survives (the id is in the `.rings` header too), but
+  LABELS do not, so the store silently leaves every label-based selection —
+  a follower matching `[service=~apache-.*]` stops following it, while `[]`
+  and `[id=…]` still do — and its declared retention stops being enforced.
+  Measured: one missing brace turns off two of the things that decide whether
+  data is shipped and whether it is kept, and `list` still shows the row as
+  healthy apart from two empty columns. So `info` should say what is no longer
+  true of the store, and `list` should mark it, in the idiom the CLI tests
+  already use — the failure worth catching is the ABSENCE, not the parse
+  error. Came out of documenting the manifest as read-not-edited (PR #156);
+  the documentation is not the fix.
 - **Expose the index in-band**: a virtual `.idx` twin file or ioctl so tools
   can query through the mount without knowing the backing dir.
 - **tail(1) fast-path**: negative-offset "time seek" via `llseek` hooks.

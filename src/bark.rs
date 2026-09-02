@@ -1,5 +1,6 @@
 //! `.bark`: the log's manifest — declared properties and provenance, as
-//! one flat, optional, human-editable JSON object next to the pair:
+//! one flat, optional JSON object next to the pair — plain enough to read
+//! by eye, and changed through `set` rather than an editor (see `write`):
 //!
 //! ```text
 //! {"index": true, "host": "foo.bar.com", "path": "/var/log/app.log"}
