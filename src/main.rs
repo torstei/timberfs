@@ -1113,7 +1113,11 @@ enum FollowerCommand {
 /// shipping — but a send whose every store was refused shipped nothing,
 /// and reporting that as success is the one thing a supervised unit
 /// cannot see.
-fn report_sent(endpoint: &str, sent: &timberfs::frames::Sent) -> anyhow::Result<()> {
+fn report_sent(
+    endpoint: &str,
+    src: &timberfs::frames::Sources,
+    sent: &timberfs::frames::Sent,
+) -> anyhow::Result<()> {
     for r in &sent.refused {
         eprintln!(
             "timberfs: {endpoint} refused {}: {}",
@@ -1134,7 +1138,7 @@ fn report_sent(endpoint: &str, sent: &timberfs::frames::Sent) -> anyhow::Result<
                 first.reason
             );
         }
-        timberfs::note!("timberfs: no store to ship");
+        timberfs::note!("timberfs: nothing to ship: {}", src.describe());
         return Ok(());
     }
     if sent.chunks() == 0 {
@@ -1841,7 +1845,7 @@ fn main() -> anyhow::Result<()> {
                     positions,
                 },
             )?;
-            report_sent(&endpoint, &sent)?;
+            report_sent(&endpoint, &src, &sent)?;
         }
         Command::OtlpIntake {
             listen,

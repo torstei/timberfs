@@ -409,6 +409,30 @@ pub enum Sources {
     },
 }
 
+impl Sources {
+    /// What was asked for, for a message about what it found. A selection
+    /// that matched nothing has to say which predicate and where it
+    /// looked, or "no store to ship" names neither the mistake nor the
+    /// place to make it.
+    pub fn describe(&self) -> String {
+        match self {
+            Sources::One(p) => p.display().to_string(),
+            Sources::Select { select, look_in } => {
+                let mut dirs: Vec<String> = crate::forest::forest_dirs()
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect();
+                dirs.extend(look_in.iter().map(|d| d.display().to_string()));
+                if dirs.is_empty() {
+                    format!("{select} (no forest is configured and no --look-in was given)")
+                } else {
+                    format!("{select} in {}", dirs.join(", "))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SendOpts {
     pub endpoint: String,
@@ -508,6 +532,25 @@ struct Stream {
     undeclared: u64,
 }
 
+/// Say once, per store, that a pair carrying no identity cannot be
+/// replicated — the destination is keyed by one. Named rather than
+/// silently skipped, and a reader has no business minting an identity
+/// into someone else's manifest.
+fn note_unidentified(out: &mut Sent, found: Vec<PathBuf>) {
+    for path in found {
+        if out.unidentified.contains(&path) {
+            continue;
+        }
+        crate::note!(
+            "timberfs: {} carries no identity, so it cannot be replicated \
+             (`timberfs identity {} --mint`)",
+            path.display(),
+            path.display()
+        );
+        out.unidentified.push(path);
+    }
+}
+
 /// One store to ship: its identity, and where it is.
 struct Source {
     id: String,
@@ -552,6 +595,16 @@ fn resolve_sources(src: &Sources) -> anyhow::Result<(Vec<Source>, Vec<PathBuf>)>
 /// Connect, then ship the selection: a stream per store, opened as the
 /// store appears, resumed from wherever the receiver says it left off.
 pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
+    let mut out = Sent::default();
+    // Resolved before connecting, so a one-shot that matches nothing says
+    // so instead of failing on an endpoint it had no reason to reach. A
+    // follow run connects anyway: its stores appear later, which is the
+    // whole reason the selection is re-resolved each pass.
+    let first = resolve_sources(src)?;
+    if !opts.follow && first.0.is_empty() {
+        note_unidentified(&mut out, first.1);
+        return Ok(out);
+    }
     let addr = opts.endpoint.clone();
     let sock = TcpStream::connect(&addr).with_context(|| format!("connecting to {addr}"))?;
     sock.set_nodelay(true).ok();
@@ -564,7 +617,6 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
     w.flush()?;
     r.read_hello()?;
 
-    let mut out = Sent::default();
     let mut live: Vec<Stream> = Vec::new();
     let mut next_wire = 0u32;
     // A store refused once is not asked again on this connection: the
@@ -574,17 +626,7 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
 
     loop {
         let (sources, unidentified) = resolve_sources(src)?;
-        for path in unidentified {
-            if !out.unidentified.contains(&path) {
-                crate::note!(
-                    "timberfs: {} carries no identity, so it cannot be replicated \
-                     (`timberfs identity {} --mint`)",
-                    path.display(),
-                    path.display()
-                );
-                out.unidentified.push(path);
-            }
-        }
+        note_unidentified(&mut out, unidentified);
 
         // A store that has left the selection: end its stream, so the far
         // end can release the writer locks and the open store it holds.
@@ -1591,10 +1633,10 @@ mod tests {
         f.flush_chunk(&cfg).unwrap();
         drop(st);
 
-        let into = d.path().join("recv");
-        let (addr, server) = one_shot(opts(&into, true));
-        let sent = cmd_send(&one(&path), &send_opts(&addr)).unwrap();
-        let _ = server.join().unwrap();
+        // No listener, and none is needed: a one-shot with nothing to
+        // ship says so rather than failing on an endpoint it had no
+        // reason to reach.
+        let sent = cmd_send(&one(&path), &send_opts("127.0.0.1:1")).unwrap();
         assert_eq!(sent.unidentified, vec![path]);
         assert!(sent.streams.is_empty());
     }

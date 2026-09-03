@@ -714,10 +714,10 @@ mod tests {
 
     #[test]
     fn a_pre_created_store_still_gets_the_origin_recorded() {
-        // `--replica` preserved the numbering but recorded no origin when
-        // the operator had pre-created the destination, so the address did
-        // not apply and the one-store-one-origin guard had nothing to
-        // compare. The manifest the operator wrote is otherwise untouched.
+        // The numbering was preserved and no origin recorded when the
+        // operator had pre-created the destination, so the address did not
+        // apply and the one-store-one-tape guard had nothing to compare.
+        // The manifest the operator wrote is otherwise untouched.
         let d = TempDir::new();
         let src = a_store(d.path(), "src", 3, false);
         let dst = d.path().join("declared.log");

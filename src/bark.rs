@@ -257,7 +257,8 @@ pub fn declare_wal(dir: &Path, name: &str) -> anyhow::Result<()> {
 /// them.
 ///
 /// This is what counts as a LABEL: what `list` shows in that column, what
-/// `frames` routes on, what a fleet view groups by. It is NOT a limit on
+/// travels on the replication wire, what a fleet view groups by. It is NOT
+/// a limit on
 /// what a selector may match — `--select` matches the whole manifest, name
 /// and settings included, because a rule that forbids asking a question
 /// only because we filed the answer under a different heading is a rule
@@ -316,15 +317,20 @@ pub const NOT_PROVENANCE: &[&str] = &[
 pub const ROUTED_FROM: &str = "timberfs.routed_from";
 
 /// The ORIGIN store's identity, when the entries arrived from another
-/// timberfs store over the wire — `timber-otlp` sends it as an OTLP
-/// resource attribute and the receiving intake seeds it.
+/// timberfs store over the wire. Two spellings, one meaning, and the
+/// stronger one wins: `origin_id` is what the frames wire records, where
+/// one destination holds one tape and the receiver enforces it;
+/// `timberfs.store.id` is the OTLP resource attribute the entry intakes
+/// seed.
 ///
-/// ⚠ Trustworthy only where routing gives one store per origin. Under
-/// fan-in it names whichever sender created the store, which is why the
-/// receiving side's routing decides whether this means anything (see
-/// ROADMAP, "Globally addressable chunks").
+/// ⚠ The OTLP spelling is trustworthy only where routing gives one store
+/// per origin. Under fan-in it names whichever sender created the store,
+/// which is why the receiving side's routing decides whether it means
+/// anything (see ROADMAP, "Globally addressable chunks").
 pub fn origin_id(map: &Map<String, Value>) -> Option<String> {
-    map.get("timberfs.store.id")
+    ["origin_id", "timberfs.store.id"]
+        .iter()
+        .find_map(|k| map.get(*k))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
