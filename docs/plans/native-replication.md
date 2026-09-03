@@ -206,11 +206,13 @@ so the renumbering half of this paragraph leaves the frames path altogether and
 
 ## The header carries `provenance()`, not the whole `.bark`
 
-labels for routing, while the receiver keeps its own retention and index
-policy. Operational settings are the receiving tier's business.
+labels, plus the store's NAME, while the receiver keeps its own retention and
+index policy. Operational settings are the receiving tier's business. ⚠ Not
+"for routing" any more: the destination is keyed by identity
+([frames-selection.md](frames-selection.md)), and the name travels because a
+path named after a uuid leaves nothing to reconstruct one from.
 
-## Transport: multiple streams per connection in the protocol, 1:1 on the wire
-first
+## Transport: multiple streams per connection, in the protocol before the wire
 
 The stream identity lives in the frame, not the connection: a `stream-open`
 frame binds a small stream id that every chunk and ack frame carries, so
