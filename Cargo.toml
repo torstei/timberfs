@@ -158,3 +158,28 @@ assets = [
 name = "timberfs"
 depends = "fuse3, libc6 (>= 2.31)"
 
+# A SEPARATE package for hosts below the floor above: Ubuntu 18.04 (bionic,
+# glibc 2.27, systemd 237), built with cargo-zigbuild against
+# x86_64-unknown-linux-gnu.2.27. Nothing in the source needs a newer glibc —
+# every libc symbol it names predates 2.27, and std's probes for newer
+# syscalls (statx, gettid) are runtime lookups with fallbacks rather than
+# link-time requirements. The 2.27 build's highest reference is GLIBC_2.25.
+#
+# `fuse3 | fuse`, not `fuse3`: bionic has no fuse3 at all, and fuser's
+# pure-Rust mount execs `fusermount` when `fusermount3` is absent, so fuse
+# 2.9.7 is a real alternative rather than a courtesy.
+#
+# A distinct package NAME, not a `~bionic` revision of `timberfs`, because
+# `apt upgrade` needs something stable to prefer: the version is the only
+# discriminator between two same-named builds and it changes every release,
+# so a version pin rots. It also keeps the release/apt-repo/CI globs on
+# `timberfs_*` unambiguous. The name is `timberfs-bionic` by cargo-deb's
+# default — a variant suffixes the package name unless it sets `name`,
+# which is what the compat variant above does to keep plain `timberfs`.
+# `provides` covers a package depending on timberfs; `conflicts` makes the
+# mutual exclusion declared rather than discovered as a file-overwrite
+# error at unpack time.
+[package.metadata.deb.variants.bionic]
+depends = "libc6 (>= 2.27), fuse3 | fuse"
+provides = "timberfs"
+conflicts = "timberfs"

@@ -21,9 +21,21 @@ After=local-fs.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/timberfs/%i.conf
-ExecStartPre=/usr/bin/mkdir -p ${BACKING} ${MOUNTPOINT}
+# /bin, not /usr/bin, for anything that is not ours: a release without
+# merged /usr has coreutils in /bin and no /usr/bin/mkdir at all, and on a
+# merged one /bin is a symlink into /usr/bin, so /bin resolves everywhere.
+# Exec lines take an absolute path — systemd's PATH lookup needs 239, which
+# is newer than the oldest release we package for.
+ExecStartPre=/bin/mkdir -p ${BACKING} ${MOUNTPOINT}
 ExecStart=/usr/bin/timberfs mount ${BACKING} ${MOUNTPOINT} --exit-on-upgrade $EXTRA_OPTS
-ExecStop=/usr/bin/fusermount3 -u ${MOUNTPOINT}
+# Both spellings, because the helper's name and path vary: fuse3 installs
+# /usr/bin/fusermount3, fuse 2.9 installs /bin/fusermount. Whichever is
+# absent cannot exec, so both are non-fatal — which does cost the report
+# when a real unmount fails (a busy mountpoint). The daemon's auto_unmount
+# is the backstop when it is active; helper discovery belongs in timberfs,
+# where fuser already does exactly this, rather than in a unit file.
+ExecStop=-/usr/bin/fusermount3 -u ${MOUNTPOINT}
+ExecStop=-/bin/fusermount -u ${MOUNTPOINT}
 Restart=on-failure
 RestartSec=2
 # --exit-on-upgrade makes the daemon exit 85 when its binary is replaced on

@@ -29,6 +29,20 @@ mount, queries, rotation, upgrade). It needs QEMU:
 cargo deb && tests/vm/run-vm-test.sh
 ```
 
+To exercise `timberfs-bionic` the same way, build it for its own floor and
+point the suite at Ubuntu 18.04 (needs zig on `PATH` for cargo-zigbuild):
+
+```sh
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.27
+cargo deb --variant bionic --no-build --target x86_64-unknown-linux-gnu
+TIMBERFS_VM_IMAGE=bionic tests/vm/run-vm-test.sh \
+    target/x86_64-unknown-linux-gnu/debian/timberfs-bionic_*_amd64.deb
+```
+
+Both builds write the same target directory, so build one and package it
+before building the other — otherwise both packages hold the same binary and
+one of them declares a libc6 floor its bytes do not match.
+
 ## Before cutting a release
 
 **There is nothing to bump, and nothing to decide.** A release is the tip of

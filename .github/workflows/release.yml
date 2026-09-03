@@ -92,10 +92,23 @@ jobs:
       # One amd64 package for every supported release. cargo-zigbuild links an
       # old glibc (target .2.31) so it installs from Ubuntu 20.04 (focal) up;
       # the `compat` variant states the true libc6 floor (see Cargo.toml).
-      - name: Build the .deb
+      #
+      # Then `timberfs-bionic`, the same source at a 2.27 floor for the one
+      # release below that.
+      #
+      # ⚠ BUILD, PACKAGE, build, package — never both builds and then both
+      # packages. cargo-zigbuild strips the glibc suffix from the target
+      # directory (which is why `cargo deb` below is given the bare triple),
+      # so both builds write the SAME `target/x86_64-unknown-linux-gnu/
+      # release/`: reordered, the second binary ends up in both packages and
+      # one of them declares a libc6 floor its bytes do not match. The bionic
+      # VM leg in CI is what catches that; nothing here can.
+      - name: Build the .debs
         run: |
           cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
           cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.27
+          cargo deb --variant bionic --no-build --target x86_64-unknown-linux-gnu
 
       # CI already passed the VM suite for this commit's TREE, on BOTH
       # images, after building the compat .deb with the identical commands
@@ -139,8 +152,12 @@ jobs:
       - name: Stage release assets
         run: |
           mkdir -p "$RUNNER_TEMP/dist"
+          # `timberfs_*` does not match `timberfs-bionic_*` — the underscore
+          # has to follow the name — so each glob picks up exactly one file.
           cp target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/"
           cp target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb "$RUNNER_TEMP/dist/timberfs_amd64.deb"
+          cp target/x86_64-unknown-linux-gnu/debian/timberfs-bionic_*_amd64.deb "$RUNNER_TEMP/dist/"
+          cp target/x86_64-unknown-linux-gnu/debian/timberfs-bionic_*_amd64.deb "$RUNNER_TEMP/dist/timberfs-bionic_amd64.deb"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
