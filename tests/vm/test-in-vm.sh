@@ -4700,9 +4700,9 @@ run_test "import: shipped segment merges verbatim, idempotently" import_segment_
 run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
 run_test "frames wire: a store replicates over a socket byte for byte" frames_wire_replicates_a_store_byte_for_byte
 run_test "frames wire: the far end's position is recorded and reported, not obeyed" frames_follower_ships_and_releases_the_head
-run_test "frames fleet: two nodes, one archive, and the routing mistake" frames_fleet_two_nodes_one_archive
+run_test "frames fleet: two nodes, one archive, one connection each, no collision" frames_fleet_two_nodes_one_archive
 run_test "frames unit: installed by the package, and documented" frames_unit_installed
-run_test "frames unit: socket activates, undeclared stream refused" frames_unit_socket_activates
+run_test "frames unit: socket activates, an unreceived store refused" frames_unit_socket_activates
 run_test "frames unit: replicates into a declared store" frames_unit_replicates_into_a_declared_store
 run_test "frames unit: the socket outlives a service restart" frames_unit_survives_a_restart
 run_test "frames unit: teardown" frames_unit_teardown
