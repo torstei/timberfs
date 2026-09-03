@@ -34,6 +34,17 @@ use crate::ship::{Shipper, Store};
 /// must not wedge a follower in silence.
 pub const HELLO_WAIT: Duration = Duration::from_secs(30);
 
+/// How long a consumer may say NOTHING mid-stream, with something in
+/// flight, before a one-shot gives up on it.
+///
+/// ⚠ NOT the same knob as `HELLO_WAIT`, though the numbers agree here.
+/// The two pull in opposite directions under test: a consumer that never
+/// speaks must not stall the suite, so the hello wait wants to be SHORT,
+/// while a shell consumer forking five processes an entry must not be
+/// given up on, so this wants to be LONG. One field could not be both,
+/// which is the argument that they are two questions.
+pub const MAX_SILENCE: Duration = Duration::from_secs(30);
+
 /// How long a consumer gets to exit after its input closes, before it is
 /// killed. It has already been told the stream ended; this is only the
 /// difference between a clean report and a signal.
@@ -54,6 +65,9 @@ pub struct Opts {
     pub argv: Vec<String>,
     /// How long to wait for the hello.
     pub hello_wait: Duration,
+    /// How long the consumer may say nothing mid-stream with something
+    /// in flight, before a one-shot stops waiting (see `MAX_SILENCE`).
+    pub max_silence: Duration,
     /// Where a store this follower has never read is picked up.
     pub follow_from: crate::ship::FollowFrom,
     /// When the interest began, if something knows better than the
@@ -76,6 +90,8 @@ fn consumer_name(argv0: &str) -> String {
 struct Pacing {
     poll: Duration,
     follow: bool,
+    /// See `MAX_SILENCE`.
+    max_silence: Duration,
 }
 
 /// One store as this loop tracks it across polls.
@@ -111,6 +127,7 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
         follow,
         argv,
         hello_wait,
+        max_silence,
         follow_from,
         since,
     } = opts;
@@ -159,7 +176,11 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
         &mut shipper,
         &mut sink,
         &reports,
-        Pacing { poll, follow },
+        Pacing {
+            poll,
+            follow,
+            max_silence,
+        },
         holds,
         &mut tracked,
     );
@@ -309,6 +330,9 @@ fn feed(
     sink.write_all(b"\0")?;
 
     let mut said: Option<usize> = None;
+    // When the consumer last went quiet with something in flight; reset
+    // by every report. `None` means it is not quiet.
+    let mut quiet_since: Option<std::time::Instant> = None;
     loop {
         let (buf, stores, matched) = {
             // A store with anything UNACKNOWLEDGED is parked: it has
@@ -364,16 +388,48 @@ fn feed(
         // becomes the ceiling on one store's throughput.
         match reports.recv_timeout(pacing.poll) {
             Ok(rep) => {
+                quiet_since = None;
                 take(shipper, tracked, rep?)?;
                 drain(shipper, reports, tracked, Drain::Now)?;
                 shipper.persist()?;
             }
-            // A whole interval with nothing said and nothing to send:
-            // for a one-shot there is nothing more coming, and for a
-            // follow it is a stall the notes explain.
+            // ⚠ A poll interval of silence is NOT the end of a one-shot,
+            // which is what it used to be taken for. A store with
+            // anything unacknowledged is parked, so its remaining
+            // entries become available only when its report arrives —
+            // returning here abandoned them, and a consumer merely
+            // SLOWER than the poll interval then drained a fraction of
+            // the selection and exited 0. Measured before the fix: 4 of
+            // 20 entries, with a consumer taking 100 ms an entry against
+            // a 20 ms poll.
+            //
+            // So silence is only an end once it has lasted long enough
+            // to mean the consumer is not coming back, and that is the
+            // same question `max_silence` answers at the hello.
             Err(RecvTimeoutError::Timeout) => {
-                if !pacing.follow {
-                    return Ok(());
+                let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= pacing.max_silence {
+                    if !pacing.follow {
+                        let stalled: Vec<&str> = tracked
+                            .iter()
+                            .filter(|(_, t)| !t.pending.is_empty())
+                            .map(|(id, _)| id.as_str())
+                            .collect();
+                        // Not an error: the positions are honest about
+                        // what was taken, so a re-run resumes exactly
+                        // here. But saying nothing would report a
+                        // part-drained selection as a finished one.
+                        crate::note!(
+                            "timberfs: the consumer said nothing for {}s with {} store(s) \
+                             unacknowledged ({}) — stopping there; their positions did not \
+                             move, so a re-run sends those entries again",
+                            pacing.max_silence.as_secs().max(1),
+                            stalled.len(),
+                            stalled.join(", ")
+                        );
+                        return Ok(());
+                    }
+                    quiet_since = None;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => bail!("the consumer closed its output"),
@@ -626,10 +682,29 @@ done"#,
             // A consumer that never speaks must not stall the suite;
             // 30s is right in production and wrong here.
             hello_wait: Duration::from_millis(500),
+            // ⚠ Wider than the hello wait, which is short: these tests
+            // feed SHELL consumers that fork several processes an entry,
+            // and a ceiling tight enough to be a race is a test that
+            // sometimes fails. It only has to exceed the gap BETWEEN
+            // reports — the clock resets on each — not a whole run, so
+            // two seconds is ~40x the gap rather than 200x the suite.
+            // A test whose consumer stalls on PURPOSE sets its own,
+            // since there is nothing there to wait for.
+            max_silence: Duration::from_secs(2),
             // The tests are about the loop, so they take the store as
             // it stands rather than the default's date comparison.
             follow_from: crate::ship::FollowFrom::Begin,
             since: None,
+        }
+    }
+
+    /// `opts` for a consumer that will never report: there is nothing to
+    /// wait for, so the silence ceiling is paid in full by every such
+    /// test and should be short.
+    fn mute_opts(root: &Path, positions: Option<&Path>, argv: Vec<String>) -> Opts {
+        Opts {
+            max_silence: Duration::from_millis(200),
+            ..opts(root, positions, argv)
         }
     }
 
@@ -759,6 +834,92 @@ done"#,
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// ⚠ A consumer merely SLOWER than the poll interval used to end a
+    /// one-shot: a store with anything unacknowledged is parked, so its
+    /// remaining entries become available only when its report arrives,
+    /// and a poll-interval timeout was taken for "nothing more is
+    /// coming". Measured against the release binary before the fix: 20
+    /// entries, a 20 ms poll and a consumer taking ~100 ms an entry
+    /// delivered 4 and exited 0 — a fifth of the selection reported as a
+    /// finished drain.
+    ///
+    /// ⚠ The silence ceiling is set ABSURDLY high here on purpose, so
+    /// this cannot be a race. Before the fix it failed whatever that
+    /// ceiling was, because the POLL timeout ended the run; a test that
+    /// has to win a race against a busy machine to prove that is a test
+    /// that sometimes fails — and three of eight runs under full load on
+    /// 14 cores did exactly that with a two-second ceiling.
+    #[test]
+    fn a_consumer_slower_than_the_poll_interval_still_drains_the_selection() {
+        let _forking = crate::store::fork_guard();
+        let root = forest("slowcon", &[("aaa", 8)]);
+        let out = root.join("got.txt");
+        let script = format!(
+            r#"printf '\036hello\037v=1\037reads=records\000'
+while IFS= read -r -d '' hdr; do
+  kind=${{hdr%%$'\037'*}}; kind=${{kind#$'\036'}}
+  [ "$kind" = entry ] || continue
+  f() {{ printf '%s' "$hdr" | tr '\037' '
+' | sed -n "s/^$1=//p"; }}
+  len=$(f len); off=$(f offset); id=$(f id)
+  payload=$(head -c "$len"; head -c 1 >/dev/null)
+  printf '%s
+' "$payload" >> {out}
+  printf '\036progress\037id=%s\037offset=%s\000' "$id" "$((off + len))"
+done"#,
+            out = out.display()
+        );
+        let mut o = opts(&root, None, vec!["bash".into(), "-c".into(), script]);
+        // Two at a time, so every batch after the first needs a report
+        // that arrives long after the poll interval has elapsed.
+        o.batch_entries = 2;
+        o.poll = Duration::from_millis(5);
+        o.max_silence = Duration::from_secs(60);
+        run(o).unwrap();
+        assert_eq!(
+            lines(&out).len(),
+            8,
+            "the drain stopped early on a consumer that was only slow"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And silence that LASTS still ends a one-shot — otherwise a wedged
+    /// consumer hangs it forever, which is what waiting on a report
+    /// unconditionally would have cost. It acknowledges nothing, so a
+    /// re-run sends those entries again.
+    #[test]
+    fn a_one_shot_gives_up_on_lasting_silence_rather_than_hanging() {
+        let _forking = crate::store::fork_guard();
+        let root = forest("wedged", &[("aaa", 4)]);
+        let pos = root.join("positions.json");
+        // Says hello, takes everything, and never reports again.
+        let script = r#"printf '\036hello\037v=1\037reads=records\000'
+while IFS= read -r -d '' hdr; do :; done"#;
+        let mut o = opts(
+            &root,
+            Some(&pos),
+            vec!["bash".into(), "-c".into(), script.into()],
+        );
+        o.max_silence = Duration::from_millis(300);
+        let began = std::time::Instant::now();
+        run(o).unwrap();
+        // Generous on purpose: the failure this pins is HANGING, so the
+        // bound only has to separate bounded from unbounded — never fast
+        // from slow, which a loaded machine decides.
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "a wedged consumer was waited on indefinitely"
+        );
+        let held = crate::cursor::Positions::load(&pos).unwrap().unwrap();
+        assert!(
+            held.at.is_empty(),
+            "a position moved for entries nothing acknowledged: {:?}",
+            held.at
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A consumer that says hello and never reports gets the entries and
     /// moves nothing — silence is "has not got there", which is what
     /// makes mandatory conformance worth having.
@@ -769,7 +930,12 @@ done"#,
         let out = root.join("got.txt");
         let pos = root.join("positions.json");
 
-        run(opts(&root, Some(&pos), shell_consumer(&root, &out, false))).unwrap();
+        run(mute_opts(
+            &root,
+            Some(&pos),
+            shell_consumer(&root, &out, false),
+        ))
+        .unwrap();
         assert_eq!(lines(&out).len(), 2, "it was still fed");
         let held = crate::cursor::Positions::load(&pos).unwrap().unwrap();
         assert!(
@@ -778,7 +944,12 @@ done"#,
         );
 
         // So the same entries come again, which is the point.
-        run(opts(&root, Some(&pos), shell_consumer(&root, &out, false))).unwrap();
+        run(mute_opts(
+            &root,
+            Some(&pos),
+            shell_consumer(&root, &out, false),
+        ))
+        .unwrap();
         assert_eq!(lines(&out).len(), 4);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -811,7 +982,7 @@ done"#,
         let script = r#"printf '\036hello\037v=1\037reads=records\000'
 printf '\036note\037text="collector unreachable"\000'
 cat >/dev/null"#;
-        run(opts(
+        run(mute_opts(
             &root,
             Some(&pos),
             vec!["bash".into(), "-c".into(), script.into()],
