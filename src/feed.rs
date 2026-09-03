@@ -333,6 +333,11 @@ fn feed(
     // When the consumer last went quiet with something in flight; reset
     // by every report. `None` means it is not quiet.
     let mut quiet_since: Option<std::time::Instant> = None;
+    // Did the last read hold a parked store out? If it did, finding
+    // nothing says nothing about the selection being drained. Set by
+    // every read before it happens, so the initializer is never read —
+    // declared here because the loop's tail needs it.
+    let mut skipped;
     loop {
         let (buf, stores, matched) = {
             // A store with anything UNACKNOWLEDGED is parked: it has
@@ -353,6 +358,9 @@ fn feed(
             // "further ahead" means "the same entries again", which is
             // what this stops.
             let parked = |id: &str| tracked.get(id).is_some_and(|t| !t.pending.is_empty());
+            // Whether ANY store was held out of this read, because that
+            // decides what its emptiness means (see below).
+            skipped = tracked.values().any(|t| !t.pending.is_empty());
             shipper.poll_excluding(&parked)?
         };
         if said != Some(matched) {
@@ -374,6 +382,18 @@ fn feed(
         // Nothing to send. Either the stores are quiet, or every store
         // that has anything left is parked waiting to be acknowledged.
         if !tracked.values().any(|t| !t.pending.is_empty()) {
+            // ⚠ And only where the read was not narrowed. A store parked
+            // AT POLL TIME is excluded from the read, and its report can
+            // arrive in the drain a few lines above — so "nothing to
+            // send and nothing in flight" is reached with the store
+            // unparked and still holding entries nobody asked it for.
+            // That is a race between the exclusion and the drain, and it
+            // ended a one-shot at 6 of 8 entries on a CI runner while
+            // passing here: the same defect as the timeout below, one
+            // path over.
+            if skipped {
+                continue;
+            }
             if !pacing.follow {
                 // The caller closes the consumer's input and drains it
                 // to the end, which is exact where a sleep is a guess.
@@ -843,43 +863,51 @@ done"#,
     /// delivered 4 and exited 0 — a fifth of the selection reported as a
     /// finished drain.
     ///
-    /// ⚠ The silence ceiling is set ABSURDLY high here on purpose, so
-    /// this cannot be a race. Before the fix it failed whatever that
-    /// ceiling was, because the POLL timeout ended the run; a test that
-    /// has to win a race against a busy machine to prove that is a test
-    /// that sometimes fails — and three of eight runs under full load on
-    /// 14 cores did exactly that with a two-second ceiling.
+    /// ⚠ The slowness is MADE here, not hoped for. An earlier version of
+    /// this test had no `sleep` and relied on a fork-heavy shell being
+    /// incidentally slower than the poll; it passed here and failed on a
+    /// CI runner at 6 of 8, for a reason that could not be reproduced.
+    /// A test that does not control the condition it is named for cannot
+    /// say which of the two it caught.
+    ///
+    /// And it asserts on what was ACKNOWLEDGED, not on what the consumer
+    /// managed to write: the positions are the thing under test, and the
+    /// consumer's own file lags them by however long its last write
+    /// takes.
     #[test]
     fn a_consumer_slower_than_the_poll_interval_still_drains_the_selection() {
         let _forking = crate::store::fork_guard();
         let root = forest("slowcon", &[("aaa", 8)]);
-        let out = root.join("got.txt");
-        let script = format!(
-            r#"printf '\036hello\037v=1\037reads=records\000'
+        let pos = root.join("positions.json");
+        // 50 ms an entry against a 1 ms poll, so the store is parked at
+        // essentially every poll — and a 60 s ceiling, so silence can
+        // never be what ends the run.
+        let script = r#"printf '\036hello\037v=1\037reads=records\000'
 while IFS= read -r -d '' hdr; do
-  kind=${{hdr%%$'\037'*}}; kind=${{kind#$'\036'}}
+  kind=${hdr%%$'\037'*}; kind=${kind#$'\036'}
   [ "$kind" = entry ] || continue
-  f() {{ printf '%s' "$hdr" | tr '\037' '
-' | sed -n "s/^$1=//p"; }}
+  f() { printf '%s' "$hdr" | tr '\037' '
+' | sed -n "s/^$1=//p"; }
   len=$(f len); off=$(f offset); id=$(f id)
-  payload=$(head -c "$len"; head -c 1 >/dev/null)
-  printf '%s
-' "$payload" >> {out}
+  head -c "$len" >/dev/null; head -c 1 >/dev/null
+  sleep 0.05
   printf '\036progress\037id=%s\037offset=%s\000' "$id" "$((off + len))"
-done"#,
-            out = out.display()
+done"#;
+        let mut o = opts(
+            &root,
+            Some(&pos),
+            vec!["bash".into(), "-c".into(), script.into()],
         );
-        let mut o = opts(&root, None, vec!["bash".into(), "-c".into(), script]);
-        // Two at a time, so every batch after the first needs a report
-        // that arrives long after the poll interval has elapsed.
         o.batch_entries = 2;
-        o.poll = Duration::from_millis(5);
+        o.poll = Duration::from_millis(1);
         o.max_silence = Duration::from_secs(60);
         run(o).unwrap();
+        let held = crate::cursor::Positions::load(&pos).unwrap().unwrap();
+        let delivered: u64 = held.at.values().map(|a| a.delivered).sum();
         assert_eq!(
-            lines(&out).len(),
-            8,
-            "the drain stopped early on a consumer that was only slow"
+            delivered, 8,
+            "the drain stopped early on a consumer that was only slow: {:?}",
+            held.at
         );
         let _ = std::fs::remove_dir_all(&root);
     }
