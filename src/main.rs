@@ -1479,6 +1479,7 @@ fn main() -> anyhow::Result<()> {
                 follow,
                 argv: consumer,
                 hello_wait: feed::HELLO_WAIT,
+                max_silence: feed::MAX_SILENCE,
                 follow_from: ship::FollowFrom::parse(&follow_from)?,
                 // No declaration, so the positions file is the only
                 // record of when this interest began.

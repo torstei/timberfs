@@ -2215,6 +2215,7 @@ pub fn cmd_run(name: &str) -> anyhow::Result<()> {
         follow: true,
         argv: decl.command.clone(),
         hello_wait: crate::feed::HELLO_WAIT,
+        max_silence: crate::feed::MAX_SILENCE,
         follow_from: decl.picks_up(),
         // When the follower was DECLARED, not when its positions file
         // was first written: one declared before its stores exist is the
