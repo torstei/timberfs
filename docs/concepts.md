@@ -136,8 +136,8 @@ this a filesystem for logs rather than a rotation scheme.
 → [design](design.md), [design](design.md#custom-indexes-the-grain-token-index)
 
 **identity** — a store's `.bark` `id`: a UUID minted on first write, constant
-across renames, moves and hosts. A follower records its store by identity, never
-by path — a store can move, and a path can come to hold a different store. It is
+across renames, moves and hosts. A follower records the stores it reads by
+identity, never by path — a store can move, and a path can come to hold a different store. It is
 the only value both stable and unique, so it is what a store IS, where the handle
 is what you call it and **provenance** is how you find it. `list` prints its
 leading 8 characters — a UUID's first group — and `info` takes that back, in full

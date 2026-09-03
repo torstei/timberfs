@@ -470,7 +470,20 @@ writing alone, because that writer's own tick is already doing the job:
 ```sh
 timberfs trim app --dry-run   # how many chunks interest would drop
 timberfs trim app
+
+# the cron-able form: every store a predicate matches, and drop one the
+# trim leaves empty — see `man timberfs` before pointing this at `[]`
+timberfs trim --select '[class=container]' --delete-empty
 ```
+
+`--delete-empty` removes a store left holding nothing **that once held
+something**: one pre-created and never written has no chunks either, and it is a
+placeholder waiting for its producer, so what tells them apart is that only the
+first has *dropped* anything. A store with a live writer is never touched, and
+one a retaining follower covers is refused rather than pulled out from under it.
+⚠ Deleting a store takes its `.bark` — identity, labels and retention policy —
+so scope it with the predicate rather than `[]`: an intermittent producer is
+empty most of the time.
 
 > The older `cursors=<dir>` key still works and is reported as superseded.
 
