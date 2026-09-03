@@ -28,14 +28,11 @@ EnvironmentFile=/etc/timberfs/%i.conf
 # is newer than the oldest release we package for.
 ExecStartPre=/bin/mkdir -p ${BACKING} ${MOUNTPOINT}
 ExecStart=/usr/bin/timberfs mount ${BACKING} ${MOUNTPOINT} --exit-on-upgrade $EXTRA_OPTS
-# Both spellings, because the helper's name and path vary: fuse3 installs
-# /usr/bin/fusermount3, fuse 2.9 installs /bin/fusermount. Whichever is
-# absent cannot exec, so both are non-fatal — which does cost the report
-# when a real unmount fails (a busy mountpoint). The daemon's auto_unmount
-# is the backstop when it is active; helper discovery belongs in timberfs,
-# where fuser already does exactly this, rather than in a unit file.
-ExecStop=-/usr/bin/fusermount3 -u ${MOUNTPOINT}
-ExecStop=-/bin/fusermount -u ${MOUNTPOINT}
+# Our own binary, so one path and no alternatives to try here: `umount`
+# discovers the helper (fuse3's fusermount3, fuse 2.9's fusermount) from
+# the same candidate list fuser mounts with. Fatal on purpose — a busy
+# mountpoint should fail the stop rather than pass quietly.
+ExecStop=/usr/bin/timberfs umount ${MOUNTPOINT}
 Restart=on-failure
 RestartSec=2
 # --exit-on-upgrade makes the daemon exit 85 when its binary is replaced on

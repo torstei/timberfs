@@ -184,6 +184,39 @@ stopped_cleanly() {
         && ! systemctl --quiet is-failed timberfs@test
 }
 
+umount_finds_the_helper() {
+    # `timberfs umount` is what the unit's ExecStop runs, and the point of
+    # it is that the helper's name is DISCOVERED: fuse3 installs
+    # fusermount3, fuse 2.9 installs fusermount, so a hardcoded ExecStop is
+    # wrong on half the releases we package for. Its own backing and
+    # mountpoint, so the mount every other test shares is untouched.
+    local b=/var/log/timberfs-backing/umt m=/var/log/umt
+    rm -rf "$b" "$m"
+    mkdir -p "$b" "$m"
+    printf '2026-08-03T09:00:00 INFO umount line\n' \
+        | timberfs append --into "$b/umt.log" --quiet 2>/dev/null || return 1
+    timberfs mount "$b" "$m" >/dev/null 2>&1 &
+    local mp=$!
+    local _
+    for _ in $(seq 1 20); do
+        mountpoint -q "$m" && break
+        sleep 0.5
+    done
+    mountpoint -q "$m" || return 1
+    grep -q "umount line" "$m/umt.log" || return 1
+    timberfs umount "$m" > /tmp/um.out 2>&1 || { cat /tmp/um.out; return 1; }
+    wait "$mp" 2>/dev/null
+    ! mountpoint -q "$m" || { echo "still mounted after umount"; return 1; }
+    # And a refusal is REPORTED -- the diagnostic a non-fatal ExecStop
+    # loses. A path that is not a mountpoint exits non-zero, in the
+    # helper's own words, whichever helper this host has.
+    timberfs umount "$m" > /tmp/um.bad 2>&1 \
+        && { echo "unmounting a non-mountpoint succeeded"; return 1; }
+    grep -qE 'fusermount3?' /tmp/um.bad || { cat /tmp/um.bad; return 1; }
+    rm -rf "$b" "$m"
+    return 0
+}
+
 offline_query_after_stop() {
     timberfs query "$BACKING/app.log" | grep -q "batch-two"
 }
@@ -575,6 +608,7 @@ run_test "mounted writes maintain a declared grain" mounted_grain_maintained
 run_test "compressed on disk (>5x)" compression_on_disk
 run_test "systemctl stop timberfs@test" stop_unit
 run_test "unmounted and not failed after stop" stopped_cleanly
+run_test "umount finds this host's fuse helper, and reports a refusal" umount_finds_the_helper
 run_test "offline query after stop" offline_query_after_stop
 run_test "restart: data persisted" restart_persists
 run_test "appender: pipe 50k lines, query round-trip" appender_roundtrip

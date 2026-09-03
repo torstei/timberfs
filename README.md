@@ -135,6 +135,7 @@ underneath:
 ```sh
 timberfs mount /var/log/myapp-backing /var/log/myapp
 # the app writes /var/log/myapp/app.log as always; tail/less/grep work
+timberfs umount /var/log/myapp            # finds fusermount3 or fusermount
 ```
 
 **d) Let it speak Fluentd Forward** — `timberfs forward-intake` is a TCP

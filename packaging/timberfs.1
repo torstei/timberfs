@@ -132,7 +132,7 @@ serves the logical view of backing directory
 on
 .IR MOUNTPOINT ,
 in the foreground. Unmount with
-.B fusermount3 \-u
+.B timberfs umount
 .IR MOUNTPOINT .
 .TP
 .BI \-\-chunk\-size " BYTES"
@@ -152,6 +152,21 @@ Let other users access the mount. Unprivileged users need
 in
 .IR /etc/fuse.conf ;
 root (e.g. the systemd unit) does not.
+.SS umount
+.B timberfs umount
+.I MOUNTPOINT
+unmounts a timberfs, which makes the mount daemon flush and exit. The fuse
+helper is discovered rather than named: fuse3 installs
+.BR fusermount3 ,
+fuse 2.9 installs
+.BR fusermount ,
+and a release without a merged
+.I /usr
+has either in
+.IR /bin .
+A helper that ran and refused \(em a busy mountpoint, or a path that is not
+a mountpoint \(em is reported in its own words, with a non-zero exit; only a
+missing helper moves on to the next candidate.
 .SS create
 .B timberfs create
 .I DEST
