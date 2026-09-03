@@ -107,7 +107,7 @@ _timberfs() {
         --payload-key | --route | --max-body | --query | --select | --cursor | \
         --rotated | --socket | --project | --key | --prefix | --only | --endpoint | \
         --keep | --drain-every | --idle | --timeout | --from-chunk | --wait-for-writer | \
-        --deadline | --positions | --batch-size | --follow-from)
+        --deadline | --positions | --batch-size | --follow-from | --delete-empty)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;

@@ -5,7 +5,7 @@ use timberfs::{
 
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 
 use clap::{Parser, Subcommand};
 
@@ -590,11 +590,33 @@ enum Command {
     /// already shipped off the box. A store somebody else is writing is
     /// left alone and said so: that writer's own tick is already doing it
     Trim {
-        /// Backing file: logical name, .trunk or .rings path
-        store: PathBuf,
-        /// Report what interest would drop without changing anything
+        /// Backing file: logical name, .trunk or .rings path. Omitted
+        /// where `--select` names the stores instead
+        store: Option<PathBuf>,
+        /// Enforce it on every store a predicate matches — the predicate
+        /// `list --select` takes. The cron-able form on a host where
+        /// stores come and go, since one store per invocation is a loop
+        /// somebody has to write
+        #[arg(long, value_name = "EXPR", conflicts_with = "store")]
+        select: Option<String>,
+        /// Delete a store the trim left holding nothing that once held
+        /// something. ⚠ Never one pre-created and never written (a
+        /// placeholder waiting for its producer), and never one a
+        /// RETAINING follower covers — that is refused, naming the
+        /// follower. ⚠ But an INTERMITTENT producer is empty most of the
+        /// time, and deleting its store takes the .bark with it — labels
+        /// and retention policy — so scope this with the predicate
+        /// (`[class=container]`, not `[]`): which stores are disposable
+        /// is knowledge you have and this cannot derive
+        #[arg(long)]
+        delete_empty: bool,
+        /// Report what interest would drop, and which stores would be
+        /// deleted, without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Forests to search with --select; default: every configured one
+        #[arg(long, value_name = "DIR")]
+        forest: Vec<PathBuf>,
     },
     /// Time-based rotation: move every chunk written before --cutoff into
     /// DEST (or drop it with --delete), relocating compressed frames
@@ -1620,10 +1642,28 @@ fn main() -> anyhow::Result<()> {
             let file = forest::resolve_source(&file)?;
             grain::cmd_reindex(&file)?;
         }
-        Command::Trim { store, dry_run } => {
-            let store = forest::resolve_source(&store)?;
-            rotate::cmd_trim(&store, dry_run)?;
-        }
+        Command::Trim {
+            store,
+            select,
+            delete_empty,
+            dry_run,
+            forest,
+        } => match (store, select) {
+            (Some(store), _) => {
+                let store = forest::resolve_source(&store)?;
+                let outcome = rotate::cmd_trim(&store, dry_run)?;
+                if delete_empty {
+                    rotate::delete_if_emptied(&store, &outcome, dry_run)?;
+                }
+            }
+            (None, Some(expr)) => {
+                rotate::cmd_trim_selection(&expr, &forest, dry_run, delete_empty)?;
+            }
+            (None, None) => bail!(
+                "no store: name one, or `--select '[k=v]'` for the stores a predicate matches \
+                 (`[]` for every one)"
+            ),
+        },
         Command::Rotate {
             source,
             dest,

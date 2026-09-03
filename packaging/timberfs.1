@@ -1346,7 +1346,12 @@ simply scanned.
 .SS trim
 .B timberfs trim
 .I STORE
-enforces the store's DECLARED retention once, now.
+enforces the store's DECLARED retention once, now;
+.B \-\-select
+.I EXPR
+does it for every store a predicate matches, which is the cron-able form
+on a host where stores come and go, since one store per invocation is a
+loop somebody has to write.
 .PP
 Load-bearing rather than convenient. Retention runs inside a live
 WRITER \(em every appender, mount and intake enforces it on its own tick \(em
@@ -1364,10 +1369,87 @@ repeat the work is the one thing this must not do. A store that declares
 no retention is a no-op, not an error \(em which is what a cron entry over a
 whole forest needs.
 .TP
+.BI \-\-select " EXPR"
+Enforce it on every store the predicate matches \(em the one
+.B list \-\-select
+takes,
+.B []
+for every store. One store's failure does not end the sweep: the rest of
+the selection is still owed its retention.
+.B \-\-forest
+narrows where to look.
+.TP
+.B \-\-delete\-empty
+Delete a store the trim left holding NOTHING that once held something.
+.IP
+Two stores are never deleted, and the difference is the point. One
+PRE-CREATED and never written is a placeholder waiting for its producer
+(the shape
+.B otlp\-intake
+without
+.B \-\-auto\-create
+asks for), and it has no chunks either \(em what tells them apart is that
+one has DROPPED something and the other has not, which is the question the
+drop counters exist to answer and which
+.B info
+renders as
+.RI \(dq "emptied, not reset" \(dq.
+And one a RETAINING follower covers is refused, naming the follower,
+rather than pulled out from under it \(em the same release-it-first step
+.B follower delete
+insists on; the sweep then exits non-zero.
+.IP
+⚠ Deleting an emptied store is not free of consequence: its
+.B .bark
+identity goes with it, so a producer that writes again creates a NEW store
+with a NEW id. Every follower place keyed to the old one becomes a place
+for a store that no longer exists (reported by
+.BR "follower status" ),
+and a follower selecting by label reads the new store from its
+.BR \-\-follow\-from .
+Keeping the empty store instead keeps the identity, and a follower resumes.
+So this is right where the producer is GONE and wrong where it is merely
+quiet \(em a distinction timberfs cannot make, which is why it is a flag.
+.IP
+⚠ Which makes
+.B \-\-select []
+the dangerous spelling, and deliberately not a special case: an
+INTERMITTENT producer is empty most of the time. A cron job's log under
+.B retain 1d
+holds nothing between runs, has no live writer, and once held data \(em so
+a sweep over every store deletes it, and takes its
+.B .bark
+with it. The replacement then carries no labels and no retention policy,
+so it matches the predicate no longer and is never trimmed again; an
+intake running without
+.B \-\-auto\-create
+does not even create it, and answers its sender
+.B 503
+until somebody does.
+.IP
+So SCOPE it with the predicate \(em
+.B [class=container]
+rather than
+.B []
+\(em because which stores are disposable is knowledge the operator has and
+this command cannot derive. There is no reliable signal to derive it from:
+the
+.B .rings
+header carries the drop counters and the store id and no last-write time,
+and a file mtime is wrong in the deleting direction whenever it has been
+copied or restored.
+.TP
 .B \\-\\-dry\\-run
 Report how many chunks INTEREST would drop, and change nothing. Age and
 size are deliberately not previewed: both carry hysteresis and are decided
 by the writer at the moment it acts, so a number here would be a guess.
+.IP
+⚠ Which bounds what it can say about
+.BR \-\-delete\-empty :
+it foresees deleting a store that is ALREADY empty, and cannot foresee one
+this run is about to empty by age or size. It says so rather than leaving
+that to be discovered, because under-reporting a deletion is the direction
+that gets a plan approved and then does more than it showed.
 .PP
 Reports the chunk NUMBERS it took, not just a count \(em after a head-drop
 the survivors keep their numbers, so a count says nothing about which
