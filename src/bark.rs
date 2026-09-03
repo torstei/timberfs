@@ -288,6 +288,12 @@ pub const NOT_PROVENANCE: &[&str] = &[
     "timestamp_utc",
     "command",
     "pattern",
+    // Which tape this pair holds — an ADDRESS, not provenance, and the
+    // key a frames destination is found by. Fully matchable (`--select`
+    // reads the manifest, not this list); it is only kept out of the
+    // labels, where it would be rendered as one and shipped on to the
+    // next hop as one, the wire carrying it in a field of its own.
+    "origin_id",
     // Lineage arriving over the wire, not provenance. `timber-otlp` sends
     // the ORIGIN store's id and path as OTLP resource attributes, and the
     // receiving intake seeds every attribute it is given — so these name
@@ -345,6 +351,9 @@ const NON_INHERITED: &[&str] = &[
     "created",
     "derived_from",
     "derived_op",
+    // An extract holds bytes from a tape; it is not that tape, so it must
+    // not claim its address.
+    "origin_id",
     "window_from",
     "window_to",
     "index",

@@ -702,9 +702,12 @@ enum Command {
     },
     /// Receive the native replication wire: compressed chunks move
     /// verbatim, so nothing is decompressed at either end and the
-    /// destination is byte-identical to its source. Answers a handshake
-    /// first — what it already holds, so a sender resumes from the
-    /// receiver's position rather than guessing, or why it is refused. The
+    /// destination is byte-identical to its source. One connection may
+    /// carry many stores, each its own stream with its own handshake —
+    /// what it already holds, so a sender resumes from the receiver's
+    /// position rather than guessing, or why that store is refused. The
+    /// destination is found by the store's IDENTITY, which travels: a
+    /// replica is the store in another place, not a derivative of it. The
     /// verb name is provisional.
     FramesIntake {
         /// Address to listen on (systemd socket activation on fd 3 is used
@@ -712,29 +715,26 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:4319")]
         listen: String,
         /// The forest to write into, as `timberfs forest list` names it:
-        /// one store per stream
+        /// each store in its own directory named after its id, with the
+        /// readable name in its manifest
         #[arg(long, value_name = "NAME")]
         forest: Option<String>,
         /// Backing directory. DEPRECATED in favour of --forest; still
         /// the way to write into a directory that is NOT a forest
         #[arg(long = "into-dir", value_name = "DIR", conflicts_with = "forest")]
         into_dir: Option<PathBuf>,
-        /// The label whose value names the store
-        #[arg(long, default_value = "service", value_name = "LABEL")]
-        route: String,
-        /// Create a store for a never-seen stream. Default: refuse it and
-        /// say so, as the other intakes do
+        /// DEPRECATED and ignored: a stream lands in the store its
+        /// identity names, never in one a label names. Routing by label
+        /// merged two hosts' identically-named stores into one
+        #[arg(long, value_name = "LABEL", hide = true)]
+        route: Option<String>,
+        /// Create a store for a stream never received here. Default:
+        /// refuse it and say so, as the other intakes do
         #[arg(long)]
         auto_create: bool,
-        /// Keep the sender's chunk numbering and record its origin, making
-        /// this a replica whose `(origin, seq)` addresses match the
-        /// source's. Refused when the numbering would not continue
-        /// exactly; without it the destination renumbers and claims no
-        /// origin, which is weaker but always possible
-        #[arg(long)]
-        replica: bool,
         /// Declare and maintain the token index on stores this receiver
         /// creates. Its own policy: settings never travel, only labels
+        /// and identity
         #[arg(long)]
         index: bool,
         /// Declare the write-ahead sidecar on stores this receiver creates
@@ -746,12 +746,24 @@ enum Command {
         #[arg(long)]
         exit_on_upgrade: bool,
     },
-    /// Ship a store over the native replication wire. Sends what the
+    /// Ship stores over the native replication wire. Sends what the
     /// receiver says it lacks, so re-running is a no-op rather than a
-    /// re-send. The verb name is provisional.
+    /// re-send. One connection carries the whole selection, a stream per
+    /// store. The verb name is provisional.
     FramesSend {
-        /// The store to ship
-        store: PathBuf,
+        /// The store to ship. Omit it and give --select to ship a set
+        #[arg(required_unless_present = "select")]
+        store: Option<PathBuf>,
+        /// Ship every store matching this predicate instead of one — the
+        /// same `[]` selector `list --select` and a follower take, and
+        /// re-resolved each pass, so a store that appears joins the
+        /// connection
+        #[arg(long, value_name = "EXPR", conflicts_with = "store")]
+        select: Option<String>,
+        /// A directory to sweep for --select stores BESIDE the configured
+        /// forests. A place to LOOK, never an address (repeatable)
+        #[arg(long, value_name = "DIR", requires = "select")]
+        look_in: Vec<PathBuf>,
         /// host:port of a `frames-intake`
         #[arg(long, value_name = "ADDR")]
         endpoint: String,
@@ -759,19 +771,19 @@ enum Command {
         /// service unit for this runs
         #[arg(long, short = 'f')]
         follow: bool,
-        /// Record the far end's acknowledged position here, so a store
-        /// declaring `cursors=<dir>` can REPORT what has left this box
-        /// (`info`, `list`). Not a resume point — the receiver's own
+        /// Record the far end's acknowledged position per store here, so a
+        /// store declaring `cursors=<dir>` can REPORT what has left this
+        /// box (`info`, `list`). Not a resume point — the receiver's own
         /// coverage is what a resume reads — and ⚠ not a retention hold
         /// either: `retain_unconsumed` reads the follower registry
         /// alone, and frames cannot be a follower until the `chunks`
         /// diet lands
-        #[arg(long, value_name = "PATH")]
-        cursor: Option<PathBuf>,
+        #[arg(long, value_name = "PATH", alias = "cursor")]
+        positions: Option<PathBuf>,
         /// Ship no sidecars, so the receiver rebuilds its own index
         #[arg(long)]
         no_sidecars: bool,
-        /// How long to wait between polls of the store with --follow
+        /// How long to wait between polls of the selection with --follow
         #[arg(long, default_value = "1s", value_name = "DUR")]
         poll: String,
         /// Socket read/write timeout
@@ -1093,6 +1105,60 @@ enum FollowerCommand {
     /// The consumer is a child, so systemd keeps the lifecycle, the
     /// restarts and the journal
     Run { name: String },
+}
+
+/// What a send did, per store, and whether it should have exited zero.
+///
+/// A refusal is per STREAM, so one store's conflict leaves the rest
+/// shipping — but a send whose every store was refused shipped nothing,
+/// and reporting that as success is the one thing a supervised unit
+/// cannot see.
+fn report_sent(endpoint: &str, sent: &timberfs::frames::Sent) -> anyhow::Result<()> {
+    for r in &sent.refused {
+        eprintln!(
+            "timberfs: {endpoint} refused {}: {}",
+            r.path.display(),
+            r.reason
+        );
+    }
+    if sent.streams.is_empty() {
+        if let Some(first) = sent.refused.first() {
+            anyhow::bail!(
+                "{endpoint} refused {}{}: {}",
+                first.path.display(),
+                if sent.refused.len() > 1 {
+                    format!(" and {} more", sent.refused.len() - 1)
+                } else {
+                    String::new()
+                },
+                first.reason
+            );
+        }
+        timberfs::note!("timberfs: no store to ship");
+        return Ok(());
+    }
+    if sent.chunks() == 0 {
+        timberfs::note!(
+            "timberfs: {endpoint} already has everything in {} store(s); nothing sent",
+            sent.streams.len()
+        );
+        return Ok(());
+    }
+    timberfs::note!(
+        "timberfs: sent {} chunk(s), {} from {} store(s) to {endpoint}{}",
+        sent.chunks(),
+        timberfs::rotate::human_bytes(sent.comp_bytes()),
+        sent.streams.len(),
+        if sent.skipped_already_held() > 0 {
+            format!(
+                " (resumed past {} chunk(s) it already held)",
+                sent.skipped_already_held()
+            )
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1724,25 +1790,32 @@ fn main() -> anyhow::Result<()> {
             into_dir,
             route,
             auto_create,
-            replica,
             index,
             wal,
             exit_on_upgrade,
-        } => timberfs::frames::cmd_intake(&timberfs::frames::IntakeOpts {
-            listen,
-            into_dir: forest::into_dir(forest.as_deref(), into_dir)?,
-            route,
-            auto_create,
-            replica,
-            index,
-            wal,
-            exit_on_upgrade,
-        })?,
+        } => {
+            if route.is_some() {
+                eprintln!(
+                    "timberfs: warning: --route is ignored — a stream lands in the store its \
+                     identity names. Drop the flag; it will be removed"
+                );
+            }
+            timberfs::frames::cmd_intake(&timberfs::frames::IntakeOpts {
+                listen,
+                into_dir: forest::into_dir(forest.as_deref(), into_dir)?,
+                auto_create,
+                index,
+                wal,
+                exit_on_upgrade,
+            })?
+        }
         Command::FramesSend {
             store,
+            select,
+            look_in,
             endpoint,
             follow,
-            cursor,
+            positions,
             no_sidecars,
             poll,
             timeout,
@@ -1752,35 +1825,23 @@ fn main() -> anyhow::Result<()> {
                     timberfs::append::parse_duration_ms(s)?,
                 ))
             };
+            let src = match (store, select) {
+                (Some(store), _) => timberfs::frames::Sources::One(store),
+                (None, Some(select)) => timberfs::frames::Sources::Select { select, look_in },
+                (None, None) => unreachable!("clap requires one of them"),
+            };
             let sent = timberfs::frames::cmd_send(
-                &store,
+                &src,
                 &timberfs::frames::SendOpts {
                     endpoint: endpoint.clone(),
-                    first_seq: 0,
                     sidecars: !no_sidecars,
                     timeout: ms(&timeout)?,
                     follow,
                     poll: ms(&poll)?,
-                    cursor,
+                    positions,
                 },
             )?;
-            if sent.chunks == 0 {
-                timberfs::note!("timberfs: {endpoint} already has everything; nothing sent");
-            } else {
-                timberfs::note!(
-                    "timberfs: sent {} chunk(s), {} to {endpoint}{}",
-                    sent.chunks,
-                    timberfs::rotate::human_bytes(sent.comp_bytes),
-                    if sent.skipped_already_held > 0 {
-                        format!(
-                            " (resumed at {}, which it already held)",
-                            sent.skipped_already_held
-                        )
-                    } else {
-                        String::new()
-                    }
-                );
-            }
+            report_sent(&endpoint, &sent)?;
         }
         Command::OtlpIntake {
             listen,

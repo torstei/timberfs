@@ -42,13 +42,27 @@ the destination whether or not the sockets are, so N connections buy
 independence that the arrangement does not have.
 
 So the mux is bookkeeping, as the codec's author intended, and there is no
-credit protocol here: a pass walks the selection, serves each store from where
-that stream resumed, and TCP's own backpressure does the work. **No shared
-cap, so no starvation** — a store with a large backlog delays the pass it is
-in and nothing else; the round-robin follower-selection.md needs exists
-because its entry cap is shared, and this one is not. Per-stream credit stays
-deferred, for the case that will actually force it: the pull direction, where
-a receiver asks and cannot decline what it gets.
+credit protocol here: a pass walks the selection, gives each store a bounded
+turn, reads the acks that turn produced, and lets TCP's own backpressure do
+the rest.
+
+⚠ **The bound is required for correctness, not for pacing.** The receiver acks
+every chunk, so a sender that writes a whole backlog without reading fills the
+receiver's write buffer; the receiver then blocks writing and stops reading,
+and both ends wait on each other. (Latent before this too — a one-shot send of
+a large enough store could reach it — and universal once several stores ship
+before one drain.) It also bounds the memory a turn holds, `serve` rendering
+its whole range into one buffer. A store with more waiting simply takes another
+turn, so **no store is starved**: the cap is per store, where the round-robin
+follower-selection.md needs exists because its entry cap is shared.
+
+⚠ **A COUNT, not a seq range.** The two are the same only while the numbering
+is dense, and a store whose oldest chunk sits above the range would answer with
+nothing — leaving a sender that resumes from what it examined stuck at a
+position it can never move past.
+
+Per-stream credit stays deferred, for the case that will actually force it: the
+pull direction, where a receiver asks and cannot decline what it gets.
 
 ⚠ **The receiver is still one thread per connection**, so a slow store's
 `fsync` does hold up the frames behind it. That is the same coupling as above
@@ -126,16 +140,28 @@ unique does.
 
 Three ordered steps, and the same `select.rs` the sender uses:
 
-1. `[id=<the stream's id>]` — the store is already here. A reconnect, a second
-   sender for the same store, a destination pre-created by an operator who
-   knew the id.
-2. `[derived_from=<the stream's id>]` — a store THIS receiver created from
-   this stream before the id travelled. It keeps its minted identity, its
-   directory and its position; only new destinations inherit. Without this
-   step an upgraded archive would start a second copy of every store it holds
-   and re-ship every byte.
+1. `[origin_id=<the stream's id>]` — **the destination declares which store it
+   holds.** A store this receiver has already received writes it; a store an
+   operator pre-created declares it by hand (`create --set origin_id=…`), which
+   is how a destination's `retain`/`index` policy is settled before any data
+   arrives; and a store received by an older build wrote it too, so an upgraded
+   archive keeps receiving instead of starting a second copy of everything it
+   holds. That legacy store keeps its own minted `id` — only new destinations
+   inherit — and `origin_id` is what says the two are one store.
+2. `[id=<the stream's id>]` — a store that already wears the identity and
+   declares no origin.
 3. Neither: `--auto-create` mints the destination, and without it the stream
    is refused and says so — the same posture as every other intake.
+
+⚠ `origin_id` and not `derived_from`, though both were recorded: lineage says
+where a DERIVATIVE came from, and only the origin says which store this is. It
+is also the one an operator can write, `derived_from` being protected against
+`set` exactly because it is lineage.
+
+⚠ A legacy archive that received WITHOUT `--replica` cannot be continued: it
+recorded no origin, and its chunks were renumbered, so it is not that store's
+replica and never was. It keeps working as the store it is; a replica of the
+source starts beside it.
 
 `--route` is then a flag with no job. Accepted for one release with a warning
 that it no longer routes, then removed; the shipped unit drops it.

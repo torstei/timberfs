@@ -1,20 +1,17 @@
 # Receives the native replication wire: compressed chunks land verbatim, so
-# the store here is byte-identical to its source. Routes by a LABEL, like
-# the other intakes.
+# the store here is byte-identical to its source. A stream lands in the store
+# its IDENTITY names — the id travels, so a replica is the store in another
+# place — and never in one a label names.
 #
-# --replica keeps the sender's chunk numbering and records its origin, so
-# (origin_id, seq) names the same bytes at both ends. Omit it and the
-# destination renumbers and claims no origin — weaker, but always possible.
-#
-# --auto-create is deliberately absent: an undeclared stream is refused and
-# said so, as the other intakes do. Add it when senders should be allowed to
-# mint stores here.
+# --auto-create is deliberately absent: a stream never received here is
+# refused and said so, as the other intakes do. Add it when senders should be
+# allowed to mint stores here, which is what an archive usually wants.
 #
 #   systemctl edit timberfs-frames.service
 #     [Service]
 #     ExecStart=
 #     ExecStart=/usr/bin/timberfs frames-intake --forest default \
-#         --route service --replica --index --auto-create --exit-on-upgrade
+#         --index --auto-create --exit-on-upgrade
 [Unit]
 Description=timberfs native replication intake
 Documentation=https://github.com/torstei/timberfs
@@ -23,7 +20,7 @@ After=timberfs-frames.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/timberfs frames-intake --forest default --replica --exit-on-upgrade
+ExecStart=/usr/bin/timberfs frames-intake --forest default --exit-on-upgrade
 StandardOutput=journal
 StandardError=journal
 LogsDirectory=timberfs

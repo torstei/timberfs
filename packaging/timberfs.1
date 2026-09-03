@@ -38,16 +38,18 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .B timberfs frames\-intake
 .B \-\-forest
 .I NAME
-.RB [ \-\-replica ]
 .RB [ \-\-auto\-create ]
 .br
 .B timberfs frames\-send
-.I STORE
+.RI { STORE " | " \-\-select
+.IR EXPR }
 .B \-\-endpoint
 .I ADDR
 .RB [ \-\-follow ]
-.RB [ \-\-cursor
+.RB [ \-\-positions
 .IR PATH ]
+.RB [ \-\-look\-in
+.IR DIR ]
 .br
 .B timberfs query
 .RB [ \-\-from
@@ -2192,34 +2194,58 @@ destination's
 VERBATIM and a record in its
 .IR .rings ,
 so nothing is decompressed at either end and the store is byte-identical
-to its source. One store per stream in the forest named by
-.BR \-\-forest ,
-named by
-.B \-\-route
-as the other intakes name theirs. Blocking, one thread per connection, no
-TLS \(em a private network or a tunnel.
+to its source. One connection may carry MANY stores, each its own stream
+with its own handshake. Blocking, one thread per connection, no TLS \(em a
+private network or a tunnel.
+.PP
+A stream lands in the store its IDENTITY names, never in one a label
+names: the id travels, so a replica is the store in another place rather
+than a derivative of it. The destination is the store here that declares
+.BI origin_id= <that\ id>
+\(em which is what a store received here already says, what an older
+build's routed store said too, and what an operator writes to declare a
+destination before any data arrives. Failing that,
+.B \-\-auto\-create
+makes one, in a directory named after the id.
 .TP
 .BI \-\-listen " ADDR"
 Default
 .BR 127.0.0.1:4319 .
 .TP
-.B \-\-replica
-Keep the sender's chunk NUMBERING and record its origin, so
-.RI ( origin_id ", " seq )
-names the same bytes at both ends. Refused when the numbering would not
-continue exactly \(em see REPLICATION. Without it the destination
-renumbers and claims no origin, which is weaker and always possible.
-.TP
 .B \-\-auto\-create
-Create a store for a never-seen stream. Default: refuse it and say so,
-as the other intakes do.
+Create a store for a stream never received here. Default: refuse it and
+say so, as the other intakes do.
 .TP
 .BR \-\-index ", " \-\-wal
-The receiving store's OWN policy. Settings never travel; only labels do.
+The receiving store's OWN policy. Settings never travel; only labels and
+identity do.
 .SS frames\-send
-Ship a store over the same wire. Sends what the receiver says it LACKS, so
+Ship stores over the same wire. Sends what the receiver says it LACKS, so
 re-running is a no-op rather than a re-send \(em the receiver's position
-is authoritative and a sender keeps none of its own.
+is authoritative and a sender keeps none of its own. One connection
+carries the whole selection, a stream per store, so a refused store leaves
+the rest shipping.
+.PP
+A store with no identity cannot be replicated \(em the destination is
+keyed by one \(em and is named rather than skipped
+.RB ( "timberfs identity <store> \-\-mint" ).
+.TP
+.BI \-\-select " EXPR"
+Ship every store the predicate matches instead of one, in place of the
+.I STORE
+argument \(em the same
+.B []
+selector
+.B list \-\-select
+and a follower take (see SELECTING STORES). Re-resolved each pass, so a
+store that appears joins the connection and one that stops matching has
+its stream closed.
+.TP
+.BI \-\-look\-in " DIR"
+A directory to sweep for
+.B \-\-select
+stores BESIDE the configured forests (repeatable). A place to LOOK, never
+an address: the selection still decides which store.
 .TP
 .BI \-\-endpoint " ADDR"
 host:port of a
@@ -2227,7 +2253,9 @@ host:port of a
 .TP
 .BR \-f ", " \-\-follow
 Keep shipping as chunks seal, on the same connection. What a service unit
-for this runs.
+for this runs. With
+.B \-\-select
+the selection is re-resolved each pass, so nothing watches the forest.
 .IP
 ⚠ Not a registered follower: a follower feeds its consumer ENTRIES, and
 frames want the
@@ -2238,11 +2266,15 @@ and ⚠ it cannot hold retention back at all until that lands, since
 .B retain_unconsumed
 reads the follower registry and nothing else.
 .TP
-.BI \-\-cursor " PATH"
-Record what the far end has ACKNOWLEDGED, so a store declaring
+.BI \-\-positions " PATH"
+Record what the far end has ACKNOWLEDGED, one entry per store keyed by
+identity, so a store declaring
 .B cursors=<dir>
 can REPORT what has left this box
 .RB ( info ", " list ).
+Spelled
+.B \-\-cursor
+before it held a set, which still works.
 ⚠ Reporting only, in both senses: not a resume point \(em the receiver's
 coverage is what a resume reads \(em and not a retention hold, a file
 lying in a directory being deliberately unable to change what may be
@@ -2731,27 +2763,38 @@ is byte-identical to the source's. Measured on 200k apache entries, the
 bytes on the wire are a wash against gzipped OTLP while the CPU is not
 \(em and that work lands on the machine serving production traffic.
 .PP
-.B A replica or a copy, and the difference is the numbering.
-With
-.B \-\-replica
-the destination keeps the sender's chunk numbers and records its
+.B A destination is a replica, and nothing else.
+It keeps the sender's chunk numbers and records its
 .IR origin_id ,
 so
 .RI ( origin_id ", " seq )
 names the same bytes at both ends. That is refused unless the numbering
 continues EXACTLY: a preserved number with a gap under it is an address
 that lies, so a stream beginning mid-tape says so rather than leaving one.
-Without it the destination renumbers and claims no origin \(em always
-possible, and weaker, since neither the address nor the evidence of a gap
-survives. The two travel together or not at all.
+Receiving somebody else's chunks as a NEW, independent tape is what
+.B export
+and
+.B import
+are for; it is not a mode here, because a destination that numbered its
+own chunks would share no address with its source and could not answer
+where a sender got to.
 .PP
-.B Identity is the destination's own.
-It mints its own
-.IR id ,
-records the sender as
-.IR derived_from ,
-and takes the sender's LABELS \(em while retention, the index and the wal
-stay its own policy. Settings never travel.
+.B The identity travels.
+A replica IS the store, in another place, so it wears the same
+.IR id .
+A second identity would make one tape answer to two names, and a
+position, a chunk address and a tape offset are each keyed by that name.
+Nothing is recorded as
+.IR derived_from :
+a replica derives from nothing. What does NOT travel is the pair's own
+facts \(em
+.IR created ,
+and retention, the index and the wal, which stay the receiving tier's
+policy.
+.PP
+.B The name travels too,
+because nothing at the far end can reconstruct it: a destination is keyed
+by identity and lives in a directory named after one.
 .PP
 .B One destination store, one origin.
 A second origin into a store that already holds one is refused, naming
@@ -2760,19 +2803,30 @@ hostname, silently appends a second tape to the first while the manifest
 describes only one of them.
 .PP
 .B The handshake is what this has over a pipe.
-A sender opens by saying what it is about to send; the receiver answers
+A sender opens by saying what a store is; the receiver answers
 with what it ALREADY HOLDS, so the sender resumes from the receiver's
 position and cannot re-send \(em running
 .B frames\-send
 twice does nothing and says so. Or the receiver answers with a conflict,
-naming the origin that holds the name, so a collision is a sentence on a
-terminal at setup rather than a mislabelled store found weeks later.
+naming the tape that holds the identity, so a collision is a sentence on a
+terminal at setup rather than a mislabelled store found weeks later. Both
+are per STREAM, so one refused store leaves the other forty-nine
+shipping.
+.PP
+.B One connection, many stores.
+The stream id is in every frame, so
+.B \-\-select
+opens one per matching store on a single connection. There is no
+per-stream credit and none is needed: a sender of a selection is one
+destination and so one queue, which is the same coupling a follower of a
+set already has \(em and retention is the budget for it.
 .PP
 .B What it cannot do.
 Only SEALED chunks exist to ship, so a replica trails the source by one
-chunk flush; the live edge belongs to
+chunk flush, however many stores share the connection; the live edge
+belongs to
 .B query \-\-follow
-on the source itself. And frames are 1:1 \(em opaque bytes whose rings
+on the source itself. And a store is 1:1 \(em opaque bytes whose rings
 must stay sorted, so interleaving two sources into one store needs
 decoding, which is the entries path's job. Frames replicate; records merge
 and transform.

@@ -92,6 +92,9 @@ is what serves extensibility and multiplexing with one mechanism.
        0..16  holder origin_id                 uuid
       16..    coverage of the holder, then a u32-prefixed reason
 
+    stream-close payload                  kind 6
+             (empty — the header's stream id is the whole message)
+
 Two corrections the implementation forced, both cases of the written layout
 being undecodable rather than merely awkward:
 
