@@ -649,9 +649,19 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
     // nor final.
     let mut refused: HashMap<String, (PathBuf, std::time::Instant, String)> = HashMap::new();
 
+    let mut sources = Vec::new();
+    let mut resolved = false;
     loop {
-        let (sources, unidentified) = resolve_sources(src)?;
-        note_unidentified(&mut out, unidentified);
+        // Re-resolved each pass while following, so a store that appears
+        // joins the connection; once for a one-shot, whose set cannot
+        // usefully change under it and whose backlog may take many
+        // passes — a forest scan per turn would be the cost of a sync.
+        if opts.follow || !resolved {
+            let (found, unidentified) = resolve_sources(src)?;
+            note_unidentified(&mut out, unidentified);
+            sources = found;
+            resolved = true;
+        }
 
         // A store that has left the selection: end its stream, so the far
         // end can release the writer locks and the open store it holds.
@@ -666,12 +676,12 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
             out.streams.push(s.into_report());
         }
 
-        for s in &sources {
+        for s in sources.iter() {
             if live.iter().any(|l| l.store == s.id) {
                 continue;
             }
-            let held = refused.get(&s.id);
-            if held.is_some_and(|(_, at, _)| at.elapsed() < REFUSAL_LINGERS) {
+            let standing = refused.get(&s.id);
+            if standing.is_some_and(|(_, at, _)| at.elapsed() < REFUSAL_LINGERS) {
                 continue;
             }
             match open_send_stream(&mut w, &mut r, next_wire, s, opts, &mut live)? {
@@ -679,7 +689,7 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
                     // Said once per reason, not once per attempt: a
                     // standing conflict is a line, and a changed answer
                     // is a new one.
-                    if held.is_none_or(|(_, _, was)| *was != reason) {
+                    if standing.is_none_or(|(_, _, was)| *was != reason) {
                         crate::note!(
                             "timberfs: {} refused {}: {reason}",
                             opts.endpoint,
