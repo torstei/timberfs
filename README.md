@@ -641,9 +641,9 @@ matrix: [docs/design.md](docs/design.md#the-sap-write-ahead-sidecar).
 ## Install
 
 Debian/Ubuntu, from the apt repository (rebuilt by CI from the GitHub
-releases on every release, GPG-signed, `apt upgrade` works). One `amd64`
+releases on every release, GPG-signed, `apt upgrade` works). The `amd64`
 package is built against an old glibc, so it installs on every current
-release — Ubuntu 20.04+ and Debian 11+:
+release — Ubuntu 20.04+ and Debian 11+ (18.04 has its own package, below):
 
 ```sh
 sudo curl -fsSL https://torstei.github.io/timberfs/key.gpg \
@@ -686,7 +686,12 @@ sudo apt install timberfs-bionic
 ```
 
 Only `libc6` is a hard dependency, so the `.deb` from the release also
-installs with `dpkg -i` on a host whose apt sources no longer resolve.
+installs on a host whose apt sources no longer resolve:
+
+```sh
+curl -LO https://github.com/torstei/timberfs/releases/latest/download/timberfs-bionic_amd64.deb
+sudo dpkg -i ./timberfs-bionic_amd64.deb
+```
 
 ## How it works
 

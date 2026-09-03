@@ -32,6 +32,14 @@ Signed-By: /usr/share/keyrings/timberfs.gpg
 EOF
 
 sudo apt update &amp;&amp; sudo apt install timberfs</pre>
+<p>That package installs on Ubuntu 20.04+ and Debian 11+. Ubuntu 18.04 is
+one release below its glibc floor and has its own package from this same
+repository, <code>timberfs-bionic</code> &mdash; built against glibc 2.27,
+and depending on <code>fuse</code> where there is no <code>fuse3</code>. It
+provides and conflicts with <code>timberfs</code>, so the two are
+alternatives rather than an upgrade path.</p>
+<p>The console is separate, and needs python3 as the filesystem does not:
+<code>sudo apt install timberfs-sh</code>.</p>
 <p>Signing key fingerprint:
 <code>B07E E67A AABF 0C6D 2674 79DD 66C1 43E8 8913 4319</code></p>
 <p>This repository is rebuilt from the
