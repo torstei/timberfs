@@ -184,6 +184,21 @@ restarts it. So a refusal lingers 60 seconds and is then offered again, and
 is logged once per REASON rather than once per attempt: a standing conflict
 is one line, a changed answer is a new one.
 
+### And a store that cannot be WRITTEN ends its own stream
+
+The same rule one step later. A write that fails after the handshake — a
+numbering that does not line up, a full disk — used to end the CONNECTION,
+which with one store per connection cost nothing and with a selection costs
+every other store its pass. So the receiver ends that stream, drops the
+session, and tells the sender with `conflict`, the frame that already means
+«not this store, and here is why». The sender stops shipping it and waits
+out a refusal like any other; without that message it would ship into a
+void for the rest of the connection.
+
+⚠ Every path that reads frames has to file such a conflict, including the
+one waiting for another store's handshake answer — a signal dropped there
+is the void case exactly.
+
 ### A rotated store is refused, at the handshake
 
 `stream-open` carries the sender's oldest chunk NUMBER, so a fresh

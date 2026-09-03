@@ -230,7 +230,28 @@ pub fn serve_connection(sock: TcpStream, opts: &IntakeOpts) -> anyhow::Result<Ve
                     continue;
                 };
                 let was_chunk = matches!(other, Frame::Chunk { .. });
-                session.apply(other)?;
+                // A store that cannot be written — a full disk, a
+                // numbering that does not line up — ends ITS stream and
+                // says so, where ending the connection would make one
+                // store's disk every other store's problem. The sender is
+                // told with the frame that already means "not this
+                // store, and here is why".
+                if let Err(e) = session.apply(other) {
+                    let reason = format!("{e:#}");
+                    crate::note!("timberfs: frames intake: {peer}: stream {id}: {reason}");
+                    open.remove(&id);
+                    send(
+                        &mut w,
+                        id,
+                        Frame::Conflict {
+                            holder_origin: [0u8; 16],
+                            runs: Vec::new(),
+                            reason,
+                        },
+                    )?;
+                    continue;
+                }
+                let session = open.get(&id).expect("still open");
                 if was_chunk {
                     // Ack every chunk. A byte-window cadence starved a
                     // low-volume stream of acks entirely — the ack IS
@@ -557,6 +578,32 @@ impl Stream {
     }
 }
 
+/// File the streams the far end dropped mid-flight: what each shipped is
+/// reported, and the store waits out a refusal like any other before it is
+/// offered again. Returns how many were removed from BEFORE the index a
+/// caller is walking, which is all of them — a stream is dropped only once
+/// its turn has been taken.
+fn give_up(
+    out: &mut Sent,
+    refused: &mut HashMap<String, (PathBuf, std::time::Instant, String)>,
+    dropped: Vec<(Stream, String)>,
+    endpoint: &str,
+) -> usize {
+    let n = dropped.len();
+    for (s, reason) in dropped {
+        crate::note!(
+            "timberfs: {endpoint} gave up on {}: {reason}",
+            s.path.display()
+        );
+        refused.insert(
+            s.store.clone(),
+            (s.path.clone(), std::time::Instant::now(), reason),
+        );
+        out.streams.push(s.into_report());
+    }
+    n
+}
+
 /// Say once, per store, that a pair carrying no identity cannot be
 /// replicated — the destination is keyed by one. Named rather than
 /// silently skipped, and a reader has no business minting an identity
@@ -676,6 +723,7 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
             out.streams.push(s.into_report());
         }
 
+        let mut dropped = Vec::new();
         for s in sources.iter() {
             if live.iter().any(|l| l.store == s.id) {
                 continue;
@@ -684,7 +732,7 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
             if standing.is_some_and(|(_, at, _)| at.elapsed() < REFUSAL_LINGERS) {
                 continue;
             }
-            match open_send_stream(&mut w, &mut r, next_wire, s, opts, &mut live)? {
+            match open_send_stream(&mut w, &mut r, next_wire, s, opts, &mut live, &mut dropped)? {
                 Some(reason) => {
                     // Said once per reason, not once per attempt: a
                     // standing conflict is a line, and a changed answer
@@ -708,13 +756,21 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
             }
         }
 
+        give_up(&mut out, &mut refused, dropped, &opts.endpoint);
+
         // A turn each, and the acks read between them: one store's
         // backlog must not fill the far end's write buffer while nothing
         // is emptying it here.
         let mut shipped = 0u64;
-        for i in 0..live.len() {
+        let mut i = 0;
+        while i < live.len() {
             shipped += ship_turn(&mut w, &mut live[i], opts)?;
-            drain_acks(&mut r, &mut live, DRAIN_WAIT)?;
+            let mut dropped = Vec::new();
+            drain_acks(&mut r, &mut live, &mut dropped, DRAIN_WAIT)?;
+            let stepped = give_up(&mut out, &mut refused, dropped, &opts.endpoint);
+            // A stream the far end dropped is removed from `live`, so the
+            // index only advances past streams that are still there.
+            i = (i + 1).saturating_sub(stepped);
         }
         // Record whatever the far end has acknowledged. That is what a
         // retention interest axis reads to know what has left this box —
@@ -740,9 +796,14 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
     // Done writing: now the far end will finish and send its last acks.
     w.shutdown(std::net::Shutdown::Write).ok();
     r.get_ref().set_read_timeout(Some(opts.timeout)).ok();
+    let mut dropped = Vec::new();
     while let Some(f) = r.next_frame()? {
         note_ack(&mut live, &f);
+        if let Some(gone) = note_conflict(&mut live, &f) {
+            dropped.push(gone);
+        }
     }
+    give_up(&mut out, &mut refused, dropped, &opts.endpoint);
     save_positions(opts.positions.as_deref(), &mut live)?;
     for s in live {
         out.streams.push(s.into_report());
@@ -766,6 +827,7 @@ fn open_send_stream(
     src: &Source,
     opts: &SendOpts,
     live: &mut Vec<Stream>,
+    dropped: &mut Vec<(Stream, String)>,
 ) -> anyhow::Result<Option<String>> {
     // The opening frame is the serve side's own, so a sender and a server
     // describe a stream identically. Sent in Coverage mode: it says what
@@ -818,10 +880,16 @@ fn open_send_stream(
                     }
                 ))
             }
-            // An ack for a stream already shipping, arriving between our
-            // open and its answer.
+            // Another stream's frame, arriving between our open and its
+            // answer: an ack, or the far end giving up on a store it was
+            // already taking. Neither may be dropped on the floor — the
+            // second especially, since a sender that misses it ships into
+            // a void for the rest of the connection.
             _ => {
                 note_ack(live, &f);
+                if let Some(gone) = note_conflict(live, &f) {
+                    dropped.push(gone);
+                }
             }
         }
     };
@@ -897,7 +965,8 @@ fn ship_turn(w: &mut impl Write, s: &mut Stream, opts: &SendOpts) -> anyhow::Res
 /// poll. True when at least one arrived.
 fn drain_acks(
     r: &mut Reader<TcpStream>,
-    live: &mut [Stream],
+    live: &mut Vec<Stream>,
+    dropped: &mut Vec<(Stream, String)>,
     poll: Duration,
 ) -> anyhow::Result<bool> {
     r.get_ref().set_read_timeout(Some(poll)).ok();
@@ -906,6 +975,9 @@ fn drain_acks(
         match r.next_frame() {
             Ok(Some(f)) => {
                 any |= note_ack(live, &f);
+                if let Some(gone) = note_conflict(live, &f) {
+                    dropped.push(gone);
+                }
             }
             Ok(None) => return Ok(any),
             Err(e) => {
@@ -939,6 +1011,17 @@ fn note_ack(live: &mut [Stream], f: &Framed) -> bool {
     };
     s.acked = runs.clone();
     true
+}
+
+/// A `conflict` for a stream already shipping: the far end has given up on
+/// that store mid-stream and said why. Its stream ends here too, or the
+/// sender ships into a void for the rest of the connection.
+fn note_conflict(live: &mut Vec<Stream>, f: &Framed) -> Option<(Stream, String)> {
+    let Frame::Conflict { reason, .. } = &f.frame else {
+        return None;
+    };
+    let at = live.iter().position(|s| s.wire == f.stream)?;
+    Some((live.remove(at), reason.clone()))
 }
 
 /// Record what the FAR END holds, per store, in the registry's positions
@@ -1489,6 +1572,114 @@ mod tests {
             sent.refused
         );
         assert!(!landed(&into, &src).exists(), "nothing was created");
+    }
+
+    /// A store that cannot be WRITTEN ends its own stream and says so.
+    /// Killing the connection would make one store's disk every other
+    /// store's problem, and dropping the stream in silence would leave
+    /// the sender shipping into a void.
+    ///
+    /// The arrangement: a source whose head has rotated away, into a
+    /// destination that already holds chunks — so the handshake answers
+    /// with real coverage the sender resumes from, and the mismatch only
+    /// shows when the first frame is applied.
+    #[test]
+    fn a_store_that_cannot_be_written_ends_its_stream_and_says_so() {
+        let d = TempDir::new();
+        let forest = d.path().join("node");
+        std::fs::create_dir_all(&forest).unwrap();
+        let cfg = crate::store::Config {
+            chunk_size: 1 << 20,
+            level: 1,
+            flush_age_ms: u64::MAX,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // The rotated source: five chunks from 1970, three from now.
+        let a = forest.join("apache-error.log");
+        crate::bark::cmd_create(
+            &a,
+            false,
+            false,
+            Some("1h"),
+            None,
+            false,
+            &["service=apache-error".to_string()],
+            false,
+        )
+        .unwrap();
+        let mut st = crate::store::Store {
+            dir: forest.clone(),
+            cfg,
+            files: std::collections::BTreeMap::new(),
+        };
+        st.create("apache-error.log").unwrap();
+        let f = st.files.get_mut("apache-error.log").unwrap();
+        for i in 0..8u64 {
+            let ms = if i < 5 { 1_000 + i } else { now };
+            f.append_windowed(
+                format!("2026-06-01T10:00:00Z line {i}\n").as_bytes(),
+                ms,
+                ms,
+                &cfg,
+            )
+            .unwrap();
+            f.flush_chunk(&cfg).unwrap();
+        }
+        drop(st);
+        crate::rotate::cmd_trim(&a, false).unwrap();
+        let b = a_store(&forest, "apache-access", 2, "apache-access");
+
+        // Its destination holds two chunks of its own, so the handshake
+        // answers 0..1 and the sender resumes at 2 — where the source's
+        // oldest is 5.
+        let into = d.path().join("archive");
+        let dst = into.join(id_of(&a));
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut map = serde_json::Map::new();
+        map.insert("id".into(), serde_json::json!(id_of(&a)));
+        map.insert("origin_id".into(), serde_json::json!(id_of(&a)));
+        crate::bark::save(&dst, &id_of(&a), &map).unwrap();
+        let mut st = crate::store::Store {
+            dir: dst.clone(),
+            cfg,
+            files: std::collections::BTreeMap::new(),
+        };
+        st.create(&id_of(&a)).unwrap();
+        let held = st.files.get_mut(&id_of(&a)).unwrap();
+        for i in 0..2u64 {
+            held.append_windowed(b"2026-06-01T10:00:00Z held\n", 900 + i, 900 + i, &cfg)
+                .unwrap();
+            held.flush_chunk(&cfg).unwrap();
+        }
+        drop(st);
+
+        let (addr, server) = one_shot(opts(&into, true));
+        let sent = cmd_send(
+            &Sources::Select {
+                select: "[service=~apache-.*]".to_string(),
+                look_in: vec![forest.clone()],
+            },
+            &send_opts(&addr),
+        )
+        .unwrap();
+        // The connection ended normally, so the OTHER store's session was
+        // finished rather than dropped along with it.
+        let got = server.join().unwrap().unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].chunks, 2, "the other store shipped whole");
+        assert_eq!(got[0].store, landed(&into, &b));
+        // And the sender was told which store the far end gave up on.
+        assert_eq!(sent.refused.len(), 1, "{sent:?}");
+        assert_eq!(sent.refused[0].path, a);
+        assert!(
+            sent.refused[0].reason.contains("continue it exactly"),
+            "{:?}",
+            sent.refused
+        );
     }
 
     /// One store's conflict must not stop the others: the handshake is per
