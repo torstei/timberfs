@@ -261,6 +261,12 @@ fn no_such_store(token: &str, forests: &[Forest]) -> anyhow::Error {
 /// The forests for `timberfs list`: the given directories as ad-hoc forests
 /// (named by their own path, same as an env-provided forest) when any are
 /// given, otherwise every configured forest.
+/// The configured forests as bare directories, for a caller that must
+/// ADD to the search rather than replace it (a follower's `look_in`).
+pub fn forest_dirs() -> Vec<PathBuf> {
+    load_forests().into_iter().map(|f| f.dir).collect()
+}
+
 pub(crate) fn forests_for_list(dirs: &[PathBuf]) -> Vec<Forest> {
     if dirs.is_empty() {
         load_forests()

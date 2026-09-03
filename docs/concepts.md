@@ -14,7 +14,7 @@ with the sections named below.
 
 ---
 
-**`.bark`** — the manifest: one flat, human-editable JSON object holding a
+**`.bark`** — the manifest: one flat JSON object holding a
 store's *declared* facts (identity, settings, retention, provenance, lineage).
 Travels with the store, survives head-drops, ships inside bundles.
 → [design](design.md#the-bark-manifest)
@@ -30,8 +30,8 @@ random-access read: one self-contained zstd frame plus one `.rings` record.
 → [design](design.md#on-disk-format)
 
 **chunk number (`seq`)** — a position in one store, never a fact about its
-contents: dense, only increasing, unchanged by a head-drop, and what a cursor
-names. Assigned by the destination on ingest, so an incoming number is ignored.
+contents: dense, only increasing, unchanged by a head-drop, and what a
+position's retention floor is recorded in. Assigned by the destination on ingest, so an incoming number is ignored.
 → [design](design.md#the-chunk-number-and-what-it-is-not)
 
 **chunk selection vs entry selection** — `query` picks chunks by the write-time
@@ -40,9 +40,11 @@ verifies every entry against the timestamp its own line carries. Coarse then
 exact, which is what makes the widening safe.
 → [design](design.md#semantics)
 
-**cursor** — a consumer's durable position, on the write axis because it is the
-only monotonic one. A follower's lives in the registry as `cursor.json`.
-→ [README](../README.md#followers-who-is-reading-and-how-far-behind)
+**consumer** — the program a **follower** feeds: it reads
+`timberfs-records(5)` on stdin and reports back on stdout how far each store's
+position may move. Any program speaking those three messages will do, including
+a shell script. timberfs owns the position; the consumer only reports.
+→ [README](../README.md#feeding-any-consumer-timberfs-feed), `timberfs-records(5)`
 
 **derived store** — what `export` and `rotate` produce: a new store with a fresh
 identity, its lineage recorded (`derived_from`, `derived_op`), provenance
@@ -74,15 +76,19 @@ ORDERING).
 (default 5 s). Therefore also the crash-loss window without `--wal`, and the
 slop the write-time index alone would leave at a window's edges.
 
-**follower** — a registered reader of a store: a name, a type, a `retaining`
-flag and a durable position. A *declared* object rather than a cursor found
-lying in a directory, which is what makes the replication-slot analogy exact.
+**follower** — a registered reader of a SELECTION of stores: a name, the
+predicate saying which, a **consumer** to feed them to, a `retaining` flag and a
+position per store. A *declared* object rather than a cursor found lying in a
+directory, which is what makes the replication-slot analogy exact. One per
+destination, not one per store.
 → [README](../README.md#followers-who-is-reading-and-how-far-behind),
 `timberfs(1)` **FOLLOWERS**
 
 **follower registry** — `/var/lib/timberfs/followers/<name>/`, one directory per
-follower, split by ownership: `follower.json` the operator writes, `cursor.json`
-the follower writes, `follower.lock` held while it runs.
+follower, split by ownership: `follower.json` the operator writes (through
+`follower update`), `positions.json` the follower writes, `follower.lock` held
+while it runs. Readable by eye; changed by the verbs, never by an editor —
+`timberfs(1)` **THE FILES ARE NOT THE INTERFACE**.
 → [README](../README.md#followers-who-is-reading-and-how-far-behind)
 
 **forest** — a directory searched for stores by a short **handle**, so `timberfs
@@ -109,9 +115,10 @@ position authoritative so a sender keeps no cursor and cannot re-send.
 → [README](../README.md#replicating-to-another-timberfs-frames-send),
 `timberfs(1)` **REPLICATION**
 
-**`GAP` warning** — what a shipper reports on resume when the chunk its cursor
-named has already been dropped: the size of the hole, inferred from the far
-side. The **override record** is the same fact, exact, from the writer's side.
+**`GAP` warning** — what `follower status` reports when the chunk a position
+named has already been dropped: the size of the hole, as an exact count of
+chunks. The **override record** is the same fact from the writer's side, at the
+moment it happens.
 → [README](../README.md#followers-who-is-reading-and-how-far-behind)
 
 **`.grain`** — the token index: one Bloom filter per chunk over every token in
@@ -157,7 +164,7 @@ this store's retaining followers have not read. Additive, never a cap — see
 **retention**.
 
 **live edge** — the newest data: buffered, not yet a chunk. `query --follow`
-tails it through the `.sap`, and so does a read that RESUMES — a cursor and no
+tails it through the `.sap`, and so does a read that RESUMES — a position and no
 window, which is a consumer following the store rather than asking about the
 past. A windowed read never includes it (chunks are selected by their write
 window, and a segment has none), nor does a chunk-granular predicate sweep (the
@@ -188,6 +195,14 @@ happens. Owed rather than optional, because with finite disk bounded loss is a
 choice already made.
 → [README](../README.md#followers-who-is-reading-and-how-far-behind),
 `timberfs(1)` **RETENTION**
+
+**position** — a consumer's durable place in one store: the absolute offset on
+its tape (what has ever left the store, plus where the bytes sit in what
+remains), so retention cannot move it. A follower keeps one per store it has
+read, in `positions.json` in its registry directory; the recorded chunk beside
+it is the retention floor. The two move TOGETHER, which is why the file is state
+rather than configuration: a reset removes an entry, it does not edit one.
+→ [README](../README.md#followers-who-is-reading-and-how-far-behind)
 
 **predicate** — `timber-filter`'s matchers, applied per entry: `--has` (whole
 token, rides the grain automatically), `--substring`, `--regex`, each with a
@@ -227,11 +242,11 @@ its origin, so a chunk answers to the same address at both ends. Numbering and
 origin travel together or not at all.
 → [README](../README.md#replicating-to-another-timberfs-frames-send)
 
-**retaining** — a follower's declaration that its position holds the store's
-head back. One half of a pair — the store declares `retain_unconsumed` — and
+**retaining** — a follower's declaration that its positions hold its stores'
+heads back. One half of a pair — the store declares `retain_unconsumed` — and
 additive rather than a cap, so `retain_size` still overrides it. A retaining
-follower with **no position holds everything**, which is both the point and the
-footgun. → [README](../README.md#followers-who-is-reading-and-how-far-behind),
+follower with **no position holds everything** it matches, which is both the
+point and the footgun. → [README](../README.md#followers-who-is-reading-and-how-far-behind),
 `timberfs(1)` **FOLLOWERS**
 
 **retention** — a property of the *log*, declared in its manifest on three axes
@@ -275,6 +290,12 @@ so looking one up can be ambiguous, and that is reported rather than guessed.
 Shown by `list` in its own column and offered by `--names`; not a **label**,
 because it is not where the entries came from, but fully matchable like
 everything else in the manifest.
+
+**selection** — a set of stores named by a predicate rather than listed:
+`[service=~apache-.*]`, or `[]` for every store. Re-resolved on every read, so a
+store that appears later joins it with nothing to reconfigure. What `list
+--select`, `feed --select` and a **follower** are all pointed at.
+→ [README](../README.md#feeding-any-consumer-timberfs-feed)
 
 **seqlock** — the counter a reader samples to know the rings and the grain it
 loaded are one generation. A pair straddling a head-drop would skip chunks that
@@ -324,6 +345,13 @@ shows at a window's edges.
 **THE TWO CLOCKS**
 
 **`--wal`** — see **`.sap`**.
+
+**watermark** — what a **consumer** reports: an offset meaning *do not send me
+these again*, never *these were delivered*. That is what lets a receiver being
+down (report nothing, be handed the same entries again) and an entry being
+refused (report past it) mean different things without an error taxonomy
+crossing the boundary.
+→ `timberfs-records(5)` **THE CONSUMER PROTOCOL**
 
 **write-time index** — see **`.rings`**.
 

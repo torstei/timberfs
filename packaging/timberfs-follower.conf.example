@@ -1,14 +1,16 @@
 # /etc/timberfs/follower-<instance>.conf — environment for one follower.
 #
-# Note what is NOT here: the store, the type and the endpoint. Those live in
+# Note what is NOT here: which stores, and what consumes them. Those live in
 # the follower's own declaration, written once by
 #
-#   timberfs follower create central --store applogs --type otlp \
-#       --endpoint http://collector.internal:4318 --retaining --enable --start
+#   timberfs follower create central --select '[service=~apache-.*]' \
+#       --retaining --enable --start -- \
+#       timber-otlp --endpoint http://collector.internal:4318
 #
-# and changed with `timberfs follower update central endpoint=...`. That is the
-# whole point of a registry: one place that answers "what follows this store",
-# validated when it is written rather than at the next restart.
+# and changed with `timberfs follower update central select=...` or a fresh
+# `-- consumer...` tail. That is the whole point of a registry: one place that
+# answers "what is reading these stores", validated when it is written rather
+# than at the next restart.
 #
 # This file is for what must NOT be in it — SECRETS. The registry is
 # world-readable on purpose, so that `timberfs follower list` and `timberfs
@@ -20,7 +22,7 @@
 # timber-otlp reads $OTEL_EXPORTER_OTLP_HEADERS in the same comma-separated
 # spelling every OpenTelemetry SDK does, and falls back to
 # $OTEL_EXPORTER_OTLP_LOGS_ENDPOINT / $OTEL_EXPORTER_OTLP_ENDPOINT for the
-# destination when the declaration names none.
+# destination when the consumer's arguments name none.
 
 #OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer sekrit
 

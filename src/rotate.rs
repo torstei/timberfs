@@ -168,8 +168,8 @@ pub fn cmd_trim(store: &Path, dry_run: bool) -> anyhow::Result<()> {
         .and_then(|f| format::read_header_next_seq(&f))
         .unwrap_or(0)
         .max(records.last().map(|c| c.seq + 1).unwrap_or(0));
-    let anchor = crate::follower::anchor_of(&dir, &name);
-    let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+    let fields = crate::follower::subject_of(&dir, &name);
+    let held = crate::follower::TickInterest::default().floor(&policy, &fields, next_seq);
     if policy.unconsumed {
         match (&held.holder, held.floor) {
             (Some(h), Some(f)) => crate::note!(
@@ -179,6 +179,12 @@ pub fn cmd_trim(store: &Path, dry_run: bool) -> anyhow::Result<()> {
             (Some(h), None) => crate::note!(
                 "timberfs: {name}: {h} retains everything (it has no usable position), so \
                  interest drops nothing"
+            ),
+            // ⚠ Blind is not the same answer, though it holds the same
+            // amount back: the registry could not be read, so EVERY
+            // store on this host is pinned on this axis until it can be.
+            (None, _) if held.blind => crate::note!(
+                "timberfs: {name}: the follower registry could not be read, so interest holds                  everything back on every store here — `timberfs follower list` names the one                  at fault"
             ),
             (None, _) => crate::note!(
                 "timberfs: {name}: nothing retains this store, so interest drops nothing"
@@ -238,7 +244,7 @@ pub fn cmd_trim(store: &Path, dry_run: bool) -> anyhow::Result<()> {
     // floor is only a statement about the store as it is at the moment of
     // the drop.
     let next_seq = st.next_seq(&name).unwrap_or(next_seq);
-    let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+    let held = crate::follower::TickInterest::default().floor(&policy, &fields, next_seq);
     match st.enforce_retention(&name, policy.max_age_ms, policy.max_comp_bytes, held.floor)? {
         None => println!("nothing to trim: every chunk is within the declared policy"),
         Some(stats) => {

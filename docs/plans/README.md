@@ -31,6 +31,13 @@ messages and pull requests are for.
   and fetching bytes from whichever holder has them.
 - [receiving-end.md](receiving-end.md) — identity, names and selection on an
   archive that many senders ship into.
+- [follower-selection.md](follower-selection.md) — one follower declaration
+  for a SET of stores: the selection as its subject, and the poll loop that
+  serves the whole set from one process.
+- [consumer-protocol.md](consumer-protocol.md) — timberfs holds the
+  position and a consumer says how far to move it: three messages, why the
+  watermark means "do not send me these again", and what that makes possible
+  (any language, and a destination on another machine).
 - [paging.md](paging.md) — walking a bounded result set: a cursor beside the
   search rather than inside it, covering every store examined.
 - [logline-order.md](logline-order.md) — ordering a multi-store answer by the

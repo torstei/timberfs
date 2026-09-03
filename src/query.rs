@@ -143,6 +143,14 @@ pub struct SourceHandle {
     /// here — not at the grain load — is what makes the comparison in
     /// `select_chunks` cover the rings read too.
     pub seq_at_open: Option<u64>,
+    /// The PAIR's identity: what the manifest declares, else what the
+    /// index carries. Read at open, because every answer that states an
+    /// id — the per-entry attribution, the `position` a consumer resumes
+    /// from — must give one store one name whichever of its files
+    /// survived. A manifest-only reading makes a store whose bark was
+    /// lost uncursorable, which for a poll loop means re-shipping it
+    /// whole, forever.
+    pub store_id: Option<String>,
 }
 
 pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
@@ -191,11 +199,19 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
         for r in &mut records {
             r.comp_start += trunk_base;
         }
+        // A bundle carries no `.rings` header to fall back on: what its
+        // manifest member says is all there is.
+        let store_id = bark
+            .as_ref()
+            .and_then(|b| b.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         return Ok(SourceHandle {
             records,
             file,
             bark,
             seq_at_open: None,
+            store_id,
         });
     }
     let (dir, base) = resolve_backing(input)?;
@@ -218,11 +234,13 @@ pub fn open_source(input: &Path) -> anyhow::Result<SourceHandle> {
     let file = File::open(format::trunk_path(&dir, &base))
         .with_context(|| format!("opening {}", format::trunk_path(&dir, &base).display()))?;
     let bark = crate::bark::load(&dir, &base);
+    let store_id = crate::bark::identity_of(&dir, &base);
     Ok(SourceHandle {
         records,
         file,
         bark,
         seq_at_open,
+        store_id,
     })
 }
 
@@ -846,7 +864,11 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
             entry_preds,
             max_chunks,
             cursor,
-            no_filename,
+            if no_filename {
+                Attribution::Never
+            } else {
+                Attribution::Auto
+            },
             show_write_time,
             null_sep,
             records,
@@ -883,6 +905,72 @@ pub fn cmd_query(q: &Query) -> anyhow::Result<()> {
         no_filename,
         max_chunks,
         &budget,
+    )
+}
+
+/// Whether an answer names the store each entry came from.
+///
+/// `Auto` is what a person wants: one store attributes nothing, because
+/// there is nothing to tell apart. `Always` is what a PROTOCOL wants — a
+/// consumer is written once and the store count is not its business, so
+/// a stream that attributed conditionally would work against a selection
+/// of three and break on a selection of one. `Never` is `--no-filename`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attribution {
+    Auto,
+    Always,
+    Never,
+}
+
+impl Attribution {
+    fn multi(&self, sources: usize) -> bool {
+        match self {
+            Attribution::Auto => sources > 1,
+            Attribution::Always => true,
+            Attribution::Never => false,
+        }
+    }
+}
+
+/// Read a set of stores FORWARD from where a previous read left each one:
+/// the whole tape from `cursor` on, entries only, bounded to `max`
+/// entries.
+///
+/// The poll a follower runs, and the same read the query document
+/// describes carrying `cursor` and `max.entries` and nothing else — so a
+/// follower shipping from this host and one shipping over the wire ask
+/// the same question of the same code.
+///
+/// ⚠ Entries are attributed (`src`/`id`) only in a MULTI-store answer.
+/// With one store the `source` and `position` records name it and the
+/// entries do not repeat it, so a caller must attribute them itself.
+pub fn read_forward<W: Write>(
+    out: &mut W,
+    files: &[std::path::PathBuf],
+    cursor: &std::collections::BTreeMap<String, u64>,
+    max: u64,
+) -> anyhow::Result<()> {
+    query_entries(
+        out,
+        files,
+        0,
+        u64::MAX,
+        None,
+        false,
+        &[],
+        &[],
+        None,
+        None,
+        cursor,
+        // A consumer of this stream is written once and the store count
+        // is not its business.
+        Attribution::Always,
+        false,
+        false,
+        true,
+        Some(max),
+        Default::default(),
+        &Budget::Unbounded,
     )
 }
 
@@ -949,7 +1037,7 @@ fn query_entries<W: Write>(
     entry_preds: Option<crate::grep::Preds>,
     max_chunks: Option<u64>,
     cursor: &std::collections::BTreeMap<String, u64>,
-    no_filename: bool,
+    attribution: Attribution,
     show_write_time: bool,
     null_sep: bool,
     records: bool,
@@ -979,7 +1067,7 @@ fn query_entries<W: Write>(
         /// the edge is not in it.
         live: crate::live::LiveTail,
     }
-    let multi = files.len() > 1 && !no_filename;
+    let multi = attribution.multi(files.len());
     // A predicate the token index answers, rather than one judged on the
     // entry: the difference decides whether the live edge can be part of
     // the answer (see the `live` field below).
@@ -1060,10 +1148,8 @@ fn query_entries<W: Write>(
         // and the answer that produced it named the store that way.
         let dropped = dropped_bytes_of(f);
         let resume_at = source
-            .bark
-            .as_ref()
-            .and_then(|b| b.get("id"))
-            .and_then(|v| v.as_str())
+            .store_id
+            .as_deref()
             .and_then(|id| cursor.get(id))
             .copied();
         let framing = crate::entry::Framing {
@@ -1185,13 +1271,7 @@ fn query_entries<W: Write>(
             // and what a position is recorded against. A path names a
             // store only within one response; everything durable — a
             // follower's declaration, a cursor, `list --json` — uses this.
-            if let Some(id) = s
-                .handle
-                .bark
-                .as_ref()
-                .and_then(|b| b.get("id"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(id) = s.handle.store_id.as_deref() {
                 write!(out, "\x1fid={id}")?;
             }
             write!(
@@ -1350,13 +1430,7 @@ fn query_entries<W: Write>(
         // of the window, which on a fleet is most of the cost.
         for (f, s) in files.iter().zip(&srcs) {
             write!(out, "\x1eposition\x1fpath={}", f.display())?;
-            if let Some(id) = s
-                .handle
-                .bark
-                .as_ref()
-                .and_then(|b| b.get("id"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(id) = s.handle.store_id.as_deref() {
                 write!(out, "\x1fid={id}")?;
             }
             // Just past the last entry DELIVERED — or, where this store
@@ -2048,14 +2122,9 @@ fn write_chunks_framed<W: Write>(
             has,
             any,
         )?;
-        // The manifest's id as text; `store_id_of` hands back bytes for the
+        // The pair's id as text; `store_id_of` hands back bytes for the
         // entry sink, which writes them straight out.
-        let id: Option<String> = source
-            .bark
-            .as_ref()
-            .and_then(|b| b.get("id"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let id: Option<String> = source.store_id.clone();
         total_chunks += source.records.len();
         write!(out, "\x1esource\x1fpath={}", f.display())?;
         if let Some(id) = &id {
@@ -2416,9 +2485,11 @@ pub struct StoreSummary {
     /// Bytes currently buffered in the `.sap` sidecar (header excluded),
     /// not yet folded into a chunk — a read-only stat, never replayed.
     pub sap_pending_bytes: Option<u64>,
-    /// The store's durable identity, when it declares one. A store written
-    /// by a plain `append` has no manifest and so no id — which is why a
-    /// catalogue must be able to say "none" rather than assume.
+    /// The store's durable identity: what its manifest declares, else
+    /// what its index carries — the PAIR is the store. `None` only where
+    /// neither side has one, which is what a plain `append` leaves until
+    /// something mints one, and is `identity`'s own verdict of "not a
+    /// store". A catalogue must be able to say so rather than assume.
     pub id: Option<String>,
     pub created: Option<String>,
     /// The id of the store these entries came FROM, when they arrived over
@@ -2490,12 +2561,24 @@ impl StoreSummary {
     /// measured for it. Legacy cursors can never be in that state (a
     /// cursor found in a directory declares no interest at all), so they
     /// compare on bytes alone.
-    pub fn worst_lag(&self) -> Option<String> {
+    pub fn worst_lag<'a>(&'a self) -> Option<String> {
+        // This store's place in each follower, not the follower's worst
+        // across its whole selection — that would name another store's
+        // backlog on this store's page.
+        let here = |r: &'a crate::follower::Registered| -> Option<&'a crate::follower::Covered> {
+            self.id.as_deref().and_then(|id| r.at(id))
+        };
         let followers = self.followers.iter().map(|r| {
+            let c = here(r);
             (
-                r.holds_everything(),
-                r.standing.map_or(0, |s| s.behind_bytes),
-                r.lag_text(),
+                self.retain_unconsumed && r.decl.retaining && c.is_some_and(|c| !c.read),
+                c.map_or(0, |c| c.behind_bytes()),
+                c.map(|c| match (&c.standing, c.read) {
+                    (_, false) => "never read".to_string(),
+                    (Some(st), true) => st.lag_text(),
+                    (None, true) => "store unreadable".to_string(),
+                })
+                .unwrap_or_else(|| "not covered".to_string()),
             )
         });
         let legacy = self
@@ -2630,7 +2713,9 @@ pub fn summarize_store(
         index_declared,
         wal_declared,
         sap_pending_bytes,
-        id: get("id"),
+        // The pair's, so `list` and `info` name a store the same way a
+        // selection and a position do.
+        id: crate::bark::identity_of(dir, name),
         created: get("created"),
         origin_id: bark.and_then(crate::bark::origin_id),
         declared_name: get("name"),
@@ -2733,6 +2818,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     // and nothing holds a position in a snapshot.
     let mut consumers: Option<crate::cursor::Survey> = None;
     let mut followers: Vec<crate::follower::Registered> = Vec::new();
+    let mut store_id: Option<String> = None;
     // Pair-only, and deliberately: `export` numbers a bundle's chunks from
     // 0 because it selects a window out of the MIDDLE, so a bundle's
     // numbering carries no history and reporting one would be a lie.
@@ -2836,8 +2922,8 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             name = base.clone();
         }
         location = dir.display().to_string();
-        let anchor = crate::cursor::store_anchor(&dir, &base, handle.bark.as_ref());
-        let declared = crate::follower::for_store(&crate::follower::registry_dir(), &anchor);
+        let fields = crate::follower::subject_of(&dir, &base);
+        let declared = crate::follower::for_store(&crate::follower::registry_dir(), &fields);
         let s = summarize_store(&dir, &base, records, handle.bark.as_ref(), declared);
         // Classified before anything is moved out of the summary.
         numbering = Some(Numbering {
@@ -2858,6 +2944,9 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
         );
         consumers = s.consumers;
         followers = s.followers;
+        // This store's identity, so a follower's line on this page is
+        // about this store and not its worst one elsewhere.
+        store_id = s.id.clone();
         (
             s.chunks,
             s.logical_bytes,
@@ -2999,7 +3088,7 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
             );
         }
         if !bundled {
-            print_followers(&followers, compressed);
+            print_followers(store_id.as_deref(), &followers, compressed);
         }
         print_numbering(numbering);
         if let Some(sv) = &consumers {
@@ -3093,21 +3182,31 @@ fn print_numbering(numbering: Option<Numbering>) {
 /// leads with them: they are the reason a store is large, and until
 /// PR-next's `retain_unconsumed` lands they are also the reason it is
 /// NOT, which is worth being honest about in one place.
-fn print_followers(followers: &[crate::follower::Registered], compressed: u64) {
+fn print_followers(id: Option<&str>, followers: &[crate::follower::Registered], compressed: u64) {
     if followers.is_empty() {
         return;
+    }
+    // This store's place in each follower — see `worst_lag`.
+    fn here<'a>(
+        id: Option<&str>,
+        r: &'a crate::follower::Registered,
+    ) -> Option<&'a crate::follower::Covered> {
+        id.and_then(|id| r.at(id))
     }
     let retaining: Vec<&crate::follower::Registered> =
         followers.iter().filter(|r| r.decl.retaining).collect();
     // What no retention honouring these followers could drop: the
-    // furthest-behind retaining one's backlog — or the whole store, when
-    // one of them has never run, since it holds everything.
-    let held = if retaining.iter().any(|r| r.holds_everything()) {
+    // furthest-behind retaining one's backlog HERE — or the whole store,
+    // when one of them has never read it, since it then holds all of it.
+    let held = if retaining
+        .iter()
+        .any(|r| here(id, r).is_some_and(|c| !c.read))
+    {
         compressed
     } else {
         retaining
             .iter()
-            .map(|r| r.standing.map_or(0, |s| s.behind_bytes))
+            .map(|r| here(id, r).map_or(0, |c| c.behind_bytes()))
             .max()
             .unwrap_or(0)
     };
@@ -3132,8 +3231,16 @@ fn print_followers(followers: &[crate::follower::Registered], compressed: u64) {
         .unwrap_or(0)
         .max(8);
     for r in followers {
-        let mut detail = r.lag_text();
-        if let Some(st) = &r.standing {
+        let c = here(id, r);
+        let mut detail = match c {
+            None => "not covered".to_string(),
+            Some(c) if !c.read => "never read".to_string(),
+            Some(c) => match &c.standing {
+                Some(st) => st.lag_text(),
+                None => "store unreadable".to_string(),
+            },
+        };
+        if let Some(st) = c.and_then(|c| c.standing.as_ref()) {
             if st.gap_chunks.is_none() && st.behind_chunks > 0 && !st.at_live_edge() {
                 detail = format!(
                     "{detail}, {} unread in {} chunk(s)",
@@ -3147,9 +3254,12 @@ fn print_followers(followers: &[crate::follower::Registered], compressed: u64) {
             r.name(),
             if r.decl.retaining { "retaining, " } else { "" },
             detail,
-            match &r.cursor {
-                Some(c) if c.delivered > 0 => format!("; {} delivered", c.delivered),
-                _ => String::new(),
+            // How many stores it covers, when it covers more than this
+            // one: a follower's name on this page is not the whole of it.
+            if r.covered.len() > 1 {
+                format!("; 1 of {} stores", r.covered.len())
+            } else {
+                String::new()
             },
             r.live.word(),
             width = width
@@ -3690,11 +3800,7 @@ fn store_value(
 /// The store's declared id, as bytes for a record field. Absent for a
 /// store with no manifest, which a plain `append` writes.
 fn store_id_of(h: &SourceHandle) -> Option<Vec<u8>> {
-    h.bark
-        .as_ref()
-        .and_then(|b| b.get("id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.as_bytes().to_vec())
+    h.store_id.as_ref().map(|s| s.as_bytes().to_vec())
 }
 
 /// What has left this store over its life, uncompressed. Added to a
@@ -3707,7 +3813,7 @@ fn store_id_of(h: &SourceHandle) -> Option<Vec<u8>> {
 /// Harmless: the understatement is a constant, every later drop is
 /// counted, and a position only ever has to be comparable with others
 /// from the same store.
-fn dropped_bytes_of(input: &Path) -> u64 {
+pub fn dropped_bytes_of(input: &Path) -> u64 {
     let Ok((dir, name)) = resolve_backing(input) else {
         return 0;
     };
@@ -4017,7 +4123,7 @@ mod paging_tests {
             None,
             None,
             cursor,
-            false,
+            Attribution::Auto,
             false,
             false,
             true, // records
@@ -4434,7 +4540,7 @@ mod paging_tests {
             None,
             None,
             &Default::default(),
-            true,
+            Attribution::Never,
             false,
             false,
             true,
@@ -4526,10 +4632,10 @@ mod deadline_tests {
             None,
             None,
             &Default::default(),
-            false, // no_filename: several stores, so they are labelled
-            false, // show_write_time
-            false, // null_sep
-            true,  // records
+            Attribution::Auto, // several stores, so they are labelled
+            false,             // show_write_time
+            false,             // null_sep
+            true,              // records
             None,
             Default::default(),
             budget,
@@ -4713,7 +4819,7 @@ mod served_bytes_tests {
                 None,
                 None,
                 &Default::default(),
-                true,  // no_filename
+                Attribution::Never,
                 false, // show_write_time
                 false, // null_sep
                 true,  // records
@@ -4777,7 +4883,7 @@ mod served_bytes_tests {
             None,
             None,
             &Default::default(),
-            true,  // no_filename
+            Attribution::Never,
             false, // show_write_time
             false, // null_sep
             true,  // records

@@ -6,9 +6,11 @@
 
 pub mod append;
 pub mod bark;
+pub mod consumer;
 pub mod cursor;
 pub mod entry;
 pub mod export;
+pub mod feed;
 pub mod follow;
 pub mod follower;
 pub mod forest;
@@ -38,6 +40,7 @@ pub mod rotate;
 pub mod sap;
 pub mod select;
 pub mod serve;
+pub mod ship;
 pub mod sink;
 pub mod store;
 pub mod store_json;

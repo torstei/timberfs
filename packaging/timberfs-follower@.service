@@ -1,25 +1,31 @@
-# Systemd template for one registered follower of a store: a consumer with a
-# name, a type, a `retaining` flag and a durable position, declared once with
+# Systemd template for one registered follower: a SELECTION of stores fed to a
+# consumer, with a name, a `retaining` flag and a durable position per store,
+# declared once with
 #
-#   timberfs follower create central --store applogs --type otlp \
-#       --endpoint http://collector.internal:4318 --retaining --enable --start
+#   timberfs follower create central --select '[service=~apache-.*]' \
+#       --retaining --enable --start -- \
+#       timber-otlp --endpoint http://collector.internal:4318
 #
 # and then run by this unit. `%i` is the follower's name, which is why those
 # names are constrained to [A-Za-z0-9_.-]: no systemd-escape, so the name in
 # `systemctl status` is the name that was typed.
 #
+# One unit per DESTINATION, not per store: the selection is re-resolved on
+# every poll, so a store that appears later is picked up with no new unit and
+# no edit here.
+#
 # There is no per-instance .conf holding a store and an endpoint, unlike every
 # other timberfs unit — that is the point of the registry. `timberfs follower
-# run %i` reads the declaration and EXECs the right shipper for its type,
-# replacing its own process, so this unit supervises the shipper directly. A
-# dispatcher, not a supervisor: timberfs runs no daemon of its own here.
+# run %i` reads the declaration, spawns the consumer and feeds it; the consumer
+# is a child, so this unit supervises the pair and timberfs runs no daemon of
+# its own.
 #
 # ⚠ Not to be confused with timberfs-follow@ — one letter, opposite direction.
 # That one is an INTAKE (`timberfs import --follow`): it reads a producer's file
 # INTO a store. This one reads a store OUT to somewhere else.
 #
-#   systemctl status timberfs-follower@central     # is my shipper running?
-#   timberfs follower status central               # ...and where is it?
+#   systemctl status timberfs-follower@central     # is my follower running?
+#   timberfs follower status central               # ...and where is each store?
 
 [Unit]
 Description=timberfs follower (%i)

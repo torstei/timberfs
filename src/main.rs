@@ -1,6 +1,6 @@
 use timberfs::{
-    append, bark, export, follow, follower, forest, forward, fs, grain, import, incus,
-    incus_intake, list, note, otlp_intake, query, querydoc, rotate, sink, store,
+    append, bark, export, feed, follow, follower, forest, forward, fs, grain, import, incus,
+    incus_intake, list, note, otlp_intake, query, querydoc, rotate, select, ship, sink, store,
 };
 
 use std::path::PathBuf;
@@ -432,6 +432,54 @@ enum Command {
         #[command(subcommand)]
         command: FollowerCommand,
     },
+    /// Feed a CONSUMER: read every store a predicate matches, hand the
+    /// records to a program, and move each store's position as far as
+    /// that program says it got. timberfs owns the position — the
+    /// consumer reports, and a report is the only thing that advances
+    /// one. Any program that speaks the consumer protocol will do,
+    /// including a shell script; see the consumer protocol
+    Feed {
+        /// Which stores: the predicate `list --select` takes. `[]` is
+        /// every store, which is a thing to have written rather than a
+        /// flag to leave out
+        #[arg(long, value_name = "EXPR")]
+        select: String,
+        /// ONE FILE holding every matched store's place, keyed by store
+        /// identity, so a restart resumes rather than re-sends. One file
+        /// and not one per store because an atomic save costs two
+        /// fsyncs: 500 stores measured at 3.9ms against 542ms. Omitted,
+        /// the places live only as long as this process — a temporary
+        /// watch
+        #[arg(long, value_name = "FILE")]
+        positions: Option<PathBuf>,
+        /// Keep going as entries arrive. Without it the selection is
+        /// drained once and this exits — a durable one-shot, durable
+        /// because the positions are
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Maximum entries handed over before the consumer's reports are
+        /// collected
+        #[arg(long, value_name = "N", default_value = "512")]
+        batch_size: u64,
+        /// How long to wait before asking again, once an answer was
+        /// exhausted
+        #[arg(long, value_name = "DUR", default_value = "1s")]
+        poll: String,
+        /// Where a store this has never read is picked up: `discovery`
+        /// ships one born since this began from its beginning and one
+        /// that predates it from its next byte; `begin` ships everything
+        /// either has; `end` ships neither's history
+        #[arg(long, value_name = "WHERE", default_value = "discovery",
+              value_parser = ["begin", "end", "discovery"])]
+        follow_from: String,
+        /// Forests to search; default: every configured one
+        #[arg(long, value_name = "DIR")]
+        forest: Vec<PathBuf>,
+        /// The consumer and its arguments, after `--`. A list, so
+        /// nothing makes a quoting round trip: `-- ssh archive01 my-sink`
+        #[arg(last = true, value_name = "CONSUMER")]
+        consumer: Vec<String>,
+    },
     /// Show a store's vital signs on one screen: identity, lineage,
     /// data and compression, time covered, index sizes and coverage,
     /// writer state. Works on backing pairs and .timber bundles alike
@@ -467,13 +515,17 @@ enum Command {
         /// A JSON array of objects instead of the human table
         #[arg(long)]
         json: bool,
-        /// Select stores by their manifest LABELS rather than by name:
-        /// `--select 'type=console,host=web01'`. Comma-separated terms are
-        /// ANDed; `key=value`, `key!=value`, `key=~regex` and `key!~regex`
-        /// (regexes anchored at both ends); an absent label reads as the
-        /// empty string, so `key!=` selects the stores that declare it.
-        /// `*` is every store, as an omitted --select is. Quote a value
-        /// that must contain a comma
+        /// Select stores by their manifest: `--select
+        /// '[type=console,host=web01]'`. Comma-separated terms are ANDed;
+        /// `key=value`, `key!=value`, `key=~regex`, `key!~regex`,
+        /// `key=*text` (a literal anywhere in the value) and `key!*text`
+        /// (regexes anchored at both ends); a BARE WORD is the name,
+        /// matched anywhere in it. An absent label reads as the empty
+        /// string, so `key!=` selects the stores that declare it. The
+        /// wrapping brackets are optional here and are how a predicate
+        /// is written in timbersh, so one pastes into the other; `[]` is
+        /// the predicate with no terms, which is every store, as an
+        /// omitted --select is. Quote a value that must contain a comma
         #[arg(long, value_name = "EXPR")]
         select: Option<String>,
         /// Print each store's whole id instead of the leading 8
@@ -675,12 +727,16 @@ enum Command {
         #[arg(long, value_name = "ADDR")]
         endpoint: String,
         /// Keep shipping as chunks seal, on the same connection — what a
-        /// registered `--type frames` follower runs
+        /// service unit for this runs
         #[arg(long, short = 'f')]
         follow: bool,
-        /// Record the far end's acknowledged position here, so
-        /// `retain_unconsumed` knows what has left this box. Not a resume
-        /// point: the receiver's own coverage is what a resume reads
+        /// Record the far end's acknowledged position here, so a store
+        /// declaring `cursors=<dir>` can REPORT what has left this box
+        /// (`info`, `list`). Not a resume point — the receiver's own
+        /// coverage is what a resume reads — and ⚠ not a retention hold
+        /// either: `retain_unconsumed` reads the follower registry
+        /// alone, and frames cannot be a follower until the `chunks`
+        /// diet lands
         #[arg(long, value_name = "PATH")]
         cursor: Option<PathBuf>,
         /// Ship no sidecars, so the receiver rebuilds its own index
@@ -885,27 +941,36 @@ enum ForestCommand {
 
 #[derive(Subcommand)]
 enum FollowerCommand {
-    /// Register a follower of a store. The name is host-unique and is
-    /// also the systemd instance (`timberfs-follower@<name>`), so it is
-    /// what gets typed into `systemctl status` — refused if taken, so a
-    /// collision is a registration error rather than two processes
-    /// overwriting one position
+    /// Register a follower: a selection, a consumer to feed it to, and
+    /// whether its positions hold retention back. The name is
+    /// host-unique and is also the systemd instance
+    /// (`timberfs-follower@<name>`), so it is what gets typed into
+    /// `systemctl status` — refused if taken, so a collision is a
+    /// registration error rather than two processes overwriting one
+    /// position
     Create {
         /// The follower's name: [A-Za-z0-9_.-], host-unique
         name: String,
-        /// The store to follow: a path, or a forest handle. Recorded by
-        /// IDENTITY (its .bark id, minted here if it has none), not by
-        /// path — a store can move
+        /// WHICH stores to follow: the predicate `list --select` takes.
+        /// `[]` is every store, which is a thing to have written rather
+        /// than a flag to leave out. Re-resolved on every poll, so a
+        /// store that appears later is picked up with no change here
+        #[arg(long, value_name = "EXPR", conflicts_with = "store")]
+        select: Option<String>,
+        /// One store instead of a predicate: a path or a forest handle,
+        /// recorded by IDENTITY (its .bark id, minted here if it has
+        /// none) as the one-term selection `[id=...]` — a store can move
         #[arg(long, value_name = "STORE")]
-        store: PathBuf,
-        /// What runs it: `otlp` execs timber-otlp (entries, over OTLP);
-        /// `frames` execs `timberfs frames-send` (chunks verbatim, over the
-        /// native wire, to a `frames-intake`)
-        #[arg(long = "type", value_name = "TYPE", default_value = "otlp")]
-        kind: String,
-        /// Where it ships to (the shipper's --endpoint)
-        #[arg(long, value_name = "URL")]
-        endpoint: Option<String>,
+        store: Option<PathBuf>,
+        /// Where a store this follower has never read is picked up:
+        /// `discovery` (the default unless --retaining) ships one born
+        /// since the follower was declared from its beginning and one
+        /// that predates it from its next byte; `begin` (the default
+        /// WITH --retaining, which promises the data is not lost until
+        /// this follower has it) ships everything; `end` ships no
+        /// history at all
+        #[arg(long, value_name = "WHERE", value_parser = ["begin", "end", "discovery"])]
+        follow_from: Option<String>,
         /// Declare that this follower's position holds the store's head
         /// back: retention keeps what it has not read ON TOP OF what age
         /// and size keep, never as a cap on them — `retain_size` still
@@ -926,12 +991,15 @@ enum FollowerCommand {
         /// registering nothing
         #[arg(long)]
         dry_run: bool,
-        /// Everything after `--` is passed to the shipper verbatim, in
-        /// its own spelling: `-- --service checkout --compress gzip`.
-        /// Deliberately not re-declared here — a second spelling of the
-        /// same flags is a second thing to keep in step
-        #[arg(last = true, value_name = "ARGS")]
-        args: Vec<String>,
+        /// The CONSUMER and its arguments, after `--`: the program fed
+        /// the records, which reports how far to move the positions.
+        /// `-- timber-otlp --endpoint http://collector:4318`, or
+        /// `-- ssh archive01 my-consumer` for a destination on another
+        /// machine. A list, so nothing makes a quoting round trip; and
+        /// recorded verbatim, since what is not ours to interpret is
+        /// passed on unread
+        #[arg(last = true, value_name = "CONSUMER")]
+        command: Vec<String>,
     },
     /// Every registered follower: name, store, type, whether it retains,
     /// its position, how far behind it is, and whether it is running
@@ -962,8 +1030,9 @@ enum FollowerCommand {
     /// own command
     Update {
         name: String,
-        /// KEY=VALUE: retaining=true|false, endpoint=URL, type=TYPE,
-        /// store=PATH
+        /// KEY=VALUE: retaining=true|false, select=EXPR, store=PATH,
+        /// follow_from=begin|end|discovery.
+        /// The consumer is replaced wholesale with what follows `--`
         #[arg(value_name = "KEY=VALUE")]
         sets: Vec<String>,
         /// Remove a key (repeatable): --unset endpoint
@@ -972,9 +1041,8 @@ enum FollowerCommand {
         /// Preview the new declaration without writing it
         #[arg(long)]
         dry_run: bool,
-        /// Replace the shipper's arguments wholesale with what follows
-        /// `--`
-        #[arg(last = true, value_name = "ARGS")]
+        /// Replace the CONSUMER wholesale with what follows `--`
+        #[arg(last = true, value_name = "CONSUMER")]
         args: Vec<String>,
     },
     /// Unregister a follower. Refused while it is `retaining` (release
@@ -990,10 +1058,11 @@ enum FollowerCommand {
         #[arg(long)]
         disable: bool,
     },
-    /// Read a follower's declaration and EXEC its shipper — what the
-    /// systemd template runs. A dispatcher, not a supervisor: the
-    /// process is replaced, so systemd keeps the lifecycle, the restarts
-    /// and the journal
+    /// Read a follower's declaration and RUN it — what the systemd
+    /// template runs: the selection is read, its consumer is fed, and
+    /// each store's position moves as far as that consumer says it got.
+    /// The consumer is a child, so systemd keeps the lifecycle, the
+    /// restarts and the journal
     Run { name: String },
 }
 
@@ -1388,28 +1457,59 @@ fn main() -> anyhow::Result<()> {
             ForestCommand::List { names, json } => forest::cmd_list(json, names)?,
             ForestCommand::Remove { name, dry_run } => forest::cmd_remove(&name, dry_run)?,
         },
+        Command::Feed {
+            select,
+            positions,
+            follow,
+            batch_size,
+            poll,
+            follow_from,
+            forest,
+            consumer,
+        } => {
+            if batch_size == 0 {
+                anyhow::bail!("--batch-size must be at least 1");
+            }
+            feed::run(feed::Opts {
+                selector: select::Selector::parse(&select)?,
+                dirs: forest,
+                positions,
+                batch_entries: batch_size,
+                poll: std::time::Duration::from_millis(append::parse_duration_ms(&poll)?.max(1)),
+                follow,
+                argv: consumer,
+                hello_wait: feed::HELLO_WAIT,
+                follow_from: ship::FollowFrom::parse(&follow_from)?,
+                // No declaration, so the positions file is the only
+                // record of when this interest began.
+                since: None,
+            })?;
+        }
         Command::Follower { command } => match command {
             FollowerCommand::Create {
                 name,
+                select,
                 store,
-                kind,
-                endpoint,
+                follow_from,
                 retaining,
                 enable,
                 start,
                 dry_run,
-                args,
+                command,
             } => follower::cmd_create(
                 &name,
                 follower::CreateOpts {
+                    select,
                     store,
-                    kind,
-                    endpoint,
+                    follow_from: follow_from
+                        .as_deref()
+                        .map(ship::FollowFrom::parse)
+                        .transpose()?,
                     retaining,
                     enable,
                     start,
                     dry_run,
-                    args,
+                    command,
                 },
             )?,
             FollowerCommand::List { store, names, json } => {
@@ -1750,6 +1850,10 @@ mod cli_tests {
     /// anywhere in the page is enough — this catches ABSENCE, which is
     /// the failure nothing else sees.
     ///
+    /// NESTED verbs are walked too: `follower create` is where the
+    /// followers surface lives, and a check that stopped at the top level
+    /// saw none of it.
+    ///
     /// Omissions are allowed but must be stated here, so leaving one out
     /// is a decision somebody made rather than something nobody noticed.
     #[test]
@@ -1761,17 +1865,27 @@ mod cli_tests {
         // `\-\-select`. Compare against the page with those undone.
         let plain = man.replace("\\-", "-");
         let mut missing = Vec::new();
-        for sub in Cli::command().get_subcommands() {
-            let name = sub.get_name().to_string();
-            if name == "help" {
+        let cli = Cli::command();
+        let mut queue: Vec<(String, &clap::Command)> = cli
+            .get_subcommands()
+            .map(|s| (s.get_name().to_string(), s))
+            .collect();
+        while let Some((name, sub)) = queue.pop() {
+            if name.ends_with("help") {
                 continue;
+            }
+            for nested in sub.get_subcommands() {
+                queue.push((format!("{name} {}", nested.get_name()), nested));
             }
             for arg in sub.get_arguments() {
                 let Some(long) = arg.get_long() else { continue };
                 if long == "help" || long == "version" {
                     continue;
                 }
-                if allowed.iter().any(|(s, f, _)| *s == name && *f == long) {
+                if allowed
+                    .iter()
+                    .any(|(s, f, _)| *s == name.as_str() && *f == long)
+                {
                     continue;
                 }
                 if !plain.contains(&format!("--{long}")) {

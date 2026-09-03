@@ -860,7 +860,8 @@ pub fn mount(
             // Paired with the policy and re-derived on the same manifest
             // change: minting a store's identity (what `follower create`
             // does) IS such a change, so one stat catches both.
-            let mut anchors: HashMap<String, String> = HashMap::new();
+            let mut subjects: HashMap<String, serde_json::Map<String, serde_json::Value>> =
+                HashMap::new();
             let mut stamps: HashMap<String, Stamp> = HashMap::new();
             let mut warned: std::collections::HashSet<String> = std::collections::HashSet::new();
             // Flushed-chunk count per store when its grain was last
@@ -896,7 +897,7 @@ pub fn mount(
                         last_good.get(&name).copied().unwrap_or_default()
                     } else {
                         stamps.insert(name.clone(), cur);
-                        anchors.insert(name.clone(), crate::follower::anchor_of(&dir, &name));
+                        subjects.insert(name.clone(), crate::follower::subject_of(&dir, &name));
                         match crate::bark::declared_retention(&dir, &name) {
                             Ok(p) => {
                                 warned.remove(&name);
@@ -917,9 +918,9 @@ pub fn mount(
                     if !policy.is_some() {
                         continue;
                     }
-                    let anchor = anchors.get(&name).cloned().unwrap_or_default();
+                    let fields = subjects.get(&name).cloned().unwrap_or_default();
                     let next_seq = store.lock().unwrap().next_seq(&name).unwrap_or(0);
-                    let held = interest.floor(&policy, &anchor, next_seq);
+                    let held = interest.floor(&policy, &fields, next_seq);
                     let res = store.lock().unwrap().enforce_retention(
                         &name,
                         policy.max_age_ms,

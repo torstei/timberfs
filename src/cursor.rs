@@ -39,9 +39,12 @@ use serde_json::{Map, Value};
 
 use crate::format::ChunkRecord;
 
-/// One consumer's position, as persisted. The file is a flat JSON object
-/// so an operator can rewind by editing `seq` (the supported edit) — but
-/// it is machine-owned state: unknown keys are ignored, not preserved.
+/// One consumer's position, as persisted. A flat JSON object so it can be
+/// READ — but machine-owned STATE, not configuration: unknown keys are
+/// ignored rather than preserved, and the resume point travels with a
+/// retention floor that means something else, so editing one field is a
+/// lie about the other. Removing an entry is the coherent reset, since
+/// absence moves both at once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cursor {
     /// Who wrote it, for the operator staring at a state directory.
@@ -224,24 +227,361 @@ impl Cursor {
             "updated".into(),
             Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
         );
-        let text = serde_json::to_string_pretty(&Value::Object(map))? + "\n";
-
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f =
-                fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-            f.write_all(text.as_bytes())?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
-        // Durable NAME, not just durable bytes: without this the rename
-        // itself can be lost and the cursor reverts to its previous value.
-        if let Ok(d) = fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-        Ok(())
+        write_atomically(path, &Value::Object(map))
     }
+}
+
+/// Atomic and durable: a torn or empty position file after a crash would
+/// be unreadable, and an unreadable position stops the consumer. tmp +
+/// fsync + rename + fsync of the directory; the pre-rename content is
+/// always a valid older position, which re-delivers rather than skips.
+fn write_atomically(path: &Path, v: &Value) -> anyhow::Result<()> {
+    let text = serde_json::to_string_pretty(v)? + "\n";
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f =
+            fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+    // Durable NAME, not just durable bytes: without this the rename
+    // itself can be lost and the position reverts to its previous value.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// a position in each store of a selection
+// ---------------------------------------------------------------------------
+
+/// One consumer's position in EVERY store of a selection, keyed by store
+/// identity.
+///
+/// ONE FILE, not a directory of cursors, and the reason is COST rather
+/// than atomicity. Measured 2026-09-02 on ext4, saving 500 stores:
+/// **3.9 ms as one file against 542 ms as one file per store**, a factor
+/// of 140 — an atomic save is a write, an fsync, a rename and an fsync of
+/// the directory, and per store that is two thousand fsyncs a batch. (On
+/// tmpfs the same comparison is 2×, which is why it has to be measured
+/// somewhere fsync means something.) The retention tick reads them too,
+/// once instead of N times.
+///
+/// ⚠ Not because a batch must move all its stores or none. It need not:
+/// a torn set of per-store files would leave some stores resuming
+/// earlier and re-delivering, which is at-least-once — the guarantee
+/// this whole path already offers, neither OTLP nor the Forward protocol
+/// carrying a deduplication key. Positions only move forward and stores
+/// are independent, so there is no cross-store invariant to break. One
+/// file gets atomicity for nothing; it is not what pays for it.
+///
+/// The position is an OFFSET on the store's tape rather than the
+/// `(seq, n)` a `Cursor` holds. It is what the answer's `position` record
+/// carries, so no conversion can disagree with the wire; and it addresses
+/// an entry in the WRITE-AHEAD SEGMENT, which a chunk number cannot — a
+/// chunk-granular position stands still at the live edge, so a restart
+/// re-delivers everything written since the last flush. The interest axis
+/// wants a chunk number and derives one, the store's own rings being what
+/// says which chunk an offset sits in.
+///
+/// A store that leaves the selection KEEPS its entry: bringing it back
+/// should resume, not re-ship a history. Membership is decided by the
+/// selection, never by what this file happens to hold, so a stale entry
+/// holds no retention and costs a few bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Positions {
+    pub consumer: String,
+    /// When this consumer came into being, as far as this file knows:
+    /// when its places were first written.
+    ///
+    /// It has to SURVIVE a restart, or a store created while the
+    /// consumer was down would count as older than it and be skipped —
+    /// which is the opposite of what `discovery` is for. A FOLLOWER has
+    /// a truer answer still and supplies it (`Shipper::since_declared`),
+    /// this file being written at its first run rather than when it was
+    /// declared.
+    pub created: String,
+    pub at: std::collections::BTreeMap<String, At>,
+    /// The consumer's last word about ITSELF rather than about a store —
+    /// an unreachable endpoint is not per store.
+    pub note: Option<Note>,
+    /// Its last word about each store, keyed the same way positions are.
+    ///
+    /// ⚠ A separate map and not a field of `At`, because a note and a
+    /// position have different lifetimes: the store a consumer most needs
+    /// to explain is the one it has never got past, which has no position
+    /// to hang a note on. Keeping them together lost the store's name
+    /// from exactly the note that most needed it.
+    pub notes: std::collections::BTreeMap<String, Note>,
+}
+
+/// Why nothing is moving, in the consumer's own words.
+///
+/// Kept here rather than only logged because `follower status` is
+/// ANOTHER PROCESS: a stalled follower's reason has to outlive the line
+/// it was printed on, or the one place an operator looks cannot show it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    pub text: String,
+    /// The entry it is about, when it is about one. An ADDRESS: the same
+    /// offset `timberview` opens at, so a note names a place a person
+    /// can go and look.
+    pub offset: Option<u64>,
+    pub when: String,
+}
+
+/// Where one store stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct At {
+    /// Resume just here: absolute on the store's tape, so retention
+    /// cannot move it.
+    pub offset: u64,
+    /// The chunk the newest delivered entry came from, when it came from
+    /// one. TWO positions, because they answer different questions and
+    /// neither can answer the other's: the offset is where to RESUME,
+    /// exact and valid inside the write-ahead segment; this is the
+    /// RETENTION FLOOR, chunks strictly below it being fully consumed.
+    ///
+    /// Recorded rather than derived, so the interest axis needs no rings
+    /// file to convert an offset — the answer states the chunk on every
+    /// entry that has one. `None` only until the first entry from a
+    /// sealed chunk arrives: an entry read from the live edge has no
+    /// chunk yet, and leaving the floor where it was is the conservative
+    /// direction.
+    pub chunk: Option<u64>,
+    /// The store's path when last written — informational, since identity
+    /// is what matches.
+    pub path: String,
+    /// The write time of the newest entry delivered, and how many have
+    /// been. For a human reading the file; neither decides anything.
+    pub wl: u64,
+    pub delivered: u64,
+}
+
+impl Positions {
+    pub fn new(consumer: &str) -> Positions {
+        Positions {
+            consumer: consumer.to_string(),
+            created: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            at: Default::default(),
+            note: None,
+            notes: Default::default(),
+        }
+    }
+
+    /// Record a consumer's note, and say whether anything changed.
+    ///
+    /// Deduped by TEXT, so a consumer retrying once a second produces one
+    /// note and one write rather than sixty. `None` for the store means
+    /// the note is about the consumer itself.
+    pub fn take_note(&mut self, id: Option<&str>, offset: Option<u64>, text: &str) -> bool {
+        let fresh = Note {
+            text: text.to_string(),
+            offset,
+            when: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        };
+        let same = |old: &Option<Note>| {
+            old.as_ref()
+                .is_some_and(|n| n.text == fresh.text && n.offset == fresh.offset)
+        };
+        match id {
+            None => {
+                if same(&self.note) {
+                    return false;
+                }
+                self.note = Some(fresh);
+                true
+            }
+            Some(id) => {
+                if same(&self.notes.get(id).cloned()) {
+                    return false;
+                }
+                self.notes.insert(id.to_string(), fresh);
+                true
+            }
+        }
+    }
+
+    /// Missing is `None` (a first run); present-but-unreadable is an
+    /// error — never silently start over, which would re-ship every
+    /// store in the selection.
+    pub fn load(path: &Path) -> anyhow::Result<Option<Positions>> {
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&text) else {
+            bail!("{} is not a JSON object", path.display());
+        };
+        let consumer = map
+            .remove("consumer")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut at = std::collections::BTreeMap::new();
+        match map.remove("stores") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(stores)) => {
+                for (id, v) in stores {
+                    let Value::Object(o) = v else {
+                        bail!("{}: store {id:?} is not an object", path.display());
+                    };
+                    // An entry without an offset is not a position, and
+                    // reading it as zero would re-ship that store whole.
+                    let offset = o.get("offset").and_then(Value::as_u64).with_context(|| {
+                        format!("{}: store {id:?} has no offset", path.display())
+                    })?;
+                    at.insert(
+                        id,
+                        At {
+                            offset,
+                            chunk: o.get("chunk").and_then(Value::as_u64),
+                            path: o
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            wl: o.get("wl").and_then(Value::as_u64).unwrap_or(0),
+                            delivered: o.get("delivered").and_then(Value::as_u64).unwrap_or(0),
+                        },
+                    );
+                }
+            }
+            Some(_) => bail!("{}: \"stores\" must be an object", path.display()),
+        }
+        let note = read_note(map.get("note"));
+        let mut notes = std::collections::BTreeMap::new();
+        if let Some(Value::Object(held)) = map.get("notes") {
+            for (id, v) in held {
+                if let Some(n) = read_note(Some(v)) {
+                    notes.insert(id.clone(), n);
+                }
+            }
+        }
+        Ok(Some(Positions {
+            consumer,
+            // An older file has none. Empty reads as "before every
+            // store", so `discovery` then sends nothing from the
+            // beginning — the conservative direction for a consumer that
+            // has plainly been running for a while.
+            created: map
+                .remove("created")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            at,
+            note,
+            notes,
+        }))
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let mut stores = Map::new();
+        for (id, a) in &self.at {
+            let mut o = Map::new();
+            o.insert("offset".into(), Value::from(a.offset));
+            match a.chunk {
+                Some(c) => o.insert("chunk".into(), Value::from(c)),
+                None => o.insert("chunk".into(), Value::Null),
+            };
+            o.insert("path".into(), Value::String(a.path.clone()));
+            o.insert("wl".into(), Value::from(a.wl));
+            o.insert("delivered".into(), Value::from(a.delivered));
+            stores.insert(id.clone(), Value::Object(o));
+        }
+        let mut map = Map::new();
+        map.insert("consumer".into(), Value::String(self.consumer.clone()));
+        map.insert("created".into(), Value::String(self.created.clone()));
+        map.insert(
+            "updated".into(),
+            Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+        );
+        if let Some(n) = &self.note {
+            map.insert("note".into(), write_note(n));
+        }
+        if !self.notes.is_empty() {
+            let held: Map<String, Value> = self
+                .notes
+                .iter()
+                .map(|(id, n)| (id.clone(), write_note(n)))
+                .collect();
+            map.insert("notes".into(), Value::Object(held));
+        }
+        map.insert("stores".into(), Value::Object(stores));
+        write_atomically(path, &Value::Object(map))
+    }
+
+    /// The query document's `cursor`: where each store was left. Handed
+    /// back verbatim, so a store this consumer has never read simply has
+    /// no entry and is read from the start.
+    pub fn cursor(&self) -> std::collections::BTreeMap<String, u64> {
+        self.at
+            .iter()
+            .map(|(id, a)| (id.clone(), a.offset))
+            .collect()
+    }
+
+    /// Record what one store delivered. `offset` is that store's own
+    /// `position` record — which, where it delivered nothing, is the one
+    /// it was resumed from, so writing it back is a no-op rather than a
+    /// rewind. `chunk` is the newest delivered entry's, absent when every
+    /// entry in the batch came from the live edge.
+    pub fn advance(
+        &mut self,
+        id: &str,
+        path: &str,
+        offset: u64,
+        chunk: Option<u64>,
+        wl: u64,
+        delivered: u64,
+    ) {
+        let e = self.at.entry(id.to_string()).or_insert(At {
+            offset,
+            chunk: None,
+            path: path.to_string(),
+            wl,
+            delivered: 0,
+        });
+        e.offset = offset;
+        e.path = path.to_string();
+        // A quiet store reports the position it was resumed from and no
+        // entries, so nothing here moves backwards. The floor especially:
+        // it is what retention may drop below.
+        e.chunk = e.chunk.max(chunk);
+        e.wl = e.wl.max(wl);
+        e.delivered += delivered;
+    }
+}
+
+fn read_note(v: Option<&Value>) -> Option<Note> {
+    let o = v?.as_object()?;
+    Some(Note {
+        text: o.get("text").and_then(Value::as_str)?.to_string(),
+        offset: o.get("offset").and_then(Value::as_u64),
+        when: o
+            .get("when")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn write_note(n: &Note) -> Value {
+    let mut o = Map::new();
+    o.insert("text".into(), Value::String(n.text.clone()));
+    if let Some(off) = n.offset {
+        o.insert("offset".into(), Value::from(off));
+    }
+    o.insert("when".into(), Value::String(n.when.clone()));
+    Value::Object(o)
 }
 
 /// Skips what a resumed stream re-delivers. `--from-chunk` seeks to a whole
@@ -315,6 +655,11 @@ pub fn store_anchor(dir: &Path, name: &str, bark: Option<&Map<String, Value>>) -
     bark.and_then(|m| m.get("id"))
         .and_then(Value::as_str)
         .map(str::to_string)
+        // The pair is the store, so a lost manifest does not lose the
+        // identity: the `.rings` header mirrors it. Without this a store
+        // whose bark went missing would silently change name, orphaning
+        // every follower and cursor that referred to it.
+        .or_else(|| crate::bark::carried_identity(dir, name))
         .unwrap_or_else(|| {
             format!(
                 "path:{}",
@@ -414,6 +759,26 @@ impl Standing {
 /// Windows are mostly-sorted, so both extremes are found by scanning
 /// (48 B per chunk) — the same choice `summarize_store` makes.
 pub fn standing(c: &Cursor, records: &[ChunkRecord]) -> Standing {
+    standing_at(c.seq, c.wl, records)
+}
+
+/// The same, from a position that is not a `Cursor`: a `Positions` entry
+/// holds the chunk and the write time without the rest of a cursor's
+/// shape, and a view must not have to fabricate one to be rendered.
+pub fn standing_at(seq: Option<u64>, wl: u64, records: &[ChunkRecord]) -> Standing {
+    let c = Cursor {
+        consumer: String::new(),
+        store: String::new(),
+        path: String::new(),
+        seq,
+        n: 0,
+        wl,
+        delivered: 0,
+    };
+    standing_inner(&c, records)
+}
+
+fn standing_inner(c: &Cursor, records: &[ChunkRecord]) -> Standing {
     let consumed_chunks = consumed_prefix(records, c.seq);
     let behind_bytes = match (records.get(consumed_chunks), records.last()) {
         (Some(next), Some(last)) => last.comp_end().saturating_sub(next.comp_start),
@@ -951,6 +1316,61 @@ mod tests {
         let no_store = dir.join("nostore.cursor");
         fs::write(&no_store, "{\"wl\": 5}").unwrap();
         assert!(Cursor::load(&no_store).is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The round trip a poll loop rests on: what was saved is the cursor
+    /// handed back, and a store never read simply has no entry — which is
+    /// what makes it read from the start rather than be skipped.
+    #[test]
+    fn positions_round_trip_and_become_the_cursor() {
+        let dir = std::env::temp_dir().join(format!("timberfs-pos-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("positions.json");
+        assert!(Positions::load(&path).unwrap().is_none(), "a first run");
+
+        let mut p = Positions::new("loki");
+        p.advance("aaa", "/l/a.log", 33, Some(4), 700, 12);
+        p.advance("bbb", "/l/b.log", 90, None, 800, 3);
+        p.save(&path).unwrap();
+
+        let back = Positions::load(&path).unwrap().unwrap();
+        assert_eq!(back, p);
+        assert_eq!(back.cursor().get("aaa"), Some(&33));
+        assert_eq!(back.cursor().get("ccc"), None);
+        assert_eq!(back.at["aaa"].chunk, Some(4));
+        assert_eq!(
+            back.at["bbb"].chunk, None,
+            "delivered from the live edge only"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A store that delivered nothing reports the position it was resumed
+    /// from, so writing it back must not move the counters — and must not
+    /// look like a rewind.
+    #[test]
+    fn a_quiet_store_neither_advances_nor_rewinds() {
+        let mut p = Positions::new("loki");
+        p.advance("aaa", "/l/a.log", 33, Some(4), 700, 12);
+        p.advance("aaa", "/l/a.log", 33, None, 0, 0);
+        let a = &p.at["aaa"];
+        assert_eq!(
+            (a.offset, a.chunk, a.wl, a.delivered),
+            (33, Some(4), 700, 12)
+        );
+    }
+
+    /// An entry with no offset is not a position. Read as zero it would
+    /// re-ship that store whole, so it is an error like an unreadable
+    /// cursor is.
+    #[test]
+    fn a_position_without_an_offset_is_refused() {
+        let dir = std::env::temp_dir().join(format!("timberfs-pos-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("positions.json");
+        fs::write(&path, r#"{"consumer":"x","stores":{"aaa":{"wl":5}}}"#).unwrap();
+        assert!(Positions::load(&path).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 }

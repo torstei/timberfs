@@ -122,9 +122,16 @@ fn attributes(pairs: &[(String, String)]) -> Value {
     )
 }
 
-/// One `ExportLogsServiceRequest`. Every entry in a batch shares one
-/// resource — a shipper is pointed at one store, and the store's `.bark`
-/// is what the resource is derived from.
+/// One store's entries and what they are ABOUT. A request carries a list
+/// of these, so a shipper following a SET of stores keeps each one's
+/// resource attributes instead of flattening the set into whichever
+/// store it happened to be pointed at.
+pub struct Group<'a> {
+    pub resource: &'a [(String, String)],
+    pub entries: &'a [Entry<'a>],
+}
+
+/// One `ExportLogsServiceRequest` for one store.
 pub fn render(resource: &[(String, String)], scope_version: &str, entries: &[Entry]) -> Value {
     let sev = Severity::new(None).expect("the default severity pattern compiles");
     render_with(resource, scope_version, entries, &sev)
@@ -136,7 +143,21 @@ pub fn render_with(
     entries: &[Entry],
     sev: &Severity,
 ) -> Value {
-    let records: Vec<Value> = entries
+    render_groups(&[Group { resource, entries }], scope_version, sev)
+}
+
+pub fn render_groups(groups: &[Group], scope_version: &str, sev: &Severity) -> Value {
+    json!({
+        "resourceLogs": groups
+            .iter()
+            .map(|g| resource_logs(g, scope_version, sev))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+fn resource_logs(g: &Group, scope_version: &str, sev: &Severity) -> Value {
+    let records: Vec<Value> = g
+        .entries
         .iter()
         .map(|e| {
             let body = e.payload.strip_suffix(b"\n").unwrap_or(e.payload);
@@ -165,12 +186,10 @@ pub fn render_with(
         })
         .collect();
     json!({
-        "resourceLogs": [{
-            "resource": {"attributes": attributes(resource)},
-            "scopeLogs": [{
-                "scope": {"name": "timberfs", "version": scope_version},
-                "logRecords": records,
-            }],
+        "resource": {"attributes": attributes(g.resource)},
+        "scopeLogs": [{
+            "scope": {"name": "timberfs", "version": scope_version},
+            "logRecords": records,
         }],
     })
 }
@@ -651,37 +670,46 @@ pub fn render_proto(
     entries: &[Entry],
     sev: &Severity,
 ) -> Vec<u8> {
+    render_groups_proto(&[Group { resource, entries }], scope_version, sev)
+}
+
+pub fn render_groups_proto(groups: &[Group], scope_version: &str, sev: &Severity) -> Vec<u8> {
     let mut w = protobuf::Writer::new();
-    w.message_field(field::RESOURCE_LOGS, |rl| {
-        rl.message_field(field::RL_RESOURCE, |res| {
-            write_attributes(res, field::RES_ATTRIBUTES, resource)
-        });
-        rl.message_field(field::RL_SCOPE_LOGS, |sl| {
-            sl.message_field(field::SL_SCOPE, |sc| {
-                sc.string_field(field::SCOPE_NAME, "timberfs");
-                sc.string_field(field::SCOPE_VERSION, scope_version);
+    for g in groups {
+        w.message_field(field::RESOURCE_LOGS, |rl| {
+            rl.message_field(field::RL_RESOURCE, |res| {
+                write_attributes(res, field::RES_ATTRIBUTES, g.resource)
             });
-            for e in entries {
-                sl.message_field(field::SL_LOG_RECORDS, |lr| {
-                    let body = e.payload.strip_suffix(b"\n").unwrap_or(e.payload);
-                    lr.fixed64_field(
-                        field::LR_TIME,
-                        e.ts_ms.unwrap_or(e.wf_ms).saturating_mul(1_000_000),
-                    );
-                    lr.fixed64_field(field::LR_OBSERVED_TIME, e.wf_ms.saturating_mul(1_000_000));
-                    if let Some((text, num)) = sev.of(e.payload) {
-                        if num > 0 {
-                            lr.varint_field(field::LR_SEVERITY_NUMBER, num as u64);
-                        }
-                        lr.string_field(field::LR_SEVERITY_TEXT, &text);
-                    }
-                    lr.message_field(field::LR_BODY, |b| {
-                        b.string_field(field::AV_STRING, &String::from_utf8_lossy(body))
-                    });
+            rl.message_field(field::RL_SCOPE_LOGS, |sl| {
+                sl.message_field(field::SL_SCOPE, |sc| {
+                    sc.string_field(field::SCOPE_NAME, "timberfs");
+                    sc.string_field(field::SCOPE_VERSION, scope_version);
                 });
-            }
+                for e in g.entries {
+                    sl.message_field(field::SL_LOG_RECORDS, |lr| {
+                        let body = e.payload.strip_suffix(b"\n").unwrap_or(e.payload);
+                        lr.fixed64_field(
+                            field::LR_TIME,
+                            e.ts_ms.unwrap_or(e.wf_ms).saturating_mul(1_000_000),
+                        );
+                        lr.fixed64_field(
+                            field::LR_OBSERVED_TIME,
+                            e.wf_ms.saturating_mul(1_000_000),
+                        );
+                        if let Some((text, num)) = sev.of(e.payload) {
+                            if num > 0 {
+                                lr.varint_field(field::LR_SEVERITY_NUMBER, num as u64);
+                            }
+                            lr.string_field(field::LR_SEVERITY_TEXT, &text);
+                        }
+                        lr.message_field(field::LR_BODY, |b| {
+                            b.string_field(field::AV_STRING, &String::from_utf8_lossy(body))
+                        });
+                    });
+                }
+            });
         });
-    });
+    }
     w.into_bytes()
 }
 
@@ -1209,6 +1237,51 @@ mod tests {
             assert_eq!(p.severity, j.severity);
             assert_eq!(p.body, j.body);
             assert_eq!(p.attrs, j.attrs);
+        }
+    }
+
+    /// A shipper following a SET of stores sends one request carrying one
+    /// resource group per store. Flattening them would label every entry
+    /// with whichever store the shipper opened with — the merge that
+    /// makes a fleet answer useless.
+    #[test]
+    fn one_request_keeps_each_stores_resource() {
+        let a: &[u8] = b"2026-08-15T09:23:45.123+02:00 INFO from web01\n";
+        let b: &[u8] = b"2026-08-15T09:23:46.500+02:00 ERROR from web02\n";
+        let ea = [Entry {
+            ts_ms: Some(1_786_778_625_123),
+            wf_ms: 1_786_783_226_105,
+            payload: a,
+        }];
+        let eb = [Entry {
+            ts_ms: Some(1_786_778_626_500),
+            wf_ms: 1_786_783_226_105,
+            payload: b,
+        }];
+        let ra = vec![("host.name".to_string(), "web01".to_string())];
+        let rb = vec![("host.name".to_string(), "web02".to_string())];
+        let groups = [
+            Group {
+                resource: &ra,
+                entries: &ea,
+            },
+            Group {
+                resource: &rb,
+                entries: &eb,
+            },
+        ];
+        let sev = Severity::new(None).unwrap();
+
+        for batches in [
+            parse_export_request(&render_groups(&groups, "0.0.0", &sev)).unwrap(),
+            parse_export_request_proto(&render_groups_proto(&groups, "0.0.0", &sev)).unwrap(),
+        ] {
+            assert_eq!(batches.len(), 2);
+            assert_eq!(batches[0].resource, ra);
+            assert_eq!(batches[1].resource, rb);
+            assert_eq!(batches[0].records.len(), 1);
+            assert!(batches[0].records[0].body.contains("web01"));
+            assert!(batches[1].records[0].body.contains("web02"));
         }
     }
 

@@ -6,7 +6,9 @@
 //! Grammar — one expression, comma-separated conjunction:
 //!
 //! ```text
-//! *              every store
+//! []             every store — a predicate with no terms
+//! *              the same, and the older spelling of it
+//! text           the NAME contains text  (`name=*text`)
 //! key=value      the label equals value
 //! key!=value     it does not
 //! key=~regex     it matches regex, anchored at both ends
@@ -14,6 +16,28 @@
 //! key=*text      it CONTAINS text, anywhere in the value
 //! key!*text      it does not
 //! ```
+//!
+//! An expression may be wrapped in `[…]`, which is how a predicate is
+//! written and rendered in `timbersh` — so the one an operator tested
+//! there is the one a declaration can hold, and a stored selection reads
+//! like the shell. The brackets are a DELIMITER, needed in a statement
+//! because it must know where the predicate ends and unnecessary on a
+//! command line, where the argument boundary says so.
+//!
+//! `[]` is therefore not the same as nothing. It is a predicate carrying
+//! no terms — «every store», said — where an empty string is nothing
+//! written at all and is refused. A read may reasonably default to every
+//! store when asked for no predicate (`list` with no `--select`); a
+//! DECLARATION may not, because "follows everything on this host" has to
+//! be a sentence somebody wrote.
+//!
+//! A bare word is the name because that is what a person types when they
+//! know which log they want and not how it is labelled. It is `=*` and
+//! not equality: `[apache]` is asked of a fleet, where the store is
+//! called `apache-access` on one host and `apache2` on the next. A word
+//! carrying `=`, `~`, `!` or `*` is a mistyped operator rather than a
+//! name, and is refused — read as a name it would answer "no stores" for
+//! a search nobody ran.
 //!
 //! `=*` exists because "the store whose name has `apache` in it" is the
 //! commonest thing anyone asks, and an anchored regex is a poor way to
@@ -81,14 +105,38 @@ impl Selector {
 
     pub fn parse(expr: &str) -> anyhow::Result<Self> {
         let expr = expr.trim();
-        if expr.is_empty() {
-            bail!("empty selector: use `*` to select every store");
-        }
-        if expr == "*" {
-            return Ok(Selector::all());
+        // The brackets are a delimiter, so they come off before anything
+        // is read — and whether they were there decides what EMPTY means.
+        let (inner, bracketed) = match expr.strip_prefix('[').and_then(|e| e.strip_suffix(']')) {
+            Some(inner) => (inner.trim(), true),
+            // ⚠ An UNCLOSED opening bracket is a syntax error, not a
+            // bare word. A dropped one is easy to type — `[service=apache`
+            // under a shell that ate the quote — and reading it as "the
+            // store with `[service=apache` in its name" answers «no store
+            // matches», which is the one thing a malformed predicate must
+            // never be mistaken for.
+            //
+            // ⚠ Only this direction. A trailing `]` with no opening one
+            // is a legal VALUE (`name=*[1]` searches for that substring),
+            // so refusing it would refuse a real search to catch a typo.
+            None if expr.starts_with('[') => bail!(
+                "selector `{expr}` opens a bracket it never closes. Write the whole predicate \
+                 inside them or leave them off entirely \u{2014} half of each reads as a store \
+                 NAME, and then answers \u{201c}no store matches\u{201d}"
+            ),
+            None => (expr, false),
+        };
+        if inner.is_empty() || inner == "*" {
+            if bracketed || expr == "*" {
+                return Ok(Selector::all());
+            }
+            bail!(
+                "empty selector: `[]` is the predicate that selects every store, where \
+                 nothing at all is nothing asked for"
+            );
         }
         let mut terms = Vec::new();
-        for part in split_terms(expr)? {
+        for part in split_terms(inner)? {
             terms.push(parse_term(&part)?);
         }
         Ok(Selector { terms })
@@ -118,6 +166,38 @@ impl Selector {
     pub fn is_all(&self) -> bool {
         self.terms.is_empty()
     }
+
+    /// The one store this names, when it names exactly one by identity:
+    /// `id=<x>` and nothing else. That predicate is a NAME rather than a
+    /// search — it can match at most one store — so a caller that needs
+    /// the single store a selection is about can have it, and one that
+    /// gets `None` is looking at a set.
+    pub fn sole_id(&self) -> Option<&str> {
+        match self.terms.as_slice() {
+            [t] if t.key == "id" && t.op == Op::Eq => Some(&t.value),
+            _ => None,
+        }
+    }
+}
+
+/// One spelling for a selection, for anything that STORES or renders
+/// one: bracketed, as a predicate is written and read everywhere else,
+/// so every store is `[]` in a file as well as on a screen.
+///
+/// Validated by parsing, so a stored selection is one that can be read
+/// back — and idempotent, so canonicalising a canonical form is a no-op.
+pub fn canonical(expr: &str) -> anyhow::Result<String> {
+    let sel = Selector::parse(expr)?;
+    if sel.is_all() {
+        return Ok("[]".to_string());
+    }
+    let inner = expr.trim();
+    let inner = inner
+        .strip_prefix('[')
+        .and_then(|e| e.strip_suffix(']'))
+        .unwrap_or(inner)
+        .trim();
+    Ok(format!("[{inner}]"))
 }
 
 /// A label's value as text. Free-form keys may hold a non-string, and a
@@ -188,15 +268,31 @@ fn parse_term(part: &str) -> anyhow::Result<Term> {
         (k, Op::Contains, v)
     } else if let Some((k, v)) = part.split_once('=') {
         (k, Op::Eq, v)
-    } else {
+    } else if part.contains(['=', '~', '!', '*']) {
+        // Something that LOOKS like an operator but is not one is a typo,
+        // not a store called that. Read as a name it would answer "no
+        // stores" for a search nobody ran — which is the reading the bare
+        // word below would otherwise give it.
         bail!(
-            "selector term {part:?} has no operator — expected key=value, \
-             key!=value, key=~regex, key!~regex, key=*text or key!*text"
+            "selector term {part:?} has no operator I know — one of {}",
+            OPS.join(", ")
         );
+    } else {
+        ("name", Op::Contains, part)
     };
     let key = key.trim();
     if key.is_empty() {
         bail!("selector term {part:?} has no label name");
+    }
+    // A key ENDING in an operator character is the same typo one term
+    // later: `service~=x` splits at the `=` into the key `service~`,
+    // which no manifest has, so it would match nothing for a search
+    // nobody meant to run. No label key ends in one of these.
+    if key.ends_with(['~', '!', '*']) {
+        bail!(
+            "selector term {part:?}: no label is called {key:?} — the operators are {}",
+            OPS.join(", ")
+        );
     }
     let value = unquote(value.trim());
     // An empty substring is contained in everything, so it says nothing —
@@ -245,6 +341,24 @@ pub fn selectable(bark: &Map<String, Value>, handle: &str) -> Map<String, Value>
     fields
 }
 
+/// What a selector matches ONE store on, read from disk: everything its
+/// manifest declares, its name, and the PAIR's identity.
+///
+/// The identity comes last and unconditionally because it is the one
+/// field that is not the manifest's alone — the index mirrors it — and a
+/// follower that names a store by `id` must keep matching it when the
+/// manifest is lost. Everything else is what the manifest says, so a
+/// store with no manifest is matchable by name and by id and nothing
+/// else, which is all it declares.
+pub fn selectable_of(dir: &std::path::Path, name: &str) -> Map<String, Value> {
+    let bark = crate::bark::load(dir, name).unwrap_or_default();
+    let mut fields = selectable(&bark, crate::forest::handle_of_logical(name));
+    if let Some(id) = crate::bark::identity_of(dir, name) {
+        fields.insert("id".to_string(), Value::String(id));
+    }
+    fields
+}
+
 /// One store a selector matched: enough to open it, and the labels it
 /// matched on so a caller can say WHY it matched.
 #[derive(Debug)]
@@ -255,6 +369,15 @@ pub struct Match {
     pub dir: std::path::PathBuf,
     /// The store's name within that directory.
     pub name: String,
+    /// Its `.bark` identity, when it declares one. What a durable
+    /// reference — a position, a follower's declaration — is keyed by, so
+    /// a store without one cannot be addressed across a move or a
+    /// restart, only read where it is.
+    pub id: Option<String>,
+    /// When the store's manifest was first written, as it records it.
+    /// Not a label — `provenance` excludes it — and the one fact
+    /// `--follow-from discovery` compares against.
+    pub created: Option<String>,
     pub labels: Map<String, Value>,
 }
 
@@ -277,13 +400,20 @@ pub fn resolve(dirs: &[std::path::PathBuf], sel: &Selector) -> Vec<Match> {
                 continue;
             };
             let bark = crate::bark::load(&dir, &name).unwrap_or_default();
-            let fields = selectable(&bark, &handle);
+            let fields = selectable_of(&dir, &name);
             if sel.matches(&fields) {
                 let labels = crate::bark::provenance(&bark);
+                let id = fields.get("id").and_then(Value::as_str).map(str::to_string);
+                let created = fields
+                    .get("created")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 out.push(Match {
                     handle,
                     dir,
                     name,
+                    id,
+                    created,
                     labels,
                 });
             }
@@ -302,6 +432,63 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
             .collect()
+    }
+
+    /// `[]` is a predicate that was WRITTEN and constrains nothing,
+    /// where an empty string is nothing written at all. A read may
+    /// default to every store; a declaration may not, so the two must
+    /// not be one value.
+    #[test]
+    fn the_empty_predicate_is_every_store_and_nothing_at_all_is_refused() {
+        let l = labels(&[("host", "web01")]);
+        for every in ["[]", "[ ]", "*", "[*]"] {
+            let sel = Selector::parse(every).unwrap();
+            assert!(sel.is_all(), "{every}");
+            assert!(sel.matches(&l), "{every}");
+            assert!(
+                sel.matches(&Map::new()),
+                "{every} against an unlabelled store"
+            );
+        }
+        for nothing in ["", "   "] {
+            let err = Selector::parse(nothing).unwrap_err().to_string();
+            assert!(err.contains("`[]`"), "{err}");
+        }
+    }
+
+    /// The brackets are a DELIMITER: what timbersh renders is what a
+    /// declaration can hold, and both spellings are one selector.
+    #[test]
+    fn a_bracketed_expression_is_the_same_selector() {
+        let l = labels(&[("service", "apache"), ("host", "web01")]);
+        for expr in ["service=apache,host=web01", "[service=apache,host=web01]"] {
+            assert!(Selector::parse(expr).unwrap().matches(&l), "{expr}");
+        }
+        // Only a WHOLE expression is unwrapped, so brackets inside a
+        // value are untouched.
+        let odd = labels(&[("name", "a[1]b")]);
+        assert!(Selector::parse("name=*[1]").unwrap().matches(&odd));
+        assert!(Selector::parse("[name=*[1]]").unwrap().matches(&odd));
+    }
+
+    /// One stored spelling, so a file reads like a screen — and every
+    /// store is `[]` in both.
+    #[test]
+    fn the_canonical_form_is_bracketed_and_idempotent() {
+        for (given, want) in [
+            ("service=apache", "[service=apache]"),
+            ("[service=apache]", "[service=apache]"),
+            ("apache", "[apache]"),
+            ("*", "[]"),
+            ("[]", "[]"),
+        ] {
+            assert_eq!(canonical(given).unwrap(), want, "{given}");
+            assert_eq!(canonical(want).unwrap(), want, "{want} is canonical");
+        }
+        assert!(
+            canonical("host~web01").is_err(),
+            "a stored selector must parse"
+        );
     }
 
     #[test]
@@ -398,8 +585,39 @@ mod tests {
     #[test]
     fn malformed_selectors_are_refused_not_guessed() {
         assert!(Selector::parse("").is_err());
-        assert!(Selector::parse("host").is_err(), "no operator");
         assert!(Selector::parse("=web01").is_err(), "no label name");
+        // A word carrying an operator character but no operator: a typo,
+        // and the one case the bare-word rule must not swallow.
+        //
+        // ⚠ A MISTYPED operator whose text still splits on `=` is the
+        // same mistake one step later: `host~=web01` leaves the key
+        // `host~`, which no manifest has, so it would match nothing for
+        // a search nobody meant to run.
+        for typo in [
+            "host~web01",
+            "host!web01",
+            "web*01",
+            "!host",
+            "host~=web01",
+            "host*=web01",
+            "host!!=web01",
+        ] {
+            assert!(Selector::parse(typo).is_err(), "{typo} should be refused");
+        }
+        // ⚠ An UNCLOSED bracket, which the bare-word rule would otherwise
+        // read as a name — the easiest of these to type, and the one
+        // whose wrong answer looks most like a real one.
+        for half in ["[host=web01", "[", "[host=web01,service=a"] {
+            assert!(Selector::parse(half).is_err(), "{half} should be refused");
+        }
+        // ⚠ But a trailing `]` alone is a legal VALUE, not half a
+        // bracket: refusing it would refuse a real substring search.
+        assert!(Selector::parse("name=*[1]").is_ok());
+        assert!(Selector::parse("host=web01]").is_ok());
+        // Both brackets, and none, stay legal.
+        assert!(Selector::parse("[host=web01]").is_ok());
+        assert!(Selector::parse("host=web01").is_ok());
+        assert!(Selector::parse("[]").is_ok());
         assert!(Selector::parse("host=web01,").is_err(), "stray comma");
         assert!(
             Selector::parse(r#"host=~"web.*"#).is_err(),
@@ -413,5 +631,35 @@ mod tests {
         let mut l = Map::new();
         l.insert("replicas".to_string(), Value::from(3));
         assert!(Selector::parse("replicas=3").unwrap().matches(&l));
+    }
+
+    /// A bare word is the store's name, matched anywhere in it — the same
+    /// thing `[apache]` means in timbersh, so a selector an operator
+    /// tested there is the selector a declaration can hold.
+    #[test]
+    fn a_bare_word_is_the_name_matched_anywhere_in_it() {
+        let l = labels(&[("name", "apache-access"), ("host", "web01")]);
+        assert!(Selector::parse("apache").unwrap().matches(&l));
+        assert!(Selector::parse("access").unwrap().matches(&l));
+        assert!(!Selector::parse("nginx").unwrap().matches(&l));
+        // Contains, not equality: the same word finds a store called
+        // something else on the next host.
+        assert!(Selector::parse("apache")
+            .unwrap()
+            .matches(&labels(&[("name", "apache2")])));
+        // It is a term like any other, so it ANDs and it quotes.
+        assert!(Selector::parse("apache,host=web01").unwrap().matches(&l));
+        assert!(Selector::parse("\"apache-access\"").unwrap().matches(&l));
+    }
+
+    /// A bare word says `name`, so it is a LITERAL — the reason `=*`
+    /// exists rather than a regex spelling of it.
+    #[test]
+    fn a_bare_word_is_not_read_as_a_pattern() {
+        let l = labels(&[("name", "apacheXaccess")]);
+        assert!(!Selector::parse("apache.access").unwrap().matches(&l));
+        assert!(Selector::parse("apache.access")
+            .unwrap()
+            .matches(&labels(&[("name", "apache.access")])));
     }
 }

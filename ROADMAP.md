@@ -541,8 +541,8 @@ here.
   follower:
   ```
   /var/lib/timberfs/followers/<name>/
-      follower.json    store, type, retaining, config   (operator writes)
-      cursor.json      seq, n, delivered                (follower writes)
+      follower.json    select, retaining, command       (operator writes)
+      positions.json   a place per store it has read    (follower writes)
       follower.lock    held while it runs               (`run` acquires)
   ```
   The declaration and the position have different OWNERS and that is why
@@ -667,7 +667,7 @@ here.
   back to true will not bring the data back, and the follower resumes at a
   position that may now be gapped. `--dry-run` fits here, as on `rotate`.
   `delete` refuses while `retaining=true` (set it false first) and while
-  the follower is RUNNING, which the held `cursor.json` reveals — deleting
+  the follower is RUNNING, which the held lock reveals — deleting
   under a live process would leave it writing an unlinked file, silently
   doing nothing. Both refusals are about deliberateness rather than
   prevention (`update && delete` is still one line), so no `--force`: the
@@ -707,6 +707,49 @@ here.
   from an idle one), and any priority or weighting among followers
   (`retaining` is the only tier, and it is a declared property rather than
   a consequence of where a file happens to sit).
+- **A follower of a SET of stores** (built): forwarding N stores to one
+  destination was N declarations, N units and N processes, with the
+  destination stated N times. So the subject of a follower became a
+  SELECTION — the same `[]` predicate `list --select` and the query
+  document already take — and a single-store follower is the one-term case
+  `id=<the store's id>`, which is what `--store` writes. One process serves
+  the whole set. Deliberately NOT a new object — no member of the set is
+  ever named, enabled or locked — which leaves "follower group" free for
+  the thing that has members: several processes sharing one selection, each
+  taking a shard.
+  It cost `positions.json` in place of `cursor.json`, the interest axis
+  evaluating selectors against labels HANDED to it rather than matching an
+  anchor, and OTLP's `resourceLogs` carrying one group per store.
+  Three things building it settled that the note did not have.
+  **The `--type` axis went away entirely.** A type named a shipper binary
+  to exec, which made a destination shape into a closed set and a flag; a
+  follower now records a CONSUMER — a command, verbatim, unverified — and
+  every follower speaks one protocol. What a destination's answer MEANT is
+  knowable in the consumer and nowhere else, so nothing but a position and
+  a sentence comes back (`timberfs-records(5)`, THE CONSUMER PROTOCOL).
+  **A store with anything unacknowledged is PARKED**, or one store in
+  trouble costs every store beside it: a read starting at an unmoved
+  position re-sends what is already in flight, filling the shared entry
+  cap on every poll. Measured at 99% of a core without the park and 0%
+  with it.
+  **`--follow-from` had to exist**, because a store JOINING a selection is
+  now routine — a relabel, a new container — and neither answer is right
+  for both cases: `end` skips a short-lived container's whole log, `begin`
+  floods on a relabel. `discovery` reads a store born since the follower
+  was declared from its beginning and one that predates it from its next
+  byte; `--retaining` implies `begin`.
+  What is left: the `chunks` diet, so `frames-send` can be a consumer too
+  (see `docs/plans/consumer-protocol.md` for the three small things
+  missing), and a withdrawal record for a store leaving a selection.
+  Design notes:
+  [docs/plans/follower-selection.md](docs/plans/follower-selection.md) for
+  the declaration and the loop, and
+  [docs/plans/consumer-protocol.md](docs/plans/consumer-protocol.md) for
+  the boundary it feeds: timberfs holds the position, a consumer reports how
+  far to move it, and so a consumer can be written in any language and run
+  on another machine. That is also the consumer-driven position the cursor entry above
+  says is missing — reached without letting a third party write the position
+  file.
 - **Splitting downstream of a spool (fan-out by cursor)**: one store as the
   intake spool — everything a web server writes, the vhost in the line — plus a
   cursor consumer that routes entries into per-stream stores, instead of routing
@@ -780,6 +823,54 @@ here.
   filesystem path (`tail`/`less`/`grep` on `/mnt/app/app.log` as it fills). Pairs
   naturally with the live sidecar above; retention's tail-rewrite is the
   coherency case to handle.
+- **`follower prune`, and telling apart the reasons a place is not
+  advancing.** A follower keeps a place for every store it has ever read,
+  because a store that leaves the selection must RESUME if it comes back
+  rather than re-ship — so places accumulate for as long as the selection
+  churns (an incus host where `[]` picks up every container leaves one per
+  container ever seen) and nothing prunes them. Measured: ~195 bytes each,
+  and since the file is rewritten whole, a one-shot feed delivering ONE
+  entry costs 0.063 s against 1 live place, 0.155 s against 20k dead ones
+  and 0.647 s against 100k (19 MiB). Slow, bounded, and not urgent.
+  `status`/`list` now ACCOUNT for them (PR #156) — covered, left the
+  selection, gone from disk — which was the part that surprised; the verb
+  to clear them is what is left. Operator-initiated, refusing while
+  running, previewing like `trim`.
+  ⛔ **NOT automatic pruning on save.** An un-match can be transient — a
+  manifest mid-rewrite, a forest not yet mounted, a label edit in flight —
+  and dropping a place then means a full re-ship at best and, under
+  `--follow-from end`, a silent skip.
+  ⚠ **`--inactive-for DUR` needs a stamp that does not exist**, and two
+  candidates were worked out and deliberately not built. A persisted
+  *status* would be a cached derivation and stale from the moment a filter
+  changed (a changed selector does not touch the file), so it is out.
+  `advanced` (when this follower last moved this place) and `lastMatched`
+  (when it last resolved into the selection) are timestamped OBSERVATIONS
+  and legitimate — `wl` is not a substitute, being the STORE's clock, so a
+  covered-but-quiet store has an ancient one. But `lastMatched` only
+  discriminates if written on a TIMER: piggybacked on saves it collapses
+  into `advanced`, because a stuck store is not saving, which is exactly
+  the row where the two needed to differ. That makes the positions file
+  something written when nothing has happened — a new class of write, and
+  the reason this waits for a real question rather than a speculative one.
+  The residual it would answer: a store two hours behind and a store two
+  years behind look alike, and *slow reception*, *recently added* and
+  *the filter changed* are not separable from a lag figure. `note` covers
+  a consumer that SAYS why; a merely slow one says nothing.
+- **An unreadable manifest should report its EFFECTS, not just its cause.**
+  Today a `.bark` that does not parse is warned about on stderr — naming the
+  syntax error — and every command still exits 0. What it actually costs is
+  invisible: identity survives (the id is in the `.rings` header too), but
+  LABELS do not, so the store silently leaves every label-based selection —
+  a follower matching `[service=~apache-.*]` stops following it, while `[]`
+  and `[id=…]` still do — and its declared retention stops being enforced.
+  Measured: one missing brace turns off two of the things that decide whether
+  data is shipped and whether it is kept, and `list` still shows the row as
+  healthy apart from two empty columns. So `info` should say what is no longer
+  true of the store, and `list` should mark it, in the idiom the CLI tests
+  already use — the failure worth catching is the ABSENCE, not the parse
+  error. Came out of documenting the manifest as read-not-edited (PR #156);
+  the documentation is not the fix.
 - **Expose the index in-band**: a virtual `.idx` twin file or ioctl so tools
   can query through the mount without knowing the backing dir.
 - **tail(1) fast-path**: negative-offset "time seek" via `llseek` hooks.

@@ -190,8 +190,9 @@ for a writer opening its own store and wrong for a reader.
 
 ### The .bark manifest
 
-An optional `<name>.bark` holds the log's *declared* facts as one flat,
-human-editable JSON object — the label on the timber:
+An optional `<name>.bark` holds the log's *declared* facts as one flat JSON
+object — the label on the timber. Plain enough to read by eye; changed with
+`timberfs set`, which is validated and atomic where an editor is neither:
 
 ```json
 {

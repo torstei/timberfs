@@ -8,7 +8,6 @@
 //! how a user SEES the ambiguity: the same handle in two forests shows up
 //! as two rows, never deduped or merged.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -78,8 +77,10 @@ fn scan(dirs: &[PathBuf], select: Option<&str>) -> anyhow::Result<Option<Vec<Row
     }
 
     // Once per listing, not once per store: every scan of the registry
-    // reads each follower's rings to place its position.
-    let mut registry = crate::follower::by_store(&crate::follower::registry_dir());
+    // reads each follower's rings to place its position. Matched per
+    // store rather than looked up, a selection not being groupable —
+    // which is also why it is no longer taken from the map.
+    let registry = crate::follower::all(&crate::follower::registry_dir());
     let mut rows: Vec<Row> = Vec::new();
     for forest in &forests {
         if !forest.dir.is_dir() {
@@ -91,7 +92,7 @@ fn scan(dirs: &[PathBuf], select: Option<&str>) -> anyhow::Result<Option<Vec<Row
             continue;
         }
         for (handle, path) in crate::forest::scan_forest(&forest.dir) {
-            match open_summary(&path, &mut registry) {
+            match open_summary(&path, &registry) {
                 Ok((dir, summary)) => rows.push(Row {
                     handle,
                     forest: forest.name.clone(),
@@ -153,17 +154,17 @@ fn scan(dirs: &[PathBuf], select: Option<&str>) -> anyhow::Result<Option<Vec<Row
 /// never reads data), and summarize it.
 fn open_summary(
     logical: &Path,
-    registry: &mut HashMap<String, Vec<crate::follower::Registered>>,
+    registry: &[crate::follower::Registered],
 ) -> anyhow::Result<(PathBuf, StoreSummary)> {
     let (dir, name) = crate::query::resolve_backing(logical)?;
     let rings = crate::format::rings_path(&dir, &name);
     let records = crate::format::read_index(&rings)
         .with_context(|| format!("reading index {}", rings.display()))?;
     let bark = crate::bark::load(&dir, &name);
-    // Taken, not cloned: a store is summarised once per listing, and its
-    // followers belong to nobody else.
-    let anchor = crate::cursor::store_anchor(&dir, &name, bark.as_ref());
-    let followers = registry.remove(&anchor).unwrap_or_default();
+    // One follower can cover many stores, so this is a match against
+    // every declaration rather than a lookup that removes one.
+    let fields = crate::follower::subject_of(&dir, &name);
+    let followers = crate::follower::covering(registry, &fields);
     let summary = crate::query::summarize_store(&dir, &name, &records, bark.as_ref(), followers);
     Ok((dir, summary))
 }

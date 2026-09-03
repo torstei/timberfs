@@ -40,12 +40,41 @@ use crate::store::{self, Config, Store};
 /// Give up if none of the first this-many lines have a timestamp.
 const DETECT_WINDOW: usize = 1000;
 
-pub struct Extractor {
-    custom: Option<(Regex, String)>,
+/// The patterns every extractor shares. Compiled ONCE for the process:
+/// they are constants, and an extractor is built per store per read — a
+/// fleet poll over 500 stores was compiling 2,500 regexes a second, which
+/// was the whole cost of the read (measured: 1.01 s for a 500-store
+/// `--records` answer against 0.01 s for the same stores as text).
+struct Builtins {
     iso: Regex,
     clf: Regex,
     ctime: Regex,
     epoch: Regex,
+}
+
+fn builtins() -> &'static Builtins {
+    static BUILTINS: std::sync::OnceLock<Builtins> = std::sync::OnceLock::new();
+    BUILTINS.get_or_init(|| Builtins {
+        iso: Regex::new(
+            r"^(\d{4})[.-](\d{2})[.-](\d{2})[T ](\d{2}:\d{2}:\d{2})(?:[.,:](\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?",
+        )
+        .unwrap(),
+        clf: Regex::new(r"\[(\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4})\]").unwrap(),
+        // Bracketed ctime, the shape Apache's error log uses (and its
+        // 2.2-era form without the microseconds): the one common log
+        // clock whose year comes last and whose zone is implied local.
+        ctime: Regex::new(
+            r"\[([A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9]\d \d{2}:\d{2}:\d{2}(?:\.\d+)? \d{4})\]",
+        )
+        .unwrap(),
+        epoch: Regex::new(r"^(\d{13}|\d{10})\b").unwrap(),
+    })
+}
+
+pub struct Extractor {
+    /// The only pattern that varies by store, and the only one this can
+    /// therefore have to compile.
+    custom: Option<(Regex, String)>,
     utc: bool,
 }
 
@@ -66,24 +95,7 @@ impl Extractor {
             (None, None) => None,
             _ => bail!("--timestamp-regex and --timestamp-format go together"),
         };
-        Ok(Extractor {
-            custom,
-            iso: Regex::new(
-                r"^(\d{4})[.-](\d{2})[.-](\d{2})[T ](\d{2}:\d{2}:\d{2})(?:[.,:](\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?",
-            )
-            .unwrap(),
-            clf: Regex::new(r"\[(\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4})\]")
-                .unwrap(),
-            // Bracketed ctime, the shape Apache's error log uses (and its
-            // 2.2-era form without the microseconds): the one common log
-            // clock whose year comes last and whose zone is implied local.
-            ctime: Regex::new(
-                r"\[([A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9]\d \d{2}:\d{2}:\d{2}(?:\.\d+)? \d{4})\]",
-            )
-            .unwrap(),
-            epoch: Regex::new(r"^(\d{13}|\d{10})\b").unwrap(),
-            utc,
-        })
+        Ok(Extractor { custom, utc })
     }
 
     fn naive_to_ms(&self, naive: NaiveDateTime) -> Option<i64> {
@@ -113,7 +125,7 @@ impl Extractor {
             return u64::try_from(ms).ok();
         }
 
-        if let Some(c) = self.iso.captures(head) {
+        if let Some(c) = builtins().iso.captures(head) {
             // reassemble as strict RFC3339-ish regardless of which
             // separators the log used
             let normalized = format!(
@@ -148,14 +160,14 @@ impl Extractor {
             return u64::try_from(ms).ok();
         }
 
-        if let Some(c) = self.clf.captures(head) {
+        if let Some(c) = builtins().clf.captures(head) {
             let ms = DateTime::parse_from_str(c.get(1).unwrap().as_str(), "%d/%b/%Y:%H:%M:%S %z")
                 .ok()?
                 .timestamp_millis();
             return u64::try_from(ms).ok();
         }
 
-        if let Some(c) = self.ctime.captures(head) {
+        if let Some(c) = builtins().ctime.captures(head) {
             let naive = NaiveDateTime::parse_from_str(
                 c.get(1).unwrap().as_str(),
                 "%a %b %e %H:%M:%S%.f %Y",
@@ -166,7 +178,7 @@ impl Extractor {
             return u64::try_from(ms).ok();
         }
 
-        if let Some(c) = self.epoch.captures(head) {
+        if let Some(c) = builtins().epoch.captures(head) {
             let digits = c.get(1).unwrap().as_str();
             let n: u64 = digits.parse().ok()?;
             return Some(if digits.len() == 13 { n } else { n * 1000 });
@@ -893,9 +905,9 @@ pub fn cmd_import(
     // grain, and the declared-index pass right below rebuilds it.
     match crate::bark::declared_retention(&dir, &name) {
         Ok(policy) if policy.is_some() => {
-            let anchor = crate::follower::anchor_of(&dir, &name);
+            let fields = crate::follower::subject_of(&dir, &name);
             let next_seq = st.next_seq(&name).unwrap_or(0);
-            let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+            let held = crate::follower::TickInterest::default().floor(&policy, &fields, next_seq);
             if let Some(stats) =
                 st.enforce_retention(&name, policy.max_age_ms, policy.max_comp_bytes, held.floor)?
             {
@@ -1020,5 +1032,28 @@ mod tests {
             at("2026-08-15T10:26:09Z said [Sat Aug 15 11:00:00.0 2026]"),
             at("2026-08-15T10:26:09Z said nothing")
         );
+    }
+
+    /// A declared pattern REPLACES the built-ins rather than outranking
+    /// them: a line it does not match carries no timestamp at all, even
+    /// one holding an ISO stamp. That is what makes a multi-line entry
+    /// work — a stack-trace line mentioning a date must not start a new
+    /// entry — and it is the opposite of the natural assumption.
+    ///
+    /// The built-ins being shared for the process rather than owned per
+    /// extractor must not change any of that: the store that declares a
+    /// pattern and the store next to it that does not read their own
+    /// clocks.
+    #[test]
+    fn a_declared_pattern_replaces_the_builtins() {
+        let custom = Extractor::new(Some(r"at=(\d{10})"), Some("%s"), true).unwrap();
+        let plain = Extractor::new(None, None, true).unwrap();
+        // Both clocks are in the line; each extractor reads its own.
+        let line = "2026-08-15T10:26:09Z ready at=1786778625";
+        assert_eq!(custom.extract(line), Some(1_786_778_625_000));
+        assert_eq!(plain.extract(line), Some(1_786_789_569_000));
+        // The declared pattern absent, and a built-in one present.
+        assert_eq!(custom.extract("2026-08-15T10:26:09Z no marker"), None);
+        assert!(plain.extract("2026-08-15T10:26:09Z no marker").is_some());
     }
 }

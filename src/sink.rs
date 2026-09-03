@@ -221,10 +221,10 @@ pub fn cmd_records_sink(
                 st.lock().unwrap().sync_wal_declarations();
                 match crate::bark::declared_retention(&dir, &name) {
                     Ok(policy) if policy.is_some() => {
-                        let anchor = crate::follower::anchor_of(&dir, &name);
+                        let fields = crate::follower::subject_of(&dir, &name);
                         let next_seq = st.lock().unwrap().next_seq(&name).unwrap_or(0);
                         let held = crate::follower::TickInterest::default()
-                            .floor(&policy, &anchor, next_seq);
+                            .floor(&policy, &fields, next_seq);
                         match st.lock().unwrap().enforce_retention(
                             &name,
                             policy.max_age_ms,
@@ -281,6 +281,12 @@ pub fn cmd_records_sink(
     let mut carried: u64 = 0;
     let mut last_ts: Option<u64> = None;
     let mut start_fields: Vec<(String, String)> = Vec::new();
+    // The origins seen on the wire. A stream carrying several is a FAN-IN
+    // — legitimate, and sometimes the point — but it is also what "one
+    // destination store, one origin" is about, so it is said once rather
+    // than discovered later from a manifest naming whichever origin the
+    // stream happened to open with.
+    let mut origins: Vec<String> = Vec::new();
     let result = loop {
         match rec_reader.next_rec() {
             Ok(Some(Rec::Start(fields))) => start_fields = fields,
@@ -288,6 +294,20 @@ pub fn cmd_records_sink(
             Ok(Some(Rec::Entry(e))) => {
                 if let Some(t) = e.ts {
                     last_ts = Some(t);
+                }
+                if let Some(id) = &e.id {
+                    if !origins.iter().any(|o| o == id) {
+                        origins.push(id.clone());
+                        if origins.len() == 2 {
+                            crate::note!(
+                                "timberfs: {}: this stream carries entries from more than one \
+                                 store ({}), which are being merged into one — the \
+                                 destination's provenance then names no single origin",
+                                dest.display(),
+                                origins.join(", ")
+                            );
+                        }
+                    }
                 }
                 // ⚠ `e.chunk` is deliberately NOT read here, and that is
                 // not an omission. `wf`/`wl` are facts about the entry —
@@ -339,6 +359,10 @@ pub fn cmd_records_sink(
                 }
                 entries += 1;
             }
+            // The source's own position, for a consumer that resumes. A
+            // sink is a destination and never resumes, so it has nothing
+            // to do with one.
+            Ok(Some(Rec::Position(_))) => {}
             Ok(Some(Rec::End(_))) => {}
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
@@ -427,9 +451,9 @@ pub fn cmd_records_sink(
     // as it ran; this is the final pass, and the only one for an import.)
     match crate::bark::declared_retention(&dir, &name) {
         Ok(policy) if policy.is_some() => {
-            let anchor = crate::follower::anchor_of(&dir, &name);
+            let fields = crate::follower::subject_of(&dir, &name);
             let next_seq = st.lock().unwrap().next_seq(&name).unwrap_or(0);
-            let held = crate::follower::TickInterest::default().floor(&policy, &anchor, next_seq);
+            let held = crate::follower::TickInterest::default().floor(&policy, &fields, next_seq);
             if let Some(stats) = st.lock().unwrap().enforce_retention(
                 &name,
                 policy.max_age_ms,
