@@ -1118,11 +1118,12 @@ fn report_sent(
     src: &timberfs::frames::Sources,
     sent: &timberfs::frames::Sent,
 ) -> anyhow::Result<()> {
-    for r in &sent.refused {
+    // The send says each refusal once, as it happens; this is the count
+    // that is still standing when it ends.
+    if !sent.refused.is_empty() && !sent.streams.is_empty() {
         eprintln!(
-            "timberfs: {endpoint} refused {}: {}",
-            r.path.display(),
-            r.reason
+            "timberfs: {} store(s) {endpoint} would not take",
+            sent.refused.len()
         );
     }
     if sent.streams.is_empty() {

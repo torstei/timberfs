@@ -172,6 +172,18 @@ lives at «something unique» and timberfs is the tool that answers where. It
 also removes the last thing `sanitize_name` was needed for on this path: a
 uuid needs no escaping, so no two route values can round to one directory.
 
+### A refusal is per stream, and therefore not final
+
+⚠ Making the handshake per stream quietly removed a retry that used to be
+free: one refusal ended the whole send, and the unit's restart re-tried
+every store. Kept as "refused once, never asked again", a TRANSIENT refusal
+— a destination momentarily held by another writer, which is refused in
+exactly the same words as a colliding origin — would strand that store for
+the life of the connection, which for a service unit means until somebody
+restarts it. So a refusal lingers 60 seconds and is then offered again, and
+is logged once per REASON rather than once per attempt: a standing conflict
+is one line, a changed answer is a new one.
+
 ### A rotated store is refused, at the handshake
 
 `stream-open` carries the sender's oldest chunk NUMBER, so a fresh

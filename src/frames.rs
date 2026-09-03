@@ -60,6 +60,17 @@ const CHUNKS_PER_TURN: u64 = 256;
 /// what paces it — and an ack still in flight is read on the next turn.
 const DRAIN_WAIT: Duration = Duration::from_millis(20);
 
+/// How long a refused store waits before its stream is offered again.
+///
+/// ⚠ Refusing FOREVER is the tempting reading and it is wrong: not every
+/// refusal is permanent. A destination momentarily held by another writer
+/// is refused exactly like a colliding origin, and never asking again
+/// would strand that store for the life of the connection — which for a
+/// service unit is until somebody restarts it. Retrying is what a
+/// per-connection refusal used to get for free, when one refusal ended
+/// the whole send and the unit's restart re-tried everything.
+const REFUSAL_LINGERS: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct IntakeOpts {
     pub listen: String,
@@ -633,10 +644,10 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
 
     let mut live: Vec<Stream> = Vec::new();
     let mut next_wire = 0u32;
-    // A store refused once is not asked again on this connection: the
-    // answer will not change while the far end holds what it holds, and
-    // re-opening every poll would be a refusal per second in the log.
-    let mut refused: Vec<String> = Vec::new();
+    // Store identity -> where it is, when it was refused, and why. Held
+    // so a refusal is neither forgotten (a refusal per poll in the log)
+    // nor final.
+    let mut refused: HashMap<String, (PathBuf, std::time::Instant, String)> = HashMap::new();
 
     loop {
         let (sources, unidentified) = resolve_sources(src)?;
@@ -656,18 +667,34 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
         }
 
         for s in &sources {
-            if live.iter().any(|l| l.store == s.id) || refused.contains(&s.id) {
+            if live.iter().any(|l| l.store == s.id) {
+                continue;
+            }
+            let held = refused.get(&s.id);
+            if held.is_some_and(|(_, at, _)| at.elapsed() < REFUSAL_LINGERS) {
                 continue;
             }
             match open_send_stream(&mut w, &mut r, next_wire, s, opts, &mut live)? {
                 Some(reason) => {
-                    refused.push(s.id.clone());
-                    out.refused.push(Refused {
-                        path: s.path.clone(),
-                        reason,
-                    });
+                    // Said once per reason, not once per attempt: a
+                    // standing conflict is a line, and a changed answer
+                    // is a new one.
+                    if held.is_none_or(|(_, _, was)| *was != reason) {
+                        crate::note!(
+                            "timberfs: {} refused {}: {reason}",
+                            opts.endpoint,
+                            s.path.display()
+                        );
+                    }
+                    refused.insert(
+                        s.id.clone(),
+                        (s.path.clone(), std::time::Instant::now(), reason),
+                    );
                 }
-                None => next_wire += 1,
+                None => {
+                    refused.remove(&s.id);
+                    next_wire += 1;
+                }
             }
         }
 
@@ -710,6 +737,12 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
     for s in live {
         out.streams.push(s.into_report());
     }
+    // What is STILL refused when the connection ends — a store that was
+    // refused and later accepted is not a refusal, it is a delay.
+    for (_, (path, _, reason)) in refused {
+        out.refused.push(Refused { path, reason });
+    }
+    out.refused.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
 
