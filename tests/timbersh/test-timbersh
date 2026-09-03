@@ -937,6 +937,47 @@ def the_completer_still_knows_the_rest_of_the_grammar():
     # A predicate literal completes its own keys, then that key's values.
     assert c.options("select records from [", "[") == ["[host=", "[type="]
     assert c.options("select records from [host=", "[host=") == ["[host=web01"]
+    # ...for EVERY term, not just the first: after a comma it offers keys
+    # again, and then that key's values.
+    assert c.options("select records from [host=web01,", "[host=web01,") \
+        == ["[host=web01,host=", "[host=web01,type="]
+    assert c.options("select records from [host=web01,type=", "[host=web01,type=") \
+        == ["[host=web01,type=console"]
+
+
+@test
+def a_space_inside_a_predicate_does_not_end_completion():
+    """⚠ readline breaks words on SPACES — which is what lets a predicate
+    complete its own keys — and a space inside `[...]` is legal, because
+    the selector trims: `[service=app, host=web01]` is a real predicate
+    somebody types. Deciding from the word alone, it no longer began with
+    `[`, so the completer read the predicate as FINISHED and offered the
+    next statement slot: `where`, `limit`, `into`. Confidently wrong
+    rather than merely silent, and it made the natural spelling of a
+    second condition look like a dead end.
+
+    Each case is the (line, text) pair readline actually hands over, text
+    being the tail after the last space."""
+    c = completer()
+
+    def offer(typed):
+        line = "select records from " + typed
+        text = line.split(" ")[-1]
+        return [o for o in c.options(line, text) if o.startswith(text)]
+
+    # No space: unchanged, and the whole predicate is one word.
+    assert offer("[host=web01,ty") == ["[host=web01,type="]
+    # A space after the comma. The candidates are relative to what
+    # readline will replace, so they carry no `[host=web01,` prefix.
+    assert offer("[host=web01, ") == ["host=", "type="]
+    assert offer("[host=web01, ty") == ["type="]
+    assert offer("[host=web01, type=") == ["type=console"]
+    assert offer("[host=web01, type=con") == ["type=console"]
+    # A space before the comma too, and around the operator's key.
+    assert offer("[host=web01 , type=") == ["type=console"]
+    # ⚠ A CLOSED predicate is not inside one: the statement grammar takes
+    # over, which is what the broken version was doing everywhere.
+    assert offer("[host=web01] ") == ["where", "limit", "into"]
 
 
 @test
@@ -991,6 +1032,33 @@ def tab_completes_a_statement_on_a_terminal():
     # `sel` is not a word this session could echo, so `select` on the
     # screen was written by the completion and nothing else.
     s.send("sel\t").expect("select")
+    s.finish()
+    s.cleanup()
+
+
+@test
+def tab_completes_a_second_condition_on_a_terminal():
+    """The spaced-predicate case through REAL readline, because the unit
+    cases above encode an assumption about what readline hands the
+    completer — the `text` it passes once a space is inside `[...]` — and
+    an assumption tested against itself proves nothing.
+
+    `ho` and `ty` are not words this session could echo, so `host=` and
+    `type=` on the screen were written by the completion."""
+    s = Pty({"": {"stores": [
+        {"kind": "pair", "handle": "app", "name": "app", "id": "i1",
+         "dir": "/l", "followers": [],
+         "labels": {"host": "web01", "type": "console"}},
+    ]}}).start()
+    s.expect("timberfs=#")
+    # First term: the whole predicate is one word, as before.
+    s.send("select records from [ho\t").expect("host=")
+    # Second term AFTER A SPACE, which is where readline stops handing
+    # over anything beginning with `[`.
+    s.send("web01, ty\t").expect("type=")
+    # And its value, so the operator half works there too.
+    s.send("\t").expect("console")
+    s.send("\n")
     s.finish()
     s.cleanup()
 
