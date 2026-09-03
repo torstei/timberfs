@@ -20,7 +20,7 @@ _timberfs() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
-    local subcommands="mount create set append import export query info index list identity reindex trim rotate feed forest follower forward-intake otlp-intake incus-intake frames-intake frames-send"
+    local subcommands="mount umount create set append import export query info index list identity reindex trim rotate feed forest follower forward-intake otlp-intake incus-intake frames-intake frames-send"
     local follower_verbs="create list status update delete run"
     local forest_verbs="create list remove"
 

@@ -28,7 +28,7 @@ struct Cli {
 enum Command {
     /// Mount a timberfs: files under MOUNTPOINT are stored compressed and
     /// time-indexed in BACKING. Runs in the foreground; unmount with
-    /// fusermount3 -u MOUNTPOINT (or Ctrl-C if auto_unmount is active).
+    /// `timberfs umount MOUNTPOINT` (or Ctrl-C if auto_unmount is active).
     Mount {
         /// Backing directory holding the .trunk/.rings pairs
         backing: PathBuf,
@@ -54,6 +54,13 @@ enum Command {
         /// RestartForceExitStatus; leave it off for an interactive mount.
         #[arg(long)]
         exit_on_upgrade: bool,
+    },
+    /// Unmount a timberfs, through whichever fuse helper this host has:
+    /// fuse3 spells it fusermount3 and fuse 2.9 fusermount, so the name is
+    /// discovered rather than typed. The mount daemon flushes and exits.
+    Umount {
+        /// The mountpoint to unmount
+        mountpoint: PathBuf,
     },
     /// Create an empty timberfs log with its properties declared up
     /// front in a .bark manifest — database-style: `create --index` is
@@ -1123,6 +1130,10 @@ fn main() -> anyhow::Result<()> {
             );
             fs::mount(s, &mountpoint, allow_other, exit_on_upgrade)?;
         }
+        Command::Umount { mountpoint } => {
+            fs::unmount(&mountpoint)?;
+            timberfs::note!("timberfs: unmounted {}", mountpoint.display());
+        }
         Command::Create {
             dest,
             index,
@@ -2017,6 +2028,11 @@ mod cli_tests {
                         "identity",
                         "a repair verb for a store that is already broken, not a reason to \
                          reach for timberfs; the man page and the deployment guide carry it",
+                    ),
+                    (
+                        "umount",
+                        "the inverse of an operation, not a use case; the deployment guide \
+                         and the man page carry it",
                     ),
                 ],
             ),

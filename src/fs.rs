@@ -1011,7 +1011,7 @@ pub fn mount(
             // in /etc/fuse.conf) on some setups; degrade gracefully.
             eprintln!(
                 "timberfs: mount with auto_unmount failed ({e}); retrying without it \
-                 (unmount manually with: fusermount3 -u {})",
+                 (unmount manually with: timberfs umount {})",
                 mountpoint.display()
             );
             let options = vec![MountOption::FSName("timberfs".to_string())];
@@ -1022,6 +1022,68 @@ pub fn mount(
     store.lock().unwrap().flush_all();
     result?;
     Ok(())
+}
+
+/// The unmount helper, fuse3's spelling before fuse 2.9's, and each with an
+/// explicit /usr/bin and /bin after the bare name: a release without a
+/// merged /usr has the binary in /bin, and the bare name only finds it if
+/// PATH carries it.
+const FUSERMOUNT_CANDIDATES: &[&str] = &[
+    "fusermount3",
+    "/usr/bin/fusermount3",
+    "/bin/fusermount3",
+    "fusermount",
+    "/usr/bin/fusermount",
+    "/bin/fusermount",
+];
+
+/// Unmount a timberfs through whichever fuse helper this host has.
+///
+/// The name is DISCOVERED, not declared: fuse3 installs `fusermount3` and
+/// fuse 2.9 installs `fusermount`, so a caller that hardcodes either is
+/// wrong on half the releases we package for — which is what the mount
+/// unit's `ExecStop` used to be. `fuser` discovers the one it mounts with;
+/// this is the same list, so a mount and its unmount cannot disagree.
+///
+/// Only `NotFound` moves to the next candidate. A helper that RAN and
+/// refused — a busy mountpoint, not ours, not mounted — is that helper's
+/// exit status and the answer, because trying the next one would turn a
+/// reportable failure into "no helper found".
+pub fn unmount(mountpoint: &Path) -> anyhow::Result<()> {
+    let mut missing = Vec::new();
+    for cand in FUSERMOUNT_CANDIDATES {
+        let out = std::process::Command::new(cand)
+            .arg("-u")
+            .arg("--")
+            .arg(mountpoint)
+            .output();
+        match out {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(*cand);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("running {cand}")));
+            }
+            Ok(o) if o.status.success() => return Ok(()),
+            Ok(o) => {
+                // The helper's own words: it knows whether the path is busy,
+                // not a mountpoint, or not ours, and paraphrasing loses that.
+                let why = String::from_utf8_lossy(&o.stderr);
+                let why = why.trim();
+                anyhow::bail!(
+                    "{cand} could not unmount {}{}{}",
+                    mountpoint.display(),
+                    if why.is_empty() { "" } else { ": " },
+                    why
+                );
+            }
+        }
+    }
+    anyhow::bail!(
+        "no fuse unmount helper on this host (tried {}) — install fuse3, \
+         or fuse where there is no fuse3",
+        missing.join(", ")
+    )
 }
 
 /// mount2() minus the convenience: we need the session in hand to give the

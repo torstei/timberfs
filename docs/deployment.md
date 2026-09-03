@@ -247,8 +247,13 @@ EXTRA_OPTS=--allow-other
 systemctl enable --now timberfs@applogs
 ```
 
-Stopping the unit unmounts first (`ExecStop`), so the daemon flushes everything
-and exits cleanly.
+Stopping the unit unmounts first (`ExecStop` runs `timberfs umount`), so the
+daemon flushes everything and exits cleanly. A stop that fails because the
+mountpoint is busy says so, rather than passing and leaving the mount up.
+
+Outside a unit, `timberfs umount MOUNTPOINT` is the same thing: it finds the
+fuse helper this host has — fuse3's `fusermount3`, fuse 2.9's `fusermount` —
+so there is no spelling to remember per release.
 
 ### Streaming logs in — `timberfs-log@.socket` + `timberfs-log@.service`
 

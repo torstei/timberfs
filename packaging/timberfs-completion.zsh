@@ -34,6 +34,7 @@ _timberfs_commands() {
     local -a subcommands
     subcommands=(
         'mount:serve a backing directory as a mounted filesystem'
+        'umount:unmount a timberfs, finding the fuse helper this host has'
         'create:create an empty log with declared properties'
         'set:change a store manifest'
         'append:append stdin to a log, no mount needed'

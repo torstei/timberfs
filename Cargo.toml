@@ -68,8 +68,8 @@ maintainer = "Torstein Tauno Svendsen <torstei@gmail.com>"
 copyright = "2026, Torstein Tauno Svendsen"
 section = "admin"
 priority = "optional"
-# fusermount3 (package fuse3) is exec'ed at mount time; $auto picks up the
-# shared-library deps of the binary itself.
+# fusermount3 (package fuse3) is exec'ed at mount and unmount time; $auto
+# picks up the shared-library deps of the binary itself.
 depends = ["$auto", "fuse3"]
 extended-description = """\
 A FUSE filesystem purpose-built for log files. Files in the \

@@ -34,7 +34,7 @@ is explained.
 - **FUSE** gives us the full VFS interface in userspace: loggers append
   through the mount unmodified, `tail -f`/`grep`/`less` all just work, and
   the implementation is ordinary safe Rust (`fuser` crate, no libfuse
-  dependency — it only needs the `fusermount3` binary at runtime).
+  dependency — it only needs a `fusermount3`/`fusermount` binary at runtime).
 
 The design cleanly splits into a *store* (file format + chunking, no FUSE
 types) and a thin FUSE layer, so the store could later be re-hosted in a
