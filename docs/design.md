@@ -208,8 +208,9 @@ object — the label on the timber. Plain enough to read by eye; changed with
   "retain_unconsumed": true,      //   keep what retaining FOLLOWERS have not read;
                                   //   additive, and needs the budget above as its backstop
   "cursors": "/var/lib/timberfs", //   SUPERSEDED by the follower registry: a
-                                  //   follower declares its store, so a store
-                                  //   declares nothing. Honoured, reported so
+                                  //   follower declares WHICH stores it reads,
+                                  //   so a store declares nothing. Honoured,
+                                  //   and reported as superseded
   "timestamp_regex": "^(...)",    // content: exotic line-timestamp format, declared once
   "timestamp_format": "%m/%d/%Y %H:%M:%S", //   (import flags persist these; inherits)
   "timestamp_utc": true,          //   zoneless line stamps are UTC, not local time

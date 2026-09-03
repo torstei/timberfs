@@ -16,12 +16,17 @@ pass its own paths.
 /usr/bin/timber-filter                    the entry-aware records filter
 
 /etc/timberfs/<instance>.conf             config for a mount instance (see below)
-/etc/timberfs/otlp-<instance>.conf        config for an OTLP shipper instance (see below)
+/etc/timberfs/follower-<instance>.conf    SECRETS for one follower, and nothing else:
+                                          which stores it reads and what consumes them
+                                          live in its declaration (chmod 0600)
 /etc/timberfs/forests.d/*.conf            forests: directories searched by handle (see below)
 
-/var/lib/timberfs/otlp-<instance>.cursor  the OTLP shipper's position in its store —
-                                          CONSUMER state, deliberately not inside the
-                                          store's backing directory (StateDirectory=)
+/var/lib/timberfs/followers/<name>/       one directory per FOLLOWER (StateDirectory=),
+                                          holding CONSUMER state — deliberately not
+                                          inside any store's backing directory:
+    follower.json                           select, retaining, command (the operator writes)
+    positions.json                          a place per store it has read (the follower writes)
+    follower.lock                           held while it runs (`follower run` acquires)
 
 /run/timberfs/<instance>.pipe             records intake FIFO, created by the .socket
                                           unit (the directory is created at boot by
@@ -1071,18 +1076,18 @@ store it alone is holding.
 
 Liveness is read from the follower's **lock**, not from systemd: a lock is
 released by the kernel on process death so it cannot go stale, while a unit's
-state answers about the unit. (The lock is taken by `run` and inherited across
-the exec, which is why the shipper needs no lock code — and why liveness also
-checks the recorded pid: the shipper spawns its own reader, that child inherits
-the descriptor, and such a child can outlive its parent.)
+state answers about the unit. It is lock held **and** recorded pid alive: a
+descriptor can be inherited by a child that outlives its parent, and a lock
+alone then reads as running with no follower behind it.
 
 The number to watch is the held bytes: **retention is the disconnection budget,
-and nothing enforces that a follower stays inside it**. A shipper down longer
-than `retain` comes back to a position pointing at a dropped chunk; it warns on
-resume (`GAP — N chunk(s) were dropped before it read them`) and continues
-from the oldest chunk, because the loss is already in the past and a shipper
-that refuses to start ships nothing. Alert on that warning, and on a follower
-whose lag approaches the retention window.
+and nothing enforces that a follower stays inside it**. A follower down longer
+than `retain` comes back to a position pointing at a dropped chunk, and reading
+resumes from the oldest one still there, because the loss is already in the past
+and a follower that refuses to start ships nothing. `follower status` reports it
+as `GAP — N chunk(s) were dropped before it read them`, from the store's side
+and before it becomes loss. Alert on that, and on a follower whose lag
+approaches the retention window.
 
 `retaining` is one half of a pair. The **store** declares the other half, and
 that is what actually moves the head:
@@ -1131,8 +1136,17 @@ retention is a no-op rather than an error:
 # /etc/systemd/system/timberfs-trim.service  (pair with a daily .timer)
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'timberfs list --names | xargs -rn1 timberfs trim'
+ExecStart=/usr/bin/timberfs trim --select '[]'
 ```
+
+`--select` is why that is one command rather than a loop over `list --names`,
+and adding `--delete-empty` removes a store the trim leaves holding nothing that
+once held something — the housekeeping a host whose stores come and go
+otherwise needs a second script for. Read `man timberfs` first: deleting a store
+takes its manifest, so its identity, labels and retention policy go with it, and
+an intermittent producer is empty most of the time. Non-zero exit means a store
+needs attention — one that failed, or one empty and retained — never merely a
+store left to its own live writer.
 
 The older `cursors=<dir>` key still works and is reported as superseded wherever
 it is found.
@@ -1323,11 +1337,11 @@ make systemd restart it onto the new binary regardless of `Restart=`.
   what was never acknowledged (that is what the chunk/ack handshake and the
   HTTP response are for), so the cost is the same at-least-once duplication a
   network blip would cause anyway.
-- **The OTLP shipper** is a reader, so a restart cannot hurt the store: it
-  resumes from its cursor, which only advances after the receiver accepted a
-  batch, so an interrupted send is re-delivered rather than skipped. A restart
-  long enough for retention to pass the cursor is the one lossy case, and it
-  warns about it by name (GAP) instead of resuming silently.
+- **A follower** is a reader, so a restart cannot hurt the store: it resumes
+  from its recorded positions, which move only when the consumer reports, so an
+  interrupted send is re-delivered rather than skipped. A restart long enough
+  for retention to pass a position is the one lossy case, and `follower status`
+  names it (GAP) rather than letting it resume silently.
 
 ## Reliability model (both intakes)
 

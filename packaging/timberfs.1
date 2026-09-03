@@ -1050,8 +1050,8 @@ header, which a live writer also rewrites when retention drops a head,
 so it refuses to run while one holds the store \(em stop the writer
 first. Log data is never touched by any of this.
 .PP
-Choosing wrongly is not cosmetic: a follower records its store by
-identity, so the side you discard is the one whose cursors stop
+Choosing wrongly is not cosmetic: a follower records the stores it reads
+by identity, so the side you discard is the one whose recorded places stop
 resolving.
 .SS index
 .B timberfs index
@@ -1217,7 +1217,9 @@ the contract being two file descriptors.
 timberfs owns the position; the consumer REPORTS how far to move it, and
 a report is the only thing that advances one. A consumer says hello, is
 fed
-.BR timberfs\-records (5),
+.BR timberfs\-records (5)
+\(em THE CONSUMER PROTOCOL in that page is the whole contract, and what
+to write a consumer against \(em
 and answers with a watermark per store meaning \(lqdo not send me these
 again\(rq \(em so a receiver that is down gets the same entries again,
 while an entry refused for being too old is reported past and never
@@ -2598,7 +2600,8 @@ advances past data the other never sent.
 A follower feeds
 .BR timberfs\-records (5)
 to a program on its stdin and reads that program's reports back on its
-stdout \(em three messages, small enough to implement in a shell script,
+stdout \(em three messages, specified under THE CONSUMER PROTOCOL in that
+page and small enough to implement in a shell script,
 which is the point of it being a protocol rather than an interface. A
 report is a WATERMARK per store meaning
 .RI \(dq "do not send me these again" \(dq,

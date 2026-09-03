@@ -110,15 +110,19 @@ Because the data is still there afterwards, any window can be re-sent:
 
 ```sh
 # the backend ate 14:00–15:00; send it again
-timber-otlp --from '2026-08-11 14:00' --to '2026-08-11 15:00' \
-    --endpoint http://collector:4318 backing/app.log
+timberfs query backing/app.log --records \
+    --from '2026-08-11 14:00' --to '2026-08-11 15:00' \
+  | timber-otlp --endpoint http://collector:4318
 
 # evaluate or migrate to a candidate backend on real traffic
-timber-otlp --from 2026-08-01 --endpoint http://candidate:4318 backing/app.log
+timberfs query backing/app.log --records --from 2026-08-01 \
+  | timber-otlp --endpoint http://candidate:4318
 ```
 
-Replay takes no cursor deliberately: it is on the logline axis, and a deliberate
-act rather than a resumable one. Delivery is at-least-once, as OTLP itself is.
+A replay is a bounded query piped into the consumer, and deliberately not a mode
+of it: it is on the logline axis and a deliberate act rather than a resumable
+one, so it holds no position and nothing has to be reset afterwards. Delivery is
+at-least-once, as OTLP itself is.
 
 *Why not a collector's persistent queue:* it retains nothing once delivered, so
 none of the three moves above exist there — an outage past the queue's size is
