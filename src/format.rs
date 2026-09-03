@@ -67,6 +67,31 @@ pub const TRIM_EXT: &str = "trim";
 pub const SAP_EXT: &str = "sap";
 pub const SAP_SEAL_EXT: &str = "sap.seal";
 
+/// Every file a store of this name owns, present or not — the pair, the
+/// manifest and every sidecar. Named in ONE place so a caller that
+/// removes a store cannot leave one behind as the set grows.
+///
+/// ⚠ The order matters for removal: the RINGS go first, because a store
+/// without them is not a store to any reader (`resolve_backing` and every
+/// forest scan test for them), so an interrupted delete leaves something
+/// nothing will pick up rather than a pair missing its index.
+pub fn every_path(dir: &Path, name: &str) -> Vec<PathBuf> {
+    [
+        RINGS_EXT,
+        TRUNK_EXT,
+        GRAIN_EXT,
+        BARK_EXT,
+        SEQ_EXT,
+        TRIM_EXT,
+        SAP_EXT,
+        SAP_SEAL_EXT,
+        "lock",
+    ]
+    .iter()
+    .map(|ext| dir.join(format!("{name}.{ext}")))
+    .collect()
+}
+
 pub fn trunk_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{TRUNK_EXT}"))
 }
