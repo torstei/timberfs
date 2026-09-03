@@ -532,6 +532,20 @@ struct Stream {
     undeclared: u64,
 }
 
+impl Stream {
+    fn into_report(self) -> StreamSent {
+        StreamSent {
+            store: self.store,
+            path: self.path,
+            chunks: self.chunks,
+            comp_bytes: self.comp_bytes,
+            accepted_at: self.accepted_at,
+            acked: self.acked,
+            skipped_already_held: self.skipped,
+        }
+    }
+}
+
 /// Say once, per store, that a pair carrying no identity cannot be
 /// replicated — the destination is keyed by one. Named rather than
 /// silently skipped, and a reader has no business minting an identity
@@ -630,18 +644,15 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
 
         // A store that has left the selection: end its stream, so the far
         // end can release the writer locks and the open store it holds.
+        // What it shipped is reported, not forgotten with it.
         let held: Vec<String> = sources.iter().map(|s| s.id.clone()).collect();
-        let mut closing = Vec::new();
-        live.retain(|s| {
-            if held.contains(&s.store) {
-                true
-            } else {
-                closing.push(s.wire);
-                false
-            }
-        });
-        for wire in closing {
-            send(&mut w, wire, Frame::StreamClose)?;
+        let (keep, gone): (Vec<Stream>, Vec<Stream>) = std::mem::take(&mut live)
+            .into_iter()
+            .partition(|s| held.contains(&s.store));
+        live = keep;
+        for s in gone {
+            send(&mut w, s.wire, Frame::StreamClose)?;
+            out.streams.push(s.into_report());
         }
 
         for s in &sources {
@@ -697,15 +708,7 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
     }
     save_positions(opts.positions.as_deref(), &mut live)?;
     for s in live {
-        out.streams.push(StreamSent {
-            store: s.store,
-            path: s.path,
-            chunks: s.chunks,
-            comp_bytes: s.comp_bytes,
-            accepted_at: s.accepted_at,
-            acked: s.acked,
-            skipped_already_held: s.skipped,
-        });
+        out.streams.push(s.into_report());
     }
     Ok(out)
 }
@@ -1390,6 +1393,59 @@ mod tests {
             "{:?}",
             sent.refused
         );
+    }
+
+    /// A store whose head has rotated away has no numbering base at a
+    /// fresh destination — and that is a REFUSAL at the handshake rather
+    /// than a failure on the first chunk, which mid-stream would be the
+    /// whole connection's.
+    #[test]
+    fn a_rotated_store_is_refused_at_the_handshake_not_mid_stream() {
+        let d = TempDir::new();
+        let src = d.path().join("src.log");
+        crate::bark::cmd_create(&src, false, false, Some("1h"), None, false, &[], false).unwrap();
+        let cfg = crate::store::Config {
+            chunk_size: 1 << 20,
+            level: 1,
+            flush_age_ms: u64::MAX,
+        };
+        let mut st = crate::store::Store {
+            dir: d.path().to_path_buf(),
+            cfg,
+            files: std::collections::BTreeMap::new(),
+        };
+        st.create("src.log").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let f = st.files.get_mut("src.log").unwrap();
+        for i in 0..4u64 {
+            let ms = if i < 2 { 1_000 + i } else { now };
+            f.append_windowed(
+                format!("2026-06-01T10:00:0{i}Z line {i} padding\n").as_bytes(),
+                ms,
+                ms,
+                &cfg,
+            )
+            .unwrap();
+            f.flush_chunk(&cfg).unwrap();
+        }
+        drop(st);
+        crate::rotate::cmd_trim(&src, false).unwrap();
+
+        let into = d.path().join("recv");
+        let (addr, server) = one_shot(opts(&into, true));
+        let sent = cmd_send(&one(&src), &send_opts(&addr)).unwrap();
+        // The connection ended normally: the refusal was one stream's.
+        assert!(server.join().unwrap().unwrap().is_empty());
+        assert_eq!(sent.refused.len(), 1, "{sent:?}");
+        assert!(
+            sent.refused[0].reason.contains("begins at chunk 2"),
+            "{:?}",
+            sent.refused
+        );
+        assert!(!landed(&into, &src).exists(), "nothing was created");
     }
 
     /// One store's conflict must not stop the others: the handshake is per

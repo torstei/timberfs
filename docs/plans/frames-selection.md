@@ -172,6 +172,16 @@ lives at «something unique» and timberfs is the tool that answers where. It
 also removes the last thing `sanitize_name` was needed for on this path: a
 uuid needs no escaping, so no two route values can round to one directory.
 
+### A rotated store is refused, at the handshake
+
+`stream-open` carries the sender's oldest chunk NUMBER, so a fresh
+destination can see at the handshake that it cannot continue a numbering
+beginning at 500 — there being no base to count from. That was already
+refused, but on the first chunk, which mid-stream is the whole connection's
+failure rather than one store's; with a stream per store that would cost
+forty-nine innocent stores their pass. Seeding such a destination from an
+`export` of the source is the way in, and the refusal says so.
+
 ## What travels: the store, not the pair
 
 Identity and labels are what the store IS, and they travel. Everything else

@@ -150,6 +150,11 @@ impl<R: Read> Reader<R> {
 pub struct Opening {
     pub origin_id: [u8; 16],
     pub sender_id: [u8; 16],
+    /// The first chunk NUMBER this stream carries — the sender's own
+    /// oldest, not what was asked for. A fresh destination can only
+    /// continue a numbering from its beginning, so this is what says at
+    /// the handshake whether it can.
+    pub first_seq: u64,
     pub provenance: Vec<u8>,
     pub sidecars: Vec<crate::frame::Sidecar>,
 }
@@ -200,6 +205,22 @@ impl Session {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating backing directory {}", dir.display()))?;
         let existed = crate::format::rings_path(&dir, &name).exists();
+
+        // A numbering can only be continued, and there is no base to
+        // continue it FROM: a store whose head has rotated away begins at
+        // chunk 500, and nothing here can hold 0..499 that never arrive.
+        // Said at the handshake, where it is one store's refusal, rather
+        // than mid-stream, where it is the connection's.
+        if !existed && open.first_seq > 0 && open.first_seq != frame::OPEN_ENDED {
+            bail!(
+                "the stream begins at chunk {} and {} holds nothing to continue from — a \
+                 replica cannot start mid-tape, there being no numbering base. Seed the \
+                 destination from an `export` of the source, or replicate a store whose \
+                 head is still whole",
+                open.first_seq,
+                dest.display()
+            );
+        }
 
         // One destination store, one origin. Checked here because this is
         // where an origin is claimed; without it a reinstall or a renamed
@@ -444,12 +465,14 @@ pub fn opening_of(f: Frame) -> anyhow::Result<Opening> {
         Frame::StreamOpen {
             origin_id,
             sender_id,
+            first_seq,
             provenance,
             sidecars,
             ..
         } => Ok(Opening {
             origin_id,
             sender_id,
+            first_seq,
             provenance,
             sidecars,
         }),
@@ -801,10 +824,13 @@ mod tests {
         let dst = d.path().join("mid.log");
         let err = receive(&dst, &bytes[..], &ReceiveOpts::default(), &cfg())
             .expect_err("a fresh store cannot start at chunk 3");
-        assert!(
-            format!("{err:#}").contains("continue it exactly"),
-            "{err:#}"
-        );
+        // Refused at the OPENING, not on the first chunk: mid-stream this
+        // is the connection's failure, and every other store sharing it
+        // pays for one store's rotation.
+        let msg = format!("{err:#}");
+        assert!(msg.contains("begins at chunk 3"), "{msg}");
+        assert!(msg.contains("nothing to continue from"), "{msg}");
+        assert!(!dst.exists(), "a refused stream leaves no trace");
     }
 
     #[test]
