@@ -580,16 +580,13 @@ impl Stream {
 
 /// File the streams the far end dropped mid-flight: what each shipped is
 /// reported, and the store waits out a refusal like any other before it is
-/// offered again. Returns how many were removed from BEFORE the index a
-/// caller is walking, which is all of them — a stream is dropped only once
-/// its turn has been taken.
+/// offered again.
 fn give_up(
     out: &mut Sent,
     refused: &mut HashMap<String, (PathBuf, std::time::Instant, String)>,
     dropped: Vec<(Stream, String)>,
     endpoint: &str,
-) -> usize {
-    let n = dropped.len();
+) {
     for (s, reason) in dropped {
         crate::note!(
             "timberfs: {endpoint} gave up on {}: {reason}",
@@ -601,7 +598,6 @@ fn give_up(
         );
         out.streams.push(s.into_report());
     }
-    n
 }
 
 /// Say once, per store, that a pair carrying no identity cannot be
@@ -761,16 +757,21 @@ pub fn cmd_send(src: &Sources, opts: &SendOpts) -> anyhow::Result<Sent> {
         // A turn each, and the acks read between them: one store's
         // backlog must not fill the far end's write buffer while nothing
         // is emptying it here.
+        //
+        // Walked by stream id rather than by index, because a drain can
+        // remove ANY stream — a conflict answering a chunk sent in an
+        // earlier pass arrives whenever it arrives — so an index would
+        // step over a store or repeat one depending on where the removal
+        // landed. One turn each, and a stream that has gone is skipped.
         let mut shipped = 0u64;
-        let mut i = 0;
-        while i < live.len() {
-            shipped += ship_turn(&mut w, &mut live[i], opts)?;
+        for wire in live.iter().map(|s| s.wire).collect::<Vec<_>>() {
+            let Some(at) = live.iter().position(|s| s.wire == wire) else {
+                continue;
+            };
+            shipped += ship_turn(&mut w, &mut live[at], opts)?;
             let mut dropped = Vec::new();
             drain_acks(&mut r, &mut live, &mut dropped, DRAIN_WAIT)?;
-            let stepped = give_up(&mut out, &mut refused, dropped, &opts.endpoint);
-            // A stream the far end dropped is removed from `live`, so the
-            // index only advances past streams that are still there.
-            i = (i + 1).saturating_sub(stepped);
+            give_up(&mut out, &mut refused, dropped, &opts.endpoint);
         }
         // Record whatever the far end has acknowledged. That is what a
         // retention interest axis reads to know what has left this box —
