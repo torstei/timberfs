@@ -214,8 +214,12 @@ object — the label on the timber. Plain enough to read by eye; changed with
   "timestamp_regex": "^(...)",    // content: exotic line-timestamp format, declared once
   "timestamp_format": "%m/%d/%Y %H:%M:%S", //   (import flags persist these; inherits)
   "timestamp_utc": true,          //   zoneless line stamps are UTC, not local time
+  "name": "apache-error",         // what it is CALLED, where the path is opaque
   "derived_from": "41d0…",        // lineage: source store's id
-  "derived_op": "export",         // …and how: export (copy) or rotate (move)
+  "derived_op": "export",         // …and how: export (copy), rotate (move) or
+                                  //   receive (replicate)
+  "origin_id": "6f9c2a1e-…",      // address: WHICH TAPE this pair holds. Equal to
+                                  //   `id` on a replica, which IS that store
   "window_from": "2026-07-04T22:00:00.000Z", // the REQUESTED window (operation
   "window_to": "2026-07-05T22:00:00.000Z"    //   fact — what was asked)
 }
@@ -224,7 +228,17 @@ object — the label on the timber. Plain enough to read by eye; changed with
 Artifacts made by `export` and by rotation into a new segment are new
 stores: fresh `id`, `derived_from`/`derived_op` lineage (chains compose
 across re-carves and shipping), provenance inherited, settings and window
-facts not. Content facts — actual spans, sizes — are never recorded (the
+facts not.
+
+**A replica is the exception, and for the same reason.** `frames-intake`
+does not derive a store, it holds the same tape somewhere else — the chunk
+numbers, the origin and the IDENTITY travel together, because each is that
+one claim, and a second `id` would make one tape answer to two names while
+every position, chunk address and tape offset is keyed by one. So a replica
+keeps the sender's `id` and its `name` (the path being a uuid at the far
+end, there is nothing left to reconstruct a name from) and records no
+`derived_from`. What stays the destination's own is everything about the
+PAIR: `created`, and the settings above. Content facts — actual spans, sizes — are never recorded (the
 artifact's own rings state them authoritatively); the *requested* window
 is recorded, because content can't state coverage: a file whose last line
 is 17:00 doesn't say whether 17:00–24:00 was covered-but-silent or simply

@@ -1,6 +1,6 @@
 # Frames of a selection: many stores on one connection, and an identity that travels
 
-**Status: design.** The frames counterpart of
+**Status: built** (branch `feature/frames-follower`). The frames counterpart of
 [follower-selection.md](follower-selection.md), and it settles what
 [receiving-end.md](receiving-end.md) left as design: the receiver's naming
 policy. The wire it rests on is [native-replication.md](native-replication.md),
