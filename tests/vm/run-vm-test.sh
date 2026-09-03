@@ -47,7 +47,12 @@ case "${TIMBERFS_VM_IMAGE:-trixie}" in
     focal)  IMG_URL=https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img ;;
     jammy)  IMG_URL=https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img ;;
     noble)  IMG_URL=https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img ;;
-    *) echo "unknown TIMBERFS_VM_IMAGE '${TIMBERFS_VM_IMAGE}' (trixie|focal|jammy|noble)" >&2; exit 2 ;;
+    # Bionic is where `timberfs-bionic` goes. Its image is frozen at the 2023
+    # EOL snapshot, so `current` does not move under the cache key; the
+    # archive is still served from archive.ubuntu.com, which the suite needs
+    # for its own zstd/jq.
+    bionic) IMG_URL=https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img ;;
+    *) echo "unknown TIMBERFS_VM_IMAGE '${TIMBERFS_VM_IMAGE}' (trixie|focal|jammy|noble|bionic)" >&2; exit 2 ;;
 esac
 IMG_URL=${TIMBERFS_VM_IMG_URL:-$IMG_URL}
 BASE=$CACHE/$(basename "$IMG_URL")

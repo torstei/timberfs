@@ -46,6 +46,12 @@ run_test() {
 BACKING=/var/log/timberfs-backing/test
 MNT=/var/log/testlogs
 
+# The package under test names itself. `timberfs-bionic` is a second package
+# for one release below the compat .deb's glibc floor, so nothing here may
+# assume the name — a hardcoded `timberfs` would purge the wrong thing and
+# read the wrong Depends.
+PKG=$(dpkg-deb -f /opt/timberfs.deb Package)
+
 install_package() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
@@ -509,7 +515,7 @@ import_resume_grown() {
 
 purge_package() {
     systemctl disable --now timberfs@test
-    apt-get purge -y -qq timberfs
+    apt-get purge -y -qq "$PKG"
 }
 
 purge_correct() {
@@ -521,6 +527,16 @@ purge_correct() {
 }
 
 echo "TIMBERFS-VM-TESTS: starting on $(uname -r), $(. /etc/os-release && echo "$PRETTY_NAME")"
+
+fuse_helper_present() {
+    # The package declares `fuse3` or `fuse3 | fuse`, and fuser's pure-Rust
+    # mount execs whichever of fusermount3/fusermount it finds first. So the
+    # assertion is that the declared dependency produced a helper, not that a
+    # particular spelling is installed: bionic has no fuse3 at all and
+    # satisfies this with fuse 2.9.7.
+    dpkg-query -f '${Depends}' -W "$PKG" | grep -q 'fuse' || return 1
+    command -v fusermount3 >/dev/null || command -v fusermount >/dev/null
+}
 
 man_page_installed() {
     zcat /usr/share/man/man1/timberfs.1.gz | grep -q "^.TH TIMBERFS 1" \
@@ -538,7 +554,7 @@ completion_scripts_installed() {
 
 run_test "install deb with dependencies" install_package
 run_test "binary runs (--version)" timberfs --version
-run_test "fuse3 dependency pulled in" command -v fusermount3
+run_test "declared fuse dependency yields a helper fuser can exec" fuse_helper_present
 run_test "man page installed and gzipped" man_page_installed
 run_test "package ships /etc/timberfs" test -f /etc/timberfs/README
 run_test "shell completion scripts installed to vendor paths" completion_scripts_installed

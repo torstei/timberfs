@@ -673,6 +673,20 @@ sudo apt install ./timberfs_amd64.deb
 
 Or from crates.io with a Rust toolchain: `cargo install timberfs`.
 
+### Ubuntu 18.04
+
+One release below that floor gets its own package, `timberfs-bionic`, from
+the same repository — built against glibc 2.27 and depending on `fuse3 |
+fuse`, since bionic has no fuse3. It `Provides: timberfs` and conflicts with
+it, so the two are alternatives rather than an upgrade path:
+
+```sh
+sudo apt install timberfs-bionic
+```
+
+Only `libc6` is a hard dependency, so the `.deb` from the release also
+installs with `dpkg -i` on a host whose apt sources no longer resolve.
+
 ## How it works
 
 Two files carry the log: the data (`<name>.trunk`, concatenated zstd frames)

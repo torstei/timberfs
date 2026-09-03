@@ -85,8 +85,19 @@ jobs:
       matrix:
         # We ship one old-glibc .deb for every supported release, so test it on
         # the OLDEST we claim (focal — Ubuntu 20.04, systemd 245, glibc 2.31)
-        # and a current one (trixie).
-        image: [trixie, focal]
+        # and a current one (trixie). `timberfs-bionic` is a second package for
+        # one release below that floor, so it gets its own leg on its own image.
+        #
+        # The glibc target, the cargo-deb variant and the package name travel
+        # WITH the image rather than being derived from it: both zigbuild
+        # targets write the same `target/x86_64-unknown-linux-gnu/release/`
+        # (cargo-zigbuild strips the glibc suffix), so a leg that built the
+        # wrong pair would package a binary its declared libc6 floor does not
+        # match — and only running it on the older image says so.
+        include:
+          - { image: trixie, glibc: "2.31", variant: compat, pkg: timberfs }
+          - { image: focal,  glibc: "2.31", variant: compat, pkg: timberfs }
+          - { image: bionic, glibc: "2.27", variant: bionic, pkg: timberfs-bionic }
     steps:
       - uses: actions/checkout@v4
         # Depth 0: the build stamps from `git describe`.
@@ -126,15 +137,15 @@ jobs:
       # Stamped like a release is — on main that is the NEXT version, so
       # what the suite tests here is what tagging this commit would
       # publish, rather than a placeholder or a version it is not.
-      - name: Build the compat .deb
+      - name: Build the .deb this leg tests
         run: |
           scripts/stamp-version.sh
-          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
-          cargo deb --variant compat --no-build --target x86_64-unknown-linux-gnu
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.${{ matrix.glibc }}
+          cargo deb --variant ${{ matrix.variant }} --no-build --target x86_64-unknown-linux-gnu
       - name: Run the VM package test suite
         env:
           TIMBERFS_VM_IMAGE: ${{ matrix.image }}
-        run: tests/vm/run-vm-test.sh target/x86_64-unknown-linux-gnu/debian/timberfs_*_amd64.deb
+        run: tests/vm/run-vm-test.sh target/x86_64-unknown-linux-gnu/debian/${{ matrix.pkg }}_*_amd64.deb
 
   # Single required status check that stays green iff every matrix leg passed.
   # Branch protection requires the context `vm-tests`; the matrix legs report as
