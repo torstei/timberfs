@@ -923,6 +923,42 @@ class Complete:
                 else ["select", "tail"]
         return []
 
+    def in_predicate(self, line, word):
+        """Which term of an unclosed `[...]` is being typed, and what of
+        `word` comes before it — or None outside one.
+
+        ⚠ Read from the LINE, not from `word`. readline breaks words on
+        spaces (that is what lets a predicate complete its own keys at
+        all), and a space inside `[...]` is legal — the selector trims,
+        so `[service=app, host=web01]` is a real predicate somebody
+        types. Once one is there `word` no longer starts with `[`, and
+        deciding from `word` alone read the predicate as finished and
+        offered the next statement slot: confidently wrong rather than
+        merely silent.
+
+        `keep` is the span of `word` before the term, so a candidate
+        replaces exactly what readline thinks it is replacing whether or
+        not the whole predicate is one word.
+        """
+        if line.count("[") > line.count("]"):
+            src = line
+        elif word.startswith("["):
+            src = word          # a caller that hands the word alone
+        else:
+            return None
+        # The term is whatever follows the last `[` or `,`. ⚠ A comma
+        # inside a quoted value splits here too — `[a=~"x{1,2}"` — which
+        # is the same limitation the rpartition before it had, and not
+        # one a completer should grow a quote parser to fix.
+        cut = max(src.rfind("["), src.rfind(","))
+        partial = src[cut + 1 :].lstrip()
+        # `word` never contains a space, so it is the term itself or the
+        # term's tail. Anything else (a space mid-term) and the term is
+        # whatever readline will replace, which is always safe.
+        if not word.endswith(partial):
+            partial = word
+        return partial, word[: len(word) - len(partial)]
+
     def options(self, line, word):
         """Everything any statement shape allows at this point.
 
@@ -938,16 +974,15 @@ class Complete:
             if len(toks) + (1 if line.endswith(" ") else 0) > 1:
                 return sorted(x["name"] for x in self.sh.universe())
             return BACKSLASH
-        if word.startswith("["):
-            body = word[1:]
-            head, _, tail = body.rpartition(",")
+        inside = self.in_predicate(line, word)
+        if inside is not None:
+            partial, keep = inside
             for op in OPS:
-                if op in tail:
-                    k, part = tail.split(op, 1)
-                    pre = f"[{head},{k}{op}" if head else f"[{k}{op}"
-                    return [pre + v for v in sorted(self.sh.values_of(k))]
-            pre = f"[{head}," if head else "["
-            return [pre + k + "=" for k in sorted(self.sh.keys_of())]
+                if op in partial:
+                    k, part = partial.split(op, 1)
+                    k = k.strip()
+                    return [keep + k + op + v for v in sorted(self.sh.values_of(k))]
+            return [keep + k + "=" for k in sorted(self.sh.keys_of())]
 
         toks = line.split()
         # A partial last word is what is being completed, not something
