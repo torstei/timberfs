@@ -15,9 +15,11 @@ registration handshake — a sender resumes from the receiver's position rather
 than a cursor of its own, and a colliding origin is refused at setup naming
 the holder. `follower --type frames` registers it as a
 supervised shipper, so the whole loop closes: retention releases a prefix only
-once the far end has acknowledged it. What is left is multiplexing and the
-receiving end's naming policy. The digest is deferred (see
-chunks-by-address.md).
+once the far end has acknowledged it. Multiplexing and the receiving end's
+naming policy are settled in
+[frames-selection.md](frames-selection.md), which supersedes two sentences
+below — the id the destination mints, and the flow control the mux was waiting
+on. The digest is deferred (see chunks-by-address.md).
 
 See also [chunks by address](chunks-by-address.md), which this is the
 transport
@@ -191,10 +193,12 @@ senders into one numbering-preserving store cannot both be honoured. So the
 header's numbering-preserving flag is load-bearing: set, the destination
 copies `origin_id` VERBATIM, preserves `seq`, and refuses a second sender;
 clear, it makes no origin claim and renumbers, which is what `export` does
-today. Either way the destination mints its own `id` — two stores sharing one
-is treated as corruption and refused, per "Which id travels" above, which is
-why the wire carries `origin_id` and the sender's `id` (the destination's
-`derived_from`) as separate fields rather than one. This is the transport for
+today. ⚠ **The destination no longer mints its own `id`** — see
+[frames-selection.md](frames-selection.md). A replica keeps the sender's,
+because a position, a chunk address and a tape offset are all keyed by identity
+and a replica is the same tape in another place; the boundary is the numbering,
+so the renumbering half of this paragraph leaves the frames path altogether and
+`export`/`import` is where a new, independent tape is made. This is the transport for
 "Globally addressable chunks".
 
 ## The header carries `provenance()`, not the whole `.bark`
@@ -212,16 +216,12 @@ multiplexing later is a transport change with no format change, no version
 bump and no incompat bit. Pipelining is **per stream from day one** — a sender
 must not stall on each chunk's ack, so there is an in-flight window
 regardless, and scoping it per stream rather than per connection is what
-leaves the mux as bookkeeping instead of a redesign. Muxing waits because the
-price of it is flow control: without per-stream credit one slow store (a full
-disk, an fsync stall, an outsized chunk) head-of-line-blocks every other
-stream on the connection, which is strictly worse than N connections. N
-connections also give independent cursors, retry and backpressure for free,
-and match the intakes' existing thread-per-connection model. The case that
-will force muxing is a **dynamic store set** — 50 containers on one host is 50
-connects, 50 receiver threads and constant churn — with a control/pull
-direction (a central server asking a node what it holds) and per-stream TLS
-handshakes behind it. Note that HTTP/2 would supply muxing, flow control and
+leaves the mux as bookkeeping instead of a redesign. ⚠ **The flow-control objection lapsed**, and
+[frames-selection.md](frames-selection.md) says why: it assumed the streams
+want to be independent, where a sender of a selection is one destination and so
+one queue by design. N connections buy an independence the arrangement does not
+have. Per-stream credit is still what the PULL direction will need, where a
+receiver asks and cannot decline what it gets. Note that HTTP/2 would supply muxing, flow control and
 TLS ready-made, at the cost of an async runtime and a TLS stack in a tree that
 today has neither and serves with blocking `TcpListener` plus `thread::spawn`;
 that is a dependency-posture decision, not a free win (see "OTLP gaps").
@@ -241,6 +241,8 @@ on every flush, which cannot make a network call) and `follower list`'s
 POSITION and LAG columns.
 
 **But it is a CACHE, not a cursor, and that distinction is load-bearing.**
+(It is a `positions.json` keyed by identity once a sender ships a selection —
+same file, same rule.)
 Lose an OTLP cursor and `--start` decides, so a store is re-shipped whole
 or skipped to the end. Lose a frames cursor and nothing happens: the next
 connect re-learns the position from the receiver, and the only cost is
