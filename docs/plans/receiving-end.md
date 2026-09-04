@@ -3,7 +3,10 @@
 **Status: design, with measured defects.** The four collisions below were each
 reproduced against a live intake and are real today. The resolution — keying on
 identity, selection as the primitive, the registration handshake and adoption —
-is not built.
+is not built, except on the frames wire: what that resolution IS, down to the
+lookup order and the id-named directory, is
+[frames-selection.md](frames-selection.md). Adoption stays here and stays
+unbuilt.
 
 See also [native replication](native-replication.md), whose wire carries the
 handshake described here.
@@ -34,7 +37,11 @@ in which the merge is wanted.
 
 The KEY is the origin store `id`: the only value both stable and unique,
 minted per store, and already what `follower create` and `cursor.rs` record
-("by IDENTITY … not by path — a store can move"). LABELS are `host`,
+("by IDENTITY … not by path — a store can move"). ⚠ Which is only a key across
+a hop if it CROSSES one, and it did not: replication minted a fresh identity at
+the destination. That is the reversal
+[frames-selection.md](frames-selection.md) makes, and this section is what
+argues for it. LABELS are `host`,
 `host.fqdn`, `env`, `service`: mutable and non-unique BY DESIGN, which is
 exactly why a hostname cannot be a key — hosts get rebuilt, renamed, reused,
 and duplicated across environments — and equally why the fully-qualified name

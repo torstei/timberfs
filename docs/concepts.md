@@ -111,7 +111,9 @@ unit. `frames-send` ships the first inside the second.
 
 **`frames-send` / `frames-intake`** — native replication between timberfs hosts:
 compressed chunks verbatim, nothing decompressed at either end, the receiver's
-position authoritative so a sender keeps no cursor and cannot re-send.
+position authoritative so a sender keeps no cursor and cannot re-send. One
+connection carries a `--select` selection, a stream per store, and a stream
+lands in the store its IDENTITY names.
 → [README](../README.md#replicating-to-another-timberfs-frames-send),
 `timberfs(1)` **REPLICATION**
 
@@ -237,9 +239,11 @@ timestamps and chunk numbers attached. What `--records` reads and writes, and
 what makes `timber-filter … | timberfs import` lossless.
 → `timberfs-records(5)`
 
-**`--replica`** — on `frames-intake`: keep the sender's chunk numbers and record
-its origin, so a chunk answers to the same address at both ends. Numbering and
-origin travel together or not at all.
+**replica** — what a frames destination always is: it keeps the sender's chunk
+numbers, its origin and its IDENTITY, so a chunk answers to the same address at
+both ends and one tape does not answer to two names. The three travel together
+or not at all, which is why receiving somebody else's chunks as a new,
+independent tape is `export`/`import` rather than a mode.
 → [README](../README.md#replicating-to-another-timberfs-frames-send)
 
 **retaining** — a follower's declaration that its positions hold its stores'

@@ -247,10 +247,13 @@ impl ChunkRecord {
 /// identity frame is exactly what it would eat first.
 ///
 /// ⚠ The id written here is always the store's OWN, read from its manifest.
-/// It must never be copied from a sender or a source: replication and
-/// `export` mint a fresh identity at the destination and record lineage in
-/// `derived_from`, so carrying a source's id across would give two stores
-/// one identity and silently rebind every cursor keyed on it.
+/// `export` and `rotate` mint a fresh identity at the destination and
+/// record lineage in `derived_from`: an extract is a new store, and giving
+/// it the source's id would silently rebind every cursor keyed on it.
+/// REPLICATION is the exception, and the reason is the same rule read the
+/// other way — a replica is not a derivative but the same tape in another
+/// place, so it keeps the id, and the numbering it keeps is what makes
+/// that true.
 ///
 /// `next_seq` exists for one case: retention can drop EVERY chunk, and a
 /// store whose record set is empty would otherwise restart numbering at 0

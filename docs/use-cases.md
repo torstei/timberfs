@@ -258,18 +258,20 @@ native wire skips all of it and copies the compressed chunks:
 
 ```sh
 # on the central host
-timberfs frames-intake --forest default --route service     --replica --index --auto-create
+timberfs frames-intake --forest default --index --auto-create
 
-# on each edge host
-timberfs frames-send backing/app.log --endpoint central:4319
+# on each edge host — one connection for every store the predicate matches
+timberfs frames-send --select '[]' --endpoint central:4319 --follow
 ```
 
 Nothing is decompressed at either end, so the central store is byte-identical —
 `.grain` included, so a `--has` lookup there skips chunks exactly as it does at
-the edge. With `--replica` the centre also keeps the edge's chunk numbers and
-records its origin, so a chunk answers to the same address on both hosts. Only
-another timberfs can be on the far end, and only *sealed* chunks ship, so the
-centre trails the edge by one chunk flush.
+the edge. The centre keeps the edge's chunk numbers, its origin and its
+IDENTITY, so a chunk answers to the same address on both hosts and one tape does
+not answer to two names — which is also how the centre knows where a stream
+belongs, no routing label being involved. Only another timberfs can be on the
+far end, and only *sealed* chunks ship, so the centre trails the edge by one
+chunk flush.
 
 Declare a **retaining follower** and the edge store stops being a hoard. It gets
 run by name, and its positions hold the heads back:
@@ -287,9 +289,9 @@ rather than a unit per store to remember to add. `--retaining` implies
 `--follow-from begin`, so nothing a store already holds is skipped.
 
 The native wire carries the same shape from the other end — `timberfs
-frames-send --follow --cursor` against a `frames-intake`, which resumes from the
-*receiver's* position, so there is no local decision about where to begin and no
-way to re-ship a store by getting one wrong. ⚠ But it cannot hold retention back
+frames-send --select [] --follow --positions` against a `frames-intake`, which
+resumes from the *receiver's* position, so there is no local decision about
+where to begin and no way to re-ship a store by getting one wrong. ⚠ But it cannot hold retention back
 yet: `retain_unconsumed` reads the follower registry, and frames want the
 `chunks` diet a follower does not serve, so a frames edge store is bounded by
 `retain_size` alone.

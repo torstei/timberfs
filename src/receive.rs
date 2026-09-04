@@ -5,12 +5,18 @@
 //! record to the rings — nothing is decompressed, which is the whole point
 //! of the wire.
 //!
-//! Two things this layer decides and one it deliberately does not. It
-//! decides the NUMBERING (preserve the sender's and claim its origin, or
-//! renumber and claim nothing — never one without the other) and what to
-//! do with SIDECARS it is offered. It does not decide the destination's
-//! name: that is the receiving end's namespace policy, which belongs to
-//! whoever calls this, not to the code that writes bytes.
+//! A destination is a REPLICA and nothing else: the sender's chunk
+//! numbering, its origin and its identity are preserved together, because
+//! each is the same claim — this is that store, in another place. A
+//! destination that numbered its own chunks would share no address with
+//! its source and could not answer where a sender got to, so it is not a
+//! mode here; `export`/`import` is where an independent tape is made. See
+//! docs/plans/frames-selection.md.
+//!
+//! What this layer does decide is what to do with SIDECARS it is offered.
+//! It does not decide WHICH store the stream lands in: that is the
+//! receiving end's lookup, which belongs to whoever calls this, not to
+//! the code that writes bytes.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -19,35 +25,12 @@ use anyhow::{bail, Context};
 
 use crate::frame::{self, Frame, Framed, Run};
 
-/// How the destination should treat the sender's chunk numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Numbering {
-    /// Keep the sender's numbers and record its origin — a true replica,
-    /// so `(origin_id, seq)` names the same bytes on both ends. Refused
-    /// when the numbering would not continue densely.
-    Preserve,
-    /// The destination numbers its own chunks and claims no origin. Always
-    /// possible, and weaker: gap evidence and addressing are both lost.
-    Renumber,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ReceiveOpts {
-    pub numbering: Numbering,
     /// The destination's own policy, not the sender's. Settings never
-    /// travel; only labels do.
+    /// travel; only labels and identity do.
     pub index: bool,
     pub wal: bool,
-}
-
-impl Default for ReceiveOpts {
-    fn default() -> Self {
-        ReceiveOpts {
-            numbering: Numbering::Renumber,
-            index: false,
-            wal: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,17 +150,31 @@ impl<R: Read> Reader<R> {
 pub struct Opening {
     pub origin_id: [u8; 16],
     pub sender_id: [u8; 16],
+    /// The first chunk NUMBER this stream carries — the sender's own
+    /// oldest, not what was asked for. A fresh destination can only
+    /// continue a numbering from its beginning, so this is what says at
+    /// the handshake whether it can.
+    pub first_seq: u64,
     pub provenance: Vec<u8>,
     pub sidecars: Vec<crate::frame::Sidecar>,
 }
 
 impl Opening {
-    /// The store's labels, or an empty map when it declared none.
+    /// What the stream says the store IS: its labels, and its name. Empty
+    /// when it declared none.
     pub fn labels(&self) -> serde_json::Map<String, serde_json::Value> {
         if self.provenance.is_empty() {
             return serde_json::Map::new();
         }
         serde_json::from_slice(&self.provenance).unwrap_or_default()
+    }
+
+    /// The store's identity, as text. `None` for a pair that carries none
+    /// on either side — which `identity` calls "not a store", and which
+    /// cannot be replicated because there is nothing to key the
+    /// destination on.
+    pub fn store_id(&self) -> Option<String> {
+        (self.origin_id != [0u8; 16]).then(|| frame::uuid_string(&self.origin_id))
     }
 }
 
@@ -189,7 +186,6 @@ pub struct Session {
     name: String,
     st: crate::store::Store,
     cfg: crate::store::Config,
-    numbering: Numbering,
     adopt_pages: bool,
     out: Received,
     _dir_lock: std::fs::File,
@@ -210,27 +206,45 @@ impl Session {
             .with_context(|| format!("creating backing directory {}", dir.display()))?;
         let existed = crate::format::rings_path(&dir, &name).exists();
 
+        // A numbering can only be continued, and there is no base to
+        // continue it FROM: a store whose head has rotated away begins at
+        // chunk 500, and nothing here can hold 0..499 that never arrive.
+        // Said at the handshake, where it is one store's refusal, rather
+        // than mid-stream, where it is the connection's.
+        if !existed && open.first_seq > 0 && open.first_seq != frame::OPEN_ENDED {
+            bail!(
+                "the stream begins at chunk {} and {} holds nothing to continue from — a \
+                 replica cannot start mid-tape, there being no numbering base. Seed the \
+                 destination from an `export` of the source, or replicate a store whose \
+                 head is still whole",
+                open.first_seq,
+                dest.display()
+            );
+        }
+
         // One destination store, one origin. Checked here because this is
         // where an origin is claimed; without it a reinstall or a renamed
         // host silently appends a second tape to the first, and the
         // manifest then names only one of them.
-        if opts.numbering == Numbering::Preserve {
-            if let Some(bark) = crate::bark::load(&dir, &name) {
-                if let Some(held) = bark
-                    .get("origin_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(frame::uuid_bytes)
-                {
-                    if held != open.origin_id {
-                        bail!(
-                            "{}: holds origin {} and the stream carries {} — one store, \
-                             one origin. Receive into a different store, or without \
-                             claiming an origin",
-                            dest.display(),
-                            frame::uuid_string(&held),
-                            frame::uuid_string(&open.origin_id)
-                        );
-                    }
+        //
+        // On `origin_id` alone, not on `id`: a store an operator
+        // pre-created, or one an older build minted an identity for, is a
+        // legitimate destination wearing a local name, and the origin is
+        // the member that says whose tape it holds.
+        if let Some(bark) = crate::bark::load(&dir, &name) {
+            if let Some(held) = bark
+                .get("origin_id")
+                .and_then(|v| v.as_str())
+                .and_then(frame::uuid_bytes)
+            {
+                if held != open.origin_id {
+                    bail!(
+                        "{}: holds origin {} and the stream carries {} — one store, one \
+                         tape. Receive into a different store",
+                        dest.display(),
+                        frame::uuid_string(&held),
+                        frame::uuid_string(&open.origin_id)
+                    );
                 }
             }
         }
@@ -247,29 +261,26 @@ impl Session {
             None => bail!("{name} already has a writer"),
         };
 
+        // The manifest is written BEFORE the pair, so the identity is in
+        // the rings header from the first byte: a pair whose two sides
+        // disagree is refused by every writer, this one included.
+        if !existed {
+            seed_manifest(&dir, &name, open, opts)?;
+        }
         let mut st = crate::store::Store {
             dir: dir.clone(),
             cfg: *cfg,
             files: std::collections::BTreeMap::new(),
         };
         st.create(&name)?;
-        if !existed {
-            seed_manifest(
-                &dir,
-                &name,
-                open.origin_id,
-                open.sender_id,
-                &open.provenance,
-                opts,
-            )?;
-        } else if opts.numbering == Numbering::Preserve {
+        if existed {
             // A store the operator pre-created keeps its manifest — the
             // OTLP intake makes the same promise, and overwriting a
             // declaration is not a receiver's business. But the ORIGIN is
-            // not provenance, it is the address: without it `--replica`
-            // preserves the numbering and silently records nothing, so
-            // `(origin_id, seq)` does not apply and the one-store-one-origin
-            // guard has nothing to compare against.
+            // not provenance, it is the address: without it the numbering
+            // is preserved and nothing records whose it is, so
+            // `(origin_id, seq)` does not apply and the one-store-one-tape
+            // guard above has nothing to compare against.
             //
             // Only into a store with no chunks, per the rule already
             // established for adopting a numbering: a store that has
@@ -311,11 +322,20 @@ impl Session {
             name,
             st,
             cfg: *cfg,
-            numbering: opts.numbering,
             adopt_pages,
             _dir_lock: dir_lock,
             _file_lock: file_lock,
         })
+    }
+
+    /// Where this session is writing. The transport needs it to answer
+    /// the handshake with a handle of its own.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// What this destination holds now — the ack, and a coverage answer.
@@ -356,10 +376,7 @@ impl Session {
                     uncomp_len,
                     first_write_ms,
                     last_write_ms,
-                    match self.numbering {
-                        Numbering::Preserve => Some(seq),
-                        Numbering::Renumber => None,
-                    },
+                    Some(seq),
                     &cfg,
                 )
                 .with_context(|| format!("appending chunk {seq} to {}", self.name))?;
@@ -430,28 +447,35 @@ pub fn receive(
     session.finish()
 }
 
-/// Read the stream's opening frame.
+/// Read the stream's opening frame — the pipe case, where the first frame
+/// after the hello is the only stream there is.
 pub fn read_opening<R: Read>(r: &mut Reader<R>) -> anyhow::Result<(Opening, u32)> {
     let Some(first) = r.next_frame()? else {
         bail!("stream carried a hello and nothing else");
     };
     let stream = first.stream;
-    match first.frame {
+    Ok((opening_of(first.frame)?, stream))
+}
+
+/// What a `stream-open` said, as the thing a session is opened from. A
+/// transport that multiplexes meets one at any point in the connection,
+/// not only first.
+pub fn opening_of(f: Frame) -> anyhow::Result<Opening> {
+    match f {
         Frame::StreamOpen {
             origin_id,
             sender_id,
+            first_seq,
             provenance,
             sidecars,
             ..
-        } => Ok((
-            Opening {
-                origin_id,
-                sender_id,
-                provenance,
-                sidecars,
-            },
-            stream,
-        )),
+        } => Ok(Opening {
+            origin_id,
+            sender_id,
+            first_seq,
+            provenance,
+            sidecars,
+        }),
         other => bail!("a stream must open with stream-open, not {other:?}"),
     }
 }
@@ -486,39 +510,31 @@ fn claim_origin(
     Ok(())
 }
 
-/// The destination's manifest: its OWN identity, the sender as its
-/// immediate parent, the origin only when the numbering was preserved, and
-/// the sender's labels. Settings are the destination's own.
-fn seed_manifest(
-    dir: &Path,
-    name: &str,
-    origin_id: [u8; 16],
-    sender_id: [u8; 16],
-    provenance: &[u8],
-    opts: &ReceiveOpts,
-) -> anyhow::Result<()> {
-    let mut map: serde_json::Map<String, serde_json::Value> = if provenance.is_empty() {
+/// The destination's manifest: the store's identity and labels, which
+/// travel, and nothing of the pair's, which does not.
+///
+/// No `derived_from`: a replica derives from nothing, it IS the store. The
+/// `created` stamp is minted here rather than inherited — it answers since
+/// when THIS host has held the store, which is what `--follow-from
+/// discovery` compares a follower's declaration against.
+fn seed_manifest(dir: &Path, name: &str, open: &Opening, opts: &ReceiveOpts) -> anyhow::Result<()> {
+    let mut map: serde_json::Map<String, serde_json::Value> = if open.provenance.is_empty() {
         serde_json::Map::new()
     } else {
-        serde_json::from_slice(provenance).context("reading the stream's labels")?
+        serde_json::from_slice(&open.provenance).context("reading the stream's labels")?
     };
-    if sender_id != [0u8; 16] {
-        map.insert(
-            "derived_from".to_string(),
-            serde_json::Value::String(frame::uuid_string(&sender_id)),
-        );
-    }
     map.insert(
         "derived_op".to_string(),
         serde_json::Value::String("receive".to_string()),
     );
-    // Never claim an origin and renumber: recording one without preserving
-    // the numbers produces an address that lies.
-    if opts.numbering == Numbering::Preserve && origin_id != [0u8; 16] {
-        map.insert(
-            "origin_id".to_string(),
-            serde_json::Value::String(frame::uuid_string(&origin_id)),
-        );
+    if let Some(id) = open.store_id() {
+        // The identity travels, so the destination adopts it rather than
+        // minting one — a second identity would make one tape answer to
+        // two names, and every position keyed on it is keyed on the wrong
+        // one. `origin_id` says the same thing for a reader that knows
+        // only the older spelling.
+        map.insert("id".to_string(), serde_json::Value::String(id.clone()));
+        map.insert("origin_id".to_string(), serde_json::Value::String(id));
     }
     crate::bark::save(dir, name, &map)?;
     if opts.index {
@@ -615,10 +631,7 @@ mod tests {
         let src = a_store(d.path(), "src", 5, false);
         let bytes = wire(&src, Mode::Frames);
         let dst = d.path().join("dst.log");
-        let opts = ReceiveOpts {
-            numbering: Numbering::Preserve,
-            ..Default::default()
-        };
+        let opts = ReceiveOpts::default();
         let got = receive(&dst, &bytes[..], &opts, &cfg()).unwrap();
 
         assert!(got.created);
@@ -648,8 +661,11 @@ mod tests {
         }
     }
 
+    /// The reversal: a position, a chunk address and a tape offset are
+    /// each keyed by identity, so a replica minting a second one would
+    /// make a single tape answer to two names.
     #[test]
-    fn identity_is_the_destinations_own_and_lineage_says_where_it_came_from() {
+    fn the_identity_travels_and_the_replica_is_the_same_store() {
         let d = TempDir::new();
         let src = a_store(d.path(), "src", 2, false);
         let bytes = wire(&src, Mode::Frames);
@@ -658,7 +674,6 @@ mod tests {
             &dst,
             &bytes[..],
             &ReceiveOpts {
-                numbering: Numbering::Preserve,
                 index: true,
                 ..Default::default()
             },
@@ -669,48 +684,70 @@ mod tests {
         let sb = crate::bark::load(d.path(), "src.log").unwrap();
         let db = crate::bark::load(d.path(), "dst.log").unwrap();
         let sid = sb.get("id").unwrap().as_str().unwrap();
-        // Labels travelled; identity did not; the sender is the parent and
-        // the origin is claimed because the numbering was preserved.
+        // The identity and the labels travelled; so did the name, which
+        // nothing at this end could reconstruct.
         assert_eq!(db.get("host").unwrap(), "apache01");
-        assert_ne!(db.get("id").unwrap().as_str().unwrap(), sid);
-        assert_eq!(db.get("derived_from").unwrap(), sid);
+        assert_eq!(db.get("id").unwrap().as_str().unwrap(), sid);
         assert_eq!(db.get("origin_id").unwrap(), sid);
+        // The EFFECTIVE name: the source declares none, so its path is
+        // all the name it has, and the replica's path is a uuid.
+        assert_eq!(db.get("name").unwrap(), "src");
+        // A replica derives from nothing: it IS the store.
+        assert!(!db.contains_key("derived_from"), "{db:?}");
         assert_eq!(db.get("derived_op").unwrap(), "receive");
         // The receiver's own policy, which the sender never sent.
         assert_eq!(db.get("index").unwrap(), true);
+        // And the pair says so too, so a lost manifest keeps the identity.
+        let (dd, dn) = crate::query::resolve_backing(&dst).unwrap();
+        assert_eq!(
+            crate::bark::carried_identity(&dd, &dn).as_deref(),
+            Some(sid)
+        );
     }
 
+    /// A replica IS the store, so the pair's own facts are the only ones
+    /// minted here — and `created` is one of them, answering since when
+    /// THIS host has held it rather than when the identity was made.
     #[test]
-    fn renumbering_never_claims_an_origin() {
-        // The load-bearing invariant: recording an origin without keeping
-        // its numbers produces an address that lies, so the two travel
-        // together or not at all.
+    fn the_pairs_own_facts_are_not_inherited() {
         let d = TempDir::new();
-        let src = a_store(d.path(), "src", 3, false);
-        let bytes = wire(&src, Mode::Frames);
-        let dst = d.path().join("copy.log");
-        receive(&dst, &bytes[..], &ReceiveOpts::default(), &cfg()).unwrap();
-        let db = crate::bark::load(d.path(), "copy.log").unwrap();
-        assert!(!db.contains_key("origin_id"), "{db:?}");
-        assert!(db.contains_key("derived_from"), "lineage still travels");
+        let src = a_store(d.path(), "src", 2, false);
+        let mut sb = crate::bark::load(d.path(), "src.log").unwrap();
+        sb.insert("created".into(), serde_json::json!("2019-01-01T00:00:00Z"));
+        crate::bark::save(d.path(), "src.log", &sb).unwrap();
+
+        let dst = d.path().join("dst.log");
+        receive(
+            &dst,
+            &wire(&src, Mode::Frames)[..],
+            &ReceiveOpts::default(),
+            &cfg(),
+        )
+        .unwrap();
+        let db = crate::bark::load(d.path(), "dst.log").unwrap();
+        assert_ne!(
+            db.get("created").unwrap(),
+            "2019-01-01T00:00:00Z",
+            "created is the pair's, not the identity's"
+        );
+        // Settings are the destination's own, so nothing declared here.
+        assert!(!db.contains_key("index"), "{db:?}");
+        assert!(!db.contains_key("wal"), "{db:?}");
     }
 
     #[test]
     fn a_pre_created_store_still_gets_the_origin_recorded() {
-        // `--replica` preserved the numbering but recorded no origin when
-        // the operator had pre-created the destination, so the address did
-        // not apply and the one-store-one-origin guard had nothing to
-        // compare. The manifest the operator wrote is otherwise untouched.
+        // The numbering was preserved and no origin recorded when the
+        // operator had pre-created the destination, so the address did not
+        // apply and the one-store-one-tape guard had nothing to compare.
+        // The manifest the operator wrote is otherwise untouched.
         let d = TempDir::new();
         let src = a_store(d.path(), "src", 3, false);
         let dst = d.path().join("declared.log");
         crate::bark::cmd_create(&dst, false, true, None, None, false, &[], false).unwrap();
         let before = crate::bark::load(d.path(), "declared.log").unwrap();
 
-        let opts = ReceiveOpts {
-            numbering: Numbering::Preserve,
-            ..Default::default()
-        };
+        let opts = ReceiveOpts::default();
         receive(&dst, &wire(&src, Mode::Frames)[..], &opts, &cfg()).unwrap();
 
         let sb = crate::bark::load(d.path(), "src.log").unwrap();
@@ -737,10 +774,7 @@ mod tests {
         let d = TempDir::new();
         let src = a_store(d.path(), "src", 2, false);
         let dst = a_store(d.path(), "used", 2, false);
-        let opts = ReceiveOpts {
-            numbering: Numbering::Preserve,
-            ..Default::default()
-        };
+        let opts = ReceiveOpts::default();
         // Its numbering is at 2, and the stream starts at 0, so the frames
         // are refused anyway -- but the manifest must not have been
         // claimed on the way to that refusal.
@@ -756,10 +790,7 @@ mod tests {
         let d = TempDir::new();
         let a = a_store(d.path(), "a", 2, false);
         let dst = d.path().join("dst.log");
-        let opts = ReceiveOpts {
-            numbering: Numbering::Preserve,
-            ..Default::default()
-        };
+        let opts = ReceiveOpts::default();
         receive(&dst, &wire(&a, Mode::Frames)[..], &opts, &cfg()).unwrap();
 
         let b = a_store(d.path(), "b", 2, false);
@@ -787,28 +818,19 @@ mod tests {
             first_seq: 3,
             last_seq: frame::OPEN_ENDED,
             sidecars: false,
+            max_chunks: None,
         };
         serve::serve(&src, &req, &mut bytes).unwrap();
         let dst = d.path().join("mid.log");
-        let err = receive(
-            &dst,
-            &bytes[..],
-            &ReceiveOpts {
-                numbering: Numbering::Preserve,
-                ..Default::default()
-            },
-            &cfg(),
-        )
-        .expect_err("a fresh store cannot start at chunk 3 as a replica");
-        assert!(
-            format!("{err:#}").contains("continue it exactly"),
-            "{err:#}"
-        );
-
-        // The same stream received as a copy is fine: it claims nothing.
-        let copy = d.path().join("mid-copy.log");
-        let got = receive(&copy, &bytes[..], &ReceiveOpts::default(), &cfg()).unwrap();
-        assert_eq!(got.runs, vec![Run { start: 0, end: 2 }]);
+        let err = receive(&dst, &bytes[..], &ReceiveOpts::default(), &cfg())
+            .expect_err("a fresh store cannot start at chunk 3");
+        // Refused at the OPENING, not on the first chunk: mid-stream this
+        // is the connection's failure, and every other store sharing it
+        // pays for one store's rotation.
+        let msg = format!("{err:#}");
+        assert!(msg.contains("begins at chunk 3"), "{msg}");
+        assert!(msg.contains("nothing to continue from"), "{msg}");
+        assert!(!dst.exists(), "a refused stream leaves no trace");
     }
 
     #[test]
@@ -816,10 +838,7 @@ mod tests {
         let d = TempDir::new();
         let src = a_store(d.path(), "src", 3, false);
         let dst = d.path().join("dst.log");
-        let opts = ReceiveOpts {
-            numbering: Numbering::Preserve,
-            ..Default::default()
-        };
+        let opts = ReceiveOpts::default();
         receive(&dst, &wire(&src, Mode::Frames)[..], &opts, &cfg()).unwrap();
 
         // The source grows; ship only what the destination lacks.
@@ -854,6 +873,7 @@ mod tests {
             first_seq: 3,
             last_seq: frame::OPEN_ENDED,
             sidecars: false,
+            max_chunks: None,
         };
         serve::serve(&src, &req, &mut bytes).unwrap();
         let got = receive(&dst, &bytes[..], &opts, &cfg()).unwrap();
@@ -872,7 +892,6 @@ mod tests {
             &dst,
             &bytes[..],
             &ReceiveOpts {
-                numbering: Numbering::Preserve,
                 index: true,
                 ..Default::default()
             },
@@ -956,7 +975,6 @@ mod tests {
             &dst,
             &bytes[..],
             &ReceiveOpts {
-                numbering: Numbering::Preserve,
                 index: true,
                 ..Default::default()
             },

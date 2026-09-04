@@ -36,6 +36,12 @@ pub struct Request {
     /// receiver that maintains a token index has to decompress every
     /// chunk to re-tokenize what the sender already computed.
     pub sidecars: bool,
+    /// Stop after this many chunk frames, leaving the rest for another
+    /// call. A COUNT and not a `last_seq`, because a seq range is only a
+    /// chunk count while the numbering is dense — a store whose oldest
+    /// chunk sits above the range would answer with nothing, and a caller
+    /// resuming from what it examined would never move.
+    pub max_chunks: Option<u64>,
 }
 
 impl Request {
@@ -46,6 +52,7 @@ impl Request {
             first_seq: 0,
             last_seq: frame::OPEN_ENDED,
             sidecars: true,
+            max_chunks: None,
         }
     }
 }
@@ -62,10 +69,28 @@ pub struct Served {
     /// hidden: the stream is short by this many, which the receiver sees
     /// as a gap and the operator should see as a number.
     pub raced_away: u64,
-    /// The highest chunk actually sent, and its write window's end. Handed
-    /// back so a caller needing that write time does not re-read the rings
+    /// The highest chunk actually sent. Handed back so a caller needing
+    /// its write time or its place on the tape does not re-read the rings
     /// to find what it just had in hand.
-    pub last_sent: Option<(u64, u64)>,
+    pub last_sent: Option<LastSent>,
+    /// The highest chunk this request SELECTED, sent or raced away.
+    ///
+    /// What a follow loop resumes from, and not the same as `last_sent`:
+    /// a chunk retained away between the index read and the frame read is
+    /// never coming, so resuming below it would ask for it on every pass
+    /// and never move.
+    pub last_examined: Option<u64>,
+}
+
+/// The highest chunk a request actually put on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastSent {
+    pub seq: u64,
+    /// The end of its write window.
+    pub last_write_ms: u64,
+    /// Where it begins on the store's TAPE: `dropped + uncomp_start`, so
+    /// retention cannot move it and a replica states the same number.
+    pub offset: u64,
 }
 
 /// Group a store's chunk numbers into runs, both ends inclusive. Today a
@@ -90,6 +115,9 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
     let mut handle = crate::query::open_source(input)?;
     let guard = crate::query::seq_guard(input);
     let mut stats = Served::default();
+    // Once per request, not per chunk: it is a header read, and what
+    // turns a chunk's local offset into its place on the tape.
+    let dropped = crate::query::dropped_bytes_of(input);
 
     let bark = handle.bark.clone().unwrap_or_default();
     let mut open_sidecars = Vec::new();
@@ -132,8 +160,8 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
                 first_seq: selected.first().map(|c| c.seq).unwrap_or(req.first_seq),
                 last_seq: selected.last().map(|c| c.seq).unwrap_or(frame::OPEN_ENDED),
                 mode: req.mode,
-                provenance: serde_json::to_vec(&crate::bark::provenance(&bark))
-                    .context("serializing the store's labels")?,
+                provenance: serde_json::to_vec(&travels(&bark, input))
+                    .context("serializing what the store is")?,
                 sidecars: open_sidecars,
             },
         },
@@ -165,6 +193,10 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
     };
 
     for (c, pos) in selected.into_iter().zip(positions) {
+        if req.max_chunks.is_some_and(|n| stats.chunks >= n) {
+            break;
+        }
+        stats.last_examined = Some(c.seq);
         let mut sidecars = Vec::new();
         if let Some(page) = grain.as_ref().and_then(|g| g.page(pos)) {
             sidecars.push(Sidecar {
@@ -206,9 +238,45 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
         out.write_all(&buf)?;
         stats.frames += 1;
         stats.chunks += 1;
-        stats.last_sent = Some((c.seq, c.last_write_ms));
+        stats.last_sent = Some(LastSent {
+            seq: c.seq,
+            last_write_ms: c.last_write_ms,
+            offset: dropped + c.uncomp_start,
+        });
     }
     Ok(stats)
+}
+
+/// What the store IS: its labels, and its name.
+///
+/// The name travels because nothing at the far end can reconstruct it —
+/// a destination is keyed by identity and lives in a directory named after
+/// one, so a replica with no name would read as its own uuid. It is not
+/// provenance (`list` and `info` give it its own column, so showing it
+/// among the labels would say it twice), which is why it is added here
+/// rather than by widening `provenance()`.
+///
+/// `created` deliberately does not travel: it answers since when THIS pair
+/// has held the store, which is what `--follow-from discovery` compares a
+/// follower's declaration against.
+///
+/// The EFFECTIVE name, so a store that never declared one still arrives
+/// with the name it is known by here — `selectable` reads it the same way,
+/// and a store whose name is only implied by its path is the common case.
+fn travels(
+    bark: &serde_json::Map<String, serde_json::Value>,
+    input: &Path,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = crate::bark::provenance(bark);
+    let implied = crate::query::resolve_backing(input)
+        .ok()
+        .map(|(_, name)| crate::forest::handle_of_logical(&name).to_string());
+    match (bark.get("name"), implied) {
+        (Some(name), _) => map.insert("name".to_string(), name.clone()),
+        (None, Some(handle)) => map.insert("name".to_string(), serde_json::Value::String(handle)),
+        (None, None) => None,
+    };
+    map
 }
 
 /// The travelling half of the address: a recorded `origin_id` if this
@@ -428,6 +496,7 @@ mod tests {
             first_seq: 2,
             last_seq: 4,
             sidecars: false,
+            max_chunks: None,
         };
         let stats = serve(&p, &req, &mut buf).unwrap();
         assert_eq!(stats.chunks, 3);
