@@ -1909,6 +1909,7 @@ fn main() -> anyhow::Result<()> {
                 .transpose()?;
             tally::cmd_tally(&tally::TallyOpts {
                 extractors,
+                etc,
                 try_it,
                 check,
                 observations,

@@ -517,6 +517,14 @@ way — and a name added in a later release could break a deployment whose own
 document already used it. A one-sided promise, enforced by a test rather than
 remembered.
 
+⚠ **A READER has a third directory the provisioning does not:**
+`~/.config/timberfs/tally.extractors.d`, where the fleet's `targets.json`
+already lives, so a document can be written and tried without root. It is
+deliberately not on the provisioning's list — that runs as a service, creating
+stores and registering followers, so what it does must not depend on whose home
+it looked in, and on a shared machine one user must not be able to shadow a
+shipped extractor for a root-run provisioning.
+
 Provisioning is site-only, in `/etc/timberfs/tally.d/`, which keeps the plain
 `.d` name for the deployment file exactly as `file.d` has it. "Extractor" and not "rule" for the document,
 because RULE already means one metric inside one, and one word meaning two
@@ -837,6 +845,143 @@ it ships.
 In `timbersh` it lands in the shape that is already there:
 `select samples from [class=tally] where metric = 'http_requests' step 5m`.
 
+## Graphing it
+
+**Status: BUILT** — `timbergraph(1)` reads tally lines from stdin or a file,
+and `timbersh`'s `graph` statement draws the same thing across the fleet. Both
+needed nothing of timberfs: a tally line is text, so it is a `loglines` read and
+a plot of what came back.
+
+⚠ **The host had to become a LABEL, which this note did not anticipate.**
+Nothing in a tally line says which host produced it — a line's labels are the
+METRIC's — so a fleet answer merged two hosts into one series, silently.
+Measured on two hosts holding one store: 90 with `by status by host`, 180
+without. Merging is legitimate as a fleet TOTAL; doing it without being asked
+was not.
+
+⚠ **`against` is the plot that answers what two metrics are usually drawn FOR.**
+Two lines on a shared time axis, especially on two y scales, is the picture
+that invites seeing a relationship that is not there — almost any pair can be
+made to look correlated by choosing the scales. A scatter of one point per
+bucket either shows a relationship or shows a cloud, and shows its SHAPE, which
+two time lines never do. Same doctrine as the rest of this note: a plot may be
+approximate, but it must not invite a conclusion the data does not carry.
+
+### The extractor document is a plot spec
+
+A grapher that does not know the contract gets a histogram WRONG, not merely
+ugly: `le` series are CUMULATIVE, so stacking or summing them multiplies the
+count. Most of what it needs is in the tape, because the coarsening invariant
+put it there — the five field names ARE the aggregation rules, so a line says
+how to combine itself:
+
+| in the line | the graph must |
+| --- | --- |
+| `count=` / `sum=` | additive — may aggregate across labels not split by, and ÷ width is a rate |
+| `min=` / `max=` | one band, not two lines |
+| `last=` | NOT additive — never aggregate, and absolute rather than a rate |
+| `le=` label | cumulative — interpolate a quantile, never sum |
+| the width | the x resolution, and the divisor for a rate |
+| `labels` | the legend dimension |
+
+⚠ **The markers are the graph's error bars**, and drawing them is what stops a
+graph lying about being exact. `!drop` says the numbers in that bucket are
+WRONG; `!cap` says understated; `!late` says it holds entries displaced from
+elsewhere; `!gap` (when it exists) says a hole rather than a quiet period. As
+annotation bands, not series.
+
+**What the tape cannot give is the UNIT and the metric LIST** — a flat-zero
+series and an absent one are identical in the lines. So a plot takes the
+extractor by name:
+
+```
+graph http_requests from [class=tally] by status using timberfs-apache-combined since '13:00'
+```
+
+⚠ **Named at plot time, and deliberately nowhere else.** The alternatives were
+weighed and are not worth their cost yet: a `derived_by=<names>` key in the
+tally store's `.bark` has to be kept in step with the provisioning that
+actually applies them, and travels to a host where those names may resolve to
+a different document or to nothing; a remote `kind: "extractors"` answer would
+make a name resolvable, but only while the producing host is alive. Neither is
+refused — both wait for a reason beyond this one. ⛔ And the reason must not be
+a rule about WHERE a tally store may be replicated: a fleet's layout is decided
+by what replication is for, not by what is convenient for a plot's metadata.
+
+Without `using`, a plot infers from the lines and is right about everything
+except those two things. That is the fallback, not a failure.
+
+### Two modes, and one is far more expensive
+
+```
+graph http_requests from [class=tally] since '13:00'          # the tally store
+graph from [service=apache] using timberfs-apache-combined last 30m   # a preview
+```
+
+The first reads a tally store: kilobytes, and it needs **no timberfs change at
+all**, because a tally line is text and `select loglines` already returns it.
+The `samples` response kind would make it typed; it is not required to start.
+
+The second is BUILT as `timbersh`'s `extracting` clause: fetch raw loglines,
+run the extractor here, plot the result — so a document can be tested against
+real production data, from a store that has no tally at all, before anything is
+provisioned. It is the one statement that refuses to be unbounded. ⚠ It transfers the
+RAW LOG. Measured on a comparable access log elsewhere, that is tens of
+megabytes per hour per host against a few kilobytes for the same window from a
+tally store — so it states its cost and defaults to a short window. That
+contrast IS the argument for tally existing, made visible in the tool. ⚠ It
+also needs a local `timberfs` binary, which a session talking to remote hosts
+may not have.
+
+### Rendering
+
+⚠ The tools are **stdlib-only** — not one third-party import across `timbersh`,
+`timberview.py` and `timberfs_client.py`. Rendering therefore arrives as a SOFT
+dependency of `timberfs-sh`, named in the error when it is absent, so nothing
+else in the toolset gains a hard one.
+
+**gnuplot, driven by a generated script**, because one code path gives every
+output: `dumb` for ASCII over ssh, `pngcairo`/`svg` for a file to attach, `qt`
+for a window where there is a display. The alternative is two renderers that
+drift apart, where the ASCII one quietly stops showing a series the image
+still has. matplotlib's one real advantage is a heatmap — a histogram over time
+is an `le`×time grid, and that is the plot that makes latency legible — which
+gnuplot can do but more awkwardly.
+
+Two properties worth building in rather than bolting on:
+
+* **Dump the data, not only the picture** — a `--tsv` beside the plot and the
+  script with its data inline, so it re-runs standalone and can be handed to
+  somebody without timbersh. The expensive half is the FETCH, trivially so for
+  a tally store and badly so for a preview, and it should not be paid twice to
+  redraw the same window a different way.
+* ⚠ **The time axis is where these go wrong.** gnuplot renders a time axis as
+  though every value were UTC, so the x column must be the epoch ALREADY
+  SHIFTED into local seconds — computed per row, so a window spanning a DST
+  change stays right — with tics snapped to round units of LOCAL wall clock
+  rather than of the epoch.
+
+Shape: `timbergraph.py` with a `timbergraph` entry point beside it and a
+`graph` statement in `timbersh`, which is what `timberview.py` / `timberview` /
+`view` already are — the same module in process, because a separate one would
+have to leave the screen and come back.
+
+### A defect this turned up
+
+⚠ **`!meta`'s cadence is a producer's lifecycle, not a reader's window.** It is
+written once per RUN, and a follower's run is however long systemd keeps it up
+— so a read of any window inside a weeks-long run finds no `!meta` at all, and
+its frequency is an upgrade schedule. It is also skipped entirely for a metric
+that declares no unit, and emitted on the first OBSERVATION, so a metric that
+claims nothing announces nothing.
+
+The cadences that would fix it are all bad — per bucket doubles the tape, every
+N buckets still misses a shorter window — which says the marker is in the wrong
+place rather than on the wrong schedule: the tape is for things that HAPPENED
+AT A TIME, and a unit did not happen at a time. Left as it is until the
+graphing that would consume it exists, and recorded here so it is not mistaken
+for something a reader can rely on.
+
 ## Two tiers around it
 
 **Tier 0 needs no extractor at all.** `.rings` already holds per-chunk byte
@@ -872,6 +1017,10 @@ loss, recorded exactly — the same rule retention already follows.
 ## Deferred, and open
 
 * **Rollups** (tier 2) — the mechanism is the fold; only the verb is missing.
+* **A frame cache** ([chunks-by-address.md](chunks-by-address.md)) applies to a
+  tally store like any other, and there it is nearly free: kilobytes against a
+  log's gigabytes, so a fleet's numbers can be cached WHOLE and graphing across
+  it becomes a local read rather than a fan-out per plot.
 * **A cost preflight for a tally read**, as the roadmap wants for query: the
   chunk count is knowable before the read here too.
 * **Exporters** — OpenMetrics and Influx renderings of a `samples` answer, and
@@ -893,6 +1042,16 @@ loss, recorded exactly — the same rule retention already follows.
 * **The `!gap` marker** — the registry reports a GAP when retention dropped
   chunks a follower had not read, and nothing writes it into the tally store
   yet. Until it does, a hole in the numbers and a quiet period look alike.
+* **Graphing** (above) — a `graph` statement in `timbersh`, the extractor named
+  at plot time, gnuplot as a soft dependency.
+* **`!meta` is in the wrong place**, not merely on the wrong schedule — see the
+  defect above. Whatever consumes it decides where it goes.
+* **Declarations scoped to a range of the tape** — the general form of "which
+  definition produced these numbers", and the only thing that would make a
+  definition survive replication honestly: a declaration anchored at an OFFSET,
+  superseded by a later one. Bigger than tally and useful beyond it (a producer
+  that changed its line format mid-life has one `timestamp_regex` today), so it
+  is a `ROADMAP.md` entry rather than this note's.
 * **`timberfs tally --dump-json`** — a generator, which the JSON form wants
   much more than the INI form did: nobody should be escaping a regex by hand.
 * **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,

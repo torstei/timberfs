@@ -1303,9 +1303,11 @@ impl Live {
 // -------------------------------------------------------------- the command
 
 pub struct TallyOpts {
-    /// Extractor documents, repeatable. A directory takes every `*.json`
-    /// in it.
+    /// Extractor documents, repeatable: a path, a directory of `*.json`,
+    /// or a NAME resolved against the reading directories.
     pub extractors: Vec<PathBuf>,
+    /// Where the site's extractors and provisionings live.
+    pub etc: PathBuf,
     /// Validate and apply to PLAIN LOG LINES on stdin rather than a
     /// records stream, reporting per metric on stderr.
     ///
@@ -1383,6 +1385,81 @@ pub fn fold_stream(
 /// and nothing else does.
 pub const SHIPPED_PREFIX: &str = "timberfs-";
 
+/// Where a READER looks for an extractor by name: the provisioning's
+/// two, plus the user's own last, so a person can try a document without
+/// root and shadow a shipped one while they do.
+///
+/// ⚠ Deliberately not the list a provisioning uses — see
+/// `Provision::extractor_dirs`.
+pub fn reading_dirs(etc: &Path) -> Vec<PathBuf> {
+    let mut dirs = Provision::extractor_dirs(etc);
+    if let Some(mine) = user_extractor_dir() {
+        dirs.push(mine);
+    }
+    dirs
+}
+
+/// `$XDG_CONFIG_HOME/timberfs/tally.extractors.d`, else
+/// `~/.config/timberfs/…` — where `targets.json` already lives.
+fn user_extractor_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    let dir = base.join("timberfs").join(EXTRACTOR_DIR);
+    dir.is_dir().then_some(dir)
+}
+
+/// A path, or a NAME resolved against the reading directories.
+///
+/// An argument that exists as a file or a directory is taken as given;
+/// anything else is a name — which is what makes a per-user directory
+/// worth having rather than another place to type a long path from.
+pub fn resolve_extractors(args: &[PathBuf], etc: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for arg in args {
+        if arg.exists() {
+            out.push(arg.clone());
+            continue;
+        }
+        let dirs = reading_dirs(etc);
+        let name = arg.to_string_lossy().to_string();
+        // Reversed: the LAST directory shadows, which is the same rule a
+        // same-named file already follows.
+        match dirs
+            .iter()
+            .rev()
+            .map(|d| d.join(format!("{name}.json")))
+            .find(|p| p.is_file())
+        {
+            Some(p) => out.push(p),
+            None => {
+                let known = load_extractors(&dirs)
+                    .map(|docs| {
+                        docs.iter()
+                            .map(|(_, d)| d.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                bail!(
+                    "no extractor {name:?} — neither a path that exists nor a document \
+                     in {}{}",
+                    dirs.iter()
+                        .map(|d| d.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if known.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", which hold {known}")
+                    }
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Every extractor named, with duplicate names refused across files.
 ///
 /// ⚠ A directory given LATER SHADOWS an earlier one by FILE NAME, which
@@ -1444,6 +1521,30 @@ struct Run {
 
 impl Run {
     fn new(docs: &[(PathBuf, Extractor)], opts: &TallyOpts) -> anyhow::Result<Run> {
+        // ⚠ A metric is named once across the APPLIED set, not merely
+        // within a document. Two documents may share a name — apache's
+        // and nginx's `http_requests` are the same measurement — and
+        // they are only wrong TOGETHER, where the two would fold into
+        // one series and the numbers would be a sum of two different
+        // things. Refused here, where the applied set is known, rather
+        // than in the directory sweep, where holding both is right.
+        let mut named: BTreeMap<&str, &Extractor> = BTreeMap::new();
+        for (_, doc) in docs {
+            for m in &doc.metrics {
+                if let Some(other) = named.insert(&m.name, doc) {
+                    if other.name != doc.name {
+                        bail!(
+                            "{} and {} both define the metric {:?} — applied together \
+                             their samples fold into one series, and the numbers become \
+                             a sum of two different measurements. Apply one",
+                            other.name,
+                            doc.name,
+                            m.name
+                        );
+                    }
+                }
+            }
+        }
         let mut live = Vec::new();
         for (path, doc) in docs {
             let mut window = doc.window;
@@ -1566,7 +1667,7 @@ pub fn cmd_tally(opts: &TallyOpts) -> anyhow::Result<()> {
     if let Some(fold) = &opts.fold {
         return cmd_fold(fold);
     }
-    let docs = load_extractors(&opts.extractors)?;
+    let docs = load_extractors(&resolve_extractors(&opts.extractors, &opts.etc)?)?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
@@ -1948,6 +2049,13 @@ impl Provision {
     }
 
     /// Where the extractors named by `APPLY` are looked up.
+    ///
+    /// ⚠ NEVER a home directory. A provisioning runs as a service — it
+    /// creates stores and registers followers — so resolving a name
+    /// against `~` would make what a service does depend on whose home
+    /// it happened to look in, and on a shared machine would let one
+    /// user shadow a shipped extractor for a root-run provisioning.
+    /// `reading_dirs` is the other list, for a person asking a question.
     pub fn extractor_dirs(etc: &Path) -> Vec<PathBuf> {
         vec![PathBuf::from(PACKAGED_EXTRACTORS), etc.join(EXTRACTOR_DIR)]
             .into_iter()
@@ -1960,7 +2068,8 @@ impl Provision {
         let dirs = Provision::extractor_dirs(etc);
         if dirs.is_empty() {
             bail!(
-                "no extractor directory to search — expected {PACKAGED_EXTRACTORS} or                  {}",
+                "no extractor directory to search — expected {PACKAGED_EXTRACTORS} \
+                 or {}",
                 etc.join(EXTRACTOR_DIR).display()
             );
         }
@@ -2366,6 +2475,7 @@ impl TallyOpts {
     fn for_run(width_ms: Option<u64>) -> TallyOpts {
         TallyOpts {
             extractors: Vec::new(),
+            etc: PathBuf::from("/etc/timberfs"),
             try_it: false,
             check: false,
             observations: false,
@@ -3127,6 +3237,30 @@ mod tests {
     }
 
     #[test]
+    fn a_provisioning_never_resolves_a_name_against_a_home_directory() {
+        // ⚠ A provisioning runs as a service — it creates stores and
+        // registers followers — so what it does must not depend on
+        // whose home it looked in, and on a shared machine one user
+        // must not be able to shadow a shipped extractor for it.
+        let home = tempdir();
+        let mine = home.join("timberfs").join(EXTRACTOR_DIR);
+        std::fs::create_dir_all(&mine).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &home);
+
+        let etc = tempdir();
+        let reading = reading_dirs(&etc);
+        assert!(reading.contains(&mine), "a reader looks there: {reading:?}");
+        assert!(
+            !Provision::extractor_dirs(&etc).contains(&mine),
+            "a provisioning does not"
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&etc).ok();
+    }
+
+    #[test]
     fn everything_shipped_carries_the_reserved_prefix() {
         // A one-sided promise, enforced rather than remembered: names
         // live in one flat namespace and a collision is refused, so a
@@ -3213,6 +3347,7 @@ mod tests {
             let docs = load_extractors(std::slice::from_ref(&doc)).unwrap();
             let opts = TallyOpts {
                 extractors: vec![doc],
+                etc: PathBuf::from("/etc/timberfs"),
                 try_it: true,
                 check: false,
                 observations: false,

@@ -1,0 +1,96 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "timberfs-nginx-combined",
+  "description": "nginx's default access log, which is NCSA combined plus $request_time. The timing field is what makes a latency histogram possible without a custom log_format.",
+  "window": {
+    "axis": "logline",
+    "width_ms": 60000,
+    "grace_ms": 120000
+  },
+  "metrics": [
+    {
+      "name": "http_requests",
+      "description": "requests a minute by status and method",
+      "claim": {
+        "all": [
+          {
+            "regex": "\" \\d{3} "
+          }
+        ]
+      },
+      "fields": {
+        "decode": "apache-combined"
+      },
+      "labels": [
+        "status",
+        "method"
+      ],
+      "measure": [
+        {
+          "count": true,
+          "unit": "requests"
+        }
+      ]
+    },
+    {
+      "name": "http_bytes",
+      "description": "response bytes a minute by status",
+      "claim": {
+        "all": [
+          {
+            "regex": "\" \\d{3} "
+          }
+        ]
+      },
+      "fields": {
+        "decode": "apache-combined"
+      },
+      "labels": [
+        "status"
+      ],
+      "measure": [
+        {
+          "count": true
+        },
+        {
+          "sum": "bytes",
+          "unit": "B"
+        }
+      ]
+    },
+    {
+      "name": "http_latency",
+      "description": "how long a request took, as a cumulative ladder",
+      "claim": {
+        "all": [
+          {
+            "regex": "\" \\d{3} \\d+ \"[^\"]*\" \"[^\"]*\" \\d+\\.\\d+$"
+          }
+        ]
+      },
+      "fields": {
+        "extract": "\" (?P<status>\\d{3}) \\d+ \"[^\"]*\" \"[^\"]*\" (?P<secs>\\d+\\.\\d+)$"
+      },
+      "labels": [
+        "status"
+      ],
+      "histogram": {
+        "field": "secs",
+        "unit": "s",
+        "buckets": [
+          0.005,
+          0.01,
+          0.025,
+          0.05,
+          0.1,
+          0.25,
+          0.5,
+          1,
+          2.5,
+          5,
+          10
+        ]
+      }
+    }
+  ]
+}

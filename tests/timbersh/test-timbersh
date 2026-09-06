@@ -18,7 +18,7 @@ FAKE = os.path.join(HERE, "fake-timberfs")
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
 from timberview import when                                  # noqa: E402
 
-VERBS_THE_PARSER_TAKES = ["select", "tail", "view", "declare", "fetch",
+VERBS_THE_PARSER_TAKES = ["select", "tail", "graph", "view", "declare", "fetch",
                           "close", "create", "drop", "refresh", "add", "show",
                           "save", "load", "help", "quit", "exit"]
 
@@ -439,6 +439,98 @@ def a_logline_window_on_chunks_is_refused_before_the_axis_is_rewritten():
         "select chunks from [svc=web] where logline since '00:00';")
     assert "logline window has nothing to apply to" in s.out, s.out
     assert s.docs("chunks") == [], s.requests
+    s.cleanup()
+
+
+@test
+def a_graph_makes_the_fleet_a_dimension_rather_than_merging_it():
+    """Nothing in a tally line says which host it came from — a line's
+    labels are the METRIC's — so a fleet answer would silently add two
+    hosts into one series. The refusal names `host` because the shell put
+    it there."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    s = Session({h: {"stores": [store("t", ID_A)], "loglines": gauge}
+                 for h in ("a", "b")}, hosts=["a", "b"]).run(
+        "graph heap from [class=tally];")
+    assert "gauge" in s.out, s.out
+    assert "host" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_graph_refuses_a_cumulative_ladder_rather_than_multiplying_it():
+    """`le` series are cumulative, so stacking them multiplies the count
+    — the one a grapher gets WRONG rather than ugly."""
+    ladder = ("2026-09-06T13:37:00.000Z 60s lat le=10 count=24\n"
+              "2026-09-06T13:37:00.000Z 60s lat le=+Inf count=150 sum=900\n")
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": ladder}}).run(
+        "graph lat from [class=tally];")
+    assert "cumulative" in s.out, s.out
+    assert "quantile" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def extracting_insists_on_a_bound_because_it_moves_the_raw_log():
+    """The one statement that refuses to be unbounded. It reads the LOG
+    to make the numbers — tens of megabytes an hour per host, against
+    kilobytes for the same window from a tally store — so the whole
+    store on every host has to be asked for rather than arrived at."""
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": ""}}).run(
+        "graph http_requests from [svc=web] extracting timberfs-apache-combined;")
+    assert "RAW LOG" in s.out, s.out
+    assert "logline since" in s.out, s.out
+    # Nothing was fetched to learn that.
+    assert s.docs("loglines") == [], s.requests
+    s.cleanup()
+
+
+@test
+def a_graph_clause_ends_a_where_rather_than_being_eaten_by_it():
+    """`where` runs to the end of a statement in a select, whose only
+    clauses after it are `limit` and `into`. A graph has its own, and
+    without them `quantile` after a `where` was read as a condition."""
+    lines = ("2026-09-06T13:37:00.000Z 60s lat le=10 count=2\n"
+             "2026-09-06T13:37:00.000Z 60s lat le=+Inf count=4 sum=90\n")
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": lines}}).run(
+        "graph lat from [class=tally] where logline since '2026-09-06' "
+        "quantile 0.95;")
+    assert "condition starts with" not in s.out, s.out
+    # It reached the read, which is what the window was for.
+    assert s.docs("loglines"), s.requests
+    s.cleanup()
+
+
+@test
+def a_scatter_pairs_two_metrics_bucket_by_bucket():
+    """`against` is the honest plot for "are these related" — two lines
+    on a shared time axis is the one that invites seeing a relationship
+    that is not there. Refused when the buckets are not pairs."""
+    mixed = ("2026-09-06T13:37:00.000Z 60s a count=1\n"
+             "2026-09-06T13:37:00.000Z 300s b count=1\n")
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": mixed}}).run(
+        "graph b against a from [class=tally];")
+    assert "not pairs" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_scatter_pairs_exactly_two_metrics():
+    lines = "2026-09-06T13:37:00.000Z 60s a count=1\n"
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": lines}}).run(
+        "graph a, b against c from [class=tally];")
+    assert "ONE metric" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_graph_says_when_it_read_no_tally_lines_at_all():
+    """"Nothing matched" and "that store holds a log, not numbers" are
+    different answers, and the second is the one somebody new makes."""
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": ""}}).run(
+        "graph m from [class=tally];")
+    assert "no tally lines" in s.out, s.out
+    assert "class=tally" in s.out, s.out
     s.cleanup()
 
 

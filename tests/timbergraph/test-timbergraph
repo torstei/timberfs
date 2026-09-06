@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""timbergraph's tests. No gnuplot, no timberfs, no network.
+
+Everything worth testing is upstream of the drawing: what a line means,
+which lines win, what may be aggregated with what, and the two things
+this refuses to draw because drawing them would be a lie.
+
+    tests/timbergraph/test-timbergraph          # all
+    tests/timbergraph/test-timbergraph gauge    # one, by substring
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
+import timbergraph as g                                    # noqa: E402
+
+TALLY = """\
+2026-09-06T13:37:00.000Z 60s http_requests method=GET status=200 count=90
+2026-09-06T13:37:00.000Z 60s http_requests method=GET status=500 count=10
+2026-09-06T13:37:00.000Z 60s http_requests method=POST status=200 count=5
+2026-09-06T13:38:00.000Z 60s http_requests method=GET status=200 count=80
+2026-09-06T13:37:00.000Z 0s !meta metric=http_requests unit=requests
+2026-09-06T13:37:00.000Z 60s !late metric=http_requests count=3 max=90000
+"""
+
+HIST = """\
+2026-09-06T13:37:00.000Z 60s lat le=10 count=24
+2026-09-06T13:37:00.000Z 60s lat le=100 count=108
+2026-09-06T13:37:00.000Z 60s lat le=+Inf count=150 sum=32368
+"""
+
+FAILED = []
+
+
+def check(name, want, got):
+    if want != got:
+        FAILED.append(f"{name}: wanted {want!r}, got {got!r}")
+
+
+def raises(name, fn, contains):
+    try:
+        fn()
+    except g.Bad as e:
+        if contains not in str(e):
+            FAILED.append(f"{name}: {contains!r} not in {str(e)!r}")
+        return
+    FAILED.append(f"{name}: no refusal, and {contains!r} was expected")
+
+
+def test_a_line_says_what_it_holds():
+    s = g.parse_line(
+        '2026-09-06T13:37:00.000Z 60s m a=1 msg="two words" count=3 sum=1.5 @40+9'
+    )
+    check("labels", {"a": "1", "msg": "two words"}, s.labels)
+    check("fields", {"count": 3.0, "sum": 1.5}, s.fields)
+    check("cite", (40, 9), s.cite)
+    check("width", 60000, s.width_ms)
+
+
+def test_the_newest_line_for_a_bucket_wins():
+    """Not lateness — nothing emits a revision. It is what makes a
+    RECOMPUTE idempotent: re-running an extractor writes its buckets
+    again, and a reader that summed both would double every count."""
+    twice = (
+        "2026-09-06T13:37:00.000Z 60s m count=90\n"
+        "2026-09-06T13:37:00.000Z 60s m count=99\n"
+    )
+    samples, _ = g.read(twice)
+    check("one bucket", 1, len(samples))
+    check("the newest", 99.0, samples[0].fields["count"])
+
+
+def test_a_line_that_is_not_one_is_fatal():
+    """A plot that silently skipped a tenth of its input would be a
+    picture of nothing in particular."""
+    raises("garbage", lambda: g.read("2026-09-06T13:37:00.000Z 60s m count=1\nnope\n"),
+           "line 2")
+    # …but a comment is a convention, not an accident.
+    samples, _ = g.read("# a golden file's header\n2026-09-06T13:37:00.000Z 60s m count=1\n")
+    check("comment skipped", 1, len(samples))
+
+
+def test_an_additive_measure_aggregates_over_labels_not_named():
+    samples, _ = g.read(TALLY)
+    field, lines = g.series(samples, "http_requests", by=("status",))
+    check("field", "count", field)
+    check("series", [("200",), ("500",)], sorted(lines))
+    # GET 90 + POST 5, over the method nobody asked to see.
+    check("summed", 95.0, lines[("200",)][g.parse_stamp("2026-09-06T13:37:00.000Z")])
+
+
+def test_a_gauge_is_never_summed_across_series():
+    """A gauge has no meaning added up, so a plot that collapsed one
+    would be inventing a number."""
+    gauge = (
+        "2026-09-06T13:37:00.000Z 60s heap host=a last=100\n"
+        "2026-09-06T13:37:00.000Z 60s heap host=b last=200\n"
+    )
+    samples, _ = g.read(gauge)
+    raises("collapsed gauge", lambda: g.series(samples, "heap"), "gauge")
+    # Named, it draws.
+    field, lines = g.series(samples, "heap", by=("host",))
+    check("per host", 2, len(lines))
+    check("gauge field", "last", field)
+
+
+def test_a_cumulative_ladder_is_never_summed():
+    """The one a grapher gets WRONG rather than ugly: `le` series are
+    cumulative, so stacking them multiplies the count."""
+    samples, _ = g.read(HIST)
+    check("detected", True, g.is_histogram(samples))
+    p50 = g.quantile(samples, 0.50)[()][g.parse_stamp("2026-09-06T13:37:00.000Z")]
+    # 75 of 150 falls between le=10 (24) and le=100 (108).
+    check("p50", "64.6", f"{p50:.1f}")
+    # Past the last finite bound the ladder cannot say where in the tail
+    # it sits, so it says the tail began.
+    check("p99", 100.0, g.quantile(samples, 0.99)[()][g.parse_stamp("2026-09-06T13:37:00.000Z")])
+
+
+def test_two_metrics_share_a_graph_and_a_unit_decides_the_axis():
+    """Two response times share an axis honestly. A count and a byte
+    total do not — and drawing them as though they did is how a plot
+    makes any two things look related, which matters most in the case
+    somebody plots two metrics FOR: checking whether they are."""
+    both = TALLY + "2026-09-06T13:37:00.000Z 60s http_bytes count=10 sum=4096\n"
+    samples, markers = g.read(both)
+    facts = {"http_requests": {"unit": "requests"}, "http_bytes": {"unit": "B"}}
+    lines, ylabel, y2label, on_y2 = g.terms(
+        samples, ["http_requests", "http_bytes"], facts=facts)
+    check("both drawn", True, len(lines) >= 2)
+    check("first axis", "count (requests)", ylabel)
+    check("second axis", "sum (B)", y2label)
+    check("only the second is on it", {("http_bytes",)}, on_y2)
+    # The metric is in the series name once there is more than one, or
+    # two lines would answer to one legend entry.
+    check("named", True, all(k[0].startswith("http_") for k in lines))
+
+    # One unit, one axis.
+    same = {"http_requests": {"unit": "requests"},
+            "http_bytes": {"unit": "requests"}}
+    _, _, y2, _ = g.terms(samples, ["http_requests", "http_bytes"], facts=same)
+    check("one axis", None, y2)
+
+
+def test_a_scatter_pairs_buckets_and_refuses_what_is_not_a_pair():
+    """The honest plot for "are these related": two lines on a shared
+    time axis, especially on two scales, is the picture that invites
+    seeing a relationship that is not there. A cloud stays a cloud."""
+    both = (
+        "2026-09-06T13:37:00.000Z 60s a count=10\n"
+        "2026-09-06T13:37:00.000Z 60s b count=1\n"
+        "2026-09-06T13:38:00.000Z 60s a count=20\n"
+        "2026-09-06T13:38:00.000Z 60s b count=2\n"
+        # ⚠ A bucket on one side only is not a pair.
+        "2026-09-06T13:39:00.000Z 60s a count=30\n"
+    )
+    samples, _ = g.read(both)
+    points, xlabel, ylabel, dropped = g.against(samples, "b", "a")
+    check("paired", [(10.0, 1.0), (20.0, 2.0)],
+          [(x, y) for x, y, _ in points[()]])
+    check("counted, not halved", 1, dropped)
+    check("x is named", True, "a" in xlabel)
+    check("y is named", True, "b" in ylabel)
+
+
+def test_a_scatter_refuses_widths_that_are_not_pairs():
+    """Points from buckets of different widths are not pairs, so they
+    are not a scatter."""
+    mixed = ("2026-09-06T13:37:00.000Z 60s a count=1\n"
+             "2026-09-06T13:37:00.000Z 300s b count=1\n")
+    samples, _ = g.read(mixed)
+    raises("mixed widths", lambda: g.against(samples, "b", "a"), "not pairs")
+
+
+def test_a_scatter_refuses_sides_that_do_not_pair():
+    """Otherwise the pairing is whichever series happened to sort
+    first, which is a picture of nothing."""
+    lopsided = ("2026-09-06T13:37:00.000Z 60s a host=x count=1\n"
+                "2026-09-06T13:37:00.000Z 60s b host=y count=1\n")
+    samples, _ = g.read(lopsided)
+    raises("no shared series", lambda: g.against(samples, "b", "a", by=("host",)),
+           "do not pair")
+
+
+def test_the_unit_comes_from_the_tape_or_the_document():
+    _, markers = g.read(TALLY)
+    check("from the tape", {"http_requests": "requests"}, g.tape_units(markers))
+
+
+def test_trouble_is_told_apart_from_metadata():
+    """!meta says what a number IS; the others say something went
+    wrong. A plot that warned about the first would cry wolf, and one
+    that ignored the second would be lying about being exact."""
+    check("meta is not trouble", False, "!meta" in g.TROUBLE)
+    check("drop is", True, "!drop" in g.TROUBLE)
+    _, markers = g.read(TALLY)
+    import io
+    out = io.StringIO()
+    g.note_markers(markers, (0, 2 ** 62), out)
+    said = out.getvalue()
+    check("late reported", True, "!late" in said and "displaced" in said)
+    check("meta not reported", False, "!meta" in said)
+
+
+def test_an_extractor_is_a_path_or_a_name():
+    """A name is what makes a per-user directory worth having rather
+    than another place to type a long path from."""
+    import tempfile
+    home = tempfile.mkdtemp(prefix="timbergraph-test-")
+    d = os.path.join(home, "timberfs", "tally.extractors.d")
+    os.makedirs(d)
+    doc = os.path.join(d, "mine.json")
+    with open(doc, "w", encoding="utf-8") as fh:
+        fh.write('{"v":"1.0-EXPERIMENTAL","name":"mine",'
+                 '"window":{"axis":"logline","width_ms":60000},'
+                 '"metrics":[{"name":"m","measure":[{"count":true,"unit":"x"}]}]}')
+    old = os.environ.get("XDG_CONFIG_HOME")
+    os.environ["XDG_CONFIG_HOME"] = home
+    try:
+        check("by name", doc, g.resolve_extractor("mine"))
+        check("by path", doc, g.resolve_extractor(doc))
+        check("the unit", "x", g.extractor_facts(["mine"])["m"]["unit"])
+        raises("neither", lambda: g.resolve_extractor("absent"), "no extractor")
+    finally:
+        if old is None:
+            del os.environ["XDG_CONFIG_HOME"]
+        else:
+            os.environ["XDG_CONFIG_HOME"] = old
+        import shutil as sh
+        sh.rmtree(home, ignore_errors=True)
+
+
+def test_the_time_axis_is_local_and_snaps_to_the_clock():
+    """gnuplot renders a time axis as though every value were UTC, so
+    the shift is in the number — and a tic lands on the hour a reader
+    sees rather than on a round number of epoch seconds."""
+    import time as t
+    ms = g.parse_stamp("2026-09-06T13:37:00.000Z")
+    check("shifted", g.local_epoch(ms), ms / 1000 + t.localtime(ms / 1000).tm_gmtoff)
+    start, step = g.x_tics(g.local_epoch(ms), 600)
+    check("a round step", True, step in g.TICS)
+    check("a round tic", 0, int(start) % int(step))
+
+
+def main():
+    only = sys.argv[1] if len(sys.argv) > 1 else ""
+    tests = [(n, f) for n, f in sorted(globals().items())
+             if n.startswith("test_") and only in n]
+    for name, fn in tests:
+        fn()
+    if FAILED:
+        for f in FAILED:
+            print(f"FAIL {f}", file=sys.stderr)
+        print(f"timbergraph: {len(FAILED)} failure(s) of {len(tests)} test(s)",
+              file=sys.stderr)
+        return 1
+    print(f"timbergraph: {len(tests)} test(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

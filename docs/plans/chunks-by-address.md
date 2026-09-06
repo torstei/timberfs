@@ -2,8 +2,9 @@
 
 **Status: design.** Two things it rests on are already true — a sealed chunk is
 immutable, and every store is already a run of a longer tape, since retention
-drops only prefixes. Sparse stores, the cache layout and discovery are not
-built; the digest is deferred and optional (see below).
+drops only prefixes. Sparse stores and discovery are not built; the digest is
+deferred and optional (see below). The cache LAYOUT is sketched — see *a
+concrete layout* — but nothing implements it.
 
 See also [native replication](native-replication.md) for the wire that carries
 this, and the roadmap's "Globally addressable chunks" for the addressing rules
@@ -293,6 +294,90 @@ producing.
 the natural trigger for a fetch. Which is the same fact as the splice
 hazard above seen from the read side: the reader must know where the
 hole is either way.
+
+## A concrete layout, and the order a query fetches in
+
+Sketched later than the rest of this note, and it settles several of the open
+details below rather than adding a thread:
+
+```
+<cache root>/<store id>/<name>.bark
+<cache root>/<store id>/<name>.rings
+<cache root>/<store id>/grain/<fanout>/<chunk>.grain
+<cache root>/<store id>/<fanout>/<chunk>.zst
+```
+
+Keyed by the store's **id**, never its path — a path names a store only within
+one answer, and the id is what survives a move, a rename and a hop. Sharded on
+the chunk NUMBER's high bits, which keeps the directory browsable and ordered
+where a hash would not, and answers "sharding, and on what".
+
+⚠ **The `.bark` is what makes a cached store answerable at all.** With it the
+copy is self-describing — identity, labels, retention, lineage — so `list` can
+show it and a SELECTION can match it without contacting the origin. Without it
+a cache is a bag of bytes that has to phone home to say what it is.
+
+**The fetch order is rings, then grain, then chunks**, and the ratios are what
+make it worth doing. On one measured store the rings are ~56 bytes a chunk
+(0.7% of the compressed size) and the grain ~13%, so rings-plus-grain costs
+about a seventh of fetching a period's chunks — and buys skipping most of them.
+So a query fetches the rings (cheap, and the only thing that can answer "which
+chunks cover this window"), then the grain pages for the candidate range, runs
+the token search LOCALLY, and pulls only the chunks that survive it. That is
+"query planning with no data" made into a sequence.
+
+⚠ **Grain coverage is easy and time coverage is not, and the difference is
+worth keeping straight.** A grain page belongs to one chunk, so "I hold the
+grain for chunks 100..200" is exact, dense and monotone — a range. But a
+chunk's `[wf,wl]` is the min/max stamp of the LINES in it, and a long-lived
+request puts an ancient stamp in a recent chunk, so chunk time windows OVERLAP
+and are not monotone in chunk number. "I hold 13:00–14:00" therefore cannot be
+deduced from which chunks are present: what was fetched has to be RECORDED,
+append-only, rather than inferred.
+
+## It works for a TALLY store too, and there it is nearly free
+
+The cache is a property of the format, so a tally store
+([tally.md](tally.md)) gets it without knowing about it. What is different
+there is the SIZE, and it changes what the cache is FOR.
+
+A tally store is kilobytes where a log is gigabytes — one measured pair: 4.6
+KiB of access log became 281 B of numbers. So a fleet's tally stores can be
+cached WHOLE rather than by fragment, which turns graphing across a fleet from
+a fan-out per plot into a local read, and re-plotting the same window a
+different way costs nothing. `timbergraph`'s `--tsv` exists precisely because
+there is no cache — it is a hand-rolled one-window one, and with a real cache
+it goes back to being an export.
+
+⚠ And it is the half of the log that a cache can afford. `timbersh`'s
+`extracting` moves the RAW log to make numbers a store has none of, which is
+why it insists on a bound; the numbers themselves are small enough to keep. So
+the two compose in the useful direction: extract once where the log is, cache
+the result everywhere it is read.
+
+The retention asymmetry compounds it. A tally store already outlives the log it
+came from, so a cached one is a durable local archive of what a fleet DID,
+surviving both the log's head-drop and the host.
+
+## The hard part is what an incomplete answer says
+
+Two questions this layout does not settle, and they are the ones to think
+about before any of it is built.
+
+**A cache miss during a query: block and fetch, or answer with a declared
+gap?** Already listed as open below, but the layout sharpens it — with the
+grain local, a miss is known BEFORE the chunk is wanted, so the choice can be
+made per query rather than per chunk.
+
+**Does a cached store answer as itself, or as the origin?** It holds a SUBSET,
+so an answer from it is complete only for what it happens to have — and the
+machinery for saying so exists: a records answer already ends in `stream-end`
+with `status: exhausted` or `limited`, and `limited` already names which bound
+fired. A cache that answered as though it were the origin, silently, would be
+the one failure this whole design refuses everywhere else. ⚠ It also outlives
+the origin's retention: a chunk head-dropped upstream is still here, which is a
+feature for an archive and a lie if the answer claims to be about the store as
+it is now.
 
 ## Deliberately open
 

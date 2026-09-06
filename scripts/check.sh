@@ -32,6 +32,8 @@ echo "==> tests/timbersh/test-timbersh"
 tests/timbersh/test-timbersh
 echo "==> tests/timberview/test-timberview"
 tests/timberview/test-timberview
+echo "==> tests/timbergraph/test-timbergraph"
+tests/timbergraph/test-timbergraph
 # A VM test that is DEFINED and never registered runs never and says
 # nothing, so it rots invisibly — nineteen registrations were once
 # deleted with a block rewrite and the suite reported a clean 94 passes

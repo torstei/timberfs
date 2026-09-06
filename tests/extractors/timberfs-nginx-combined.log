@@ -1,0 +1,5 @@
+10.0.0.1 - - [06/Sep/2026:13:37:00 +0200] "GET /index.html HTTP/1.1" 200 2326 "-" "curl/8.5.0" 0.004
+10.0.0.2 - - [06/Sep/2026:13:37:01 +0200] "GET /api/v1/order HTTP/1.1" 200 812 "-" "curl/8.5.0" 0.180
+10.0.0.3 - - [06/Sep/2026:13:37:20 +0200] "POST /api/v1/order HTTP/1.1" 500 90 "-" "Mozilla/5.0" 2.400
+10.0.0.1 - - [06/Sep/2026:13:38:00 +0200] "GET /index.html HTTP/1.1" 200 2326 "-" "curl/8.5.0" 0.006
+2026-09-06T13:38:01Z level=info msg="a line of another shape entirely"

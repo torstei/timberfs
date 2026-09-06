@@ -50,9 +50,11 @@ jobs:
       - name: It has to run
         run: |
           python3 -m py_compile tools/timbersh tools/timberview.py \
-            tools/timberview tools/timberfs_client.py
+            tools/timberview tools/timberfs_client.py \
+            tools/timbergraph.py tools/timbergraph
           python3 tools/timbersh --help > /dev/null
           python3 tools/timberview --help > /dev/null
+          python3 tools/timbergraph --help > /dev/null
 
       # The suites gate the release, not only the PR: they take seconds and
       # need no VM, no timberfs and no network, so a release that skipped
@@ -62,6 +64,7 @@ jobs:
           tests/timberfs-client/test-timberfs-client
           tests/timbersh/test-timbersh
           tests/timberview/test-timberview
+          tests/timbergraph/test-timbergraph
 
       # Architecture: all — it is a script, and cargo-deb would have called
       # it amd64.
@@ -93,21 +96,25 @@ jobs:
           Architecture: all
           Depends: python3, zstd
           Recommends: timberfs (>= 0.26.0)
+          Suggests: gnuplot
           Maintainer: Torstein Tauno Svendsen <torstei@gmail.com>
           Homepage: https://github.com/torstei/timberfs
-          Description: timbersh and timberview, clients for timberfs
+          Description: timbersh, timberview and timbergraph, clients for timberfs
            A console for reading timberfs stores in a grammar borrowed from
            SQL, and a pager that reads one as a tape. EXPERIMENTAL: the
            statements timbersh accepts are not promised.
           EOF
           install -m 755 tools/timbersh "$root/usr/bin/timbersh"
           install -m 755 tools/timberview "$root/usr/bin/timberview"
+          install -m 755 tools/timbergraph "$root/usr/bin/timbergraph"
           # The module both front ends import: timbersh calls the viewer in
           # process, and /usr/bin/timberview is the entry point beside it.
           install -m 644 tools/timberview.py "$root/usr/share/timberfs-sh/timberview.py"
+          install -m 644 tools/timbergraph.py "$root/usr/share/timberfs-sh/timbergraph.py"
           install -m 644 tools/timberfs_client.py "$root/usr/share/timberfs-sh/timberfs_client.py"
           gzip -9c packaging/timbersh.1 > "$root/usr/share/man/man1/timbersh.1.gz"
           gzip -9c packaging/timberview.1 > "$root/usr/share/man/man1/timberview.1.gz"
+          gzip -9c packaging/timbergraph.1 > "$root/usr/share/man/man1/timbergraph.1.gz"
           install -m 644 tools/README.md "$root/usr/share/doc/timberfs-sh/README.md"
           # Dual-licensed, like the crate. Both, not one silently chosen —
           # and NOT `|| true`, which would let a missing licence file ship
