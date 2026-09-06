@@ -1904,6 +1904,9 @@ mod tests {
     /// A store with no identity on either side cannot be replicated: the
     /// destination is keyed by one. Named rather than silently skipped.
     #[test]
+    /// A pair made by an OLDER build, which is the only way one comes
+    /// without an identity now: it is named and the send fails, rather
+    /// than reporting a replication that has quietly stopped as success.
     fn a_store_with_no_identity_is_named_not_shipped() {
         let d = TempDir::new();
         let path = d.path().join("plain.log");
@@ -1923,9 +1926,10 @@ mod tests {
             .unwrap();
         f.flush_chunk(&cfg).unwrap();
         drop(st);
+        crate::format::clear_carried_identity(d.path(), "plain.log").unwrap();
 
-        // No listener, and none is needed: a one-shot with nothing to
-        // ship says so rather than failing on an endpoint it had no
+        // No listener, and none is needed: the store is resolved before
+        // anything connects, so this never reaches an endpoint it had no
         // reason to reach.
         let sent = cmd_send(&one(&path), &send_opts("127.0.0.1:1")).unwrap();
         assert_eq!(sent.unidentified, vec![path]);

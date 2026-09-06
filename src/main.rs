@@ -1112,18 +1112,26 @@ enum FollowerCommand {
 /// A refusal is per STREAM, so one store's conflict leaves the rest
 /// shipping — but a send whose every store was refused shipped nothing,
 /// and reporting that as success is the one thing a supervised unit
-/// cannot see.
+/// cannot see. A store carrying no identity counts the same way: it was
+/// found and it could not ship, which is a different fact from a
+/// selection that matched nothing.
 fn report_sent(
     endpoint: &str,
     src: &timberfs::frames::Sources,
     sent: &timberfs::frames::Sent,
 ) -> anyhow::Result<()> {
-    // The send says each refusal once, as it happens; this is the count
-    // that is still standing when it ends.
+    // The send says each of these once, as it happens; these are the
+    // counts still standing when it ends.
     if !sent.refused.is_empty() && !sent.streams.is_empty() {
         eprintln!(
             "timberfs: {} store(s) {endpoint} would not take",
             sent.refused.len()
+        );
+    }
+    if !sent.unidentified.is_empty() && !sent.streams.is_empty() {
+        eprintln!(
+            "timberfs: {} store(s) carry no identity and were not shipped",
+            sent.unidentified.len()
         );
     }
     if sent.streams.is_empty() {
@@ -1137,6 +1145,17 @@ fn report_sent(
                     String::new()
                 },
                 first.reason
+            );
+        }
+        if let Some(first) = sent.unidentified.first() {
+            let (subject, verb) = match sent.unidentified.len() {
+                1 => (first.display().to_string(), "carries"),
+                n => (format!("{} and {} more", first.display(), n - 1), "carry"),
+            };
+            anyhow::bail!(
+                "nothing shipped: {subject} {verb} no identity, and a destination is keyed by \
+                 one (`timberfs identity {} --mint`)",
+                first.display()
             );
         }
         timberfs::note!("timberfs: nothing to ship: {}", src.describe());
@@ -1892,6 +1911,51 @@ mod cli_tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// A send that shipped nothing exits non-zero whenever something was
+    /// named or matched and could not go — the failure a supervised unit
+    /// cannot otherwise see. Only a selection that matched nothing at all
+    /// is a success, because then there was nothing to ship.
+    #[test]
+    fn a_send_that_shipped_nothing_says_so_in_its_exit_code() {
+        use timberfs::frames::{Refused, Sent, Sources, StreamSent};
+        let named = Sources::One(PathBuf::from("/logs/a.log"));
+        let verdict = |sent: &Sent| report_sent("archive:4319", &named, sent).is_ok();
+
+        assert!(verdict(&Sent::default()), "nothing matched: nothing to do");
+        assert!(
+            !verdict(&Sent {
+                unidentified: vec![PathBuf::from("/logs/a.log")],
+                ..Default::default()
+            }),
+            "a store that cannot be keyed is not an empty selection"
+        );
+        assert!(
+            !verdict(&Sent {
+                refused: vec![Refused {
+                    path: PathBuf::from("/logs/a.log"),
+                    reason: "held by another origin".to_string(),
+                }],
+                ..Default::default()
+            }),
+            "every store refused"
+        );
+        // One store shipped: the rest are reported, not fatal — a refusal
+        // is per stream, and the connection did its job for the others.
+        assert!(verdict(&Sent {
+            streams: vec![StreamSent {
+                store: "id-a".to_string(),
+                path: PathBuf::from("/logs/b.log"),
+                chunks: 1,
+                comp_bytes: 10,
+                accepted_at: Vec::new(),
+                acked: Vec::new(),
+                skipped_already_held: 0,
+            }],
+            unidentified: vec![PathBuf::from("/logs/a.log")],
+            ..Default::default()
+        }));
     }
 
     /// `--dump-json` reads nothing, so requiring a store made the one job
