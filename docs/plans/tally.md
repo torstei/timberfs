@@ -7,8 +7,10 @@ extractor document with its published schema
 plain file, `--fold`, and two shipped extractors tested by their own `--try`
 output (`timberfs.1`, **tally**). ⚠ **The PROVISIONING half is not built** —
 which stores get a tally store, named how, declaring what, with which
-extractors applied. Until it is, a pipeline names its own source and the
-operator creates the tally store. Not built either: the consumer/follower half
+extractors applied. Its shape is settled below and its file is the whole
+interface: the follower it registers is derived, so no command is typed. Until
+it is built, a pipeline names its own source and the operator creates the tally
+store. Not built either: the consumer/follower half
 that fans out per store, the `samples` response kind, rollups. It rests on
 the follower registry and its position per store
 ([follower-selection.md](follower-selection.md)), the consumer protocol
@@ -170,27 +172,43 @@ next reader makes wrongly.
 Entries arrive in the store's order, which is arrival order — so on the
 logline axis a stamp can arrive after its bucket has passed (Apache logs a
 request's start and writes at completion; a 90-minute websocket puts an ancient
-stamp in a recent chunk). A bucket is therefore **sealed** after `GRACE` of
-arrival-time has passed its end, and written. Anything later:
+stamp in a recent chunk). A bucket is therefore **sealed** once the watermark
+has passed its end by `grace`, written, and **evicted**.
 
-> **A late entry emits a REVISION of the sealed bucket, and the newest line for
-> a key wins.**
+> **`grace` is the only mechanism for lateness. An entry arriving after its
+> bucket sealed is counted in a `!late` marker and measured nowhere.**
 
-Which an append-only tape does natively, and which pays for itself three more
-times:
+Bounded loss, recorded exactly — the rule retention already follows — and the
+marker is how an operator learns their `grace` is too small.
 
-* **Recompute is idempotent by the same mechanism.** Re-running a rule over a
-  window rewrites its buckets; no dedupe, no delete, no transaction.
-* **It composes with head-drop.** A revision is always nearer the tail than
-  what it revises, so dropping the head can never leave a stale line winning
-  over the fresh one it replaced.
-* **A backfill and a live extractor produce the same tape.**
+⚠ **A REVISE window was designed and dropped, and the reasoning is worth
+keeping** because the shape recurs. It let a late entry re-open a sealed bucket
+and emit a REVISION of it, newest-wins. That is a SECOND mechanism for the
+problem `grace` already solves, and the second one costs everything expensive:
 
-⚠ The cost lands on the READER: a window must be resolved before it is
-answered. That is bounded by series × buckets, not by entries — small — but it
-means a **`--follow` of a tally store delivers unresolved lines and must say
-so**, exactly as a live-edge entry carries no chunk number. A windowed read is
-closed and therefore resolved; a tail is not.
+* A revision must restate the COMPLETE bucket. A process that advanced its
+  position past a sealed bucket and then RESTARTED has forgotten that bucket's
+  contents, so a late entry re-opens it from zero and emits a revision holding
+  only the late entries. **Silently wrong numbers**, which is the worst failure
+  this design can have.
+* Avoiding that means the position may not advance until a bucket is EVICTED,
+  so a follower lags `grace + revise` behind the live edge — an hour, at the
+  defaults that were shipped. That is retention pressure on the SOURCE store,
+  and `GAP`s wherever retention is tight.
+
+A graph does not have to be exact. It does have to not lie about being exact,
+and a `!late` counter is that, at none of the cost.
+
+⚠ **Newest-wins survives, as a READ rule, for a different reason.** Re-running
+an extractor over a window emits the same buckets again, and
+
+> **the newest line for `(metric, labels, start, width)` wins**
+
+is what makes a recompute idempotent rather than doubling. It is a property of
+reading a tape, not of writing one: nothing emits a revision, but a reader must
+still resolve a window before answering it. Bounded by series × buckets, not by
+entries. A **`--follow` of a tally store delivers unresolved lines and must say
+so**, exactly as a live-edge entry carries no chunk number.
 
 ## A tally store has two clocks too, and they are FAR apart
 
@@ -219,8 +237,8 @@ Widening both ways only ever costs I/O — the per-entry verification keeps the
 output exact — and the per-chunk logline range the zone-map sidecar would add
 makes the declaration unnecessary rather than wrong.
 
-A tally writer knows its own lag exactly (`GRACE` + `REVISE`), so it should
-declare it on the store it creates, once that half exists.
+A tally writer knows its own lag exactly (`grace`, plus the width of the bucket
+being closed), so it should declare it on the store it creates.
 
 ⚠ **A BACKFILL's lag is unbounded** — its lines are about whenever the source
 data is from — so a store that has been backfilled must declare a lag wide
@@ -298,8 +316,7 @@ never in the `.bark` beside `timestamp_regex`, tempting as that looked.
 {
   "v": "1.0-EXPERIMENTAL",
   "name": "apache-access",
-  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000,
-              "revise_ms": 3600000 },
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000 },
   "metrics": [
     { "name": "http_requests",
       "description": "requests by status and method",
@@ -368,14 +385,20 @@ STORE_DIR=/var/log/timberfs
 [apache]
 SELECT=[service=~apache-.*]
 OUTPUT={name}-tally
-APPLY=apache-access volume
-DECLARE=class=tally index=true retain=730d retain_size=5G
+APPLY=timberfs-apache-combined timberfs-volume
+DECLARE=index=true retain=730d retain_size=5G
 #WIDTH=30s          # overrides the extractors' own default
+```
+
+```sh
+timberfs tally --check apache          # declare, converge, say what resolved
+systemctl enable --now timberfs-tally@apache
 ```
 
 INI here for the reason it is wrong for definitions: this file is ABOUT THIS
 HOST, hand-edited, and it is `file.d`'s shape — a preamble, a section per
-subject, `DECLARE` for the bark.
+subject, `DECLARE` for the bark, a `--check` that declares and reports, a
+templated unit named after the set.
 
 It is a store-PROVISIONING rule, not merely a binding, and that is what it buys:
 `forward-intake --auto-create` and `otlp-intake` mint source stores on first
@@ -387,7 +410,38 @@ store-declared shapes.
 attribution labels (`--label '{host}'`), so `{name}`, `{host}`, `{service}`
 and `{id}` are the fields.
 
-Four rules fall out:
+### The file is the interface; the FOLLOWER is state
+
+⚠ **The operator types no command, and this is the point.** A follower's
+`command` exists because "a destination is a program and timberfs does not need
+to know which" — but here the destination is a TIMBERFS STORE, and timberfs
+knows exactly how to write one. Feeding itself through a pipe protocol designed
+for foreign programs is ceremony.
+
+So `timberfs tally --check apache` REGISTERS the follower — named `tally-apache`,
+its selection and its command both DERIVED from the file — and the operator
+never writes either. The registration still exists, because that is where the
+position and the retention floor live and a program that writes those can get
+retention wrong silently (see [consumer-protocol.md](consumer-protocol.md)).
+`follower status tally-apache` still shows a real command that would work if it
+were typed, which keeps the registry honest.
+
+That also answers an objection to having a file at all: two objects holding one
+selection, kept in step by hand. They are not — one is derived from the other,
+so drift is impossible by construction rather than merely detectable. The same
+argument said the other way round is the one that decides it: **with the file,
+the command is not needed; without the file, the command is all there is.**
+
+Five rules fall out:
+
+* ⚠ **A tally follower never reads a store whose `class` is `tally`, and that
+  is IMPLICIT rather than something an operator remembers.** A tally store
+  inherits its source's provenance, so `[service=~apache-.*]` matches
+  `apache-access-tally`, whose every line `timberfs-volume` then claims,
+  producing `apache-access-tally-tally`, and then that one. Not hypothetical:
+  it follows from "inherit provenance" plus "selections re-resolve". Nothing
+  legitimate is lost — measuring a tally store is a ROLLUP, which is tier 2 and
+  a different verb.
 
 * ⚠ **The collision check is on `OUTPUT`, not on `SELECT`.** Two provisionings
   may cover one source store as long as they produce DIFFERENT tally stores;
@@ -395,7 +449,7 @@ Four rules fall out:
   permissive than "one tally follower per store" and exactly as safe — and it
   is checkable at load, where overlapping input selections are not decidable in
   general.
-* ⚠ **`logline_lag` is DERIVED, not typed.** It is `grace + revise` of the
+* ⚠ **`logline_lag` is DERIVED, not typed.** It is the `width + grace` of the
   applied extractors, and the provisioning knows both. Making an operator write
   it invites precisely the failure this note records twice. `DECLARE` may
   override it, which is what a backfill needs.
@@ -422,18 +476,18 @@ does.** Names live in one flat namespace and a collision is refused, so without
 a reserved prefix a site writing its own `apache-combined` finds ours in the
 way — and a name added in a later release could break a deployment whose own
 document already used it. A one-sided promise, enforced by a test rather than
-remembered. Provisioning is site-only, in
-`/etc/timberfs/tally.d/`, which keeps the plain `.d` name for the deployment
-file exactly as `file.d` has it. "Extractor" and not "rule" for the document,
+remembered.
+
+Provisioning is site-only, in `/etc/timberfs/tally.d/`, which keeps the plain
+`.d` name for the deployment file exactly as `file.d` has it. "Extractor" and not "rule" for the document,
 because RULE already means one metric inside one, and one word meaning two
 things is how a format becomes hard to talk about.
 
 ### What this leaves open
 
 * **The window override is recorded only halfway.** A width is in every tally
-  line, so a reader sees which applied; `grace` and `revise` are not, and a
-  bucket sealed under a different grace is not distinguishable from one that
-  was not.
+  line, so a reader sees which applied; `grace` is not, and a bucket sealed
+  under a different one is not distinguishable from a bucket that was not.
 * **`timberfs tally --dump-json`** does not exist, and the JSON form is much
   worse without it than the INI form was.
 * **`type=` vs `class=`.** Settled as `class=tally` — but the tree is already
@@ -798,8 +852,13 @@ loss, recorded exactly — the same rule retention already follows.
   the tally store with its labels, lineage and `logline_lag`, and writing the
   `!gap` marker from the registry's GAP.
 * **The provisioning file** — `SELECT`, `OUTPUT`, `APPLY`, `DECLARE`, the
-  `OUTPUT` collision check, the derived `logline_lag`, and converge-not-cascade.
-  It needs the follower half to have anything to run it.
+  `OUTPUT` collision check, the derived `logline_lag`, converge-not-cascade,
+  the implicit `class!=tally`, and the derived follower registration. It needs
+  the follower half to have anything to run it, so the two land together.
+* **`revise_ms` must come OUT of the built code** — the document's `window`,
+  `Roller`, `--fold --revise` and the man page all still carry it, and
+  `!late` must replace it. Sealing then evicts, and a position lags by `grace`
+  alone.
 * **`timberfs tally --dump-json`** — a generator, which the JSON form wants
   much more than the INI form did: nobody should be escaping a regex by hand.
 * **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,
