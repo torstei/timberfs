@@ -315,7 +315,7 @@ COUNT=
 Section keys: the store selection (`SELECT`), the entry predicate (`HAS`,
 `ANY`, `SUBSTRING`, `REGEX` and their `NOT_` forms — `timber-filter`'s
 vocabulary, so one language for matching an entry), the field source
-(`DECODE`, `EXTRACT`, `EXEC`), what becomes a label (`LABELS`), the measures
+(`DECODE` or `EXTRACT`), what becomes a label (`LABELS`), the measures
 (`COUNT`, `SUM`, `MIN`, `MAX`, `LAST`, or `OBSERVE` + `BUCKETS` for a
 histogram), and the axis/width/grace/citation knobs, each inherited from the
 preamble.
@@ -610,11 +610,9 @@ loss, recorded exactly — the same rule retention already follows.
 * **Exporters** — OpenMetrics and Influx renderings of a `samples` answer, and
   the Grafana datasource as one consumer of the API rather than the reason for
   its shape.
-* **Whether `EXEC` may be fed CHUNKS** rather than entries, for an extractor
-  cheap enough that framing dominates.
 * **Trace-shaped questions** (a request id correlating two entries into a
-  duration) are expressible at level 4 today and awkwardly; whether they
-  deserve a level of their own is unanswered until somebody writes three.
+  duration) are what the session's `SPAN=ts` is meant to cover; whether that is
+  enough is unanswered until somebody writes three.
 * **What it costs**, barely measured: one 29 KB access log of 300 requests
   produced 1.9 KB of tally lines compressing to 346 B (5.5x, against the
   source's 9.1x — canonical lines repeat, but there are few of them). A real
@@ -625,9 +623,9 @@ loss, recorded exactly — the same rule retention already follows.
   bucket still depends on, so a restart re-derives identical lines), creating
   the tally store with its labels, lineage and `logline_lag`, and writing the
   `!gap` marker from the registry's GAP.
-* **The session (level 4)** — the next thing to build, and the reason `EXEC`
-  can wait: `GROUP`, `CLOSE`, `TIMEOUT`, `SPAN`, `MAX_SESSIONS`, and `Roller`
-  keyed by a field value instead of a bucket start.
+* **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,
+  `TIMEOUT`, `SPAN`, `MAX_SESSIONS`, and `Roller` keyed by a field value
+  instead of a bucket start.
 * **`EXEC` is gone**, and `--fold` is what replaced it: the boundary is a pipe
   and a text format rather than a coprocess protocol. The key stays reserved so
   that reaching for it gets an answer.

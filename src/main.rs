@@ -663,7 +663,7 @@ enum Command {
         revise: String,
         /// Print the width-0s OBSERVATIONS instead of bucketing them:
         /// one line per measurement per entry. The debugging path, and
-        /// the format an EXEC extractor is expected to emit
+        /// the format --fold takes
         #[arg(long)]
         observations: bool,
         /// Only these metrics — for recomputing one over history without

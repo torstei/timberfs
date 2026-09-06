@@ -1334,10 +1334,10 @@ Print the width-\fB0s\fR OBSERVATIONS instead of bucketing them: one line
 per measurement per entry, in the same grammar. An observation is a
 bucket of no width, so bucketing is the fold over them and coarsening a
 tape is the same fold \(em one operation, three call sites. It is also
-what an
-.B EXEC
-extractor is expected to emit, which makes this both the debugging path
-and the way to learn the format.
+exactly what
+.B \-\-fold
+takes, which makes this both the debugging path and the way to learn the
+format.
 .TP
 .B \-\-fold
 Read width-\fB0s\fR OBSERVATION lines on stdin and write buckets,

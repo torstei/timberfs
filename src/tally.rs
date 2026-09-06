@@ -516,7 +516,7 @@ pub enum Axis {
 /// A line of known shape, turned into fields a rule can name. Few, and
 /// only for formats somebody else standardised: a decoder per producer
 /// would be a taxonomy growing a binary per format, which is what
-/// `EXTRACT` and `EXEC` exist to avoid.
+/// `EXTRACT` exists to avoid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Decoder {
     Logfmt,
@@ -867,7 +867,8 @@ pub fn parse(file: &str, text: &str) -> anyhow::Result<RuleSet> {
                     "apache-combined" => Decoder::ApacheCombined,
                     other => bail!(
                         "{file}:{line}: no decoder {other:?} — this build has logfmt, json, \
-                         apache-combined; anything else is {EXTRACT} or {EXEC}"
+                         apache-combined; anything else is {EXTRACT}, or a consumer of \
+                         your own (see {EXEC})"
                     ),
                 };
                 one_source(cur, DECODE, Fields::Decode(d))?
@@ -988,7 +989,7 @@ fn close(o: Open, d: &Defaults, file: &str) -> anyhow::Result<Rule> {
         if let Some(f) = needs.first() {
             bail!(
                 "{file}:{at}: [{}] names the field {f:?} but states no {DECODE}, {EXTRACT} \
-                 or {EXEC} to get it from",
+                 to get it from",
                 o.metric
             );
         }
@@ -1307,8 +1308,7 @@ pub struct TallyOpts {
     /// through here, and the fold is the one that ships.
     pub fold: Option<FoldOpts>,
     /// Print the width-`0s` observations instead of bucketing them —
-    /// the debugging path, and the way to learn what an `EXEC`
-    /// extractor is expected to emit.
+    /// the debugging path, and the way to see what `--fold` takes.
     pub observations: bool,
     /// Only these metrics, for recomputing one over history.
     pub metrics: Vec<String>,
@@ -1583,8 +1583,9 @@ mod tests {
 
     #[test]
     fn a_line_round_trips_through_its_own_parser() {
-        // The format is a wire format the moment an EXEC extractor emits
-        // one, so render and parse must be one grammar rather than two.
+        // The format is a wire format the moment somebody's own
+        // extractor pipes one into `--fold`, so render and parse must be
+        // one grammar rather than two.
         for line in [
             "2026-09-06T13:37:00.000Z 60s http_requests status=500 vhost=example.com sum=42 @1994848392+51221",
             "2026-09-06T13:37:00.000Z 0s heap_used count=1 last=8419221.5",
