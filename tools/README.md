@@ -701,7 +701,9 @@ timberfs query my-app-tally | timbergraph -m requests --using my-app
 
 A name is looked up in `/usr/lib/timberfs/tally.extractors.d`, then
 `/etc/…`, then `~/.config/…`, later shadowing earlier — so a document can be
-written and tried without root, and can shadow a shipped one while it is.
+written and tried without root, and can shadow a shipped one while it is. ⚠ The
+name here is the **file's**, `<name>.json`; a provisioning's `APPLY` names the
+**document**. Keep the two the same, as everything shipped does.
 
 ⚠ That last directory is a **reader's**. `timberfs tally --provision` never
 looks in a home: it runs as a service, creating stores and registering
