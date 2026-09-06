@@ -584,6 +584,18 @@ pub enum Axis {
     Write,
 }
 
+impl Axis {
+    /// The wire spelling. Reported rather than `{:?}`, which prints
+    /// `Logline` — a Rust identifier nobody can type back into a
+    /// document.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Axis::Logline => "logline",
+            Axis::Write => "write",
+        }
+    }
+}
+
 /// One metric: which lines are mine, how to read one, and what to measure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
@@ -1489,14 +1501,19 @@ pub fn cmd_tally(opts: &TallyOpts) -> anyhow::Result<()> {
     if opts.check {
         for (path, doc) in &docs {
             eprintln!(
-                "{} — {} ({} metric(s), window {} {:?}, grace {})",
+                "{} — {} ({} metric(s), window {} {}, grace {})",
                 doc.name,
                 path.display(),
                 doc.metrics.len(),
                 render_width(doc.window.width_ms),
-                doc.window.axis,
+                doc.window.axis.as_str(),
                 render_width(doc.window.grace_ms),
             );
+            // Shown, because being SHOWN is the whole reason the format
+            // has descriptions instead of comments.
+            if let Some(d) = &doc.description {
+                eprintln!("  {d}");
+            }
             // Compiling is the check: predicates, regexes and every field
             // name whose source declares what it can produce.
             doc.compile(doc.window)?;
@@ -1602,12 +1619,12 @@ fn axis_of(docs: &[(PathBuf, Extractor)]) -> anyhow::Result<Axis> {
     for (path, doc) in it {
         if doc.window.axis != first.window.axis {
             bail!(
-                "{} is on the {:?} axis and {} on the {:?} — one run reads one entry \
+                "{} is on the {} axis and {} on the {} — one run reads one entry \
                  stream, so its extractors must agree",
                 first_path.display(),
-                first.window.axis,
+                first.window.axis.as_str(),
                 path.display(),
-                doc.window.axis
+                doc.window.axis.as_str()
             );
         }
     }

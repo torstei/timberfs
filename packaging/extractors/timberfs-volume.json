@@ -1,12 +1,12 @@
 {
   "v": "1.0-EXPERIMENTAL",
   "name": "timberfs-volume",
-  "description": "How much a log says. The only thing knowable about every log without knowing its format, which is why it is the only thing in here: whether a line is an ERROR is semantics, and semantics come from the format.",
+  "description": "Measurements that need no knowledge of a log's format, and therefore apply to any store.",
   "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000 },
   "metrics": [
     {
       "name": "entries_logged",
-      "description": "entries a minute, whatever the log's shape",
+      "description": "entries a minute",
       "measure": [{ "count": true, "unit": "entries" }]
     }
   ]
