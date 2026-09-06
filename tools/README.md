@@ -597,6 +597,10 @@ Several metrics go on one graph, comma-separated — which is how two stores
 answer at once, since `[class=tally]` covers both and the metric name is what
 tells them apart.
 
+`using <name>` names the extractor document the numbers came from, which is
+where the **unit** is written down; it is `timbergraph --using` below, with the
+same lookup. `svg 'FILE'` draws where `png 'FILE'` does.
+
 ### `extracting` — metrics from a store that has no tally
 
 ```

@@ -77,11 +77,13 @@ jobs:
       # works; `--no-install-recommends` is the workstation that only
       # ever talks to other machines.
       #
-      # The version belongs there too, and only as a hint: the viewer is
-      # nothing but seeks and the bounded `from_chunk` one landed in
-      # 0.26.0. What a dpkg constraint cannot reach is the case that
-      # matters anyway — a REMOTE target, about which it says nothing —
-      # so the runtime diagnosis is the real guard.
+      # The version belongs there too, and only as a hint: `graph ...
+      # extracting` runs `timberfs tally --try` HERE and resolves an
+      # extractor name against the directory the timberfs package ships,
+      # both of which landed in 0.32.0. What a dpkg constraint cannot
+      # reach is the case that matters anyway — a REMOTE target, about
+      # which it says nothing — so the runtime diagnosis is the real
+      # guard.
       - name: Build the .deb
         run: |
           V=$(tr -d '[:space:]' < tools/VERSION)
@@ -95,7 +97,7 @@ jobs:
           Priority: optional
           Architecture: all
           Depends: python3, zstd
-          Recommends: timberfs (>= 0.26.0)
+          Recommends: timberfs (>= 0.32.0)
           Suggests: gnuplot
           Maintainer: Torstein Tauno Svendsen <torstei@gmail.com>
           Homepage: https://github.com/torstei/timberfs
