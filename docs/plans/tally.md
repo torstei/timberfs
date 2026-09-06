@@ -1017,6 +1017,10 @@ loss, recorded exactly — the same rule retention already follows.
 ## Deferred, and open
 
 * **Rollups** (tier 2) — the mechanism is the fold; only the verb is missing.
+* **A frame cache** ([chunks-by-address.md](chunks-by-address.md)) applies to a
+  tally store like any other, and there it is nearly free: kilobytes against a
+  log's gigabytes, so a fleet's numbers can be cached WHOLE and graphing across
+  it becomes a local read rather than a fan-out per plot.
 * **A cost preflight for a tally read**, as the roadmap wants for query: the
   chunk count is knowable before the read here too.
 * **Exporters** — OpenMetrics and Influx renderings of a `samples` answer, and

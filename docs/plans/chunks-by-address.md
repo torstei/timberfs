@@ -335,6 +335,30 @@ and are not monotone in chunk number. "I hold 13:00–14:00" therefore cannot be
 deduced from which chunks are present: what was fetched has to be RECORDED,
 append-only, rather than inferred.
 
+## It works for a TALLY store too, and there it is nearly free
+
+The cache is a property of the format, so a tally store
+([tally.md](tally.md)) gets it without knowing about it. What is different
+there is the SIZE, and it changes what the cache is FOR.
+
+A tally store is kilobytes where a log is gigabytes — one measured pair: 4.6
+KiB of access log became 281 B of numbers. So a fleet's tally stores can be
+cached WHOLE rather than by fragment, which turns graphing across a fleet from
+a fan-out per plot into a local read, and re-plotting the same window a
+different way costs nothing. `timbergraph`'s `--tsv` exists precisely because
+there is no cache — it is a hand-rolled one-window one, and with a real cache
+it goes back to being an export.
+
+⚠ And it is the half of the log that a cache can afford. `timbersh`'s
+`extracting` moves the RAW log to make numbers a store has none of, which is
+why it insists on a bound; the numbers themselves are small enough to keep. So
+the two compose in the useful direction: extract once where the log is, cache
+the result everywhere it is read.
+
+The retention asymmetry compounds it. A tally store already outlives the log it
+came from, so a cached one is a durable local archive of what a fleet DID,
+surviving both the log's head-drop and the host.
+
 ## The hard part is what an incomplete answer says
 
 Two questions this layout does not settle, and they are the ones to think
