@@ -1,0 +1,93 @@
+# Example set for timberfs-file@.service — one system's log files, tailed
+# into a store each by ONE process.
+#
+# Copy to /etc/timberfs/file.d/<set>.conf and start it by that name:
+#
+#   systemctl enable --now timberfs-file@exim
+#
+# The set's name is the file's and the unit instance's. It names no store:
+# every store is named by a section.
+
+# --- the preamble: what every section inherits -----------------------------
+
+# Each store is <STORE_DIR>/<section>/<section>.log — one directory per
+# store, named after the store, which is also the handle it answers to:
+#   timberfs query exim-reject --from 13:40
+# Nothing in the path names the intake. Point STORE_DIR at a directory of
+# your own to group a subject's stores in one place, e.g.
+# STORE_DIR=/var/log/timberfs/mail.
+STORE_DIR=/var/log/timberfs
+
+# Properties DECLARED on every store on every start, as KEY=VALUE pairs:
+# retain=90d, retain_size=50G, index=true|false, wal=true|false, or any
+# free-form provenance key. (Not a value containing spaces.)
+#
+# ⚠ A section that states its own DECLARE REPLACES this wholly rather than
+# adding to it. A partial merge of a space-separated string is a rule
+# nobody can predict from reading the file, so there isn't one: write out
+# what that store should have.
+DECLARE=index=true retain=90d
+
+# How often to look for new data and for a replaced file. Takes the same
+# time syntax as retain: 2s, 500ms is not a unit here (the floor is 1s).
+#POLL=1s
+
+# How long followed data may sit unflushed. A VISIBILITY knob, not a
+# durability one: the source file is the durable copy, so lowering it only
+# makes lines queryable sooner, at the cost of chunks too small to compress
+# on a quiet log.
+#FLUSH_AGE=60s
+
+# Where rotation moves a source, for data written while this was NOT
+# running. Rotation while it IS running needs no configuration at all — the
+# descriptor already held is the file that moved, and it is drained before
+# the new one is opened. Defaults to <SOURCE>.1 and <SOURCE>.0.
+#ROTATED=/var/log/exim4/mainlog.1 /var/log/exim4/mainlog.0
+
+# --- a section per source; its name is the store's -------------------------
+#
+# ⚠ SOURCE is an absolute path, and the sources need not share a directory:
+# a set is a NAMED LIST of files that are usually — not necessarily — near
+# each other. There is no directory to point at and nothing is globbed:
+# /var/log/exim4/*log would match mainlog.1 the first time logrotate ran and
+# import a rotated file as a store of its own.
+
+[exim-main]
+SOURCE=/var/log/exim4/mainlog
+
+[exim-reject]
+SOURCE=/var/log/exim4/rejectlog
+DECLARE=index=true retain=365d
+
+[exim-panic]
+SOURCE=/var/log/exim4/paniclog
+# Rare and urgent: keep it long, and make each line queryable as it lands
+# rather than at the next chunk flush.
+DECLARE=index=true retain=365d wal=true
+FLUSH_AGE=2s
+
+# --- Apache, as its own set (file.d/apache.conf) ---------------------------
+#
+#   DECLARE=index=true retain=90d
+#
+#   [apache-access]
+#   SOURCE=/var/log/apache2/access.log
+#   [apache-error]
+#   SOURCE=/var/log/apache2/error.log
+#
+# Put the vhost in the log line and one pair of stores covers every site: a
+# new vhost then needs no logging configuration at all, and chunks fill from
+# every site at once, which compresses better than per-site dribbles.
+#
+# --- one set per system, which is the opinionated default ------------------
+#
+# An everything-on-this-host set works and is simply a longer list. Prefer
+# one per system anyway: a set is a unit of SUPERVISION as well as of
+# configuration — if the process dies, every tail in it stops and restarts
+# together — and the intake must be able to read every source it names, so
+# a host-wide set has to run as whoever can read all of them.
+#
+# Keep the producer's own logrotate: the plain file is no longer the archive,
+# so it only has to outlive this intake's downtime. On a busy site rotating
+# HOURLY is worth doing — it bounds both the plain file's size and the scan
+# each tail does at startup to re-sync against its store.

@@ -827,6 +827,23 @@ fn validate_cursors_dir(v: &str) -> anyhow::Result<()> {
 /// manifest on their retention tick, so a change takes effect within
 /// seconds, no restart.
 pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Result<()> {
+    let saved = declare(store, sets, unsets)?;
+    println!("{}", serde_json::to_string_pretty(&Value::Object(saved))?);
+    Ok(())
+}
+
+/// What `set` does, without saying it: the same validation and the same
+/// atomic write, returning the manifest instead of printing it.
+///
+/// Split out for the file intake, which converges a store's declaration on
+/// every start the way `timberfs-follow@`'s `ExecStartPre=` line does —
+/// but for every store in a set at once, where one manifest per store per
+/// restart in the journal is noise nobody reads.
+pub fn declare(
+    store: &Path,
+    sets: &[String],
+    unsets: &[String],
+) -> anyhow::Result<Map<String, Value>> {
     if crate::query::is_bundle(store) {
         bail!(
             "{} is a .timber transfer bundle — bundles are read-only",
@@ -911,9 +928,7 @@ pub fn cmd_set(store: &Path, sets: &[String], unsets: &[String]) -> anyhow::Resu
     retention_from_map(&map)?;
 
     save(&dir, &name, &map)?;
-    let saved = load(&dir, &name).context("re-reading the manifest")?;
-    println!("{}", serde_json::to_string_pretty(&Value::Object(saved))?);
-    Ok(())
+    load(&dir, &name).context("re-reading the manifest")
 }
 
 #[cfg(test)]

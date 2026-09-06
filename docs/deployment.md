@@ -561,6 +561,59 @@ DECLARE=index=true retain=90d format=exim-main
 systemctl enable --now timberfs-follow@exim-main
 ```
 
+#### A system's logs are a SET — `timberfs-file@`
+
+Exim does not write one log. It writes `mainlog`, `rejectlog` and `paniclog`,
+and Apache writes an access log beside an error log. One `timberfs-follow@`
+per file is a unit and a process each, and states that system's retention
+policy once per file — free to drift once per file. A **set** states it once
+and runs the whole system in one process:
+
+```ini
+# /etc/timberfs/file.d/exim.conf
+DECLARE=index=true retain=90d
+
+[exim-main]
+SOURCE=/var/log/exim4/mainlog
+
+[exim-reject]
+SOURCE=/var/log/exim4/rejectlog
+DECLARE=index=true retain=365d
+
+[exim-panic]
+SOURCE=/var/log/exim4/paniclog
+DECLARE=index=true retain=365d wal=true
+FLUSH_AGE=2s
+```
+```sh
+timberfs file-intake exim --check      # declare, converge, and say what resolved
+systemctl enable --now timberfs-file@exim
+```
+
+The **section name is the store's name**, and its handle: `timberfs query
+exim-reject`. Each section inherits the preamble key by key and overrides
+what differs — so «90 days for the main log, a year for rejects and panics»
+is three lines, not three files. Every store is declared *before* any tail
+starts, so a typo in the fifth section fails at startup rather than after
+four tails are already writing; `--check` does exactly that and stops.
+
+⚠ **The sources are a named list, not a directory.** They usually sit
+together and need not: nothing is globbed, because `/var/log/exim4/*log`
+matches `mainlog.1` the first time logrotate runs and would import a rotated
+file as a store of its own.
+
+**One set per system** is the shape to reach for — `exim`, `apache`,
+`postgres`. A set is a unit of *supervision* as well as of configuration: if
+one tail ends, the set stops and systemd restarts all of them, which is
+affordable only because each store is its own tail's checkpoint. It is also
+what keeps `User=` usable, since the intake must read every source it names.
+An everything-on-this-host set works and is simply a longer list; it just has
+to run as whoever can read all of it.
+
+Measured on a release build, idle: one `file-intake` over Exim's three logs
+is **10.6 MB RSS in 7 threads, against 27.5 MB in three processes** for the
+same three `import --follow`.
+
 Three rules carry the whole thing, and each is stated where an operator will
 look — in the journal, as it happens:
 

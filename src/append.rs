@@ -43,6 +43,14 @@ pub fn stopping() -> bool {
     STOP.load(Ordering::Relaxed)
 }
 
+/// Ask this process to wind down as if SIGTERM had arrived, for a process
+/// holding SEVERAL writers that must all flush: the file intake's binary
+/// watch trips this instead of exiting, where a single-store writer can
+/// flush its own store and call `exit` because there is no other.
+pub fn request_stop() {
+    STOP.store(true, Ordering::Relaxed);
+}
+
 /// SIGTERM/SIGINT set the stop flag; installed WITHOUT SA_RESTART so a
 /// blocking stdin read returns EINTR and the main loop notices promptly.
 pub fn install_signal_handlers() {

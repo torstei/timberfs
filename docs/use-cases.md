@@ -176,6 +176,43 @@ permanent feed: a stdin stream is not a store, so it takes no `--cursor` and a
 restart does not resume where it stopped. Filtered shipping is at its best for
 a window you send on purpose.
 
+## Archive a system's logs without reconfiguring it
+
+Exim writes `mainlog`, `rejectlog` and `paniclog`; Apache writes an access log
+beside an error log. None of them can safely be pointed at a pipe — an MTA
+whose log write fails defers mail — so timberfs reads the files the producer
+keeps writing, and a **set** describes the whole system at once:
+
+```ini
+# /etc/timberfs/file.d/exim.conf
+DECLARE=index=true retain=90d
+
+[exim-main]
+SOURCE=/var/log/exim4/mainlog
+
+[exim-reject]
+SOURCE=/var/log/exim4/rejectlog
+DECLARE=index=true retain=365d
+
+[exim-panic]
+SOURCE=/var/log/exim4/paniclog
+DECLARE=index=true retain=365d wal=true
+```
+```sh
+timberfs file-intake exim --check
+systemctl enable --now timberfs-file@exim
+```
+
+One config, one unit, one process for the system — with the retention policy
+stated once and overridden only where it differs, instead of once per file and
+free to drift once per file. The section name is the store's name and its
+handle, so `timberfs query exim-reject --from 09:00` works from anywhere.
+
+*Why not one unit per file:* it is the same policy written three times, three
+units to enable and monitor, and three processes (27.5 MB against 10.6 MB for
+the set). The producer is untouched either way — a tail is a reader, so if it
+stalls, dies or is upgraded badly, the worst it can do is fall behind.
+
 ## Take container logs without running a logging stack
 
 `timberfs forward-intake` speaks Fluentd Forward v1 — the protocol Docker's

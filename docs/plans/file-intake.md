@@ -1,6 +1,6 @@
 # A file intake: one declaration, a set of files, one process
 
-**Status: proposed.** The ingest counterpart of
+**Status: built** (branch `feature/file-intake`). The ingest counterpart of
 [follower-selection.md](follower-selection.md) and
 [frames-selection.md](frames-selection.md), which made the same move on the
 read and replication sides. It does NOT copy their mechanism, and the section
@@ -38,6 +38,7 @@ its own labels and its own retention, defaulting to the set's.
         [exim-panic]
         SOURCE=/var/log/exim4/paniclog
         DECLARE=index=true retain=365d wal=true
+        FLUSH_AGE=2s
 
     systemctl enable --now timberfs-file@exim
 
@@ -91,9 +92,12 @@ It is two smaller things, and the honest ones:
 
 - **The management surface.** N units to enable, monitor and upgrade, and N
   places for one system's retention policy to drift.
-- **The runtime.** Measured on a release build, idle: **~9 MB RSS per
-  `import --follow`**. Exim plus Apache is five processes ≈ 45 MB, which on
-  a mail server is noise. A host tailing fifty logs is ~450 MB, which is not.
+- **The runtime.** Measured on a release build, idle: **~9.1 MB RSS per
+  `import --follow`**, and one `file-intake` over Exim's three logs is
+  **10.6 MB in 7 threads against 27.5 MB in three processes**. So a source
+  costs ~0.5 MB inside a set and ~9.1 MB outside one. On a mail server the
+  difference is noise; on a host tailing fifty logs it is ~450 MB against
+  ~30 MB, which is not.
 
 What makes one process *safe* is the same property that removes the
 registry: a tail that dies re-syncs against its store's own lines. If the
@@ -145,6 +149,24 @@ parser.
 **Not a new tailer.** Each section runs the `cmd_follow` that exists, with
 the arguments it already takes. What is new is the declaration, the process
 that holds several, and the supervision over them.
+
+**Not an `EXTRA_OPTS` string.** The systemd units carry one because a unit
+can only hand a CLI a string, so their knobs must be spelled as flags. A
+file timberfs parses itself has no such excuse, and structure inside a
+string is structure re-parsed under rules neither side owns. `POLL`,
+`FLUSH_AGE` and `ROTATED` are keys: validated at startup with a line
+number, and a misspelling refused rather than passed through to be ignored.
+
+## What the build settled
+
+`declare()` is `set` without the printing — the same validation and the
+same atomic write, returning the manifest instead of putting it on stdout.
+The set converges every store through it at startup, and one manifest per
+store per restart in the journal is noise nobody reads.
+
+`--check` declares and converges the whole set, prints what each source
+resolved to, and follows nothing: the command to run after editing a set
+and before restarting the unit that serves it.
 
 ## The name
 
