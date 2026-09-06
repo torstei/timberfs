@@ -988,8 +988,8 @@ fn close(o: Open, d: &Defaults, file: &str) -> anyhow::Result<Rule> {
             .collect();
         if let Some(f) = needs.first() {
             bail!(
-                "{file}:{at}: [{}] names the field {f:?} but states no {DECODE}, {EXTRACT} \
-                 to get it from",
+                "{file}:{at}: [{}] names the field {f:?} but states no {DECODE} or \
+                 {EXTRACT} to get it from",
                 o.metric
             );
         }
