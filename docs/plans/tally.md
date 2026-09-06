@@ -78,10 +78,10 @@ extractor never ran over is a hole, and must be written down as one.
 ## The line
 
 ```
-2026-09-06T13:37:00.000Z 60s http_requests status=500 vhost=my.visena.com sum=42 @1994848392+51221
-2026-09-06T13:37:00.000Z 60s http_bytes vhost=my.visena.com count=1204 sum=8419221 @1994848392+51221
-2026-09-06T13:37:00.000Z 60s http_latency le=0.5 vhost=my.visena.com count=1150 @1994848392+51221
-2026-09-06T13:37:00.000Z 60s http_latency le=+Inf vhost=my.visena.com count=1204 @1994848392+51221
+2026-09-06T13:37:00.000Z 60s http_requests status=500 vhost=example.com sum=42 @1994848392+51221
+2026-09-06T13:37:00.000Z 60s http_bytes vhost=example.com count=1204 sum=8419221 @1994848392+51221
+2026-09-06T13:37:00.000Z 60s http_latency le=0.5 vhost=example.com count=1150 @1994848392+51221
+2026-09-06T13:37:00.000Z 60s http_latency le=+Inf vhost=example.com count=1204 @1994848392+51221
 2026-09-06T13:38:00.000Z 60s !gap reason=follower-gap chunks=4200..4830
 ```
 
@@ -338,7 +338,9 @@ will never be fed, rather than quietly measuring nothing.
 
 ## Site-specific extractors, and how they are addressed
 
-Four levels, and the first two cover most of what anyone writes.
+Five levels, and the first two cover most of what anyone writes. Levels 4 and 5
+are NOT BUILT; level 4 is the one to build next, and it is what stops level 5
+from being the answer to everything a regex cannot do.
 
 1. **A predicate and nothing else.** `COUNT=` over entries a predicate
    selected: entries logged, bytes logged, errors logged, "how often does this
@@ -352,18 +354,85 @@ Four levels, and the first two cover most of what anyone writes.
 3. **A regex with named captures.** `EXTRACT=^\S+ (?P<status>\d{3}) (?P<ms>\d+)`
    — the universal escape for a format nobody standardised, which is most
    in-house logs. Site-specific extraction is almost always this line.
-4. **A program.** `EXEC=/usr/local/lib/timberfs/tally/gc-cycles` for what a
-   regex over ONE entry cannot express: state across entries (a ZGC cycle is
-   ~48 lines and its fields must be paired), correlation by request id, a
-   lookup. It is fed the same `timberfs-records(5)` stream every consumer gets
-   and answers with **width-`0s` observation lines** — so it owns extraction
-   and nothing else, and cannot get sealing or revisions wrong because it never
-   sees them. Any language; `awk` is enough.
+4. **A session** — a window keyed by a FIELD rather than by time, for what a
+   regex over one entry cannot express because the answer is spread across
+   several: a ZGC cycle is ~48 separately-stamped lines, a request duration is
+   a `BEGIN` and a `COMPLETE` sharing an id. Not built; see below.
+5. **A program.** `EXEC=/usr/local/lib/timberfs/tally/whatever` — the ceiling,
+   not the first stop. Not built.
 
 **Addressed by absolute path, with no search path** — the decision `file.d`
 made for `SOURCE` and for the same reason: with a search path, which program
 you get depends on install order. `/usr/local/lib/timberfs/tally/` is a
 convention for where to put them, not a lookup.
+
+### The session: the fold applied twice
+
+**Not built. The next thing to build.**
+
+The observation that makes this small: **a session is the bucket with a
+different key and a different close condition.** A bucket is a window keyed by
+`(metric, labels)` and closed by a time watermark; a session is a window keyed
+by a field VALUE and closed by a pattern or a timeout. Same structure, same
+combine rules, so `Roller` is most of it already. A session emits ONE
+observation, which then goes into ordinary bucketing — two folds stacked, one
+implementation.
+
+```ini
+[gc_pause]
+EXTRACT=GC\((?P<cycle>\d+)\)|Pause \w+ \w+ (?P<pause>[0-9.]+)ms|->(?P<after>\d+)M\((?P<pct>\d+)%\) (?P<secs>[0-9.]+)s
+GROUP=cycle              # the window's key, instead of the bucket's start
+CLOSE=Major Collection   # the line that ends one
+TIMEOUT=5m               # an unclosed one is dropped and counted
+SUM=pause                # the measures apply WITHIN the session
+LAST=secs
+```
+
+Three things make it fit the format rather than strain it:
+
+- **No nesting.** One `EXTRACT` with ALTERNATION, applied per line, each line
+  filling whichever named groups it carries and leaving the rest unmatched.
+  That is how 48 lines of different shapes become one record without a
+  sub-record syntax a `KEY=VALUE` file cannot express.
+- **A duration needs one new measure, not a language.** `SPAN=field` is
+  max−min within the session, and the entry's own stamp as a pseudo-field
+  (`ts`) turns a `BEGIN`/`COMPLETE` pair keyed by request id into a duration.
+  Nothing else is required for the correlation case.
+- **The watermark problem disappears.** timberfs can see which entries are in
+  an open session, so `safe_offset` is computed directly — none of the
+  receipt-by-citation, `!at` marker, coprocess lifetime or failure policy
+  below is needed. That is the bulk of level 5's machinery DELETED rather than
+  moved, and it is the argument for building this first.
+
+An incomplete session is **dropped and counted**, which is not a new rule:
+`timberfs-records(5)` already says a bounded read drops the entry it was
+assembling rather than flushing half a stack trace.
+
+⚠ **Cardinality, one level down.** Open sessions are one per distinct key and a
+request id is unbounded, so `MAX_SESSIONS` and `TIMEOUT` bound them with the
+drops recorded — the rule `MAX_SERIES` already follows for labels.
+
+⚠ **Backfill stops being edge-exact.** A recompute of 13:00–14:00 misses a
+session that opened at 12:59, where buckets align and sessions do not. The safe
+offset covers the live case; a windowed recompute is edge-lossy and has to say
+so rather than look complete.
+
+⚠ **A label's value inside a session needs a rule**, since only numbers have
+combine rules. First non-empty wins is the obvious one — the key is shared by
+construction — but it is a decision, not a default that falls out.
+
+⚠ **One real extractor is thin evidence.** The ZGC cycle is the case this was
+designed against and it is well understood, but a second SHAPE would test it
+harder before it is built.
+
+### What is left for a program, after the session
+
+An external lookup; arithmetic beyond max−min (a ratio of two fields); a real
+parser (a binary format, a deep JSON path); a sketch (distinct counting needs a
+mergeable one — a plain distinct count is not additive and so is not storable);
+and grouping by something that is not a captured field. The wall moves a long
+way out, which is the point: `EXEC` should be where expressiveness ends, not
+where cross-entry state begins.
 
 ### Where state lives, and why extraction has none
 
@@ -400,7 +469,11 @@ lines — a Java stack trace is NOT this, an entry already carries its
 continuations), and distinct counting. Those are programs, and the
 non-determinism is then visibly the program's rather than the format's.
 
-### How often an EXEC runs
+### How an EXEC would run, when there is one
+
+Recorded because the reasoning is what showed that level 4 should exist: all of
+it is scaffolding around an OPAQUE box, and none of it is about the metric. A
+session needs none of it.
 
 **Once, for the life of the run** — a coprocess, not a callback. Per entry
 would be a fork per line: 47 a second on one measured access log at its quiet
@@ -551,10 +624,14 @@ loss, recorded exactly — the same rule retention already follows.
   bucket still depends on, so a restart re-derives identical lines), creating
   the tally store with its labels, lineage and `logline_lag`, and writing the
   `!gap` marker from the registry's GAP.
+* **The session (level 4)** — the next thing to build, and the reason `EXEC`
+  can wait: `GROUP`, `CLOSE`, `TIMEOUT`, `SPAN`, `MAX_SESSIONS`, and `Roller`
+  keyed by a field value instead of a bucket start.
 * **`EXEC` is parsed and refused at run time, not yet spawned.** The
   observation format it answers in is settled and `--observations` prints it;
   what is missing is the coprocess plumbing, and the `!at` marker that lets one
-  release the watermark over entries it consumed and made nothing of.
+  release the watermark over entries it consumed and made nothing of. It should
+  stay unbuilt until something real needs a level the session cannot reach.
 
 ## What must change elsewhere when this ships
 

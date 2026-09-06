@@ -1390,7 +1390,7 @@ its CHUNK's, so a bucket is only as fine as a chunk \(em on a quiet log,
 very coarse. The write-time index answers volume on that axis exactly
 and for nothing, which is the cheaper way to ask.
 .PP
-Fields come from one of four places, and the first two cover most of
+Fields come from one of three places, and the first two cover most of
 what anyone writes:
 a predicate and nothing else
 .RB ( HAS ,
@@ -1406,16 +1406,25 @@ forms, then
 .RB ( logfmt ,
 .BR json ,
 .BR apache\-combined ,
-for formats somebody else standardised) \(em
+for formats somebody else standardised) \(em and
 .B EXTRACT
-(a regex with NAMED captures, which is what most in-house formats need)
-\(em and
+(a regex with NAMED captures, which is what most in-house formats need,
+and where site-specific extraction almost always lands).
+.PP
+⚠ What none of the three can express is an answer spread across SEVERAL
+entries: a collection cycle logged over dozens of lines, a duration from
+a
+.B BEGIN
+and a
+.B COMPLETE
+sharing an id. That is a SESSION \(em a window keyed by a field value
+rather than by time \(em and it is NOT BUILT.
 .B EXEC
-(an ABSOLUTE path to a program, with no search path: which program you
-get must not depend on install order). A program is fed the same records
-stream and answers with width-\fB0s\fR observation lines, so it owns
-extraction and nothing else \(em it cannot get sealing or revisions
-wrong, because it never sees them.
+(an external program) is declared for what a session would still not
+reach, and is not built either: a rule stating one is REFUSED at load,
+rather than accepted and then measuring nothing.
+.B docs/plans/tally.md
+has both.
 .PP
 Everything else is declared per rule or inherited from the preamble:
 .BR WIDTH ,

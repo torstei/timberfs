@@ -973,6 +973,21 @@ fn close(o: Open, d: &Defaults, file: &str) -> anyhow::Result<Rule> {
         );
     }
     let fields = o.fields.unwrap_or(Fields::Entry);
+    // Accepted by the parser and refused here, rather than accepted and
+    // then measuring nothing: a rule that silently produces no
+    // observations is a metric nobody is collecting, and nothing later
+    // says so. The shape is declared in docs/plans/tally.md; what should
+    // reach for it first is the SESSION, which is not built either.
+    if let Fields::Exec(p) = &fields {
+        bail!(
+            "{file}:{at}: [{}] declares {EXEC}={} — an external extractor is not built \
+             yet. Cross-entry state (a cycle spread over many lines, a duration from two \
+             entries sharing an id) is what the session form will cover; see \
+             docs/plans/tally.md",
+            o.metric,
+            p.display()
+        );
+    }
     if matches!(fields, Fields::Entry) {
         let needs: Vec<&str> = o
             .measures
@@ -1220,8 +1235,9 @@ pub fn observe(
             }
             out
         }
-        // A program's observations arrive on its own stdout, so nothing
-        // is extracted here.
+        // Unreachable: the rule parser refuses an EXEC rule outright.
+        // A program's observations would arrive on its own stdout, so
+        // nothing would be extracted here either way.
         Fields::Exec(_) => return Outcome::Skipped,
     };
 
@@ -1519,7 +1535,7 @@ mod tests {
         // The format is a wire format the moment an EXEC extractor emits
         // one, so render and parse must be one grammar rather than two.
         for line in [
-            "2026-09-06T13:37:00.000Z 60s http_requests status=500 vhost=my.visena.com sum=42 @1994848392+51221",
+            "2026-09-06T13:37:00.000Z 60s http_requests status=500 vhost=example.com sum=42 @1994848392+51221",
             "2026-09-06T13:37:00.000Z 0s heap_used count=1 last=8419221.5",
             "2026-09-06T13:38:00.000Z 60s !gap chunks=4200..4830 reason=follower-gap",
             "2026-09-06T13:38:00.000Z 60s http_latency agent=\"Mozilla 5.0\" le=+Inf count=3 sum=1.25",
@@ -1712,6 +1728,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("ONE source"), "{err}");
+    }
+
+    #[test]
+    fn an_exec_rule_is_refused_rather_than_measuring_nothing() {
+        // The failure being prevented: EXEC parsed, the rule loaded, and
+        // every entry silently producing no observation — a metric
+        // nobody is collecting, which nothing downstream can report.
+        let err = parse(
+            "t.conf",
+            "AXIS=logline\n[m]\nEXEC=/usr/local/lib/timberfs/tally/x\nCOUNT=\n",
+        )
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("not built"), "{text}");
     }
 
     #[test]

@@ -93,15 +93,14 @@ BUCKETS=0.05 0.1 0.5 1 5 10 120
 #   LABELS=vhost status
 #   COUNT=
 #
-# And when one entry is not enough — a GC cycle is ~48 lines whose fields
-# must be paired, a duration needs two entries correlated by request id —
-# a program is:
+# --- what none of these reaches yet -----------------------------------------
 #
-#   [gc_pause]
-#   EXEC=/usr/local/lib/timberfs/tally/gc-cycles
+# An answer spread across SEVERAL entries — a collection cycle logged over
+# dozens of lines, a duration from a BEGIN and a COMPLETE sharing an id —
+# is a SESSION: a window keyed by a field value rather than by time. It is
+# not built; docs/plans/tally.md has the design.
 #
-# It is fed the same records stream and answers with width-0s OBSERVATION
-# lines (`timberfs tally --observations` prints exactly what it should
-# emit), so it owns extraction and nothing else: it cannot get sealing or
-# revisions wrong, because it never sees them. An absolute path, with no
-# search path — which program you get must not depend on install order.
+# EXEC=<absolute path> is declared for what a session would still not
+# reach (an external lookup, a real parser) and is not built either: a
+# rule stating one is REFUSED at load rather than accepted and then
+# measuring nothing.
