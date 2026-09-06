@@ -175,11 +175,41 @@ request's start and writes at completion; a 90-minute websocket puts an ancient
 stamp in a recent chunk). A bucket is therefore **sealed** once the watermark
 has passed its end by `grace`, written, and **evicted**.
 
-> **`grace` is the only mechanism for lateness. An entry arriving after its
-> bucket sealed is counted in a `!late` marker and measured nowhere.**
+> **If an entry's own bucket has already sealed, it goes in the CURRENT bucket.
+> Otherwise it goes in its own.**
 
-Bounded loss, recorded exactly — the rule retention already follows — and the
-marker is how an operator learns their `grace` is too small.
+So lateness is a DISPLACEMENT, never a loss. The current bucket is unsealed by
+construction — sealing needs `watermark >= end + grace`, and the watermark is
+inside it — so nothing ever re-opens, and the placement is monotonic without
+needing to be made so.
+
+⚠ **Placed by the WATERMARK, not by the write time.** The obvious alternative
+is "a late entry takes its arrival time", but on a logline-axis extractor there
+may be no arrival time to take: `--try` has none at all, and a records entry
+carries `wf` only when it came from a chunk. The watermark — the greatest stamp
+seen — IS the arrival frontier on that axis, is always available, and gives the
+monotonicity as a consequence rather than as a rule of its own.
+
+**What it buys, stated as a property rather than a nicety:** `sum` of a count
+metric over a window equals the number of entries. A checkable identity, where
+dropping the late ones breaks it silently unless a reader also reads the
+markers.
+
+⚠ **A displacement is invisible in the line it lands in**, which is why the
+marker stays — as a record of displacement rather than of loss:
+
+```
+2026-09-06T13:39:00.000Z 60s !late metric=http_requests count=7 max=93000
+```
+
+`count` is how many were displaced into this bucket and `max` the worst
+lateness in milliseconds, which is exactly the number that says whether `grace`
+is too small. Both are measures that already exist; the marker needs no syntax
+of its own.
+
+**Determinism survives**, which is what made this safe to take: the watermark
+is EVENT time, not wall clock, so a backfill and a live run see the same stamps
+in the same order and displace identically. Same tape either way.
 
 ⚠ **A REVISE window was designed and dropped, and the reasoning is worth
 keeping** because the shape recurs. It let a late entry re-open a sealed bucket
@@ -197,7 +227,18 @@ problem `grace` already solves, and the second one costs everything expensive:
   and `GAP`s wherever retention is tight.
 
 A graph does not have to be exact. It does have to not lie about being exact,
-and a `!late` counter is that, at none of the cost.
+and a displacement plus a `!late` counter is that, at none of the cost.
+
+⚠ **The trap neither answer fixes: one entry stamped in the FUTURE poisons the
+watermark**, after which every subsequent entry is late. Dropping them loses
+everything after it — catastrophic and very visible. Displacing them puts a
+day's traffic in one bucket a year hence — catastrophic and it LOOKS LIKE DATA,
+which is worse. It is not introduced by displacement (a future stamp already
+seals every open bucket instantly), and timberfs detects the related case
+already: persistent whole-hour offsets between the two clocks are warned about
+once. Named here rather than guarded against, because a robust watermark is its
+own design and choosing a percentile over the max should be forced by a real
+log rather than imagined.
 
 ⚠ **Newest-wins survives, as a READ rule, for a different reason.** Re-running
 an extractor over a window emits the same buckets again, and
@@ -856,9 +897,9 @@ loss, recorded exactly — the same rule retention already follows.
   the implicit `class!=tally`, and the derived follower registration. It needs
   the follower half to have anything to run it, so the two land together.
 * **`revise_ms` must come OUT of the built code** — the document's `window`,
-  `Roller`, `--fold --revise` and the man page all still carry it, and
-  `!late` must replace it. Sealing then evicts, and a position lags by `grace`
-  alone.
+  `Roller`, `--fold --revise` and the man page all still carry it. Sealing then
+  evicts, a position lags by `grace` alone, and an entry whose bucket has gone
+  is displaced into the current one with a `!late` marker counting it.
 * **`timberfs tally --dump-json`** — a generator, which the JSON form wants
   much more than the INI form did: nobody should be escaping a regex by hand.
 * **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,
