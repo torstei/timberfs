@@ -164,10 +164,34 @@ jobs:
         with:
           subject-path: ${{ runner.temp }}/dist/*
 
+      # The tag's own annotation LEADS the notes. `--generate-notes` alone
+      # lists PR titles, which can say what changed and never what an
+      # upgrade will FEEL: 0.31.0 changed when a store's identity is minted
+      # and made `frames-send` exit non-zero, and neither reached the page
+      # a reader upgrading through apt actually opens.
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/dist/* --generate-notes --verify-tag
+        run: |
+          gen=$RUNNER_TEMP/notes-generated.md
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$GITHUB_REF_NAME" --jq .body > "$gen"
+          # A LIGHTWEIGHT tag has no annotation, and `%(contents:body)`
+          # would hand back the commit message it points at — a release
+          # note nobody wrote. Ask the object what it is instead.
+          ann=$RUNNER_TEMP/notes-annotation.md
+          : > "$ann"
+          if [ "$(git cat-file -t "$GITHUB_REF_NAME")" = tag ]; then
+              git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > "$ann"
+          fi
+          notes=$RUNNER_TEMP/notes.md
+          if [ -s "$ann" ]; then
+              { cat "$ann"; printf '\n---\n\n'; cat "$gen"; } > "$notes"
+          else
+              cp "$gen" "$notes"
+          fi
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/dist/* \
+              --notes-file "$notes" --verify-tag
 
       - name: Get a crates.io token via Trusted Publishing (OIDC)
         id: crates_auth
