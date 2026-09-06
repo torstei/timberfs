@@ -5302,6 +5302,79 @@ run_test "purge keeps user conf and data, drops package files" purge_correct
 
 # Health checks run LAST: a test that leaks disk turns a clear failure into
 # confusing cascades (a full /tmp made query fail silently, empty-stderr),
+# ---------------------------------------------------------------- tally
+
+tally_example_installed() {
+    # A wrong asset path in Cargo.toml only shows up in the built package,
+    # which is what this VM installs.
+    test -f /usr/share/doc/timberfs/examples/tally.conf.example \
+        && zcat /usr/share/man/man1/timberfs.1.gz | tr -d ' \n' | grep -q 'SStally'
+}
+
+tally_derives_metrics_that_are_a_store_like_any_other() {
+    # End to end, and the claim being tested is the one the whole design
+    # rests on: the numbers land in an ordinary store, so nothing new
+    # reads them.
+    local d=/var/log/timberfs/vmtally s=/var/log/timberfs/vmtallysrc
+    rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.conf
+    mkdir -p /etc/timberfs/tally.d
+
+    timberfs create "$s/vmtallysrc.log" --set service=vmapp --index >/dev/null 2>&1 || return 1
+    {
+        printf '2026-09-06T10:00:01Z level=info ms=5 msg=ok\n'
+        printf '2026-09-06T10:00:20Z level=warn ms=40 msg=slow\n'
+        printf '2026-09-06T10:00:40Z level=info ms=7 msg=ok\n'
+        printf '2026-09-06T10:02:00Z level=info ms=9 msg=ok\n'
+    } > /tmp/vmtally.log
+    timberfs import /tmp/vmtally.log --into "$s/vmtallysrc.log" >/dev/null 2>&1 || return 1
+
+    cat > /etc/timberfs/tally.d/vm.conf <<'CONF'
+SELECT=[service=vmapp]
+AXIS=logline
+WIDTH=60s
+GRACE=30s
+
+[requests]
+DECODE=logfmt
+LABELS=level
+COUNT=
+SUM=ms
+CONF
+
+    # The distance this store's two clocks sit apart, without which a
+    # logline window selects no chunk at all. GRACE + REVISE for a live
+    # tally; for a BACKFILL like this one, however old the data is.
+    timberfs create "$d/vmtally.log" --set class=tally --index >/dev/null 2>&1 || return 1
+    timberfs set "$d/vmtally.log" logline_lag=520w >/dev/null 2>&1 || return 1
+
+    timberfs query --records "$s/vmtallysrc.log" 2>/dev/null \
+        | timberfs tally --rules /etc/timberfs/tally.d/vm.conf 2>/tmp/vmtally.err \
+        | timberfs append --into "$d/vmtally.log" >/dev/null 2>&1 || {
+        cat /tmp/vmtally.err >&2
+        return 1
+    }
+
+    # Two info entries in the first minute, 5 + 7 ms between them.
+    timberfs query "$d/vmtally.log" 2>/dev/null \
+        | grep -q '^2026-09-06T10:00:00.000Z 60s requests level=info count=2 sum=12 @' || {
+        timberfs query "$d/vmtally.log" >&2
+        return 1
+    }
+    # …and the bucket is findable by the minute it DESCRIBES, which is the
+    # half the declared lag buys.
+    timberfs query "$d/vmtally.log" --from '2026-09-06 10:02' --to '2026-09-06 10:03' 2>/dev/null \
+        | grep -q 'count=1' || {
+        echo "a logline window over the buckets found nothing" >&2
+        return 1
+    }
+
+    rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.conf /tmp/vmtally.log
+}
+
+run_test "tally: example conf and man section installed by the package" tally_example_installed
+run_test "tally: metrics derived into an ordinary store" \
+    tally_derives_metrics_that_are_a_store_like_any_other
+
 # so assert the filesystems aren't near-full and surface it as its own test.
 health_filesystems_not_full() {
     local fs pct

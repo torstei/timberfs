@@ -76,6 +76,13 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .I STORE
 .RB [ \-\-dry\-run ]
 .br
+.B timberfs tally
+.B \-\-rules
+.I PATH
+.RB [ \-\-observations ]
+.RB [ \-\-metric
+.IR NAME ]
+.br
 .B timberfs follower create
 .I NAME
 .B \-\-store
@@ -282,9 +289,10 @@ neither. Known settings are parse-checked
 .RI ( "an absolute directory, SUPERSEDED by the follower registry \(em see"
 .BR FOLLOWERS ));
 .BR timestamp_regex ,
-.B timestamp_format
-and
+.BR timestamp_format ,
 .B timestamp_utc
+and
+.B logline_lag
 are parse-checked too (see THE TWO CLOCKS); anything else is free-form
 provenance
 .RB ( host =...),
@@ -1246,6 +1254,210 @@ resent. No hello, no run.
 Small enough to implement in a shell script, which is the point of it
 being a protocol at all.
 .RE
+.SS tally
+.B timberfs tally
+.B \-\-rules
+.I PATH
+reads a
+.BR timberfs\-records (5)
+stream on stdin, applies the rules a set declares, and writes TALLY
+LINES on stdout: metrics derived from the log \(em requests a minute,
+bytes transferred, errors logged, the spread of a duration. It writes no
+store itself, so the numbers land in one of their own the way anything
+else does:
+.PP
+.RS
+.nf
+timberfs query \-\-records app \-\-from 13:00 \\
+  | timberfs tally \-\-rules /etc/timberfs/tally.d \\
+  | timberfs append \-\-into backing/app\-tally.log
+.fi
+.RE
+.PP
+⚠ EXPERIMENTAL. The format, the rule file and the flags may still move;
+see
+.B docs/plans/tally.md
+for what is settled and what is not.
+.PP
+A tally line is a bucket:
+.PP
+.RS
+.nf
+2026\-09\-06T13:37:00.000Z 60s http_requests status=500 vhost=example.com count=42 @1994848392+51221
+.fi
+.RE
+.PP
+\(em a stamp (the bucket's START, on the axis its rule declared), a
+width, a metric name, labels, and one or more of exactly five MEASURES:
+.BR count ,
+.BR sum ,
+.BR min ,
+.BR max ,
+.BR last .
+Five, because each one IS its own coarsening rule \(em count and sum
+add, min and max take the extreme, last takes the newer \(em so a wider
+bucket is the narrower ones combined and the tape needs no schema for a
+reader to know it. A measure that could not be combined that way could
+not be re-bucketed, which is why there is no
+.B avg
+and no stored percentile: an average does not average, and a p95 does
+not add. A histogram is written instead, as one series per
+.B le
+label, and a quantile becomes interpolation over sums.
+.PP
+The trailing
+.BI @ offset + len
+is the CITATION: the span of the SOURCE store's tape this bucket
+counted. It is a range to read and not the set of entries \(em a rule
+matching one line in a hundred cites the ninety\-nine between them \(em
+so the spike in a graph opens the log around it. Turn it off per rule
+with
+.BR CITE=false .
+.TP
+.BI \-\-rules " PATH"
+A rule file, or a directory of
+.B *.conf
+read WHOLE (the shape
+.B /etc/timberfs/tally.d
+has). ⚠ Unlike
+.BR file.d ,
+where a set is a unit of supervision, one process reads the whole
+directory: two files may declare rules for one store, and a store has
+one writer. The file split is for editing.
+.TP
+.B \-\-observations
+Print the width-\fB0s\fR OBSERVATIONS instead of bucketing them: one line
+per measurement per entry, in the same grammar. An observation is a
+bucket of no width, so bucketing is the fold over them and coarsening a
+tape is the same fold \(em one operation, three call sites. It is also
+what an
+.B EXEC
+extractor is expected to emit, which makes this both the debugging path
+and the way to learn the format.
+.TP
+.BI \-\-metric " NAME"
+Only this metric, repeatable \(em for recomputing one over history
+without rewriting the rest. A recompute is idempotent: the newest line
+for a bucket wins, so re-running a rule over a window replaces its
+buckets rather than doubling them.
+.TP
+.BI \-\-store " PATH"
+Which store the stream came from, when the stream cannot say. A
+.B feed
+stream carries each store's labels and needs nothing; a
+.B "query \-\-records"
+answer names a path only, so a rule with a
+.B SELECT
+has nothing to match against.
+.PP
+.B The rule file.
+A preamble of defaults and a section per rule, where \(em as
+.B [exim\-main]
+names a store in
+.BR file.d " \(em"
+the section name is the METRIC name:
+.PP
+.RS
+.nf
+SELECT=[service=~apache\-.*]
+AXIS=logline
+WIDTH=60s
+GRACE=2m
+
+[http_requests]
+DECODE=apache\-combined
+LABELS=vhost status
+COUNT=
+
+[http_latency]
+DECODE=apache\-combined
+LABELS=vhost
+OBSERVE=ms
+BUCKETS=0.05 0.1 0.5 1 5 10 120
+.fi
+.RE
+.PP
+.B AXIS
+is required and has no default, for the reason a query document's
+.B window.axis
+is:
+.B logline
+buckets by the stamp the line carries and
+.B write
+by when it arrived, the answers differ, and a default is an assumption
+the next reader makes wrongly. ⚠ On the write axis an entry's arrival is
+its CHUNK's, so a bucket is only as fine as a chunk \(em on a quiet log,
+very coarse. The write-time index answers volume on that axis exactly
+and for nothing, which is the cheaper way to ask.
+.PP
+Fields come from one of four places, and the first two cover most of
+what anyone writes:
+a predicate and nothing else
+.RB ( HAS ,
+.BR ANY ,
+.BR SUBSTRING ,
+.BR REGEX
+and their
+.B NOT_
+forms, then
+.BR COUNT= )
+\(em
+.B DECODE
+.RB ( logfmt ,
+.BR json ,
+.BR apache\-combined ,
+for formats somebody else standardised) \(em
+.B EXTRACT
+(a regex with NAMED captures, which is what most in-house formats need)
+\(em and
+.B EXEC
+(an ABSOLUTE path to a program, with no search path: which program you
+get must not depend on install order). A program is fed the same records
+stream and answers with width-\fB0s\fR observation lines, so it owns
+extraction and nothing else \(em it cannot get sealing or revisions
+wrong, because it never sees them.
+.PP
+Everything else is declared per rule or inherited from the preamble:
+.BR WIDTH ,
+.B GRACE
+(how long past a bucket's end before it is sealed and written),
+.B REVISE
+(how long after that a late entry may still restate it),
+.BR CITE ,
+.BR MAX_SERIES ,
+.BR LABELS ,
+and the measures
+.RB ( COUNT= ,
+.BI SUM= field\fR,
+.BR MIN= / MAX= / LAST= ,
+or
+.BI OBSERVE= field
+with
+.BR BUCKETS ).
+.PP
+⚠ A metric is defined ONCE across the directory: a name declared in two
+files is refused, naming both, rather than merged or resolved by
+whichever the filesystem returned first. And a label may not be named
+after a measure \(em dispatch is on the key, so the two namespaces
+cannot overlap.
+.PP
+⚠ Loss is counted, never silent. An entry a rule selected and then could
+not read emits a
+.B !drop
+marker; a bucket that hit
+.B MAX_SERIES
+emits a
+.BR !cap .
+A marker's name starts with
+.BR ! ,
+which no metric may, so a reader tells them apart on the first byte.
+.PP
+⚠ A tally store's two clocks sit far apart BY CONSTRUCTION \(em its
+lines are numbers about a minute that closed some minutes ago \(em so
+declare
+.B logline_lag
+on it (see THE TWO CLOCKS) or a logline-time window will select no chunk
+and answer nothing.
 .SS list
 .TP
 .BI \-\-select " EXPR"
@@ -3242,6 +3454,20 @@ the CONTENT, so unlike settings they inherit into derived artifacts.
 Do not backfill historical data through
 .B append
 (its index gets today's write times): import the file instead.
+.PP
+The minute of widening is a GUESS, and a store that knows better says so:
+.B logline_lag
+declares how far a line's own stamp may sit from the moment it was
+written, and chunk selection is widened by that instead. It exists
+because the guess has a class of store it cannot cover \(em one whose
+producer stamps a line long before writing it. A TALLY store is the
+clearest case: its lines are numbers about a minute that closed some
+minutes earlier (the sealing grace, plus however long a revision may
+arrive), and a backfilled one's are about last month. Without the
+declaration a logline-time window over such a store selects no chunk at
+all and answers nothing, which reads exactly like an empty minute.
+Widening both ways only ever costs I/O \(em the per-entry verification
+keeps the output exactly inside the window asked for.
 .SH TIME FORMATS
 .I TIME
 arguments accept RFC 3339

@@ -1,6 +1,7 @@
 use timberfs::{
     append, bark, export, feed, follow, follower, forest, forward, fs, grain, import, incus,
     incus_intake, list, note, otlp_intake, query, querydoc, rotate, select, ship, sink, store,
+    tally,
 };
 
 use std::path::PathBuf;
@@ -624,6 +625,39 @@ enum Command {
         /// Forests to search with --select; default: every configured one
         #[arg(long, value_name = "DIR")]
         forest: Vec<PathBuf>,
+    },
+    /// Metrics derived from a log: read a timberfs-records(5) stream on
+    /// stdin, apply the rules a set declares, and write tally lines on
+    /// stdout. Pipe them into a store of their own:
+    ///
+    ///   timberfs query --records app --from 13:00 \
+    ///     | timberfs tally --rules /etc/timberfs/tally.d \
+    ///     | timberfs append app-tally
+    ///
+    /// The store that receives them stamps its chunks when the line
+    /// arrives, so a tally store's write axis is WHEN A NUMBER WAS
+    /// COMPUTED and its logline axis is WHICH MINUTE IT IS ABOUT.
+    Tally {
+        /// A rule file, or a directory of *.conf read whole (the shape
+        /// /etc/timberfs/tally.d has). ⚠ One process reads the whole
+        /// directory: two files may declare rules for one store, and a
+        /// store has one writer
+        #[arg(long, value_name = "PATH")]
+        rules: PathBuf,
+        /// Print the width-0s OBSERVATIONS instead of bucketing them:
+        /// one line per measurement per entry. The debugging path, and
+        /// the format an EXEC extractor is expected to emit
+        #[arg(long)]
+        observations: bool,
+        /// Only these metrics — for recomputing one over history without
+        /// rewriting the rest. Repeatable
+        #[arg(long, value_name = "NAME")]
+        metric: Vec<String>,
+        /// Which store the stream came from, when the stream cannot say.
+        /// A `query --records` answer names a path and carries no
+        /// labels, so a rule with a SELECT has nothing to match against
+        #[arg(long, value_name = "PATH")]
+        store: Option<PathBuf>,
     },
     /// Time-based rotation: move every chunk written before --cutoff into
     /// DEST (or drop it with --delete), relocating compressed frames
@@ -1784,6 +1818,17 @@ fn main() -> anyhow::Result<()> {
             let file = forest::resolve_source(&file)?;
             grain::cmd_reindex(&file)?;
         }
+        Command::Tally {
+            rules,
+            observations,
+            metric,
+            store,
+        } => tally::cmd_tally(&tally::TallyOpts {
+            rules,
+            observations,
+            metrics: metric,
+            store,
+        })?,
         Command::Trim {
             store,
             select,

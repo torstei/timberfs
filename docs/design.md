@@ -214,6 +214,9 @@ object — the label on the timber. Plain enough to read by eye; changed with
   "timestamp_regex": "^(...)",    // content: exotic line-timestamp format, declared once
   "timestamp_format": "%m/%d/%Y %H:%M:%S", //   (import flags persist these; inherits)
   "timestamp_utc": true,          //   zoneless line stamps are UTC, not local time
+  "logline_lag": "8h",            // how far a line's stamp may sit from its
+                                  //   WRITE time — widens chunk selection in
+                                  //   place of the one-minute guess
   "name": "apache-error",         // what it is CALLED, where the path is opaque
   "derived_from": "41d0…",        // lineage: source store's id
   "derived_op": "export",         // …and how: export (copy), rotate (move) or

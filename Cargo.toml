@@ -139,6 +139,7 @@ assets = [
     ["packaging/timberfs-follow.conf.example", "usr/share/doc/timberfs/examples/timberfs-follow.conf.example", "644"],
     ["packaging/timberfs-file.conf.example", "usr/share/doc/timberfs/examples/timberfs-file.conf.example", "644"],
     ["packaging/timberfs-follower.conf.example", "usr/share/doc/timberfs/examples/timberfs-follower.conf.example", "644"],
+    ["packaging/tally.conf.example", "usr/share/doc/timberfs/examples/tally.conf.example", "644"],
     ["packaging/limits.conf.example", "usr/share/doc/timberfs/examples/limits.conf.example", "644"],
     ["packaging/etc-README", "etc/timberfs/README", "644"],
     ["packaging/forests-default.conf", "etc/timberfs/forests.d/default.conf", "644"],

@@ -1,0 +1,107 @@
+# Example rules for `timberfs tally` — metrics DERIVED from a log, on a
+# tape of their own.
+#
+# Copy to /etc/timberfs/tally.d/<topic>.conf. The whole directory is read
+# by ONE process, unlike file.d: two files may declare rules for one
+# store, and a store has one writer. Split the files by topic, for
+# editing.
+#
+#   timberfs query --records apache-access --from 13:00 \
+#     | timberfs tally --rules /etc/timberfs/tally.d \
+#     | timberfs append --into backing/apache-access-tally.log
+#
+# ⚠ Declare `logline_lag` on the tally store (GRACE + REVISE, or more):
+# its lines are numbers about a minute that closed some minutes ago, and
+# without the declaration a logline-time window selects no chunk at all.
+
+# --- the preamble: what every section inherits -----------------------------
+
+# WHICH STORES these rules measure, as a selection — the predicate
+# `list --select` takes. `[]` is every store, said rather than left out.
+SELECT=[service=~apache-.*]
+
+# WHICH CLOCK a bucket is on. Required, with no default: `logline` buckets
+# by the stamp the line carries, `write` by when it arrived, and the
+# answers differ.
+# ⚠ On the write axis an entry's arrival is its CHUNK's, so a bucket is
+# only as fine as a chunk. `.rings` answers volume on that axis exactly
+# and for free — ask it instead where it can.
+AXIS=logline
+
+# The bucket. Coarser is always available at read time (a wider bucket is
+# the narrower ones summed), finer never is.
+WIDTH=60s
+
+# How long past a bucket's end before it is sealed and written, and how
+# long after that a late entry may still restate it. A stamp can arrive
+# after its bucket passed — Apache logs a request's START and writes at
+# completion — so the answer is a REVISION, and the newest line for a
+# bucket wins.
+GRACE=2m
+#REVISE=1h
+
+# The tape span each bucket counted, so a spike opens the log around it.
+#CITE=true
+
+# Cardinality is where every metrics system dies. Label keys are declared
+# per rule and never discovered from the data; this bounds the rest, and
+# hitting it writes a `!cap` marker rather than losing numbers quietly.
+#MAX_SERIES=1000
+
+# --- a section per rule; its name is the METRIC name -----------------------
+
+[http_requests]
+DECODE=apache-combined
+LABELS=vhost status
+COUNT=
+
+[http_bytes]
+DECODE=apache-combined
+LABELS=vhost
+COUNT=
+SUM=bytes
+
+# A histogram is one series per `le`, which is what makes a quantile
+# interpolation over sums rather than a stored number that cannot be
+# re-bucketed.
+[http_latency]
+DECODE=apache-combined
+LABELS=vhost
+OBSERVE=ms
+BUCKETS=0.05 0.1 0.5 1 5 10 120
+
+# --- generic.conf: anything, anywhere --------------------------------------
+#
+#   SELECT=[]
+#   AXIS=write
+#   WIDTH=60s
+#
+#   [errors_logged]
+#   ANY=ERROR FATAL SEVERE
+#   COUNT=
+#
+# A predicate and a count needs no parsing at all, which is why the
+# generic rules are the ones pointed at every store.
+
+# --- a format nobody standardised ------------------------------------------
+#
+# Apache's LogFormat is configurable, so "the Apache format" is not a
+# thing a decoder can claim to know. A regex with NAMED captures is:
+#
+#   [http_requests]
+#   EXTRACT=^(?P<vhost>[^:]+):\d+ \S+ \S+ \S+ \[[^\]]*\] "[^"]*" (?P<status>\d+) (?P<ms>\d+) (?P<bytes>\d+)
+#   LABELS=vhost status
+#   COUNT=
+#
+# And when one entry is not enough — a GC cycle is ~48 lines whose fields
+# must be paired, a duration needs two entries correlated by request id —
+# a program is:
+#
+#   [gc_pause]
+#   EXEC=/usr/local/lib/timberfs/tally/gc-cycles
+#
+# It is fed the same records stream and answers with width-0s OBSERVATION
+# lines (`timberfs tally --observations` prints exactly what it should
+# emit), so it owns extraction and nothing else: it cannot get sealing or
+# revisions wrong, because it never sees them. An absolute path, with no
+# search path — which program you get must not depend on install order.
