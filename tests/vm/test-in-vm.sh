@@ -4483,6 +4483,102 @@ frames_fleet_two_nodes_one_archive() {
 
 FRAMES_UNIT_SRC=/tmp/framesunit/src.log
 
+file_intake_unit_installed() {
+    # A wrong asset path in Cargo.toml only shows up in the built package,
+    # which is what this VM installs.
+    test -f /lib/systemd/system/timberfs-file@.service \
+        && test -f /usr/share/doc/timberfs/examples/timberfs-file.conf.example \
+        && grep -q 'timberfs file-intake %i' /lib/systemd/system/timberfs-file@.service \
+        && grep -q 'RestartForceExitStatus=85' /lib/systemd/system/timberfs-file@.service \
+        && zcat /usr/share/man/man1/timberfs.1.gz | tr -d ' \n' \
+            | grep -q 'file\\-intake'
+}
+
+file_intake_set_follows_several_files() {
+    # The whole point, end to end: one system's logs, one config, one
+    # process -- each store with its OWN name, labels and retention, and
+    # the set's policy stated once.
+    local d=/var/log/vmfileset e=/etc/timberfs/file.d
+    rm -rf "$d" /var/log/timberfs/fsmain /var/log/timberfs/fsreject /var/log/timberfs/fspanic
+    mkdir -p "$d" "$e"
+    printf '2026-09-06T10:00:00Z main one\n' > $d/mainlog
+    printf '2026-09-06T10:00:01Z reject one\n' > $d/rejectlog
+    # paniclog deliberately absent: a rare log that does not exist yet must
+    # not stop the set, and must be picked up when it appears.
+
+    cat > $e/vmexim.conf <<CONF
+DECLARE=index=true retain=90d
+FLUSH_AGE=2s
+
+[fsmain]
+SOURCE=$d/mainlog
+
+[fsreject]
+SOURCE=$d/rejectlog
+DECLARE=index=true retain=365d
+
+[fspanic]
+SOURCE=$d/paniclog
+DECLARE=index=true retain=365d wal=true
+CONF
+
+    # --check declares every store and follows nothing.
+    timberfs file-intake vmexim --check > /tmp/vmfi.out 2>&1 || {
+        cat /tmp/vmfi.out >&2
+        return 1
+    }
+    grep -q "fspanic	$d/paniclog" /tmp/vmfi.out || { cat /tmp/vmfi.out >&2; return 1; }
+    # Per-file retention: the set's default, and the two that override it.
+    jq -e '.retain == "90d" and .index == true' \
+        /var/log/timberfs/fsmain/fsmain.log.bark >/dev/null || return 1
+    jq -e '.retain == "365d"' /var/log/timberfs/fsreject/fsreject.log.bark >/dev/null || return 1
+    jq -e '.retain == "365d" and .wal == true' \
+        /var/log/timberfs/fspanic/fspanic.log.bark >/dev/null || return 1
+
+    systemctl enable --now timberfs-file@vmexim >/dev/null 2>&1 || return 1
+    sleep 3
+    # ONE process for the three tails.
+    local procs
+    procs=$(pgrep -fc 'timberfs file-intake vmexim') || true
+    [ "$procs" = 1 ] || { echo "expected 1 process, got $procs" >&2; return 1; }
+
+    printf '2026-09-06T10:00:02Z main two\n' >> $d/mainlog
+    printf '2026-09-06T10:00:03Z PANIC now\n' > $d/paniclog     # appears late
+    sleep 6
+    timberfs query /var/log/timberfs/fsmain/fsmain.log 2>/dev/null \
+        | grep -q 'main two' || { timberfs query /var/log/timberfs/fsmain/fsmain.log; return 1; }
+    timberfs query /var/log/timberfs/fsreject/fsreject.log 2>/dev/null | grep -q 'reject one' || return 1
+    timberfs query /var/log/timberfs/fspanic/fspanic.log 2>/dev/null \
+        | grep -q 'PANIC now' || { echo "a log that appeared late was not picked up" >&2; return 1; }
+
+    systemctl disable --now timberfs-file@vmexim >/dev/null 2>&1
+    rm -f $e/vmexim.conf
+    rm -rf "$d"
+}
+
+file_intake_refuses_a_set_that_would_collect_nothing() {
+    # A source nobody is collecting is invisible afterwards, so the whole
+    # set is refused at STARTUP rather than partially started. Checked
+    # through the unit, since exiting non-zero is what systemd acts on.
+    local e=/etc/timberfs/file.d
+    mkdir -p $e
+    cat > $e/vmbad.conf <<'CONF'
+[a]
+SOURCE=/var/log/vmfileset/one.log
+RETAIN=90d
+CONF
+    timberfs file-intake vmbad --check > /tmp/vmbad.out 2>&1 && {
+        cat /tmp/vmbad.out >&2
+        rm -f $e/vmbad.conf
+        return 1
+    }
+    grep -q 'unknown key' /tmp/vmbad.out || { cat /tmp/vmbad.out >&2; rm -f $e/vmbad.conf; return 1; }
+    # ...and it names the line, because a config error nobody can locate is
+    # a config error twice.
+    grep -q 'line 3' /tmp/vmbad.out || { cat /tmp/vmbad.out >&2; rm -f $e/vmbad.conf; return 1; }
+    rm -f $e/vmbad.conf
+}
+
 frames_unit_installed() {
     # A wrong asset path in Cargo.toml only shows up in the built package,
     # which is what this VM installs. The man page is checked too, since a
@@ -4724,6 +4820,9 @@ run_test "frames wire: a store replicates over a socket byte for byte" frames_wi
 run_test "frames wire: the far end's position is recorded and reported, not obeyed" frames_follower_ships_and_releases_the_head
 run_test "frames fleet: two nodes, one archive, one connection each, no collision" frames_fleet_two_nodes_one_archive
 run_test "frames unit: installed by the package, and documented" frames_unit_installed
+run_test "file intake: unit and example installed by the package" file_intake_unit_installed
+run_test "file intake: one set, several files, one process" file_intake_set_follows_several_files
+run_test "file intake: a set that would collect nothing is refused" file_intake_refuses_a_set_that_would_collect_nothing
 run_test "frames unit: socket activates, an unreceived store refused" frames_unit_socket_activates
 run_test "frames unit: replicates into a declared store" frames_unit_replicates_into_a_declared_store
 run_test "frames unit: the socket outlives a service restart" frames_unit_survives_a_restart
