@@ -272,7 +272,8 @@ head-drops, travels on rename, and ships inside `.timber` bundles.
 
 **Chunk selection** is the write-time index's job and is deliberately
 coarse: every chunk whose write-time window overlaps the requested range
-(widened by about a minute to catch buffered stragglers) is read in full.
+(widened by the store's `logline_lag`, or about a minute where it declares
+none, to catch buffered stragglers) is read in full.
 Chunk windows are bounded by `--flush-age` (default 5 s) for slow writers
 and by `--chunk-size` (default 256 KiB) for fast ones, so that is the slop
 the index alone would leave at the edges.

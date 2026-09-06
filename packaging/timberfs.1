@@ -1338,10 +1338,12 @@ A named set of metrics read off ONE SHAPE OF LINE. It carries NO STORE
 SELECTION, and that absence is the design: a document that says nothing
 about this host is an artefact \(em shippable, shareable, versioned \(em
 rather than configuration. Which stores get measured is deployment, and
-belongs to the provisioning that is not built yet
-.RB ( docs/plans/tally.md ).
-The schema is
-.BR docs/tally\-extractor.schema.json ;
+belongs to the PROVISIONING \(em see
+.BR \-\-provision .
+A JSON Schema for the document is published at
+.I /usr/share/doc/timberfs/tally\-extractor.schema.json
+and in the repository as
+.IR docs/tally\-extractor.schema.json ;
 an unknown member is an error, and so is a
 .B v
 this build does not read.

@@ -212,8 +212,10 @@ the **write-time wall clock**. Either way, `query --from/--to` asks about the
 time the log talks about: chunks are selected on the store's clock, then every
 entry is verified against its own logline stamp. Where a producer's two clocks
 diverge — Apache logs a request's start time and writes the line when the
-request completes — that selection leans on a one-minute widening, and past
-that a follower is the better route, its chunks carrying the logline clock.
+request completes — that selection leans on a widening of about a minute.
+A store whose two clocks sit further apart says so: `timberfs set <store>
+logline_lag=8h` widens the selection by what that store actually needs
+instead of by the guess.
 See [Two clocks](docs/deployment.md#two-clocks-and-when-they-diverge).
 
 ## Beyond the getting-started path
@@ -602,8 +604,24 @@ bucket counted, so the spike in a graph opens the lines that made it.
 It describes metrics read off **one shape of line** and carries **no store
 selection** — which is what makes it shippable: a document that says nothing
 about this host can be published, shared and versioned. Which stores get
-measured is deployment, and belongs to a provisioning file that is not built
-yet.
+measured is deployment, and belongs to a **provisioning**:
+
+```ini
+# /etc/timberfs/tally.d/apache.conf
+SELECT=[service=~apache-.*]
+OUTPUT={name}-tally
+APPLY=timberfs-apache-combined timberfs-volume
+DECLARE=index=true retain=730d
+```
+
+```sh
+timberfs tally --provision apache          # declare, converge, register
+systemctl enable --now timberfs-follower@tally-apache
+```
+
+which creates a tally store per matched log and registers the follower that
+writes it. The operator writes no follower and no command: both are derived
+from the file, so the two cannot drift.
 
 ⚠ Its subject is a *line shape*, never a store — a store carries logfmt request
 lines beside stack traces beside a startup banner — so every metric **claims**
