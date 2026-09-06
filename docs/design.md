@@ -238,11 +238,11 @@ every position, chunk address and tape offset is keyed by one. So a replica
 keeps the sender's `id` and its `name` (the path being a uuid at the far
 end, there is nothing left to reconstruct a name from) and records no
 `derived_from`. What stays the destination's own is everything about the
-PAIR: `created`, and the settings above. Content facts — actual spans, sizes — are never recorded (the
-artifact's own rings state them authoritatively); the *requested* window
-is recorded, because content can't state coverage: a file whose last line
-is 17:00 doesn't say whether 17:00–24:00 was covered-but-silent or simply
-not exported.
+PAIR: `created`, and the settings above. Content facts — actual spans,
+sizes — are never recorded (the artifact's own rings state them
+authoritatively); the *requested* window is recorded, because content
+can't state coverage: a file whose last line is 17:00 doesn't say whether
+17:00–24:00 was covered-but-silent or simply not exported.
 
 Which is why **an empty result is a result**: exporting or rotating a
 window that contains nothing still produces the (empty) artifact.

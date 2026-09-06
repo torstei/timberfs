@@ -728,6 +728,10 @@ enum Command {
         /// merged two hosts' identically-named stores into one
         #[arg(long, value_name = "LABEL", hide = true)]
         route: Option<String>,
+        /// DEPRECATED and ignored: a destination is a replica and nothing
+        /// else, so this is what it now always does
+        #[arg(long, hide = true)]
+        replica: bool,
         /// Create a store for a stream never received here. Default:
         /// refuse it and say so, as the other intakes do
         #[arg(long)]
@@ -1813,6 +1817,7 @@ fn main() -> anyhow::Result<()> {
             forest,
             into_dir,
             route,
+            replica,
             auto_create,
             index,
             wal,
@@ -1822,6 +1827,13 @@ fn main() -> anyhow::Result<()> {
                 eprintln!(
                     "timberfs: warning: --route is ignored — a stream lands in the store its \
                      identity names. Drop the flag; it will be removed"
+                );
+            }
+            if replica {
+                eprintln!(
+                    "timberfs: warning: --replica is ignored — a destination is a replica and \
+                     nothing else, so this is what it always does. Drop the flag; it will be \
+                     removed"
                 );
             }
             timberfs::frames::cmd_intake(&timberfs::frames::IntakeOpts {

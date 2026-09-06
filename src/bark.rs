@@ -263,11 +263,10 @@ pub fn declare_wal(dir: &Path, name: &str) -> anyhow::Result<()> {
 ///
 /// This is what counts as a LABEL: what `list` shows in that column, what
 /// travels on the replication wire, what a fleet view groups by. It is NOT
-/// a limit on
-/// what a selector may match — `--select` matches the whole manifest, name
-/// and settings included, because a rule that forbids asking a question
-/// only because we filed the answer under a different heading is a rule
-/// that helps nobody.
+/// a limit on what a selector may match — `--select` matches the whole
+/// manifest, name and settings included, because a rule that forbids
+/// asking a question only because we filed the answer under a different
+/// heading is a rule that helps nobody.
 ///
 /// The split lives here because bark owns what its keys mean; views that
 /// re-guessed it drifted, which is why `info` once showed `wal` as a label.
