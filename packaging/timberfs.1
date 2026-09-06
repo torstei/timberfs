@@ -1452,6 +1452,65 @@ and a
 sharing an id. That is a SESSION \(em a window keyed by a field value
 rather than by time \(em and it is NOT BUILT.
 .PP
+⚠ **Where the field NAMES come from differs by source, and this is the
+thing to get straight.**
+.B DECODE=logfmt
+and
+.B DECODE=json
+take them from the PRODUCER: they are the keys its own lines carry, so
+a line reading
+.B "level=info ms=1500 tenant=acme"
+offers exactly
+.BR level ,
+.B ms
+and
+.BR tenant ,
+and renaming one in the application renames it here.
+.B EXTRACT
+names them itself \(em they are the regex's NAMED capture groups.
+.B DECODE=apache\-combined
+is positional, so the DECODER assigns them:
+.BR host ,
+.BR ident ,
+.BR user ,
+.BR time ,
+.BR request ,
+.BR status ,
+.BR bytes ,
+.BR referer ,
+.BR agent ,
+plus
+.BR method ,
+.B path
+and
+.B protocol
+split out of the request line.
+.PP
+⚠ The decoder list is CLOSED, and narrowly so: a decoder exists only
+where the KEY SET IS OPEN and a regex therefore cannot express the shape.
+.B logfmt
+and
+.B json
+qualify \(em there is no capture group for a key you do not know in
+advance. Anything POSITIONAL is what a regex does well and belongs in an
+.BR EXTRACT ;
+.B apache\-combined
+is there because it is a published grammar many sites share and one that
+is easy to get subtly wrong by hand, not because it could not be written
+as one. ⚠
+.B json
+reads only the TOP level: a nested object is skipped and there is no path
+syntax.
+.PP
+⚠ Where the source names its own fields \(em
+.B EXTRACT
+and a positional decoder \(em a rule naming one it cannot produce is
+REFUSED at load, listing what it can have. Where the producer names them
+there is nothing to check against, so a misspelling is only visible at
+run time, as a
+.B !drop
+marker counting every entry it cost. Read those.
+.PP
 ⚠ There is no external-extractor hook and there will not be one. A
 program that needs state across entries is a CONSUMER, and that already
 has a lifecycle, a watermark rule and a registry: register it as a

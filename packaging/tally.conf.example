@@ -50,23 +50,36 @@ GRACE=2m
 
 # --- a section per rule; its name is the METRIC name -----------------------
 
+# ⚠ WHERE THE FIELD NAMES COME FROM differs by source:
+#   DECODE=logfmt / json  — the PRODUCER's: the keys its own lines carry,
+#                           so `level=info ms=1500` offers `level` and `ms`
+#   EXTRACT=              — yours: the regex's named capture groups
+#   DECODE=apache-combined— the DECODER's, the format being positional:
+#                           host ident user time request status bytes
+#                           referer agent, plus method path protocol
+# The last two are checked at LOAD (a name the source cannot produce is
+# refused, listing what it can); the first cannot be, so a typo there
+# shows up at run time as a !drop marker counting what it cost.
+
 [http_requests]
 DECODE=apache-combined
-LABELS=vhost status
+LABELS=status method
 COUNT=
 
 [http_bytes]
 DECODE=apache-combined
-LABELS=vhost
+LABELS=status
 COUNT=
 SUM=bytes
 
 # A histogram is one series per `le`, which is what makes a quantile
 # interpolation over sums rather than a stored number that cannot be
 # re-bucketed.
+# ⚠ apache-combined carries no timing field — %{ms}T is not part of the
+# NCSA format — so a latency rule over a log that logs one needs EXTRACT.
 [http_latency]
-DECODE=apache-combined
-LABELS=vhost
+EXTRACT=" (?P<status>\d{3}) (?P<ms>\d+) \d+$
+LABELS=status
 OBSERVE=ms
 BUCKETS=0.05 0.1 0.5 1 5 10 120
 

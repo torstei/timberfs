@@ -348,11 +348,9 @@ it says why.
    selected: entries logged, bytes logged, errors logged, "how often does this
    exception appear". No parsing at all, and generic across every log — which
    is why `generic.conf` above is pointed at `[]`.
-2. **A named decoder.** `DECODE=apache-combined|logfmt|json` turns a line of
-   known shape into fields a rule names. Few, and only for formats somebody
-   else standardised — a decoder per customer's log would be a taxonomy that
-   grows a binary per format, which is the mistake the follower's `type` field
-   made before it became a command.
+2. **A named decoder.** `DECODE=logfmt|json|apache-combined` turns a line into
+   fields a rule names. The list is CLOSED, and the criterion for being in it
+   is narrow — see below.
 3. **A regex with named captures.** `EXTRACT=^\S+ (?P<status>\d{3}) (?P<ms>\d+)`
    — the universal escape for a format nobody standardised, which is most
    in-house logs. Site-specific extraction is almost always this line.
@@ -364,6 +362,43 @@ Beyond that is not a level of this rule language at all — see **an extractor
 that needs a program is a follower**, below. `EXEC` stays a RESERVED key that
 says so, rather than an unknown one: reaching for it is a reasonable instinct
 and deserves an answer.
+
+### What may be a decoder, and why the list is closed
+
+The rule that keeps `DECODE` from becoming a taxonomy of everyone's log
+formats — one variant per customer, which is the mistake the follower's `type`
+field made before it became a command:
+
+> **A decoder exists only where the KEY SET IS OPEN, and a regex therefore
+> cannot express the shape.**
+
+`logfmt` and `json` qualify: there is no capture group for a key you do not
+know in advance. Everything POSITIONAL — a fixed grammar with fixed slots — is
+what a regex does well and should be an `EXTRACT`.
+
+⚠ Which makes **`apache-combined` the anomaly in its own list**, and its
+justification is a different one: not that it cannot be regexed (it can), but
+that it is a PUBLISHED grammar many sites share and one that is easy to get
+subtly wrong by hand. The evidence is this tree's own: the first
+`tally.conf.example` shipped a hand-written apache regex that matched nothing,
+over a `$` that does not mean what it looks like.
+
+**The list stops growing by PARAMETERISATION, not by plugins.** If a fourth
+request arrives the answer is not a fourth variant, it is
+
+```ini
+DECODE=positional
+FIELDS=host ident user time request status bytes referer agent
+```
+
+which subsumes `apache-combined`, covers CSV with quoted separators (which a
+regex genuinely cannot do robustly), and turns the enum into SHAPES rather than
+FORMATS. Worth building when something asks, and not before.
+
+⚠ **The gap that is real today: `json` reads only the top level.** A nested
+object is skipped outright, so `{"http":{"status":500}}` offers no `status` and
+there is no path syntax — a hole in the one shape whose whole point is that the
+key set is open.
 
 ### The session: the fold applied twice
 

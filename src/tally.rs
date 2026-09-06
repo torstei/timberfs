@@ -524,6 +524,25 @@ pub enum Decoder {
     ApacheCombined,
 }
 
+impl Decoder {
+    /// The field names this decoder produces, where it decides them.
+    ///
+    /// `logfmt` and `json` do not: the names are the PRODUCER's — the
+    /// keys its own lines carry — so nothing here can know them and a
+    /// misspelled one is only discoverable at run time, as a `!drop`.
+    /// A positional format is the opposite: the decoder assigns every
+    /// name, so a rule naming one that cannot exist is refused at load.
+    pub fn fields(self) -> Option<&'static [&'static str]> {
+        match self {
+            Decoder::Logfmt | Decoder::Json => None,
+            Decoder::ApacheCombined => Some(&[
+                "host", "ident", "user", "time", "request", "status", "bytes", "referer", "agent",
+                "method", "path", "protocol",
+            ]),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Fields {
     /// No parsing at all: a predicate and a count. Most generic metrics.
@@ -951,6 +970,30 @@ fn width(ms: u64, file: &str, line: usize) -> anyhow::Result<u64> {
     Ok(ms)
 }
 
+/// Every field name a rule refers to, with the word for how it refers to
+/// it — so the error says "measures" or "labels with" rather than making
+/// the reader work out which line is wrong.
+fn named_fields(
+    measures: &[Measure],
+    histogram: &Option<(String, Vec<f64>)>,
+    labels: &[String],
+) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = measures
+        .iter()
+        .filter_map(|m| match m {
+            Measure::Count => None,
+            Measure::Sum(f) | Measure::Min(f) | Measure::Max(f) | Measure::Last(f) => {
+                Some(("measures", f.clone()))
+            }
+        })
+        .collect();
+    if let Some((f, _)) = histogram {
+        out.push(("observes", f.clone()));
+    }
+    out.extend(labels.iter().map(|l| ("labels with", l.clone())));
+    out
+}
+
 fn close(o: Open, d: &Defaults, file: &str) -> anyhow::Result<Rule> {
     let at = o.line;
     let histogram = match (o.observe, o.buckets) {
@@ -1000,6 +1043,36 @@ fn close(o: Open, d: &Defaults, file: &str) -> anyhow::Result<Rule> {
                 "{file}:{at}: [{}] labels with {l:?}, which is a measure name",
                 o.metric
             );
+        }
+    }
+    // Where the source names its own fields, a rule naming one it cannot
+    // produce is refused HERE. Otherwise the failure is 240 `!drop`
+    // markers and a silently label-less series — a metric nobody is
+    // measuring, found by reading the output rather than the config.
+    // `logfmt` and `json` take their names from the producer's own line,
+    // so there is nothing to check against and the run-time counter is
+    // the only signal there can be.
+    let known: Option<Vec<String>> = match &fields {
+        Fields::Extract(re) => Some(re.capture_names().flatten().map(str::to_string).collect()),
+        Fields::Decode(d) => d
+            .fields()
+            .map(|f| f.iter().map(|s| s.to_string()).collect()),
+        Fields::Entry => None,
+    };
+    if let Some(known) = known {
+        for (what, name) in named_fields(&o.measures, &histogram, &o.labels) {
+            if !known.contains(&name) {
+                bail!(
+                    "{file}:{at}: [{}] {what} {name:?}, which this rule's {} cannot produce \
+                     — it has {}",
+                    o.metric,
+                    match &fields {
+                        Fields::Extract(_) => EXTRACT,
+                        _ => DECODE,
+                    },
+                    known.join(", ")
+                );
+            }
         }
     }
     let axis = o.axis.or(d.axis).with_context(|| {
@@ -1449,12 +1522,16 @@ pub fn cmd_tally(opts: &TallyOpts) -> anyhow::Result<()> {
                     };
                     let cite = e.offset.map(|off| (off, e.payload.len() as u64));
                     let Some(ts) = ts else {
-                        note_drop(&mut l.roller, &l.rule.metric, "nostamp");
+                        // No stamp is the one case with no time to charge
+                        // it to: the watermark is the nearest thing.
+                        note_drop(&mut l.roller, &l.rule.metric, "nostamp", None);
                         continue;
                     };
                     match observe(l.rule, &l.preds, &e.payload, ts, cite) {
                         Outcome::Skipped => {}
-                        Outcome::Dropped(why) => note_drop(&mut l.roller, &l.rule.metric, why),
+                        Outcome::Dropped(why) => {
+                            note_drop(&mut l.roller, &l.rule.metric, why, Some(ts))
+                        }
                         Outcome::Observed(obs) => {
                             for o in &obs {
                                 if opts.observations {
@@ -1525,8 +1602,12 @@ fn one_store(seen: &mut Option<String>, id: &str) -> anyhow::Result<()> {
     }
 }
 
-fn note_drop(roller: &mut Roller, metric: &str, why: &'static str) {
-    let ts = roller.watermark();
+/// ⚠ Stamped with the ENTRY's own time where there is one. Charging it
+/// to the watermark put every drop at the epoch until some other rule
+/// had produced an observation — and a rule whose every entry drops has
+/// no watermark of its own, which is exactly the case worth reading.
+fn note_drop(roller: &mut Roller, metric: &str, why: &'static str, at: Option<u64>) {
+    let ts = at.unwrap_or_else(|| roller.watermark());
     let s = Sample::new(ts, 0, "!drop")
         .label("metric", metric)
         .label("reason", why)
@@ -1843,6 +1924,67 @@ mod tests {
         // double every count on a re-run.
         let err = folded("2026-09-06T10:00:00.000Z 60s m count=3\n", 60_000).unwrap_err();
         assert!(format!("{err}").contains("OBSERVATIONS"), "{err}");
+    }
+
+    #[test]
+    fn a_rule_may_not_name_a_field_its_source_cannot_produce() {
+        // Where the SOURCE names the fields, a typo is refused at load
+        // rather than discovered as a column of !drop markers. The
+        // message lists what the rule can have, so the error doubles as
+        // the reference for a decoder whose names are its own.
+        let err = parse(
+            "t.conf",
+            "AXIS=logline\n[m]\nEXTRACT=level=(?P<level>\\w+)\nSUM=ms\n",
+        )
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("\"ms\"") && text.contains("level"), "{text}");
+
+        let err = parse(
+            "t.conf",
+            "AXIS=logline\n[m]\nDECODE=apache-combined\nLABELS=vhost\nCOUNT=\n",
+        )
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("vhost") && text.contains("referer"), "{text}");
+
+        // …and a field the source DOES produce is fine, label or measure.
+        assert!(parse(
+            "t.conf",
+            "AXIS=logline\n[m]\nDECODE=apache-combined\nLABELS=status method\nSUM=bytes\n",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn logfmt_and_json_take_their_names_from_the_producer_so_nothing_is_checked() {
+        // The asymmetry is the point: these names are the keys the
+        // PRODUCER's own lines carry, so no load-time check can exist and
+        // the run-time !drop counter is the only signal there can be.
+        assert!(Decoder::Logfmt.fields().is_none());
+        assert!(Decoder::Json.fields().is_none());
+        assert!(parse(
+            "t.conf",
+            "AXIS=logline\n[m]\nDECODE=logfmt\nLABELS=anything\nSUM=whatever\n",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_drop_is_charged_to_the_entry_that_caused_it() {
+        // It was charged to the WATERMARK, which is zero until some
+        // observation lands — so a rule whose every entry drops put all
+        // of them at the epoch, which is exactly the rule worth reading.
+        let mut r = Roller::new(60_000, 0, 0, 1000);
+        note_drop(&mut r, "m", "unparsed", Some(1_788_700_000_000));
+        let out = r.drain(true);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].render().starts_with("2026-09-06T"),
+            "{}",
+            out[0].render()
+        );
+        assert_eq!(out[0].metric, "!drop");
     }
 
     #[test]
