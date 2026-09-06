@@ -839,9 +839,12 @@ In `timbersh` it lands in the shape that is already there:
 
 ## Graphing it
 
-**Not built.** A number a minute is not the point; the shape of it over time
-is. `timbersh` is where this goes — it is already the fleet reader, already
-experimental, and already reaches every host through the resolver.
+**Status: `timbergraph` is BUILT** — the module, the entry point, its tests and
+its man page (`timbergraph(1)`). It reads tally lines from stdin or a file, so
+it needed nothing of timberfs. ⚠ **Not built: the `graph` statement in
+`timbersh`**, which is where the value is — a graph across the fleet rather
+than of one store — and which needs the shell's fan-out rather than another
+renderer.
 
 ### The extractor document is a plot spec
 

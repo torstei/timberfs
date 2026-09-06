@@ -585,19 +585,68 @@ so a search returning one, opening one, and handing a place back to the
 shell are the same operation. The store id is the name and the host is a
 hint: bake the host in and a pasted link breaks the day a store moves.
 
+## `timbergraph` — a graph of a tally store
+
+⚠ **Experimental.** Draws what a metric did over time, from
+`timberfs(1)` tally lines on stdin or in a file — so it needs nothing of
+timberfs beyond a store to read, a tally line being text.
+
+```sh
+timberfs query app-tally --from 13:00 | timbergraph -m http_requests --by status
+timberfs query app-tally --from 13:00 | timbergraph          # what is in here?
+```
+
+**Most of what a plot must know is already in the line**, because the
+measure names *are* the aggregation rules. `count` and `sum` are
+additive, so a series may be summed over labels you did not ask to see;
+`min`/`max` take the extreme; `last` is a gauge and is **never** summed
+across series — a plot that collapsed one would be inventing a number,
+so it is refused. An `le` label makes a **cumulative** ladder, which is
+the one a grapher gets *wrong* rather than ugly: stacking those
+multiplies the count, so drawing one without `--quantile` or `--by le` is
+refused too.
+
+What a line cannot say is the **unit**, and which metrics exist but were
+silent in the window. A `!meta` marker supplies the unit where the window
+happens to hold one; otherwise name the extractor document with
+`--using`.
+
+**The markers are the graph's error bars.** `!drop` says the numbers in
+that bucket are *wrong*, `!cap` that they are understated, `!late` that
+they hold entries displaced from another bucket. Reported on stderr,
+drawn as marks in an image — a plot that hid them would be lying about
+being exact, which is the one thing this format has refused throughout.
+
+`--png`/`--svg`/`--window` draw somewhere other than the terminal, and
+`--tsv`/`--gnuplot` take the data and the script elsewhere — the script
+carries its data inline, so `gnuplot -p FILE` redraws it with nothing
+else present. Keep them: the expensive half is the fetch, and it should
+not be paid twice to redraw the same window a different way.
+
+⚠ Needs [gnuplot](https://gnuplot.info), which is a **suggested**
+dependency rather than a required one — these tools carry no third-party
+Python imports and nothing here should be the first. One generated script
+gives every output: ASCII in a terminal over ssh, a PNG to attach, a
+window where there is a display. Two renderers would drift, and the ASCII
+one would be the one that quietly stopped showing a series.
+
+`man timbergraph` is the reference; `docs/plans/tally.md` is the design.
+
 ## Tests
 
 ```sh
 tests/timbersh/test-timbersh              # all
 tests/timbersh/test-timbersh short_id     # one, by substring
-tests/timberview/test-timberview          # the viewer's model
+tests/timberview/test-timberview             # the viewer's model
+tests/timbergraph/test-timbergraph           # what a plot may and may not draw
 tests/timberfs-client/test-timberfs-client   # the fleet resolver
 ```
 
-No VM and no timberfs. The url transport's tests serve the same fake over
-a loopback port and a unix socket in the test process, which is as far out
-as they go. `scripts/check.sh` runs all three, so they gate a push like
-everything else.
+No VM and no timberfs, and no gnuplot either — everything worth testing
+about a graph is upstream of the drawing. The url transport's tests serve
+the same fake over a loopback port and a unix socket in the test process,
+which is as far out as they go. `scripts/check.sh` runs them all, so they
+gate a push like everything else.
 
 For timbersh, `--cmd` points at a fake that answers from a script. For the
 viewer, the fake is one level up: it implements the four operations, which
