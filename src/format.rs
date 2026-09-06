@@ -300,6 +300,32 @@ pub fn header_store_id(buf: &[u8]) -> Option<[u8; 16]> {
     (id != [0u8; 16]).then_some(id)
 }
 
+/// Make a pair look like one created before identity was stamped at
+/// creation: a header whose id field is all zero, which `header_store_id`
+/// reads as carrying none. That is the only way a store without an
+/// identity still comes about, so it is the only way to test one.
+#[cfg(test)]
+pub fn clear_carried_identity(dir: &Path, name: &str) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(rings_path(dir, name))?
+        .write_all_at(&[0u8; 16], STORE_ID_OFF as u64)
+}
+
+/// A fresh v4 UUID as its 16 raw bytes.
+///
+/// Here rather than beside the manifest because the PAIR is what gets one
+/// first: identity is stamped into the `.rings` header when the pair is
+/// created, and a manifest written later adopts it.
+pub fn new_uuid_bytes() -> io::Result<[u8; 16]> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    Ok(b)
+}
+
 /// A hyphenated UUID as its 16 raw bytes. None for anything that is not
 /// one — an id is minted by us, so a manifest holding something else is a
 /// fact to report, never something to reshape into 16 bytes.

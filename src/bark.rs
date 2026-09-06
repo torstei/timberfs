@@ -15,10 +15,12 @@
 //!   .grain automatically: imports extend it for new chunks and rebuild
 //!   it when it is missing (e.g. after rotation/retention dropped it).
 //!
-//! Every manifest is minted with a durable identity on first write:
-//! "id" (a random UUID — constant across renames, moves and hosts; the
-//! identity of the STORE, where paths are merely its current address)
-//! and "created" (RFC3339, when the identity was established).
+//! Every manifest carries a durable identity: "id" (a random UUID —
+//! constant across renames, moves and hosts; the identity of the STORE,
+//! where paths are merely its current address) and "created" (RFC3339,
+//! when the identity was established). The id is minted when the PAIR is
+//! created, not here, so a store has one before any manifest exists; a
+//! manifest written later adopts it.
 //!
 //! Unknown keys are preserved untouched — bark is a label, not a schema.
 //!
@@ -26,7 +28,6 @@
 //! with its properties declared up front, database-style.
 
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{bail, Context};
@@ -53,22 +54,15 @@ pub fn load(dir: &Path, name: &str) -> Option<Map<String, Value>> {
 
 /// A random UUIDv4, dependency-free (we are Linux-only anyway).
 pub fn new_uuid() -> anyhow::Result<String> {
-    let mut b = [0u8; 16];
-    fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
-    b[6] = (b[6] & 0x0f) | 0x40; // version 4
-    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
-    Ok(format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
-        b[14], b[15]
-    ))
+    Ok(format::uuid_text(&format::new_uuid_bytes()?))
 }
 
-/// Every store gets a durable identity the first time a manifest is
-/// written, whichever path writes it: "id" stays constant across renames,
-/// moves and hosts (paths change, identity does not), and "created"
-/// records when the identity was established. Once present, neither is
-/// ever touched.
+/// The last resort: mint an identity for a map that has none and whose
+/// pair could not supply one. "id" stays constant across renames, moves
+/// and hosts (paths change, identity does not), and "created" records
+/// when the identity was established. Once present, neither is ever
+/// touched. `save` is what adopts the pair's own id first, so this only
+/// mints for a store that does not exist on disk yet.
 pub fn with_identity(mut map: Map<String, Value>) -> anyhow::Result<Map<String, Value>> {
     if !map.contains_key("id") {
         map.insert("id".to_string(), Value::String(new_uuid()?));
@@ -83,7 +77,18 @@ pub fn with_identity(mut map: Map<String, Value>) -> anyhow::Result<Map<String, 
 }
 
 pub fn save(dir: &Path, name: &str, map: &Map<String, Value>) -> anyhow::Result<()> {
-    let map = with_identity(map.clone())?;
+    let mut map = map.clone();
+    // The pair is the store, so its identity is the store's — adopt it
+    // rather than minting a second. Without this, every path that creates
+    // the pair before writing its manifest (`import`, `append --retain`)
+    // would leave the two sides naming different stores, which the next
+    // open refuses outright.
+    if !map.contains_key("id") {
+        if let Some(id) = carried_identity(dir, name) {
+            map.insert("id".to_string(), Value::String(id));
+        }
+    }
+    let map = with_identity(map)?;
     let text = serde_json::to_string_pretty(&Value::Object(map))?;
     // Atomic (tmp + rename): live writers re-read the manifest on their
     // retention tick, and a torn read must be impossible.
@@ -425,8 +430,9 @@ pub enum IdentitySide {
 /// the same store answer differently depending on which files survived.
 ///
 /// `None` means the pair carries no identity anywhere, which is
-/// `identity`'s own verdict of «this pair is not a store» — what a plain
-/// `append` leaves behind until something mints one.
+/// `identity`'s own verdict of «this pair is not a store». Every pair
+/// this build creates is stamped at creation, so the answer is only ever
+/// None for one made before that — `identity --mint` is what fixes it.
 pub fn identity_of(dir: &Path, name: &str) -> Option<String> {
     if let Some(id) = try_load(dir, name)
         .ok()
@@ -710,8 +716,8 @@ pub fn cmd_create(
     // the store's identity, and `FileStore::open` reads it from the
     // manifest — so a store created with anything declared carries its id
     // in the pair from the very first byte, rather than from its first
-    // write. (A bare `create` declares nothing, writes no manifest, and so
-    // still has no identity; that is a separate question.)
+    // write. A bare `create` declares nothing and writes no manifest; the
+    // pair still gets an identity, minted where it is stamped.
     if !map.is_empty() {
         save(&dir, &name, &map)?;
     }

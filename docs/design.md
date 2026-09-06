@@ -196,7 +196,7 @@ object — the label on the timber. Plain enough to read by eye; changed with
 
 ```json
 {
-  "id": "6f9c2a1e-…",             // identity: random UUID, minted on first write,
+  "id": "6f9c2a1e-…",             // identity: random UUID, minted with the PAIR,
   "created": "2026-07-11T09:14:02Z", //   constant across renames, moves and hosts
   "host": "imap03.example.com",   // provenance: free-form, yours (--set k=v)
   "service": "checkout",          //   free-form, but timber-otlp reads it as the

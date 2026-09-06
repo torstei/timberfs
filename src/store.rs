@@ -504,6 +504,14 @@ impl FileStore {
         // to run.
         let mut store_id = manifest_store_id(dir, name);
         if rings.metadata()?.len() == 0 {
+            // A pair IS a store, so it gets its identity here rather than
+            // from whichever manifest happens to be written first — a bare
+            // `append` writes none at all, and a store with no id is
+            // invisible to every reader keyed on one: a cursor, a
+            // follower, a query document, a replica's destination.
+            if store_id.is_none() {
+                store_id = Some(format::new_uuid_bytes()?);
+            }
             rings.write_all_at(
                 &format::rings_header(0, format::Dropped::default(), store_id),
                 0,
@@ -2128,6 +2136,64 @@ pub fn read_lock_raw(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant every reader keyed on identity depends on: a cursor,
+    /// a follower, a query document and a replica's destination all ask
+    /// what a store IS, and a pair that could not answer was invisible to
+    /// each of them. `append` writes no manifest, so waiting for one meant
+    /// the commonest store had no identity at all.
+    #[test]
+    fn a_pair_carries_an_identity_from_the_moment_it_exists() {
+        let dir = std::env::temp_dir().join(format!("tfs-ident-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            chunk_size: 1 << 20,
+            level: 1,
+            flush_age_ms: u64::MAX,
+        };
+
+        // No manifest, no declaration: what a bare `append` leaves.
+        let mut st = Store {
+            dir: dir.clone(),
+            cfg,
+            files: BTreeMap::new(),
+        };
+        st.create("a.log").unwrap();
+        drop(st);
+        assert!(
+            !format::bark_path(&dir, "a.log").exists(),
+            "nothing declared"
+        );
+        let carried = crate::bark::identity_of(&dir, "a.log").expect("the pair is a store");
+
+        // A manifest written LATER adopts it rather than minting a second
+        // — two ids for one store is what the next open refuses outright.
+        crate::bark::save(&dir, "a.log", &serde_json::Map::new()).unwrap();
+        assert_eq!(
+            crate::bark::load(&dir, "a.log")
+                .unwrap()
+                .get("id")
+                .and_then(|v| v.as_str()),
+            Some(carried.as_str())
+        );
+        let mut again = Store {
+            dir: dir.clone(),
+            cfg,
+            files: BTreeMap::new(),
+        };
+        again.create("a.log").expect("the two sides agree");
+
+        // And two pairs are two stores.
+        let mut other = Store {
+            dir: dir.clone(),
+            cfg,
+            files: BTreeMap::new(),
+        };
+        other.create("b.log").unwrap();
+        assert_ne!(crate::bark::identity_of(&dir, "b.log"), Some(carried));
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_recorded_writer_is_named_only_while_it_lives() {

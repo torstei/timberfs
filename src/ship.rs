@@ -964,6 +964,11 @@ mod tests {
             serde_json::to_string(&Value::Object(bark)).unwrap(),
         )
         .unwrap();
+        // Both sides, or the pair still answers: a store this old is one
+        // an older build created, and stripping only the manifest leaves
+        // the identity the header has carried since.
+        drop(st);
+        crate::format::clear_carried_identity(&dir, "plain.log").unwrap();
 
         let b = shipper(&root, "service=apache", 100).poll().unwrap();
         assert_eq!(b.matched, 2, "it matched");
