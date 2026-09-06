@@ -365,6 +365,78 @@ made for `SOURCE` and for the same reason: with a search path, which program
 you get depends on install order. `/usr/local/lib/timberfs/tally/` is a
 convention for where to put them, not a lookup.
 
+### Where state lives, and why extraction has none
+
+Two different things are being called stateless, and only one of them is.
+
+**The fold has state and it is timberfs's**: open buckets, the watermark that
+seals them, the re-opening a revision needs, the citation span, the safe
+offset. That is precisely what is NOT delegated — it is the part every
+extractor would otherwise reimplement, and the part where being subtly wrong is
+invisible in the output.
+
+**Field extraction has none**, at levels 1–3, and that is load-bearing rather
+than a gap. It is what makes a backfill and a live run produce byte-identical
+tape — no warm-up, no first-entry special case — and it keeps the fold
+associative, so sharding a tape across processes later is a fold over partial
+results rather than a redesign.
+
+⚠ **The case that looks like it needs state and does not.** A log line carrying
+a CUMULATIVE total (`total_requests: 12345`) where the wanted number is the
+delta looks like "remember the previous value". It is not: `LAST=field` stores
+the value per bucket and the READER differences adjacent buckets. Same
+information, no extractor state, determinism intact. The cost is that a
+head-drop losing bucket *n-1* loses one delta at the head — one, rather than
+the base, which is the whole reason deltas beat cumulative counters.
+
+That is also the argument against a `DELTA=` measure, which is the obvious
+thing to add: it would buy this one case and spend the invariant that a
+recompute equals a live run, since the first entry of any window has no
+predecessor and would have to emit nothing.
+
+What genuinely needs state is correlation (a duration from a request id in two
+entries), cross-entry record assembly (a ZGC cycle is ~48 separately-stamped
+lines — a Java stack trace is NOT this, an entry already carries its
+continuations), and distinct counting. Those are programs, and the
+non-determinism is then visibly the program's rather than the format's.
+
+### How often an EXEC runs
+
+**Once, for the life of the run** — a coprocess, not a callback. Per entry
+would be a fork per line: 47 a second on one measured access log at its quiet
+rate, and far more on a busy one.
+
+- **One per (rule, store)**, which is the granularity a rule instance already
+  has, since a tally store belongs to one source store.
+- **Fed the stream AFTER the rule's predicate**, which is both the optimisation
+  and what keeps the program simple: a GC reader narrows to the ~60% of lines
+  it parses before a line reaches it. A rule whose program must COUNT what the
+  predicate excludes states no predicate — it is declared per rule, so the
+  author decides.
+- **It answers with width-`0s` observation lines and nothing else.**
+
+⚠ **The citation is the receipt.** Nothing can see inside the coprocess, so
+nothing knows which entries it has accounted for — except that an observation
+cites the tape span it came from. A program holding a half-assembled cycle
+emits, when it finally does, a citation covering the whole span, and
+`safe_offset` therefore holds the watermark at the start of the open cycle. A
+restart re-reads exactly what the program had not finished with.
+
+⚠ **Which needs a way to say "seen this far, nothing came of it"**, or a
+program that consumes ten thousand entries and emits nothing pins the watermark
+at the first of them. That is a marker in the grammar that already exists —
+`!at offset=…` — and it is the consumer protocol's `progress` one level down.
+An EXEC is a mini-consumer.
+
+**Failure needs no policy of its own.** If it exits, the rule's numbers stop,
+that is recorded, and the run fails; the follower restarts it from the safe
+offset. A restart-in-place policy would risk a silent gap or a double count
+where the position machinery already gets it right.
+
+The open cost is process count — (stores matched) × (EXEC rules) coprocesses on
+a large fan-out. Lazy spawn on the first matching entry and an idle exit are the
+answers, and both can wait for a fleet that has one.
+
 **Named by what they produce, never by where they came from.** The metric name
 is the section name, declared; the rule file's name does not appear in the tape.
 Deriving a metric name from a file would mean renaming a file rewrites the
@@ -481,7 +553,8 @@ loss, recorded exactly — the same rule retention already follows.
   `!gap` marker from the registry's GAP.
 * **`EXEC` is parsed and refused at run time, not yet spawned.** The
   observation format it answers in is settled and `--observations` prints it;
-  what is missing is the plumbing that feeds one a records stream.
+  what is missing is the coprocess plumbing, and the `!at` marker that lets one
+  release the watermark over entries it consumed and made nothing of.
 
 ## What must change elsewhere when this ships
 
