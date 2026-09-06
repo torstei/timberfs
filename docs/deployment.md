@@ -1227,6 +1227,53 @@ store left to its own live writer.
 The older `cursors=<dir>` key still works and is reported as superseded wherever
 it is found.
 
+## Deriving metrics from a log — `timberfs tally`
+
+⚠ **Experimental**, and not yet a unit: there is no follower half, so this runs
+from a pipe or from cron. `man timberfs`, **tally**, is the reference and
+[docs/plans/tally.md](plans/tally.md) is the design.
+
+Rules live in `/etc/timberfs/tally.d/*.conf`, copied from
+`/usr/share/doc/timberfs/examples/tally.conf.example`. ⚠ Unlike `file.d`, where
+a set is a unit of supervision, the whole directory is read by ONE process: two
+files may declare rules for one store, and a store has one writer. Split the
+files by topic, for editing.
+
+The numbers go into a store of their own, one per source store:
+
+```sh
+timberfs create /var/log/timberfs/apache-access-tally/apache-access-tally.log \
+    --index --retain 730d \
+    --set class=tally --set service=apache-access --set host="$(hostname -s)" \
+    --set derived_op=tally --set logline_lag=1h
+
+timberfs query --records apache-access --from '13:00' \
+  | timberfs tally --rules /etc/timberfs/tally.d \
+  | timberfs append --into /var/log/timberfs/apache-access-tally/apache-access-tally.log
+```
+
+Three of those declarations are load-bearing:
+
+- **`class=tally`** is how a reader tells the numbers from the log. It matters
+  the other way round too: a tally store inherits the source's labels, so
+  `[service=~apache-.*]` now matches *both*, and a follower shipping apache logs
+  onward would start shipping tally lines. Narrow such a selection with
+  `class!=tally` — an absent key reads as the empty string, so that already
+  excludes every store on disk today.
+- **`logline_lag`** is how far a line's own stamp may sit from the moment it was
+  written: `GRACE` + `REVISE` for a live tally, and however old the data is for
+  a backfill. Chunk selection is widened by it in place of the one-minute guess,
+  and without it a logline-time window over the buckets selects no chunk at all
+  and answers nothing — which reads exactly like a quiet minute. `timberfs info`
+  reports the declared value, because that failure is otherwise silent.
+- **`retain`** is the whole point of materialising: the tally store keeps its
+  numbers long after the log they came from has been head-dropped. Size it in
+  years where the log is sized in weeks.
+
+⚠ The source stream must carry ONE store. A `feed` stream carries each store's
+labels and needs nothing else; a `query --records` answer names a path only, so
+a rule with a `SELECT` has nothing to match against unless `--store` names it.
+
 ## What a store declares about itself
 
 A manifest holds two kinds of key, and mixing them up is the thing that makes a
