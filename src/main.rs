@@ -794,6 +794,28 @@ enum Command {
         #[arg(long, default_value = "30s", value_name = "DUR")]
         timeout: String,
     },
+    /// Follow a NAMED SET of this system's log files, a store each, in one
+    /// process. The set is declared in
+    /// /etc/timberfs/file.d/<SET>.conf — a section per source, whose name
+    /// is the store's — so one system's logs (exim's three, apache's two)
+    /// are one config, one unit and one process instead of that many of
+    /// each. The producer keeps writing its own files; timberfs reads them.
+    #[command(name = "file-intake")]
+    FileIntake {
+        /// The set to run: /etc/timberfs/file.d/<SET>.conf
+        set: String,
+        /// Where the set declarations live
+        #[arg(long, value_name = "DIR", default_value = "/etc/timberfs")]
+        etc: PathBuf,
+        /// Declare and converge every store the set names, print what it
+        /// resolved to, and exit without following anything
+        #[arg(long)]
+        check: bool,
+        /// Exit 85 when this binary is replaced on disk, so a supervised
+        /// run re-execs into the new one
+        #[arg(long)]
+        exit_on_upgrade: bool,
+    },
     /// Tap the consoles of incus containers into timberfs, over the local
     /// incus unix socket. The console is the "everything else" channel —
     /// boot output, a crashing JVM's fatal log, whatever a process writes
@@ -1669,6 +1691,21 @@ fn main() -> anyhow::Result<()> {
         Command::Info { file, json } => {
             let file = forest::resolve_source(&file)?;
             query::cmd_info(&file, json)?;
+        }
+        Command::FileIntake {
+            set,
+            etc,
+            check,
+            exit_on_upgrade,
+        } => {
+            let declared = timberfs::file_intake::load(&set, &etc)?;
+            timberfs::file_intake::cmd_file_intake(
+                &declared,
+                &timberfs::file_intake::RunOpts {
+                    exit_on_upgrade,
+                    check_only: check,
+                },
+            )?
         }
         Command::IncusIntake {
             forest,

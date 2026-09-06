@@ -102,6 +102,18 @@ logrotate hook is cheap even on huge files:
 timberfs import --quiet /var/log/myapp/app.log --into backing/app.log --quick
 ```
 
+**a2) Follow a whole system's files** — `timberfs file-intake` tails a NAMED
+SET of files, a store each, in one process, for producers that keep writing
+their own logs (Exim's three, Apache's two). One config states the system's
+retention once; a section per source names its store and overrides what
+differs:
+
+```sh
+# /etc/timberfs/file.d/exim.conf declares [exim-main], [exim-reject], …
+timberfs file-intake exim --check      # declare, converge, say what resolved
+systemctl enable --now timberfs-file@exim
+```
+
 **b) Pipe it** — if the producer can write to a pipe, cut the plain file
 out entirely (svlogd-style, retention built in):
 
@@ -732,13 +744,15 @@ sudo dpkg -i target/debian/timberfs_*.deb
 ```
 
 The package installs `/usr/bin/timberfs`, `timber-filter`, `timber-otlp` and
-seven systemd unit families: `timberfs@<instance>` (a template) to mount a
+eight systemd unit families: `timberfs@<instance>` (a template) to mount a
 store at boot, a socket-activated `timberfs-log@<instance>` (also a template)
 to stream a records producer into a store without a mount, its plain-text
 sibling `timberfs-text@<instance>` for a producer that can only log to a path
 (Apache's `CustomLog`/`ErrorLog`, nginx's `access_log`), `timberfs-follow@<instance>`
 to read a file a producer keeps writing (no coupling to that producer at all),
-socket-activated `timberfs-forward` and `timberfs-otlp` (not templated — both
+`timberfs-file@<set>` to read a whole SYSTEM's files that way — exim's three
+logs, apache's two — from one config and one process, each with its own name,
+labels and retention, socket-activated `timberfs-forward` and `timberfs-otlp` (not templated — both
 multiplex every stream over one listener) for the two network intakes above,
 and — in the other direction — `timberfs-follower@<instance>`, which runs a
 *registered* follower: which stores and what consumes them come from the
@@ -746,7 +760,7 @@ declaration rather than from a per-instance `.conf`, so it is one unit per
 destination and not one per store.
 
 See **[Deploying timberfs](docs/deployment.md)** for the directory layout, all
-seven unit families, the ownership/permission model, and
+eight unit families, the ownership/permission model, and
 self-restart-on-upgrade.
 
 ## Roadmap

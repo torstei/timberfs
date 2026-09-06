@@ -11,6 +11,7 @@ pub mod cursor;
 pub mod entry;
 pub mod export;
 pub mod feed;
+pub mod file_intake;
 pub mod follow;
 pub mod follower;
 pub mod forest;

@@ -37,6 +37,9 @@ messages and pull requests are for.
 - [follower-selection.md](follower-selection.md) — one follower declaration
   for a SET of stores: the selection as its subject, and the poll loop that
   serves the whole set from one process.
+- [file-intake.md](file-intake.md) — the same move on the INGEST side: a named
+  set of a system's log files tailed by one process, and why this one needs no
+  registry.
 - [consumer-protocol.md](consumer-protocol.md) — timberfs holds the
   position and a consumer says how far to move it: three messages, why the
   watermark means "do not send me these again", and what that makes possible

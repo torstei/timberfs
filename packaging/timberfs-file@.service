@@ -1,0 +1,67 @@
+# Systemd template for following a SET of one system's log files into a
+# store each: `timberfs file-intake`, one process for the whole set.
+#
+# Each instance runs /etc/timberfs/file.d/<instance>.conf, a section per
+# source whose name is the store's:
+#
+#   /etc/timberfs/file.d/exim.conf:
+#     DECLARE=index=true retain=90d
+#     [exim-main]
+#     SOURCE=/var/log/exim4/mainlog
+#     [exim-panic]
+#     SOURCE=/var/log/exim4/paniclog
+#     DECLARE=index=true retain=365d wal=true
+#
+#   systemctl enable --now timberfs-file@exim
+#
+# The producer keeps writing its own files and timberfs reads them, so
+# nothing in the producer's write path depends on this unit. That is the
+# difference from the timberfs-text@ FIFO pair, where the producer's write
+# goes into a pipe this side has to keep draining — and it is why this is
+# the safer default for a mail server, where Exim ends the process whose
+# log write fails.
+#
+# WARNING: not timberfs-follow@ (ONE file, its instance naming the store)
+# and not timberfs-follower@ (the opposite direction: a registered follower
+# reading a store OUT to somewhere else). This unit is an intake, reading a
+# SET of files IN.
+#
+# ONE INSTANCE PER SYSTEM is the intended shape — exim, apache, postgres —
+# not one per host. A set is a unit of supervision as well as of
+# configuration: if the process dies, every tail in it stops and restarts
+# together, so a set should hold logs that belong together. It is also what
+# keeps User= usable, since the intake must be able to read every source it
+# names. An everything-on-this-host set is supported, and is simply a
+# longer list; it just has to run as whoever can read all of it.
+#
+# A restart is cheap and safe at any time: each store is its own tail's
+# checkpoint, so a restart re-syncs against the store's own lines and can
+# neither lose nor duplicate. There is no position file to go stale.
+
+[Unit]
+Description=timberfs file intake (%i)
+Documentation=https://github.com/torstei/timberfs
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/timberfs file-intake %i --exit-on-upgrade
+StandardOutput=journal
+StandardError=journal
+
+# The stores this set declares live under one directory each, all beneath
+# STORE_DIR; the set creates and converges them at startup, before any tail
+# begins, so a typo in the fifth section fails here rather than after four
+# tails are already writing.
+LogsDirectory=timberfs
+
+Restart=always
+RestartSec=2
+# --exit-on-upgrade: exit 85 when this binary is replaced on disk, so the
+# restart lands on the new one. SuccessExitStatus keeps it out of the
+# failure log. (Keep --exit-on-upgrade in any ExecStart override.)
+SuccessExitStatus=85
+RestartForceExitStatus=85
+
+[Install]
+WantedBy=multi-user.target

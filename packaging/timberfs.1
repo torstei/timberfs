@@ -1937,6 +1937,94 @@ Exit for a clean re\-exec when this binary is upgraded on disk; the systemd
 unit sets it.
 .PP
 The verb name is provisional.
+.SS file\-intake
+.B timberfs file\-intake
+.I SET
+.RB [ \-\-etc
+.IR DIR ]
+.RB [ \-\-check ]
+.RB [ \-\-exit\-on\-upgrade ]
+.PP
+Follow a NAMED SET of this system's log files, a store each, in ONE
+process. The producer keeps writing its own files and timberfs reads them,
+so nothing in the producer's write path depends on this \(em the same
+contract
+.B timberfs\-follow@
+has, one declaration wider.
+.PP
+A system rarely has one log. Exim writes
+.IR mainlog ,
+.I rejectlog
+and
+.IR paniclog ;
+Apache writes an access and an error log. One
+.B import \-\-follow
+per file is a unit and a process each, and states that system's retention
+policy once per file, free to drift once per file. A SET states it once.
+.PP
+.I SET
+names
+.BI /etc/timberfs/file.d/ SET .conf
+and the unit instance
+.RB ( "systemctl enable \-\-now timberfs\-file@exim" ),
+and names no store: every store is named by a
+.B [section]
+in that file, which is also the handle it answers to. A section declares
+.B SOURCE
+(an absolute path, required) and may override the preamble's
+.BR STORE_DIR ,
+.BR DECLARE ,
+.BR POLL ,
+.B FLUSH_AGE
+and
+.BR ROTATED ,
+key by key. A section that states a key REPLACES the default wholly: a
+partial merge of a space-separated
+.B DECLARE
+is a rule nobody can predict from reading the file.
+.PP
+⚠ The sources are a named LIST and need not share a directory, and nothing
+is globbed:
+.B /var/log/exim4/*log
+would match
+.I mainlog.1
+the first time logrotate ran and import a rotated file as a store of its
+own.
+.TP
+.BI \-\-etc " DIR"
+Where the set declarations live. Default
+.BR /etc/timberfs .
+.TP
+.B \-\-check
+Declare and converge every store the set names, print what each source
+resolved to, and exit without following anything \(em the check to run
+after editing a set, and before restarting the unit that serves it.
+.TP
+.B \-\-exit\-on\-upgrade
+Exit 85 when this binary is replaced on disk, so a supervised run re-execs
+into the new one. ⚠ ONE watch for the set, which trips the same wind-down
+SIGTERM does: a per-store watch would flush its own store and exit while
+every other tail still held unflushed buffers.
+.PP
+.B Every store is declared FIRST,
+serially, before any tail starts, so a typo in the fifth section fails at
+startup rather than after four tails are already writing.
+.PP
+.B A set is a unit of supervision as well as of configuration.
+If one tail ends \(em an error, or a panic, which would otherwise die alone
+and silently while the unit stayed green \(em the set stops and exits
+non-zero naming that source, and systemd restarts all of them. That is
+affordable because each store is its own tail's checkpoint: a restart
+re-syncs against the store's own lines and can neither lose nor duplicate,
+with no position file to go stale. Prefer ONE SET PER SYSTEM for the same
+reason, and because the intake must be able to read every source it names.
+An everything-on-this-host set works and is simply a longer list.
+.PP
+Measured on a release build, idle: one
+.B file\-intake
+over Exim's three logs is 10.6 MB RSS in 7 threads, against 27.5 MB in
+three processes for the same three
+.BR "import \-\-follow" s.
 .SS incus\-intake
 .B timberfs incus\-intake
 .BI \-\-forest " NAME"
