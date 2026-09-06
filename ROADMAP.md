@@ -895,6 +895,34 @@ here.
   head-drop takes a cumulative base), `sum`+`count` over averages, and
   histogram buckets over quantiles. Design note:
   [docs/plans/tally.md](docs/plans/tally.md).
+- **Declarations scoped to a range of the tape**: everything a store
+  declares about itself is true of the WHOLE store, and some of it is only
+  ever true of a stretch. A producer that changed its line format mid-life
+  has one `timestamp_regex`, so half its history is unparseable; a tally
+  store's metric definitions are the same shape one level up, and so is a
+  label whose meaning changed. The mechanism is a declaration ANCHORED AT
+  AN OFFSET — "this was in force from 0x1000", superseded by "this from
+  0x424242" — which works because a tape offset is already absolute
+  (what has ever left the store, plus where the bytes sit in what
+  remains), so a scope survives a head-drop where a chunk number or a
+  timestamp would not.
+  **The property that makes it affordable** is the split this tree already
+  keeps: the `.bark` holds what is IN FORCE, the history holds the
+  TRANSITIONS. A head-drop then takes a superseded declaration exactly
+  when it takes the range that declaration described — the old definition
+  is lost precisely when the data it applied to is, which is correct
+  rather than lossy, and no re-announcement cadence is needed.
+  ⚠ **Where the history lives is the open question, and a log answers it
+  differently from a tally store.** A tally store's markers are already
+  lines, so a transition can be one. A log store's bytes are the
+  producer's, and a declaration cannot be injected into them — which
+  points at a sidecar in the family `.grain`/`.sap`/`.bark` already forms,
+  with its own contract about travelling (`.bark` does; `.grain` is
+  derived and need not).
+  Came out of asking how a tally store's extractor definitions could
+  survive replication; deferred there in favour of naming the extractor at
+  plot time (docs/plans/tally.md), because the fleet's layout should not
+  be decided by a plot's metadata.
 - **Expose the index in-band**: a virtual `.idx` twin file or ioctl so tools
   can query through the mount without knowing the backing dir.
 - **tail(1) fast-path**: negative-offset "time seek" via `llseek` hooks.

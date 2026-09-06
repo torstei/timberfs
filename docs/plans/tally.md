@@ -1017,6 +1017,12 @@ loss, recorded exactly — the same rule retention already follows.
   at plot time, gnuplot as a soft dependency.
 * **`!meta` is in the wrong place**, not merely on the wrong schedule — see the
   defect above. Whatever consumes it decides where it goes.
+* **Declarations scoped to a range of the tape** — the general form of "which
+  definition produced these numbers", and the only thing that would make a
+  definition survive replication honestly: a declaration anchored at an OFFSET,
+  superseded by a later one. Bigger than tally and useful beyond it (a producer
+  that changed its line format mid-life has one `timestamp_regex` today), so it
+  is a `ROADMAP.md` entry rather than this note's.
 * **`timberfs tally --dump-json`** — a generator, which the JSON form wants
   much more than the INI form did: nobody should be escaping a regex by hand.
 * **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,
