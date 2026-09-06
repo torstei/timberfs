@@ -1,0 +1,8 @@
+# entries_logged: claimed 5 skipped 0 dropped 0
+# errors_logged: claimed 2 skipped 3 dropped 0
+2026-09-06T13:37:00.000Z 0s !meta metric=entries_logged unit=entries
+2026-09-06T13:37:10.000Z 0s !meta metric=errors_logged unit=entries
+2026-09-06T13:37:00.000Z 60s entries_logged count=3 @0+205
+2026-09-06T13:37:00.000Z 60s errors_logged count=1 @38+132
+2026-09-06T13:38:00.000Z 60s entries_logged count=2 @205+91
+2026-09-06T13:38:00.000Z 60s errors_logged count=1 @205+55

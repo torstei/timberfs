@@ -269,7 +269,11 @@ pub struct Predicate {
 impl Predicate {
     /// Exactly one matcher, or a refusal that says so. A predicate with
     /// none matches everything and one with two is two questions.
-    fn compile(&self) -> anyhow::Result<crate::grep::Pred> {
+    ///
+    /// `pub(crate)` because the tally extractor's `claim` is this same
+    /// vocabulary one level down — one language for matching an entry,
+    /// rather than two spellings of it.
+    pub(crate) fn compile(&self) -> anyhow::Result<crate::grep::Pred> {
         use crate::grep::PredKind;
         let set: Vec<(PredKind, &String)> = [
             self.has.as_ref().map(|t| (PredKind::Has, t)),

@@ -20,7 +20,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use serde_json::{Map, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Where a site's rules live, under `/etc/timberfs`.
 pub const CONF_DIR: &str = "tally.d";
@@ -502,36 +503,177 @@ pub fn resolve(samples: Vec<Sample>) -> Vec<Sample> {
     out.into_iter().flatten().collect()
 }
 
-// --------------------------------------------------------------- the rules
+// ----------------------------------------------------------- the extractor
 
-/// Which clock a bucket is on. Required with no default, for the reason
-/// a query document's `window.axis` is: the two answers differ and a
-/// default is an assumption the next reader makes wrongly.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The extractor document's format version, matched exactly.
+pub const EXTRACTOR_VERSION: &str = "1.0-EXPERIMENTAL";
+
+/// A named set of metrics read off ONE SHAPE OF LINE.
+///
+/// It carries no store selection, and that absence is the design: a
+/// document that says nothing about this host is an ARTEFACT — shippable,
+/// shareable, versioned — rather than configuration. Which stores get
+/// measured is the provisioning's business (docs/plans/tally.md).
+///
+/// ⚠ Its subject is a line SHAPE, never a store. A store carries many
+/// shapes at once — logfmt request lines beside stack traces beside a
+/// startup banner — so each metric CLAIMS its own lines rather than
+/// assuming the store is uniform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Extractor {
+    /// The format version, matched exactly against `EXTRACTOR_VERSION`.
+    pub v: String,
+    /// What this document IS, declared here and never taken from the
+    /// filename: renaming a file must not change what a document is, the
+    /// rule a metric name and a store identity already follow.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub window: Window,
+    pub metrics: Vec<Metric>,
+}
+
+/// The bucket every metric in this document is folded into.
+///
+/// A DEFAULT, which a provisioning may override — the window is partly a
+/// deployment choice (a busy host may want ten seconds where a quiet one
+/// wants sixty) and partly incomplete without a value.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Window {
+    /// Required, with no default, for the reason a query document's
+    /// `window.axis` is: logline and write bucket differently, and a
+    /// default is an assumption the next reader makes wrongly.
+    pub axis: Axis,
+    pub width_ms: u64,
+    /// How long past a bucket's end before it is sealed and written.
+    #[serde(default = "default_grace")]
+    pub grace_ms: u64,
+    /// How long after sealing a late entry may still restate it, as a
+    /// revision.
+    #[serde(default = "default_revise")]
+    pub revise_ms: u64,
+    /// Distinct series per bucket, after which a `!cap` marker counts
+    /// what was lost. Cardinality is where every metrics system dies.
+    #[serde(default = "default_max_series")]
+    pub max_series: usize,
+}
+
+fn default_grace() -> u64 {
+    120_000
+}
+fn default_revise() -> u64 {
+    3_600_000
+}
+fn default_max_series() -> usize {
+    1000
+}
+
+/// Which clock a bucket is on.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
 pub enum Axis {
+    /// The timestamps the lines themselves carry.
     Logline,
+    /// When the data arrived. ⚠ An entry's arrival is its CHUNK's, so a
+    /// bucket on this axis is only as fine as a chunk.
     Write,
 }
 
-/// A line of known shape, turned into fields a rule can name. Few, and
-/// only for formats somebody else standardised: a decoder per producer
-/// would be a taxonomy growing a binary per format, which is what
-/// `EXTRACT` exists to avoid.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// One metric: which lines are mine, how to read one, and what to measure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Metric {
+    pub name: String,
+    /// Shown where a comment could only be read in the file — in a
+    /// listing, in an error. Which is why the format has no comments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// WHICH LINES ARE MINE. Absent means every entry, which is right for
+    /// a volume metric and wrong for anything that parses: without a
+    /// claim, "this line is not mine" and "this line is mine and broken"
+    /// cannot be told apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<Claim>,
+    /// Where fields come from. Absent means none are read, which only a
+    /// bare `count` can do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<FieldSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measure: Vec<MeasureSpec>,
+    /// Cumulative buckets, emitted as one series per `le` — Prometheus's
+    /// own encoding, so a quantile is interpolation over sums and needs
+    /// no syntax of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub histogram: Option<Histogram>,
+    /// Record the source tape span each bucket counted. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cite: Option<bool>,
+}
+
+/// The lines a metric claims, in the query document's own vocabulary:
+/// every `all` must match, at least one `any` must, and no `none` may.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Claim {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub all: Vec<crate::querydoc::Predicate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub any: Vec<crate::querydoc::Predicate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub none: Vec<crate::querydoc::Predicate>,
+}
+
+/// Where a claimed line's fields come from. Exactly one is set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct FieldSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode: Option<Decoder>,
+    /// A regex whose NAMED capture groups become the fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<String>,
+}
+
+/// A line of known shape turned into fields.
+///
+/// ⚠ The list is CLOSED, and narrowly: a decoder exists only where the
+/// KEY SET IS OPEN and a regex therefore cannot express the shape.
+/// `logfmt` and `json` qualify — there is no capture group for a key you
+/// do not know in advance. Anything POSITIONAL is what a regex does well
+/// and belongs in an `extract`; `apache-combined` is here because it is a
+/// published grammar many sites share and easy to get subtly wrong by
+/// hand, not because it could not be written as one.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
 pub enum Decoder {
+    /// `key=value` pairs. ⚠ The names are the PRODUCER's — the keys its
+    /// own lines carry — so nothing here can know them.
     Logfmt,
+    /// A JSON object. ⚠ TOP LEVEL only: a nested object is skipped and
+    /// there is no path syntax.
     Json,
+    /// NCSA common and combined. The decoder names the fields, being
+    /// positional: host, ident, user, time, request, status, bytes,
+    /// referer, agent, plus method, path and protocol split out of the
+    /// request line.
     ApacheCombined,
 }
 
 impl Decoder {
     /// The field names this decoder produces, where it decides them.
-    ///
-    /// `logfmt` and `json` do not: the names are the PRODUCER's — the
-    /// keys its own lines carry — so nothing here can know them and a
-    /// misspelled one is only discoverable at run time, as a `!drop`.
-    /// A positional format is the opposite: the decoder assigns every
-    /// name, so a rule naming one that cannot exist is refused at load.
+    /// `None` says the PRODUCER names them, so nothing can be checked
+    /// against it at load and a misspelling is only visible at run time.
     pub fn fields(self) -> Option<&'static [&'static str]> {
         match self {
             Decoder::Logfmt | Decoder::Json => None,
@@ -543,706 +685,435 @@ impl Decoder {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum Fields {
-    /// No parsing at all: a predicate and a count. Most generic metrics.
-    Entry,
+/// One measure. Exactly one of the five is set — and each one IS its own
+/// coarsening rule, which is what lets a tape be re-bucketed without a
+/// schema.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MeasureSpec {
+    /// One per claimed entry. Takes no field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub count: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<String>,
+    /// What the number IS — `ms`, `B`, `requests`. Free text, announced
+    /// once per run in a `!meta` marker, because the tape outlives the
+    /// document that described it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Histogram {
+    pub field: String,
+    /// Upper bounds, in the units of the field. ⚠ Buckets whose scale
+    /// does not match the field's produce a well-formed histogram that
+    /// means nothing, which is why `unit` is worth stating.
+    pub buckets: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+// ------------------------------------------------------------- compiling
+
+/// One metric, ready to run: predicates compiled, regex compiled, the
+/// measures resolved into the fields they read.
+pub struct Live {
+    pub metric: String,
+    pub unit: Option<String>,
+    claim: Option<crate::grep::Preds>,
+    fields: Option<Source>,
+    labels: Vec<String>,
+    measures: Vec<(Field, Option<String>)>,
+    histogram: Option<(String, Vec<f64>)>,
+    cite: bool,
+    roller: Roller,
+    announced: bool,
+    /// What this run has seen, which is what `--try` reports.
+    pub seen: Seen,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct Seen {
+    pub claimed: u64,
+    pub skipped: u64,
+    pub dropped: u64,
+    pub observations: u64,
+}
+
+enum Source {
     Decode(Decoder),
     Extract(Box<regex::bytes::Regex>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Measure {
-    Count,
-    Sum(String),
-    Min(String),
-    Max(String),
-    Last(String),
+/// A document's name is not a metric's: it is an identifier an operator
+/// types and a provisioning's `APPLY` lists, so it takes the character
+/// set a follower name does — legal as a directory entry, needing no
+/// escaping, and permitting the `-` that `apache-combined` wants.
+fn check_doc_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        bail!("an extractor has a name");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        bail!("{name:?} is not an extractor name (letters, digits, _ - and .)");
+    }
+    Ok(())
 }
 
-#[derive(Clone, Debug)]
-pub struct Rule {
-    pub metric: String,
-    pub select: String,
-    pub preds: crate::grep::PredSpec,
-    pub fields: Fields,
-    pub labels: Vec<String>,
-    pub measures: Vec<Measure>,
-    /// `OBSERVE` + `BUCKETS`: cumulative histogram buckets, emitted as
-    /// one series per `le` — Prometheus's own encoding, so a quantile is
-    /// read-time interpolation over additive data and needs no syntax of
-    /// its own.
-    pub histogram: Option<(String, Vec<f64>)>,
-    pub axis: Axis,
-    pub width_ms: u64,
-    pub grace_ms: u64,
-    pub revise_ms: u64,
-    pub cite: bool,
-    pub max_series: usize,
-    /// Where it was declared, for the message a collision has to make.
-    pub file: String,
-    pub line: usize,
-}
+impl Extractor {
+    /// Read one from JSON, checking everything that can be checked
+    /// without data: the version, the shape, the regexes, and every field
+    /// name whose source declares what it can produce.
+    pub fn parse(text: &str, from: &str) -> anyhow::Result<Extractor> {
+        let doc: Extractor = serde_json::from_str(text)
+            .with_context(|| format!("{from} is not a tally extractor document"))?;
+        doc.validate(from)?;
+        Ok(doc)
+    }
 
-impl Rule {
-    /// What a change to this rule changes about the numbers. Its own
-    /// name is deliberately NOT in it: renaming a metric is a new
-    /// series, not a drift of an old one.
-    pub fn definition(&self) -> String {
-        format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
-            self.preds,
-            match &self.fields {
-                Fields::Entry => "entry".to_string(),
-                Fields::Decode(d) => format!("{d:?}"),
-                Fields::Extract(r) => r.as_str().to_string(),
-            },
-            self.labels,
-            self.measures,
-            self.histogram,
-            self.axis,
-            self.width_ms,
-            self.select,
-        )
+    pub fn load(path: &Path) -> anyhow::Result<Extractor> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Extractor::parse(&text, &path.display().to_string())
+    }
+
+    fn validate(&self, from: &str) -> anyhow::Result<()> {
+        if self.v != EXTRACTOR_VERSION {
+            bail!(
+                "{from}: this build reads extractor documents at v={EXTRACTOR_VERSION}, \
+                 the document says v={}",
+                self.v
+            );
+        }
+        check_doc_name(&self.name).with_context(|| format!("{from}: name"))?;
+        if self.metrics.is_empty() {
+            bail!("{from}: an extractor with no metrics measures nothing");
+        }
+        if self.window.width_ms == 0 || !self.window.width_ms.is_multiple_of(1000) {
+            bail!("{from}: window.width_ms is whole seconds and not zero");
+        }
+        let mut named: BTreeMap<&str, usize> = BTreeMap::new();
+        for (i, m) in self.metrics.iter().enumerate() {
+            check_metric(&m.name).with_context(|| format!("{from}: metrics[{i}]"))?;
+            if m.name.starts_with(MARKER) {
+                bail!("{from}: metrics[{i}]: {MARKER} starts a MARKER, which no metric may name");
+            }
+            if let Some(first) = named.insert(&m.name, i) {
+                bail!(
+                    "{from}: metrics[{i}] repeats the name {:?} from metrics[{first}] — \
+                     a metric is named once",
+                    m.name
+                );
+            }
+            m.validate(from, i)?;
+        }
+        Ok(())
+    }
+
+    /// Compile every metric, in document order.
+    pub fn compile(&self, window: Window) -> anyhow::Result<Vec<Live>> {
+        self.metrics.iter().map(|m| m.compile(window)).collect()
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Defaults {
-    pub select: String,
-    pub axis: Option<Axis>,
-    pub width_ms: u64,
-    pub grace_ms: u64,
-    pub revise_ms: u64,
-    pub cite: bool,
-    pub max_series: usize,
-    /// Declared on every tally store this set writes.
-    pub declare: Vec<String>,
-    pub store_dir: Option<PathBuf>,
-    /// How a tally store is named after its source; `{name}` is the
-    /// source's.
-    pub name: String,
-}
-
-impl Default for Defaults {
-    fn default() -> Defaults {
-        Defaults {
-            select: "[]".to_string(),
-            axis: None,
-            width_ms: 60_000,
-            grace_ms: 120_000,
-            revise_ms: 3_600_000,
-            cite: true,
-            max_series: 1000,
-            declare: Vec::new(),
-            store_dir: None,
-            name: "{name}-tally".to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RuleSet {
-    pub rules: Vec<Rule>,
-    pub defaults: Defaults,
-}
-
-const SELECT: &str = "SELECT";
-const AXIS: &str = "AXIS";
-const WIDTH: &str = "WIDTH";
-const GRACE: &str = "GRACE";
-const REVISE: &str = "REVISE";
-const CITE: &str = "CITE";
-const MAX_SERIES: &str = "MAX_SERIES";
-const DECLARE: &str = "DECLARE";
-const STORE_DIR: &str = "STORE_DIR";
-const NAME: &str = "NAME";
-const HAS: &str = "HAS";
-const ANY: &str = "ANY";
-const SUBSTRING: &str = "SUBSTRING";
-const REGEX: &str = "REGEX";
-const NOT_HAS: &str = "NOT_HAS";
-const NOT_SUBSTRING: &str = "NOT_SUBSTRING";
-const NOT_REGEX: &str = "NOT_REGEX";
-const DECODE: &str = "DECODE";
-const EXTRACT: &str = "EXTRACT";
-const EXEC: &str = "EXEC";
-const LABELS: &str = "LABELS";
-const COUNT: &str = "COUNT";
-const SUM: &str = "SUM";
-const MIN: &str = "MIN";
-const MAX: &str = "MAX";
-const LAST: &str = "LAST";
-const OBSERVE: &str = "OBSERVE";
-const BUCKETS: &str = "BUCKETS";
-
-const KEYS: &[&str] = &[
-    SELECT,
-    AXIS,
-    WIDTH,
-    GRACE,
-    REVISE,
-    CITE,
-    MAX_SERIES,
-    DECLARE,
-    STORE_DIR,
-    NAME,
-    HAS,
-    ANY,
-    SUBSTRING,
-    REGEX,
-    NOT_HAS,
-    NOT_SUBSTRING,
-    NOT_REGEX,
-    DECODE,
-    EXTRACT,
-    EXEC,
-    LABELS,
-    COUNT,
-    SUM,
-    MIN,
-    MAX,
-    LAST,
-    OBSERVE,
-    BUCKETS,
-];
-
-/// Keys that belong to the preamble alone.
-const PREAMBLE_ONLY: &[&str] = &[DECLARE, STORE_DIR, NAME];
-
-#[derive(Default)]
-struct Open {
-    metric: String,
-    line: usize,
-    select: Option<String>,
-    axis: Option<Axis>,
-    width_ms: Option<u64>,
-    grace_ms: Option<u64>,
-    revise_ms: Option<u64>,
-    cite: Option<bool>,
-    max_series: Option<usize>,
-    preds: crate::grep::PredSpec,
-    fields: Option<Fields>,
-    fields_key: Option<&'static str>,
-    labels: Vec<String>,
-    measures: Vec<Measure>,
-    observe: Option<String>,
-    buckets: Option<Vec<f64>>,
-}
-
-/// Parse one rule file.
-///
-/// ⚠ A line this build cannot use is FATAL, as in `file.d` and for the
-/// same reason: a rule that was skipped is a metric nobody is measuring,
-/// and nothing later says so.
-pub fn parse(file: &str, text: &str) -> anyhow::Result<RuleSet> {
-    let mut defaults = Defaults::default();
-    let mut open: Option<Open> = None;
-    let mut rules: Vec<Rule> = Vec::new();
-    let mut named: BTreeMap<String, usize> = BTreeMap::new();
-
-    for (i, raw) in text.lines().enumerate() {
-        let line = i + 1;
-        let s = raw.trim();
-        if s.is_empty() || s.starts_with('#') {
-            continue;
-        }
-
-        if let Some(head) = s.strip_prefix('[') {
-            let Some(metric) = head.strip_suffix(']') else {
-                bail!("{file}:{line}: a section header ends with ']' — got {s:?}");
-            };
-            let metric = metric.trim().to_string();
-            check_metric(&metric).with_context(|| format!("{file}:{line}"))?;
-            if metric.starts_with(MARKER) {
-                bail!("{file}:{line}: {MARKER} starts a MARKER, which no rule may name");
-            }
-            if let Some(first) = named.insert(metric.clone(), line) {
-                bail!(
-                    "{file}:{line}: [{metric}] was already declared on line {first} — \
-                     a metric is named once"
-                );
-            }
-            if let Some(prev) = open.take() {
-                rules.push(close(prev, &defaults, file)?);
-            }
-            open = Some(Open {
-                metric,
-                line,
-                ..Open::default()
-            });
-            continue;
-        }
-
-        let Some((key, value)) = s.split_once('=') else {
-            bail!("{file}:{line}: expected KEY=VALUE or [metric] — got {s:?}");
+impl Metric {
+    fn source(&self) -> anyhow::Result<Option<Source>> {
+        let Some(f) = &self.fields else {
+            return Ok(None);
         };
-        let key = key.trim();
-        let value = value.trim();
-        if !KEYS.contains(&key) {
-            bail!(
-                "{file}:{line}: unknown key {key:?} — this build reads {}",
-                KEYS.join(", ")
-            );
-        }
-        let ms = |k: &str| -> anyhow::Result<u64> {
-            crate::append::parse_duration_ms(value).with_context(|| format!("{file}:{line}: {k}"))
-        };
-        let flag = || -> anyhow::Result<bool> {
-            match value {
-                "true" | "yes" | "1" | "" => Ok(true),
-                "false" | "no" | "0" => Ok(false),
-                other => bail!("{file}:{line}: {key}={other:?} is true or false"),
-            }
-        };
-        let words = || -> Vec<String> { value.split_whitespace().map(str::to_string).collect() };
-
-        let Some(cur) = open.as_mut() else {
-            match key {
-                SELECT => {
-                    defaults.select = crate::select::canonical(value)
-                        .with_context(|| format!("{file}:{line}: {SELECT}"))?
-                }
-                AXIS => defaults.axis = Some(parse_axis(value, file, line)?),
-                WIDTH => defaults.width_ms = width(ms(WIDTH)?, file, line)?,
-                GRACE => defaults.grace_ms = ms(GRACE)?,
-                REVISE => defaults.revise_ms = ms(REVISE)?,
-                CITE => defaults.cite = flag()?,
-                MAX_SERIES => defaults.max_series = value.parse()?,
-                DECLARE => defaults.declare = words(),
-                STORE_DIR => defaults.store_dir = Some(PathBuf::from(value)),
-                NAME => defaults.name = value.to_string(),
-                other => {
-                    bail!("{file}:{line}: {other} belongs to a section — it describes ONE metric")
-                }
-            };
-            continue;
-        };
-
-        if PREAMBLE_ONLY.contains(&key) {
-            bail!(
-                "{file}:{line}: {key} belongs to the preamble — it is a property of \
-                 the SET, not of [{}]",
-                cur.metric
-            );
-        }
-        let one_source = |cur: &mut Open, which: &'static str, f: Fields| -> anyhow::Result<()> {
-            if let Some(had) = cur.fields_key {
-                bail!(
-                    "{file}:{line}: [{}] already states {had} — a rule has ONE source \
-                     of fields",
-                    cur.metric
-                );
-            }
-            cur.fields_key = Some(which);
-            cur.fields = Some(f);
-            Ok(())
-        };
-        match key {
-            SELECT => {
-                cur.select = Some(
-                    crate::select::canonical(value)
-                        .with_context(|| format!("{file}:{line}: {SELECT}"))?,
-                )
-            }
-            AXIS => cur.axis = Some(parse_axis(value, file, line)?),
-            WIDTH => cur.width_ms = Some(width(ms(WIDTH)?, file, line)?),
-            GRACE => cur.grace_ms = Some(ms(GRACE)?),
-            REVISE => cur.revise_ms = Some(ms(REVISE)?),
-            CITE => cur.cite = Some(flag()?),
-            MAX_SERIES => cur.max_series = Some(value.parse()?),
-            HAS => cur
-                .preds
-                .all
-                .extend(words().iter().map(|w| pred(w, crate::grep::PredKind::Has))),
-            ANY => cur
-                .preds
-                .any
-                .extend(words().iter().map(|w| pred(w, crate::grep::PredKind::Has))),
-            NOT_HAS => cur
-                .preds
-                .none
-                .extend(words().iter().map(|w| pred(w, crate::grep::PredKind::Has))),
-            SUBSTRING => cur
-                .preds
-                .all
-                .push(pred(value, crate::grep::PredKind::Substring)),
-            NOT_SUBSTRING => cur
-                .preds
-                .none
-                .push(pred(value, crate::grep::PredKind::Substring)),
-            REGEX => cur
-                .preds
-                .all
-                .push(pred(value, crate::grep::PredKind::Regex)),
-            NOT_REGEX => cur
-                .preds
-                .none
-                .push(pred(value, crate::grep::PredKind::Regex)),
-            DECODE => {
-                let d = match value {
-                    "logfmt" => Decoder::Logfmt,
-                    "json" => Decoder::Json,
-                    "apache-combined" => Decoder::ApacheCombined,
-                    other => bail!(
-                        "{file}:{line}: no decoder {other:?} — this build has logfmt, json, \
-                         apache-combined; anything else is {EXTRACT}, or a consumer of \
-                         your own (see {EXEC})"
-                    ),
-                };
-                one_source(cur, DECODE, Fields::Decode(d))?
-            }
-            EXTRACT => {
-                let re = regex::bytes::Regex::new(value)
-                    .with_context(|| format!("{file}:{line}: {EXTRACT}"))?;
+        match (f.decode, &f.extract) {
+            (Some(d), None) => Ok(Some(Source::Decode(d))),
+            (None, Some(re)) => {
+                let re = regex::bytes::RegexBuilder::new(re)
+                    // ⚠ multi_line, for the same reason `grep`'s
+                    // predicates are: an entry may be several lines, and a
+                    // `$` that meant end-of-ENTRY in one place and
+                    // end-of-line in another is a trap nobody escapes twice.
+                    .multi_line(true)
+                    .build()
+                    .with_context(|| format!("metric {:?}: fields.extract", self.name))?;
                 if re.capture_names().flatten().count() == 0 {
                     bail!(
-                        "{file}:{line}: {EXTRACT} needs NAMED captures — (?P<status>…) is \
-                         what becomes a field"
+                        "metric {:?}: fields.extract has no NAMED captures — (?P<status>…) is \
+                         what becomes a field",
+                        self.name
                     );
                 }
-                one_source(cur, EXTRACT, Fields::Extract(Box::new(re)))?
+                Ok(Some(Source::Extract(Box::new(re))))
             }
-            // A RESERVED key rather than an unknown one: reaching for it
-            // is a reasonable instinct, and the answer is a route that
-            // already exists rather than a missing feature.
-            EXEC => bail!(
-                "{file}:{line}: [{}] states {EXEC} — there is no external extractor and \
-                 there will not be one. A program that needs state across entries is a \
-                 CONSUMER: register it as a follower, have it write a tally store of its \
-                 own, and pipe its width-0s observations through `timberfs tally --fold` \
-                 so it need not bucket them itself. Several tally stores may derive from \
-                 one log; a reader selects across them. See docs/plans/tally.md",
-                cur.metric
+            (None, None) => bail!(
+                "metric {:?}: fields is present but empty — state `decode` or `extract`, \
+                 or leave fields out",
+                self.name
             ),
-            LABELS => cur.labels = words(),
-            COUNT => {
-                if !flag()? {
-                    bail!("{file}:{line}: {COUNT} is stated or absent, never false");
-                }
-                cur.measures.push(Measure::Count)
-            }
-            SUM => cur.measures.push(Measure::Sum(value.to_string())),
-            MIN => cur.measures.push(Measure::Min(value.to_string())),
-            MAX => cur.measures.push(Measure::Max(value.to_string())),
-            LAST => cur.measures.push(Measure::Last(value.to_string())),
-            OBSERVE => cur.observe = Some(value.to_string()),
-            BUCKETS => {
-                let mut b: Vec<f64> = Vec::new();
-                for w in value.split_whitespace() {
-                    b.push(
-                        w.parse()
-                            .with_context(|| format!("{file}:{line}: {BUCKETS} {w:?}"))?,
-                    );
-                }
-                b.sort_by(|a, c| a.partial_cmp(c).unwrap_or(std::cmp::Ordering::Equal));
-                cur.buckets = Some(b)
-            }
-            other => bail!("{file}:{line}: {other} is not a section key"),
+            (Some(_), Some(_)) => bail!(
+                "metric {:?}: fields states both `decode` and `extract`, which is two \
+                 ways of reading one line",
+                self.name
+            ),
         }
     }
-    if let Some(prev) = open.take() {
-        rules.push(close(prev, &defaults, file)?);
-    }
-    Ok(RuleSet { rules, defaults })
-}
 
-fn pred(text: &str, kind: crate::grep::PredKind) -> crate::grep::Pred {
-    crate::grep::Pred {
-        kind,
-        text: text.to_string(),
-        caseless: false,
-    }
-}
-
-fn parse_axis(v: &str, file: &str, line: usize) -> anyhow::Result<Axis> {
-    match v {
-        "logline" => Ok(Axis::Logline),
-        "write" => Ok(Axis::Write),
-        other => bail!("{file}:{line}: {AXIS}={other:?} is logline or write"),
-    }
-}
-
-fn width(ms: u64, file: &str, line: usize) -> anyhow::Result<u64> {
-    if ms == 0 || !ms.is_multiple_of(1000) {
-        bail!("{file}:{line}: {WIDTH} is whole seconds and not zero");
-    }
-    Ok(ms)
-}
-
-/// Every field name a rule refers to, with the word for how it refers to
-/// it — so the error says "measures" or "labels with" rather than making
-/// the reader work out which line is wrong.
-fn named_fields(
-    measures: &[Measure],
-    histogram: &Option<(String, Vec<f64>)>,
-    labels: &[String],
-) -> Vec<(&'static str, String)> {
-    let mut out: Vec<(&'static str, String)> = measures
-        .iter()
-        .filter_map(|m| match m {
-            Measure::Count => None,
-            Measure::Sum(f) | Measure::Min(f) | Measure::Max(f) | Measure::Last(f) => {
-                Some(("measures", f.clone()))
-            }
-        })
-        .collect();
-    if let Some((f, _)) = histogram {
-        out.push(("observes", f.clone()));
-    }
-    out.extend(labels.iter().map(|l| ("labels with", l.clone())));
-    out
-}
-
-fn close(o: Open, d: &Defaults, file: &str) -> anyhow::Result<Rule> {
-    let at = o.line;
-    let histogram = match (o.observe, o.buckets) {
-        (Some(f), Some(b)) => Some((f, b)),
-        (Some(_), None) => bail!(
-            "{file}:{at}: [{}] states {OBSERVE} without {BUCKETS}",
-            o.metric
-        ),
-        (None, Some(_)) => bail!(
-            "{file}:{at}: [{}] states {BUCKETS} without {OBSERVE}",
-            o.metric
-        ),
-        (None, None) => None,
-    };
-    if o.measures.is_empty() && histogram.is_none() {
-        bail!(
-            "{file}:{at}: [{}] measures nothing — state {COUNT}, {SUM}=field, {MIN}/{MAX}/{LAST}, \
-             or {OBSERVE}+{BUCKETS}",
-            o.metric
-        );
-    }
-    let fields = o.fields.unwrap_or(Fields::Entry);
-    if matches!(fields, Fields::Entry) {
-        let needs: Vec<&str> = o
-            .measures
-            .iter()
-            .filter_map(|m| match m {
-                Measure::Count => None,
-                Measure::Sum(f) | Measure::Min(f) | Measure::Max(f) | Measure::Last(f) => {
-                    Some(f.as_str())
-                }
-            })
-            .chain(histogram.iter().map(|(f, _)| f.as_str()))
-            .chain(o.labels.iter().map(|s| s.as_str()))
-            .collect();
-        if let Some(f) = needs.first() {
-            bail!(
-                "{file}:{at}: [{}] names the field {f:?} but states no {DECODE} or \
-                 {EXTRACT} to get it from",
-                o.metric
-            );
-        }
-    }
-    for l in &o.labels {
-        if Field::parse(l).is_some() {
-            bail!(
-                "{file}:{at}: [{}] labels with {l:?}, which is a measure name",
-                o.metric
-            );
-        }
-    }
-    // Where the source names its own fields, a rule naming one it cannot
-    // produce is refused HERE. Otherwise the failure is 240 `!drop`
-    // markers and a silently label-less series — a metric nobody is
-    // measuring, found by reading the output rather than the config.
-    // `logfmt` and `json` take their names from the producer's own line,
-    // so there is nothing to check against and the run-time counter is
-    // the only signal there can be.
-    let known: Option<Vec<String>> = match &fields {
-        Fields::Extract(re) => Some(re.capture_names().flatten().map(str::to_string).collect()),
-        Fields::Decode(d) => d
-            .fields()
-            .map(|f| f.iter().map(|s| s.to_string()).collect()),
-        Fields::Entry => None,
-    };
-    if let Some(known) = known {
-        for (what, name) in named_fields(&o.measures, &histogram, &o.labels) {
-            if !known.contains(&name) {
-                bail!(
-                    "{file}:{at}: [{}] {what} {name:?}, which this rule's {} cannot produce \
-                     — it has {}",
-                    o.metric,
-                    match &fields {
-                        Fields::Extract(_) => EXTRACT,
-                        _ => DECODE,
-                    },
-                    known.join(", ")
-                );
-            }
-        }
-    }
-    let axis = o.axis.or(d.axis).with_context(|| {
-        format!(
-            "{file}:{at}: [{}] has no {AXIS} and the preamble sets none — \
-             logline and write bucket differently and there is no safe default",
-            o.metric
-        )
-    })?;
-    Ok(Rule {
-        metric: o.metric,
-        select: o.select.unwrap_or_else(|| d.select.clone()),
-        preds: o.preds,
-        fields,
-        labels: o.labels,
-        measures: o.measures,
-        histogram,
-        axis,
-        width_ms: o.width_ms.unwrap_or(d.width_ms),
-        grace_ms: o.grace_ms.unwrap_or(d.grace_ms),
-        revise_ms: o.revise_ms.unwrap_or(d.revise_ms),
-        cite: o.cite.unwrap_or(d.cite),
-        max_series: o.max_series.unwrap_or(d.max_series),
-        file: file.to_string(),
-        line: at,
-    })
-}
-
-/// Load a file, or every `*.conf` in a directory.
-///
-/// A directory is read WHOLE by one process: two rule files may match one
-/// source store and there is one writer per store, so the file split is
-/// for editing, not for supervision — unlike `file.d`, where a set is a
-/// unit of both.
-pub fn load(path: &Path) -> anyhow::Result<RuleSet> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    if path.is_dir() {
-        let mut names: Vec<PathBuf> = std::fs::read_dir(path)
-            .with_context(|| format!("reading {}", path.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "conf"))
-            .collect();
-        names.sort();
-        files.extend(names);
-    } else {
-        files.push(path.to_path_buf());
-    }
-    if files.is_empty() {
-        bail!("no *.conf under {}", path.display());
-    }
-    let mut all: Vec<Rule> = Vec::new();
-    let mut defaults = Defaults::default();
-    let mut where_named: BTreeMap<String, (String, usize)> = BTreeMap::new();
-    for f in &files {
-        let text =
-            std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
-        let name = f.display().to_string();
-        let set = parse(&name, &text)?;
-        for r in &set.rules {
-            if let Some((other, line)) = where_named.get(&r.metric) {
-                if *other != r.file {
-                    // Refused rather than merged or last-one-wins: which
-                    // definition a number came from must not depend on
-                    // readdir order.
-                    bail!(
-                        "{}:{}: [{}] is also declared at {other}:{line} — a metric is \
-                         defined once",
-                        r.file,
-                        r.line,
-                        r.metric
-                    );
-                }
-            }
-            where_named.insert(r.metric.clone(), (r.file.clone(), r.line));
-        }
-        // The last file's preamble wins for the SET-wide facts; per-rule
-        // ones were already resolved against their own file's preamble.
-        defaults = set.defaults;
-        all.extend(set.rules);
-    }
-    Ok(RuleSet {
-        rules: all,
-        defaults,
-    })
-}
-
-impl RuleSet {
-    /// The rules that apply to one store, by what it declares.
-    pub fn for_store(&self, manifest: &Map<String, Value>) -> anyhow::Result<Vec<&Rule>> {
+    fn measures(&self) -> anyhow::Result<Vec<(Field, Option<String>)>> {
         let mut out = Vec::new();
-        for r in &self.rules {
-            let sel = crate::select::Selector::parse(&r.select)?;
-            if sel.matches(manifest) {
-                out.push(r);
+        for (i, m) in self.measure.iter().enumerate() {
+            let set: Vec<(Field, Option<String>)> = [
+                m.count.then_some((Field::Count, None)),
+                m.sum.clone().map(|f| (Field::Sum, Some(f))),
+                m.min.clone().map(|f| (Field::Min, Some(f))),
+                m.max.clone().map(|f| (Field::Max, Some(f))),
+                m.last.clone().map(|f| (Field::Last, Some(f))),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            match set.len() {
+                1 => out.push(set.into_iter().next().expect("one")),
+                0 => bail!(
+                    "metric {:?}: measure[{i}] measures nothing — state `count`, or \
+                     `sum`/`min`/`max`/`last` with a field",
+                    self.name
+                ),
+                _ => bail!(
+                    "metric {:?}: measure[{i}] states more than one measure — give each \
+                     its own entry in the list",
+                    self.name
+                ),
             }
         }
         Ok(out)
     }
+
+    fn validate(&self, from: &str, i: usize) -> anyhow::Result<()> {
+        let ctx = |e: anyhow::Error| anyhow::anyhow!("{from}: metrics[{i}]: {e}");
+        let source = self.source().map_err(ctx)?;
+        let measures = self.measures().map_err(ctx)?;
+        if measures.is_empty() && self.histogram.is_none() {
+            bail!(
+                "{from}: metrics[{i}]: {:?} measures nothing — state a `measure`, or a \
+                 `histogram`",
+                self.name
+            );
+        }
+        if let Some(h) = &self.histogram {
+            if h.buckets.is_empty() {
+                bail!("{from}: metrics[{i}]: histogram.buckets is empty");
+            }
+            if h.buckets.iter().any(|b| !b.is_finite()) {
+                bail!(
+                    "{from}: metrics[{i}]: histogram.buckets must be finite — the +Inf \
+                     bucket is always emitted and is not written down"
+                );
+            }
+        }
+        for l in &self.labels {
+            if Field::parse(l).is_some() {
+                bail!(
+                    "{from}: metrics[{i}]: labels with {l:?}, which is a measure name — \
+                     dispatch on a line is by key, so the two namespaces cannot overlap"
+                );
+            }
+        }
+        // Every field this metric refers to, against what its source can
+        // produce — where the source declares that at all.
+        let named: Vec<(&str, &str)> = measures
+            .iter()
+            .filter_map(|(_, f)| f.as_deref().map(|f| ("measures", f)))
+            .chain(
+                self.histogram
+                    .iter()
+                    .map(|h| ("observes", h.field.as_str())),
+            )
+            .chain(self.labels.iter().map(|l| ("labels with", l.as_str())))
+            .collect();
+        match &source {
+            None => {
+                if let Some((what, f)) = named.first() {
+                    bail!(
+                        "{from}: metrics[{i}]: {} {f:?} but states no `fields` to read it \
+                         from",
+                        what
+                    );
+                }
+            }
+            Some(src) => {
+                let known: Option<Vec<String>> = match src {
+                    Source::Extract(re) => {
+                        Some(re.capture_names().flatten().map(str::to_string).collect())
+                    }
+                    Source::Decode(d) => d
+                        .fields()
+                        .map(|f| f.iter().map(|s| s.to_string()).collect()),
+                };
+                if let Some(known) = known {
+                    for (what, f) in &named {
+                        if !known.iter().any(|k| k == f) {
+                            bail!(
+                                "{from}: metrics[{i}]: {what} {f:?}, which this metric's \
+                                 source cannot produce — it has {}",
+                                known.join(", ")
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn compile(&self, window: Window) -> anyhow::Result<Live> {
+        let claim = match &self.claim {
+            None => None,
+            Some(c) => {
+                let spec = crate::grep::PredSpec {
+                    all: compile_preds(&c.all)?,
+                    any: compile_preds(&c.any)?,
+                    none: compile_preds(&c.none)?,
+                };
+                if spec.is_empty() {
+                    None
+                } else {
+                    Some(crate::grep::Preds::compile(spec)?)
+                }
+            }
+        };
+        Ok(Live {
+            metric: self.name.clone(),
+            unit: self
+                .histogram
+                .as_ref()
+                .and_then(|h| h.unit.clone())
+                .or_else(|| self.measure.iter().find_map(|m| m.unit.clone())),
+            claim,
+            fields: self.source()?,
+            labels: self.labels.clone(),
+            measures: self.measures()?,
+            histogram: self
+                .histogram
+                .as_ref()
+                .map(|h| (h.field.clone(), sorted(&h.buckets))),
+            cite: self.cite.unwrap_or(true),
+            roller: Roller::new(
+                window.width_ms,
+                window.grace_ms,
+                window.revise_ms,
+                window.max_series,
+            ),
+            announced: false,
+            seen: Seen::default(),
+        })
+    }
+}
+
+fn sorted(b: &[f64]) -> Vec<f64> {
+    let mut v = b.to_vec();
+    v.sort_by(|a, c| a.partial_cmp(c).unwrap_or(std::cmp::Ordering::Equal));
+    v
+}
+
+fn compile_preds(list: &[crate::querydoc::Predicate]) -> anyhow::Result<Vec<crate::grep::Pred>> {
+    list.iter().map(|p| p.compile()).collect()
 }
 
 // ------------------------------------------------------------- extraction
 
-/// One entry's fields, as whatever source the rule declared reads them.
-fn decode(d: Decoder, entry: &[u8]) -> BTreeMap<String, String> {
+/// One entry's fields, as whatever source the metric declared reads them.
+///
+/// `None` means the line is NOT OF THIS SHAPE — an ordinary event on a
+/// store carrying many shapes, and not a loss. An empty map means the
+/// shape fit and carried nothing.
+fn decode(d: Decoder, entry: &[u8]) -> Option<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     match d {
         Decoder::Logfmt => {
             let text = String::from_utf8_lossy(entry);
             let line = text.lines().next().unwrap_or("");
-            if let Ok(toks) = tokenize(line) {
-                for t in toks {
-                    if let Some((k, v)) = t.split_once('=') {
-                        out.insert(k.to_string(), v.to_string());
-                    }
+            let toks = tokenize(line).ok()?;
+            for t in toks {
+                if let Some((k, v)) = t.split_once('=') {
+                    out.insert(k.to_string(), v.to_string());
                 }
+            }
+            // No pair at all is not a logfmt line.
+            if out.is_empty() {
+                return None;
             }
         }
         Decoder::Json => {
-            if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(entry) {
-                for (k, v) in map {
-                    let s = match v {
-                        Value::String(s) => s,
-                        Value::Null | Value::Array(_) | Value::Object(_) => continue,
-                        other => other.to_string(),
-                    };
-                    out.insert(k, s);
-                }
+            let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(entry) else {
+                return None;
+            };
+            for (k, v) in map {
+                let s = match v {
+                    Value::String(s) => s,
+                    Value::Null | Value::Array(_) | Value::Object(_) => continue,
+                    other => other.to_string(),
+                };
+                out.insert(k, s);
             }
         }
         Decoder::ApacheCombined => {
             let text = String::from_utf8_lossy(entry);
             let line = text.lines().next().unwrap_or("");
-            if let Some(c) = apache_re().captures(line) {
-                let mut put = |k: &str, i: usize| {
-                    if let Some(m) = c.get(i) {
-                        if m.as_str() != "-" {
-                            out.insert(k.to_string(), m.as_str().to_string());
+            let c = apache_re().captures(line)?;
+            // ⚠ `-` means ABSENT for an identity and ZERO for a count:
+            // CLF writes it for %b when no body was sent, so reading it
+            // as absent turns every empty response into an unreadable
+            // entry and a `!drop` that says the numbers are wrong.
+            let mut put = |k: &str, i: usize| {
+                if let Some(m) = c.get(i) {
+                    match (m.as_str(), k) {
+                        ("-", "bytes") => {
+                            out.insert(k.to_string(), "0".to_string());
+                        }
+                        ("-", _) => {}
+                        (v, _) => {
+                            out.insert(k.to_string(), v.to_string());
                         }
                     }
-                };
-                put("host", 1);
-                put("ident", 2);
-                put("user", 3);
-                put("time", 4);
-                put("request", 5);
-                put("status", 6);
-                put("bytes", 7);
-                put("referer", 8);
-                put("agent", 9);
-                if let Some(req) = out.get("request").cloned() {
-                    let mut parts = req.split(' ');
-                    if let Some(m) = parts.next() {
-                        out.insert("method".to_string(), m.to_string());
-                    }
-                    if let Some(p) = parts.next() {
-                        out.insert("path".to_string(), p.to_string());
-                    }
-                    if let Some(p) = parts.next() {
-                        out.insert("protocol".to_string(), p.to_string());
-                    }
+                }
+            };
+            put("host", 1);
+            put("ident", 2);
+            put("user", 3);
+            put("time", 4);
+            put("request", 5);
+            put("status", 6);
+            put("bytes", 7);
+            put("referer", 8);
+            put("agent", 9);
+            if let Some(req) = out.get("request").cloned() {
+                let mut parts = req.split(' ');
+                if let Some(m) = parts.next() {
+                    out.insert("method".to_string(), m.to_string());
+                }
+                if let Some(p) = parts.next() {
+                    out.insert("path".to_string(), p.to_string());
+                }
+                if let Some(p) = parts.next() {
+                    out.insert("protocol".to_string(), p.to_string());
                 }
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// NCSA common and combined, which differ only by the last two fields —
 /// hence one pattern with them optional. Anything else a producer emits
-/// is `EXTRACT`'s job, deliberately: Apache's `LogFormat` is
+/// is `extract`'s job, deliberately: Apache's `LogFormat` is
 /// configurable, so "the Apache format" is not a thing a decoder can
 /// claim to know.
 fn apache_re() -> &'static regex::Regex {
@@ -1256,138 +1127,132 @@ fn apache_re() -> &'static regex::Regex {
 }
 
 pub enum Outcome {
-    /// The predicate did not select this entry: not a loss, and not
-    /// counted as one.
+    /// Not this metric's line: the claim did not select it, or it is not
+    /// of the shape the source reads. ⚠ NOT a loss, and not counted as
+    /// one — on a store carrying many shapes this is the ordinary case,
+    /// and a counter that conflated it with a real failure would be noise
+    /// exactly where signal is wanted.
     Skipped,
     Observed(Vec<Sample>),
-    /// Selected, and then not measurable. Counted and reported — never
-    /// silently dropped.
+    /// Claimed, of the right shape, and then unreadable. A real defect:
+    /// the number is now wrong rather than merely absent.
     Dropped(&'static str),
 }
 
-pub fn observe(
-    rule: &Rule,
-    preds: &crate::grep::Preds,
-    entry: &[u8],
-    ts: u64,
-    cite: Option<(u64, u64)>,
-) -> Outcome {
-    if !preds.is_empty() && !preds.keep(entry) {
-        return Outcome::Skipped;
-    }
-    let fields = match &rule.fields {
-        Fields::Entry => BTreeMap::new(),
-        Fields::Decode(d) => decode(*d, entry),
-        Fields::Extract(re) => {
-            let Some(c) = re.captures(entry) else {
-                return Outcome::Dropped("nomatch");
+impl Live {
+    pub fn observe(&self, entry: &[u8], ts: u64, cite: Option<(u64, u64)>) -> Outcome {
+        if let Some(preds) = &self.claim {
+            if !preds.keep(entry) {
+                return Outcome::Skipped;
+            }
+        }
+        let fields = match &self.fields {
+            None => BTreeMap::new(),
+            Some(Source::Decode(d)) => match decode(*d, entry) {
+                Some(f) => f,
+                None => return Outcome::Skipped,
+            },
+            Some(Source::Extract(re)) => {
+                let Some(c) = re.captures(entry) else {
+                    return Outcome::Skipped;
+                };
+                let mut out = BTreeMap::new();
+                for name in re.capture_names().flatten() {
+                    if let Some(m) = c.name(name) {
+                        out.insert(
+                            name.to_string(),
+                            String::from_utf8_lossy(m.as_bytes()).into(),
+                        );
+                    }
+                }
+                out
+            }
+        };
+
+        // An absent label is OMITTED, which reads as the empty string in
+        // every selector — the rule the whole tree already follows.
+        let labels: Vec<(String, String)> = self
+            .labels
+            .iter()
+            .filter_map(|k| fields.get(k).map(|v| (k.clone(), v.clone())))
+            .collect();
+
+        let num =
+            |key: &str| -> Option<f64> { fields.get(key).and_then(|v| v.parse::<f64>().ok()) };
+        let cite = if self.cite { cite } else { None };
+
+        let mut out = Vec::new();
+        if !self.measures.is_empty() {
+            let mut s = Sample::new(ts, 0, &self.metric);
+            s.labels = labels.clone();
+            s.labels.sort();
+            s.cite = cite;
+            for (f, from) in &self.measures {
+                let v = match from {
+                    None => 1.0,
+                    Some(key) => match num(key) {
+                        Some(v) => v,
+                        None => return Outcome::Dropped("unreadable"),
+                    },
+                };
+                s = s.field(*f, v);
+            }
+            out.push(s);
+        }
+
+        if let Some((key, bounds)) = &self.histogram {
+            let Some(v) = num(key) else {
+                return Outcome::Dropped("unreadable");
             };
-            let mut out = BTreeMap::new();
-            for name in re.capture_names().flatten() {
-                if let Some(m) = c.name(name) {
-                    out.insert(
-                        name.to_string(),
-                        String::from_utf8_lossy(m.as_bytes()).into(),
-                    );
+            // Cumulative, as Prometheus spells it: every bucket at or
+            // above the value counts it, so coarsening stays addition and
+            // a quantile is interpolation over sums.
+            for b in bounds {
+                if v <= *b {
+                    let mut s = Sample::new(ts, 0, &self.metric);
+                    s.labels = labels.clone();
+                    s.labels.push(("le".to_string(), number(*b)));
+                    s.labels.sort();
+                    s.cite = cite;
+                    out.push(s.field(Field::Count, 1.0));
                 }
             }
-            out
+            let mut inf = Sample::new(ts, 0, &self.metric);
+            inf.labels = labels;
+            inf.labels.push(("le".to_string(), "+Inf".to_string()));
+            inf.labels.sort();
+            inf.cite = cite;
+            // The +Inf bucket carries the total, so an average needs no
+            // second metric.
+            out.push(inf.field(Field::Count, 1.0).field(Field::Sum, v));
         }
-    };
 
-    // An absent label is OMITTED, which reads as the empty string in
-    // every selector — the rule the whole tree already follows.
-    let labels: Vec<(String, String)> = rule
-        .labels
-        .iter()
-        .filter_map(|k| fields.get(k).map(|v| (k.clone(), v.clone())))
-        .collect();
-
-    let num = |key: &str| -> Option<f64> { fields.get(key).and_then(|v| v.parse::<f64>().ok()) };
-
-    let mut out = Vec::new();
-    if !rule.measures.is_empty() {
-        let mut s = Sample::new(ts, 0, &rule.metric);
-        s.labels = labels.clone();
-        s.labels.sort();
-        s.cite = if rule.cite { cite } else { None };
-        for m in &rule.measures {
-            let (f, v) = match m {
-                Measure::Count => (Field::Count, 1.0),
-                Measure::Sum(k) => match num(k) {
-                    Some(v) => (Field::Sum, v),
-                    None => return Outcome::Dropped("unparsed"),
-                },
-                Measure::Min(k) => match num(k) {
-                    Some(v) => (Field::Min, v),
-                    None => return Outcome::Dropped("unparsed"),
-                },
-                Measure::Max(k) => match num(k) {
-                    Some(v) => (Field::Max, v),
-                    None => return Outcome::Dropped("unparsed"),
-                },
-                Measure::Last(k) => match num(k) {
-                    Some(v) => (Field::Last, v),
-                    None => return Outcome::Dropped("unparsed"),
-                },
-            };
-            s = s.field(f, v);
-        }
-        out.push(s);
+        Outcome::Observed(out)
     }
-
-    if let Some((key, bounds)) = &rule.histogram {
-        let Some(v) = num(key) else {
-            return Outcome::Dropped("unparsed");
-        };
-        // Cumulative, as Prometheus spells it: every bucket at or above
-        // the value counts it, so coarsening stays addition and a
-        // quantile is interpolation over sums.
-        for b in bounds {
-            if v <= *b {
-                let mut s = Sample::new(ts, 0, &rule.metric);
-                s.labels = labels.clone();
-                s.labels.push(("le".to_string(), number(*b)));
-                s.labels.sort();
-                s.cite = if rule.cite { cite } else { None };
-                out.push(s.field(Field::Count, 1.0));
-            }
-        }
-        let mut inf = Sample::new(ts, 0, &rule.metric);
-        inf.labels = labels;
-        inf.labels.push(("le".to_string(), "+Inf".to_string()));
-        inf.labels.sort();
-        inf.cite = if rule.cite { cite } else { None };
-        // The +Inf bucket carries the total, so an average needs no
-        // second metric.
-        out.push(inf.field(Field::Count, 1.0).field(Field::Sum, v));
-    }
-
-    Outcome::Observed(out)
 }
 
 // -------------------------------------------------------------- the command
 
 pub struct TallyOpts {
-    /// Absent under `--fold`, which needs no rules: it buckets lines
-    /// somebody else produced.
-    pub rules: Option<PathBuf>,
-    /// Read width-`0s` OBSERVATION lines on stdin and write buckets,
-    /// instead of reading a records stream.
+    /// Extractor documents, repeatable. A directory takes every `*.json`
+    /// in it.
+    pub extractors: Vec<PathBuf>,
+    /// Validate and apply to PLAIN LOG LINES on stdin rather than a
+    /// records stream, reporting per metric on stderr.
     ///
-    /// This is what makes "write your own extractor" a real answer
-    /// rather than an invitation to reimplement sealing, revisions and
-    /// the citation span: a program emits observations, pipes them
-    /// through here, and the fold is the one that ships.
+    /// The tally lines still go to stdout alone, which is what makes a
+    /// `--try` run diffable against a golden file — and therefore what
+    /// tests every extractor this repository ships.
+    pub try_it: bool,
+    /// Validate and report, reading nothing.
+    pub check: bool,
     pub fold: Option<FoldOpts>,
-    /// Print the width-`0s` observations instead of bucketing them —
-    /// the debugging path, and the way to see what `--fold` takes.
+    /// Print the width-`0s` observations instead of bucketing them.
     pub observations: bool,
     /// Only these metrics, for recomputing one over history.
     pub metrics: Vec<String>,
-    /// The store the stream came from, when it cannot say — a
-    /// `query --records` answer names a path but carries no labels.
-    pub store: Option<PathBuf>,
+    /// Override the extractors' own window.
+    pub width_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1400,10 +1265,6 @@ pub struct FoldOpts {
 
 /// Bucket observation lines from stdin. The metric, labels and measures
 /// are the input's; only the window is this side's.
-///
-/// ⚠ A line that does not parse is FATAL, not skipped. A fold that
-/// quietly dropped a tenth of its input would report numbers that are
-/// wrong rather than missing, and nothing downstream could tell.
 pub fn cmd_fold(o: &FoldOpts) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -1413,6 +1274,9 @@ pub fn cmd_fold(o: &FoldOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// ⚠ A line that does not parse is FATAL, not skipped. A fold that
+/// quietly dropped a tenth of its input would report numbers that are
+/// wrong rather than missing, and nothing downstream could tell.
 pub fn fold_stream(
     o: &FoldOpts,
     input: impl std::io::BufRead,
@@ -1426,10 +1290,6 @@ pub fn fold_stream(
         }
         let s = Sample::parse(&line).with_context(|| format!("stdin line {}", n + 1))?;
         if s.width_ms != 0 {
-            // Re-bucketing a tape is legitimate and is the same fold, but
-            // it must be asked for knowingly: silently accepting a
-            // 60s line into a 60s fold would double every count on a
-            // re-run.
             bail!(
                 "stdin line {}: width {} — `--fold` takes OBSERVATIONS (width 0s). \
                  Re-bucketing an existing tape is the same operation and will be its \
@@ -1445,137 +1305,325 @@ pub fn fold_stream(
     Ok(())
 }
 
-struct Live<'a> {
-    rule: &'a Rule,
-    preds: crate::grep::Preds,
-    roller: Roller,
+/// Every extractor named, with duplicate names refused across files.
+pub fn load_extractors(paths: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Extractor)>> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(p)
+                .with_context(|| format!("reading {}", p.display()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                .collect();
+            found.sort();
+            if found.is_empty() {
+                bail!("no *.json under {}", p.display());
+            }
+            files.extend(found);
+        } else {
+            files.push(p.clone());
+        }
+    }
+    let mut out: Vec<(PathBuf, Extractor)> = Vec::new();
+    for f in files {
+        let doc = Extractor::load(&f)?;
+        // Refused rather than merged or last-one-wins: which definition a
+        // number came from must not depend on readdir order.
+        if let Some((other, _)) = out.iter().find(|(_, d)| d.name == doc.name) {
+            bail!(
+                "{}: the extractor named {:?} is also defined by {} — a name is claimed \
+                 once",
+                f.display(),
+                doc.name,
+                other.display()
+            );
+        }
+        out.push((f, doc));
+    }
+    Ok(out)
+}
+
+/// One run: every metric of every extractor, fed entries.
+struct Run {
+    live: Vec<Live>,
+}
+
+impl Run {
+    fn new(docs: &[(PathBuf, Extractor)], opts: &TallyOpts) -> anyhow::Result<Run> {
+        let mut live = Vec::new();
+        for (path, doc) in docs {
+            let mut window = doc.window;
+            if let Some(w) = opts.width_ms {
+                window.width_ms = w;
+            }
+            for m in doc
+                .compile(window)
+                .with_context(|| path.display().to_string())?
+            {
+                if opts.metrics.is_empty() || opts.metrics.contains(&m.metric) {
+                    live.push(m);
+                }
+            }
+        }
+        for want in &opts.metrics {
+            if !live.iter().any(|l| l.metric == *want) {
+                bail!("no metric named {want:?} in the extractors given");
+            }
+        }
+        if live.is_empty() {
+            bail!("the extractors given define no metrics");
+        }
+        Ok(Run { live })
+    }
+
+    fn feed(
+        &mut self,
+        e: &crate::records::EntryRec,
+        axis: Axis,
+        out: &mut impl Write,
+        observations: bool,
+    ) -> anyhow::Result<()> {
+        let mut batch: Vec<Sample> = Vec::new();
+        for l in self.live.iter_mut() {
+            let ts = match axis {
+                Axis::Logline => e.ts,
+                // The chunk's first write is the best arrival stamp an
+                // entry carries, so a write-axis bucket is only as fine
+                // as a chunk.
+                Axis::Write => e.wf,
+            };
+            let cite = e.offset.map(|off| (off, e.payload.len() as u64));
+            let Some(ts) = ts else {
+                l.seen.dropped += 1;
+                note_drop(&mut l.roller, &l.metric, "nostamp", None);
+                continue;
+            };
+            match l.observe(&e.payload, ts, cite) {
+                Outcome::Skipped => l.seen.skipped += 1,
+                Outcome::Dropped(why) => {
+                    l.seen.dropped += 1;
+                    note_drop(&mut l.roller, &l.metric, why, Some(ts));
+                }
+                Outcome::Observed(obs) => {
+                    l.seen.claimed += 1;
+                    l.seen.observations += obs.len() as u64;
+                    // The unit is announced ONCE per run rather than on
+                    // every line: the tape outlives the document that
+                    // described it, and a number whose unit is unknown is
+                    // a number nobody can act on.
+                    if !l.announced {
+                        l.announced = true;
+                        if let Some(u) = &l.unit {
+                            writeln!(
+                                out,
+                                "{}",
+                                Sample::new(ts, 0, "!meta")
+                                    .label("metric", &l.metric)
+                                    .label("unit", u)
+                                    .render()
+                            )?;
+                        }
+                    }
+                    for o in &obs {
+                        if observations {
+                            writeln!(out, "{}", o.render())?;
+                        } else {
+                            l.roller.add(o);
+                        }
+                    }
+                }
+            }
+            if !observations {
+                batch.extend(l.roller.drain(false));
+            }
+        }
+        emit(out, batch)
+    }
+
+    fn finish(&mut self, out: &mut impl Write, observations: bool) -> anyhow::Result<()> {
+        if observations {
+            return Ok(());
+        }
+        let mut batch: Vec<Sample> = Vec::new();
+        for l in self.live.iter_mut() {
+            batch.extend(l.roller.drain(true));
+        }
+        emit(out, batch)
+    }
 }
 
 pub fn cmd_tally(opts: &TallyOpts) -> anyhow::Result<()> {
     if let Some(fold) = &opts.fold {
         return cmd_fold(fold);
     }
-    let Some(rules) = &opts.rules else {
-        bail!("--rules names what to measure; --fold buckets observations somebody else made");
-    };
-    let set = load(rules)?;
-    let stdin = std::io::stdin();
-    let mut reader = crate::records::Reader::new(stdin.lock());
+    let docs = load_extractors(&opts.extractors)?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
-    let mut manifest: Option<Map<String, Value>> = opts.store.as_ref().and_then(|p| {
-        Some(crate::select::selectable_of(
-            p.parent()?,
-            p.file_name()?.to_str()?,
-        ))
-    });
-    let mut live: Option<Vec<Live>> = None;
-    let mut seen_store: Option<String> = None;
-    let mut ended = false;
+    if opts.check {
+        for (path, doc) in &docs {
+            eprintln!(
+                "{} — {} ({} metric(s), window {} {:?}, grace {})",
+                doc.name,
+                path.display(),
+                doc.metrics.len(),
+                render_width(doc.window.width_ms),
+                doc.window.axis,
+                render_width(doc.window.grace_ms),
+            );
+            // Compiling is the check: predicates, regexes and every field
+            // name whose source declares what it can produce.
+            doc.compile(doc.window)?;
+            for m in &doc.metrics {
+                eprintln!(
+                    "  {:<24} {}",
+                    m.name,
+                    m.description.as_deref().unwrap_or("")
+                );
+            }
+        }
+        return Ok(());
+    }
 
+    let axis = axis_of(&docs)?;
+    let mut run = Run::new(&docs, opts)?;
+
+    if opts.try_it {
+        let mut text = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut text)?;
+        let tried = try_text(&docs, opts, &text)?;
+        eprintln!(
+            "{} entr{} from {} byte(s) of plain text",
+            tried.entries,
+            if tried.entries == 1 { "y" } else { "ies" },
+            text.len()
+        );
+        out.write_all(tried.tally.as_bytes())?;
+        out.flush()?;
+        for (metric, s) in &tried.seen {
+            eprintln!(
+                "  {metric:<24} claimed {}, skipped {}, dropped {} -> {} observation(s)",
+                s.claimed, s.skipped, s.dropped, s.observations
+            );
+        }
+        return Ok(());
+    }
+
+    let stdin = std::io::stdin();
+    let mut reader = crate::records::Reader::new(stdin.lock());
+    let mut ended = false;
     while let Some(rec) = reader.next_rec()? {
         match rec {
-            crate::records::Rec::Source(fields) => {
-                let get = |k: &str| fields.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
-                if let Some(id) = get("id").or_else(|| get("path")) {
-                    one_store(&mut seen_store, &id)?;
-                }
-                if let Some(text) = get("labels") {
-                    if let Ok(Value::Object(m)) = serde_json::from_str(&text) {
-                        manifest = Some(m);
-                        live = None;
-                    }
-                } else if manifest.is_none() {
-                    if let Some(p) = get("path") {
-                        let p = PathBuf::from(p);
-                        if let (Some(dir), Some(name)) = (p.parent(), p.file_name()) {
-                            if let Some(name) = name.to_str() {
-                                manifest = Some(crate::select::selectable_of(dir, name));
-                            }
-                        }
-                    }
-                }
-            }
-            crate::records::Rec::Entry(e) => {
-                if let Some(id) = e.id.clone().or_else(|| e.src.clone()) {
-                    one_store(&mut seen_store, &id)?;
-                }
-                let rules = match live.as_mut() {
-                    Some(l) => l,
-                    None => {
-                        live = Some(resolve_rules(&set, manifest.as_ref(), &opts.metrics)?);
-                        live.as_mut().expect("just set")
-                    }
-                };
-                let mut batch: Vec<Sample> = Vec::new();
-                for l in rules.iter_mut() {
-                    let ts = match l.rule.axis {
-                        Axis::Logline => e.ts,
-                        // The chunk's first write is the best arrival
-                        // stamp an entry carries — so a write-axis
-                        // bucket is only as fine as a chunk, and on a
-                        // quiet log that is coarse. `.rings` answers
-                        // volume on this axis exactly and for nothing;
-                        // prefer it where it can.
-                        Axis::Write => e.wf,
-                    };
-                    let cite = e.offset.map(|off| (off, e.payload.len() as u64));
-                    let Some(ts) = ts else {
-                        // No stamp is the one case with no time to charge
-                        // it to: the watermark is the nearest thing.
-                        note_drop(&mut l.roller, &l.rule.metric, "nostamp", None);
-                        continue;
-                    };
-                    match observe(l.rule, &l.preds, &e.payload, ts, cite) {
-                        Outcome::Skipped => {}
-                        Outcome::Dropped(why) => {
-                            note_drop(&mut l.roller, &l.rule.metric, why, Some(ts))
-                        }
-                        Outcome::Observed(obs) => {
-                            for o in &obs {
-                                if opts.observations {
-                                    writeln!(out, "{}", o.render())?;
-                                } else {
-                                    l.roller.add(o);
-                                }
-                            }
-                        }
-                    }
-                    if !opts.observations {
-                        batch.extend(l.roller.drain(false));
-                    }
-                }
-                emit(&mut out, batch)?;
-            }
+            crate::records::Rec::Entry(e) => run.feed(&e, axis, &mut out, opts.observations)?,
             crate::records::Rec::End(_) => ended = true,
-            crate::records::Rec::Start(_) | crate::records::Rec::Position(_) => {}
+            _ => {}
         }
     }
-    if !opts.observations {
-        if let Some(rules) = live.as_mut() {
-            let mut batch: Vec<Sample> = Vec::new();
-            for l in rules.iter_mut() {
-                batch.extend(l.roller.drain(true));
-            }
-            emit(&mut out, batch)?;
-        }
-    }
+    run.finish(&mut out, opts.observations)?;
     out.flush()?;
     if !ended {
-        // A stream that died and one that finished are the same
-        // observation without this record, and a tally of a truncated
-        // read is a graph that is wrong rather than short.
         bail!("the record stream ended without stream-end — the answer is truncated");
     }
     Ok(())
 }
 
-/// One batch of sealed buckets, in time order. Every rule seals off the
-/// same entry stream, so ordering the batch is what keeps a tape written
-/// by several rules readable — the store's own clock is arrival, and a
-/// reader's is the stamp on the line, so neither depends on this; it is
-/// for the person who runs `zstd -dc`.
+/// What a `--try` produced: the tally lines, and what each metric made
+/// of the input.
+pub struct Tried {
+    pub entries: usize,
+    pub tally: String,
+    pub seen: Vec<(String, Seen)>,
+}
+
+/// Apply extractors to PLAIN LOG LINES, for trying one against a real
+/// file — and for testing the extractors this repository ships, which is
+/// the same operation.
+pub fn try_text(
+    docs: &[(PathBuf, Extractor)],
+    opts: &TallyOpts,
+    text: &[u8],
+) -> anyhow::Result<Tried> {
+    let axis = axis_of(docs)?;
+    if axis == Axis::Write {
+        bail!(
+            "--try reads plain log lines, which carry no arrival time — an extractor \
+             with window.axis=write cannot be tried against a file, only against a store"
+        );
+    }
+    let mut run = Run::new(docs, opts)?;
+    let entries = entries_of_text(text)?;
+    let mut tally: Vec<u8> = Vec::new();
+    for e in &entries {
+        run.feed(e, axis, &mut tally, opts.observations)?;
+    }
+    run.finish(&mut tally, opts.observations)?;
+    Ok(Tried {
+        entries: entries.len(),
+        tally: String::from_utf8_lossy(&tally).into_owned(),
+        seen: run
+            .live
+            .iter()
+            .map(|l| (l.metric.clone(), l.seen))
+            .collect(),
+    })
+}
+
+/// Every extractor in one run must agree on the axis: they share one
+/// entry stream, and an entry cannot be on two clocks at once.
+fn axis_of(docs: &[(PathBuf, Extractor)]) -> anyhow::Result<Axis> {
+    let mut it = docs.iter();
+    let (first_path, first) = it.next().expect("load_extractors refuses an empty set");
+    for (path, doc) in it {
+        if doc.window.axis != first.window.axis {
+            bail!(
+                "{} is on the {:?} axis and {} on the {:?} — one run reads one entry \
+                 stream, so its extractors must agree",
+                first_path.display(),
+                first.window.axis,
+                path.display(),
+                doc.window.axis
+            );
+        }
+    }
+    Ok(first.window.axis)
+}
+
+/// Plain text into the SAME entries a store would yield: the real
+/// assembly, so a `--try` run and a live run cannot disagree about where
+/// one entry ends and the next begins.
+fn entries_of_text(text: &[u8]) -> anyhow::Result<Vec<crate::records::EntryRec>> {
+    let extractor = crate::import::Extractor::new(None, None, false)?;
+    let mut sink = crate::entry::EntrySink::new(
+        extractor,
+        None,
+        crate::entry::Framing {
+            null_sep: false,
+            records: true,
+            show_write: false,
+            label: None,
+            store_id: None,
+        },
+        None,
+        "-",
+    );
+    let mut framed: Vec<u8> = Vec::new();
+    sink.push_chunk(text, None, (0, 0), 0, &mut framed)?;
+    sink.finish(&mut framed)?;
+    // The sink writes ENTRIES; a stream's brackets belong to whoever is
+    // producing the answer, and here that is this function. Without the
+    // marker the reader below correctly calls its own input truncated.
+    framed.extend_from_slice(b"\x1estream-end\0");
+    let mut reader = crate::records::Reader::new(std::io::Cursor::new(framed));
+    let mut out = Vec::new();
+    while let Some(rec) = reader.next_rec()? {
+        if let crate::records::Rec::Entry(e) = rec {
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+/// One batch of sealed buckets, in time order.
 fn emit(out: &mut impl Write, mut batch: Vec<Sample>) -> anyhow::Result<()> {
     batch.sort_by(|a, b| (a.ts, &a.metric, &a.labels).cmp(&(b.ts, &b.metric, &b.labels)));
     for s in batch {
@@ -1584,27 +1632,9 @@ fn emit(out: &mut impl Write, mut batch: Vec<Sample>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One tally store per source store, so one source per run. The fan-out
-/// belongs to the follower that runs one of these per store, which is
-/// not built yet — refusing here beats writing two stores' numbers into
-/// one tape under one set of labels.
-fn one_store(seen: &mut Option<String>, id: &str) -> anyhow::Result<()> {
-    match seen {
-        Some(had) if had == id => Ok(()),
-        Some(had) => bail!(
-            "this stream carries more than one store ({had} and {id}) — a tally store \
-             belongs to ONE source store, so read them one at a time"
-        ),
-        None => {
-            *seen = Some(id.to_string());
-            Ok(())
-        }
-    }
-}
-
 /// ⚠ Stamped with the ENTRY's own time where there is one. Charging it
-/// to the watermark put every drop at the epoch until some other rule
-/// had produced an observation — and a rule whose every entry drops has
+/// to the watermark put every drop at the epoch until some other metric
+/// had produced an observation — and a metric whose every entry drops has
 /// no watermark of its own, which is exactly the case worth reading.
 fn note_drop(roller: &mut Roller, metric: &str, why: &'static str, at: Option<u64>) {
     let ts = at.unwrap_or_else(|| roller.watermark());
@@ -1613,45 +1643,6 @@ fn note_drop(roller: &mut Roller, metric: &str, why: &'static str, at: Option<u6
         .label("reason", why)
         .field(Field::Count, 1.0);
     roller.add(&s);
-}
-
-fn resolve_rules<'a>(
-    set: &'a RuleSet,
-    manifest: Option<&Map<String, Value>>,
-    only: &[String],
-) -> anyhow::Result<Vec<Live<'a>>> {
-    let empty = Map::new();
-    let m = manifest.unwrap_or(&empty);
-    let mut chosen = set.for_store(m)?;
-    if !only.is_empty() {
-        chosen.retain(|r| only.contains(&r.metric));
-        for want in only {
-            if !chosen.iter().any(|r| r.metric == *want) {
-                bail!("no rule named {want:?} applies to this store");
-            }
-        }
-    }
-    if chosen.is_empty() {
-        eprintln!(
-            "tally: no rule matches this store — {} rule(s) loaded, none selecting it",
-            set.rules.len()
-        );
-    }
-    chosen
-        .into_iter()
-        .map(|rule| {
-            Ok(Live {
-                preds: crate::grep::Preds::compile(rule.preds.clone())?,
-                roller: Roller::new(
-                    rule.width_ms,
-                    rule.grace_ms,
-                    rule.revise_ms,
-                    rule.max_series,
-                ),
-                rule,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1705,9 +1696,9 @@ mod tests {
         assert!(check_metric("http-requests").is_err());
         // A label named after a measure would make the line ambiguous:
         // dispatch is on the key, so the two namespaces cannot overlap.
-        let set = parse(
-            "t.conf",
-            "AXIS=logline\n[m]\nDECODE=logfmt\nLABELS=sum\nCOUNT=\n",
+        let set = parsed(
+            r#"{"name":"m","fields":{"decode":"logfmt"},
+                "labels":["sum"],"measure":[{"count":true}]}"#,
         );
         assert!(set.is_err(), "a label may not be called sum");
     }
@@ -1820,66 +1811,241 @@ mod tests {
         assert_eq!(cap[0].fields, vec![(Field::Count, 3.0)]);
     }
 
-    #[test]
-    fn a_rule_needs_an_axis_and_something_to_measure() {
-        assert!(
-            parse("t.conf", "[m]\nCOUNT=\n").is_err(),
-            "no axis anywhere"
-        );
-        assert!(
-            parse("t.conf", "AXIS=logline\n[m]\n").is_err(),
-            "measures nothing"
-        );
-        assert!(parse("t.conf", "AXIS=logline\n[m]\nCOUNT=\n").is_ok());
+    fn doc(metrics: &str) -> String {
+        format!(
+            r#"{{"v":"{EXTRACTOR_VERSION}","name":"t",
+                "window":{{"axis":"logline","width_ms":60000}},
+                "metrics":[{metrics}]}}"#
+        )
+    }
+
+    fn parsed(metrics: &str) -> anyhow::Result<Extractor> {
+        Extractor::parse(&doc(metrics), "t.json")
+    }
+
+    fn live(metrics: &str) -> Live {
+        let d = parsed(metrics).expect("a valid document");
+        d.compile(d.window).expect("compiles").pop().expect("one")
+    }
+
+    fn observed(l: &Live, line: &str, ts: u64) -> Vec<Sample> {
+        match l.observe(line.as_bytes(), ts, None) {
+            Outcome::Observed(v) => v,
+            Outcome::Skipped => Vec::new(),
+            Outcome::Dropped(why) => panic!("dropped: {why}"),
+        }
     }
 
     #[test]
-    fn a_field_named_with_no_source_to_read_it_from_is_refused() {
-        // The failure this catches is a rule that parses, runs, and
-        // measures nothing forever: SUM=bytes over an undecoded entry
-        // has no `bytes` and would drop every line.
-        let err = parse("t.conf", "AXIS=logline\n[m]\nSUM=bytes\n").unwrap_err();
-        assert!(format!("{err}").contains("bytes"), "{err}");
+    fn a_document_states_its_version_and_measures_something() {
+        assert!(parsed(r#"{"name":"m","measure":[{"count":true}]}"#).is_ok());
+
+        // An unknown member is an error, not a shrug: a request that
+        // tolerates a typo does something other than what was asked.
+        let err = Extractor::parse(
+            &doc(r#"{"name":"m","measure":[{"count":true}],"labls":["x"]}"#),
+            "t.json",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("labls"), "{err:#}");
+
+        let wrong = doc(r#"{"name":"m","measure":[{"count":true}]}"#).replace("1.0-", "9.9-");
+        let err = Extractor::parse(&wrong, "t.json").unwrap_err();
+        assert!(format!("{err}").contains("v="), "{err}");
+
+        let err = parsed(r#"{"name":"m"}"#).unwrap_err();
+        assert!(format!("{err}").contains("measures nothing"), "{err}");
     }
 
     #[test]
-    fn a_metric_is_defined_once_across_the_directory() {
-        let dir = tempdir();
-        std::fs::write(dir.join("a.conf"), "AXIS=logline\n[m]\nCOUNT=\n").unwrap();
-        std::fs::write(dir.join("b.conf"), "AXIS=logline\n[m]\nCOUNT=\n").unwrap();
-        let err = load(&dir).unwrap_err();
+    fn a_metric_names_a_field_only_where_its_source_can_produce_one() {
+        // No source at all, and a measure that names a field.
+        let err = parsed(r#"{"name":"m","measure":[{"sum":"bytes"}]}"#).unwrap_err();
+        assert!(format!("{err}").contains("no `fields`"), "{err}");
+
+        // An extract whose captures do not include it.
+        let err = parsed(
+            r#"{"name":"m","fields":{"extract":"level=(?P<level>\\w+)"},
+                "measure":[{"sum":"ms"}]}"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("cannot produce"), "{err}");
+
+        // A positional decoder, whose field set is its own.
+        let err = parsed(
+            r#"{"name":"m","fields":{"decode":"apache-combined"},
+                "labels":["vhost"],"measure":[{"count":true}]}"#,
+        )
+        .unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("a.conf") && text.contains("b.conf"), "{text}");
+        assert!(text.contains("vhost") && text.contains("referer"), "{text}");
+
+        // …and logfmt takes its names from the PRODUCER, so there is
+        // nothing to check against and anything is accepted.
+        assert!(parsed(
+            r#"{"name":"m","fields":{"decode":"logfmt"},
+                "labels":["anything"],"measure":[{"sum":"whatever"}]}"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn one_source_of_fields_and_one_measure_per_entry() {
+        let err = parsed(
+            r#"{"name":"m","fields":{"decode":"logfmt","extract":"(?P<a>x)"},
+                "measure":[{"count":true}]}"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("two"), "{err}");
+
+        let err = parsed(r#"{"name":"m","measure":[{"count":true,"sum":"x"}]}"#).unwrap_err();
+        assert!(format!("{err}").contains("more than one"), "{err}");
+
+        let err = parsed(r#"{"name":"m","measure":[{}]}"#).unwrap_err();
+        assert!(format!("{err}").contains("measures nothing"), "{err}");
+    }
+
+    #[test]
+    fn a_line_of_another_shape_is_skipped_and_never_counted_as_a_loss() {
+        // The correction that matters on a real store: it carries many
+        // line shapes at once, so "not mine" is the ORDINARY case. A
+        // counter that conflated it with a real failure would be noise
+        // exactly where signal is wanted.
+        let l = live(
+            r#"{"name":"m","fields":{"decode":"logfmt"},
+                "labels":["level"],"measure":[{"count":true}]}"#,
+        );
+        assert!(matches!(
+            l.observe(b"\tat com.example.Thing.method(Thing.java:42)", 1000, None),
+            Outcome::Skipped
+        ));
+        assert!(matches!(
+            l.observe(b"level=warn ms=3", 1000, None),
+            Outcome::Observed(_)
+        ));
+
+        // Claimed, of the right shape, and then unreadable IS a loss.
+        let l = live(r#"{"name":"m","fields":{"decode":"logfmt"},"measure":[{"sum":"ms"}]}"#);
+        match l.observe(b"ms=notanumber", 1000, None) {
+            Outcome::Dropped(why) => assert_eq!(why, "unreadable"),
+            _ => panic!("a measure that cannot be read is a drop, not a zero"),
+        }
+    }
+
+    #[test]
+    fn a_claim_says_which_lines_are_mine() {
+        let l =
+            live(r#"{"name":"m","claim":{"all":[{"has":"ERROR"}]},"measure":[{"count":true}]}"#);
+        assert!(matches!(
+            l.observe(b"all is well", 1000, None),
+            Outcome::Skipped
+        ));
+        assert!(matches!(
+            l.observe(b"ERROR the thing", 1000, None),
+            Outcome::Observed(_)
+        ));
+    }
+
+    #[test]
+    fn decoders_produce_the_fields_a_metric_names() {
+        let l = live(
+            r#"{"name":"m","fields":{"decode":"logfmt"},
+                "labels":["level"],"measure":[{"sum":"ms"}]}"#,
+        );
+        assert_eq!(
+            observed(&l, "level=warn ms=42 msg=\"a thing happened\"", 1000)[0].render(),
+            "1970-01-01T00:00:01.000Z 0s m level=warn sum=42"
+        );
+
+        let l = live(
+            r#"{"name":"m","fields":{"decode":"apache-combined"},
+                "labels":["status","method"],"measure":[{"sum":"bytes"}]}"#,
+        );
+        let line =
+            r#"10.0.0.1 - - [06/Sep/2026:13:37:00 +0200] "GET /x HTTP/1.1" 200 5120 "-" "curl/8""#;
+        assert_eq!(
+            observed(&l, line, 1000)[0].render(),
+            "1970-01-01T00:00:01.000Z 0s m method=GET status=200 sum=5120"
+        );
+    }
+
+    #[test]
+    fn an_absent_label_is_omitted_and_reads_as_empty() {
+        // The rule the selector already follows, one level down: an
+        // absent key is the empty string, so a series with no `status`
+        // is selectable by `status=`.
+        let l = live(
+            r#"{"name":"m","fields":{"decode":"logfmt"},
+                "labels":["status"],"measure":[{"count":true}]}"#,
+        );
+        assert_eq!(
+            observed(&l, "msg=hello", 1000)[0].render(),
+            "1970-01-01T00:00:01.000Z 0s m count=1"
+        );
+    }
+
+    #[test]
+    fn a_histogram_is_cumulative_and_carries_its_total_on_inf() {
+        let l = live(
+            r#"{"name":"m","fields":{"decode":"logfmt"},
+                "histogram":{"field":"ms","unit":"ms","buckets":[10,100]}}"#,
+        );
+        let out = observed(&l, "ms=40", 1000);
+        assert_eq!(
+            out.iter().map(|s| s.render()).collect::<Vec<_>>(),
+            vec![
+                "1970-01-01T00:00:01.000Z 0s m le=100 count=1",
+                "1970-01-01T00:00:01.000Z 0s m le=+Inf count=1 sum=40",
+            ]
+        );
+        // Summable, therefore re-bucketable: the +Inf count is the
+        // number of observations and each `le` is a prefix of it.
+        assert_eq!(Roller::fold(60_000, &out).len(), 2);
+    }
+
+    #[test]
+    fn an_extractor_name_is_claimed_once_across_the_files_given() {
+        let dir = tempdir();
+        for f in ["a.json", "b.json"] {
+            std::fs::write(
+                dir.join(f),
+                doc(r#"{"name":"m","measure":[{"count":true}]}"#),
+            )
+            .unwrap();
+        }
+        let err = load_extractors(std::slice::from_ref(&dir)).unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("a.json") && text.contains("b.json"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn one_source_of_fields_per_rule() {
-        let err = parse(
-            "t.conf",
-            "AXIS=logline\n[m]\nDECODE=logfmt\nEXTRACT=(?P<a>x)\nCOUNT=\n",
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("ONE source"), "{err}");
+    fn plain_text_yields_the_same_entries_a_store_would() {
+        // What `--try` rests on: a stack trace is ONE entry, so a claim
+        // written against a real store behaves the same against a file.
+        let text = b"2026-09-06T10:00:00Z ERROR boom\n\tat a.b.C(C.java:1)\n\tat d.e.F(F.java:2)\n\
+                     2026-09-06T10:00:01Z INFO fine\n";
+        let entries = entries_of_text(text).unwrap();
+        assert_eq!(entries.len(), 2, "a stack trace is not three entries");
+        assert!(entries[0].payload.ends_with(b"F.java:2)\n"));
+        assert!(entries[0].ts.is_some(), "stamped from its own line");
     }
 
     #[test]
-    fn exec_is_reserved_and_points_at_the_route_that_exists() {
-        // There is no external extractor and there will not be one: a
-        // program that needs state across entries is a CONSUMER, which
-        // already has a lifecycle, a watermark rule and a registry. The
-        // key stays reserved because reaching for it is a reasonable
-        // instinct that deserves an answer rather than "unknown key".
-        let err = parse(
-            "t.conf",
-            "AXIS=logline\n[m]\nEXEC=/usr/local/lib/timberfs/tally/x\nCOUNT=\n",
-        )
-        .unwrap_err();
-        let text = format!("{err}");
+    fn a_drop_is_charged_to_the_entry_that_caused_it() {
+        // It was charged to the WATERMARK, which is zero until some
+        // observation lands — so a metric whose every entry drops put all
+        // of them at the epoch, which is exactly the one worth reading.
+        let mut r = Roller::new(60_000, 0, 0, 1000);
+        note_drop(&mut r, "m", "unreadable", Some(1_788_700_000_000));
+        let out = r.drain(true);
+        assert_eq!(out.len(), 1);
         assert!(
-            text.contains("follower") && text.contains("--fold"),
-            "{text}"
+            out[0].render().starts_with("2026-09-06T"),
+            "{}",
+            out[0].render()
         );
+        assert_eq!(out[0].metric, "!drop");
     }
 
     fn folded(input: &str, width_ms: u64) -> anyhow::Result<String> {
@@ -1896,7 +2062,7 @@ mod tests {
 
     #[test]
     fn fold_buckets_observations_anybody_produced() {
-        // The whole reason there is no EXEC: a program emits
+        // The reason there is no external-extractor hook: a program emits
         // observations and the fold that ships does the rest, so nobody
         // reimplements sealing, revisions or the citation span.
         let out = folded(
@@ -1911,8 +2077,7 @@ mod tests {
     #[test]
     fn fold_refuses_a_line_it_cannot_read_and_one_already_bucketed() {
         // Fatal, not skipped: a fold that quietly dropped a tenth of its
-        // input would report numbers that are WRONG rather than missing,
-        // and nothing downstream could tell.
+        // input would report numbers that are WRONG rather than missing.
         let err = folded(
             "2026-09-06T10:00:01.000Z 0s m count=1\nnot a sample\n",
             60_000,
@@ -1920,169 +2085,98 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err}").contains("line 2"), "{err}");
 
-        // And a bucket line is not an observation: accepting one would
-        // double every count on a re-run.
         let err = folded("2026-09-06T10:00:00.000Z 60s m count=3\n", 60_000).unwrap_err();
         assert!(format!("{err}").contains("OBSERVATIONS"), "{err}");
     }
 
+    /// Every extractor this repository SHIPS, run against a fixture and
+    /// compared to a committed answer.
+    ///
+    /// It is the same operation an operator does with `--try`, which is
+    /// the point: the tool for trying a definition against a real file
+    /// and the harness that tests ours are one thing, so neither can rot
+    /// while the other is exercised. The fixtures earn their keep — the
+    /// apache one already caught `-` (CLF's zero-byte response) being
+    /// read as unreadable, which turned every empty response into a
+    /// `!drop` saying the numbers were wrong.
     #[test]
-    fn a_rule_may_not_name_a_field_its_source_cannot_produce() {
-        // Where the SOURCE names the fields, a typo is refused at load
-        // rather than discovered as a column of !drop markers. The
-        // message lists what the rule can have, so the error doubles as
-        // the reference for a decoder whose names are its own.
-        let err = parse(
-            "t.conf",
-            "AXIS=logline\n[m]\nEXTRACT=level=(?P<level>\\w+)\nSUM=ms\n",
-        )
-        .unwrap_err();
-        let text = format!("{err}");
-        assert!(text.contains("\"ms\"") && text.contains("level"), "{text}");
-
-        let err = parse(
-            "t.conf",
-            "AXIS=logline\n[m]\nDECODE=apache-combined\nLABELS=vhost\nCOUNT=\n",
-        )
-        .unwrap_err();
-        let text = format!("{err}");
-        assert!(text.contains("vhost") && text.contains("referer"), "{text}");
-
-        // …and a field the source DOES produce is fine, label or measure.
-        assert!(parse(
-            "t.conf",
-            "AXIS=logline\n[m]\nDECODE=apache-combined\nLABELS=status method\nSUM=bytes\n",
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn logfmt_and_json_take_their_names_from_the_producer_so_nothing_is_checked() {
-        // The asymmetry is the point: these names are the keys the
-        // PRODUCER's own lines carry, so no load-time check can exist and
-        // the run-time !drop counter is the only signal there can be.
-        assert!(Decoder::Logfmt.fields().is_none());
-        assert!(Decoder::Json.fields().is_none());
-        assert!(parse(
-            "t.conf",
-            "AXIS=logline\n[m]\nDECODE=logfmt\nLABELS=anything\nSUM=whatever\n",
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn a_drop_is_charged_to_the_entry_that_caused_it() {
-        // It was charged to the WATERMARK, which is zero until some
-        // observation lands — so a rule whose every entry drops put all
-        // of them at the epoch, which is exactly the rule worth reading.
-        let mut r = Roller::new(60_000, 0, 0, 1000);
-        note_drop(&mut r, "m", "unparsed", Some(1_788_700_000_000));
-        let out = r.drain(true);
-        assert_eq!(out.len(), 1);
-        assert!(
-            out[0].render().starts_with("2026-09-06T"),
-            "{}",
-            out[0].render()
-        );
-        assert_eq!(out[0].metric, "!drop");
-    }
-
-    #[test]
-    fn a_decoder_this_build_lacks_names_the_escapes() {
-        let err = parse("t.conf", "AXIS=logline\n[m]\nDECODE=gc\nCOUNT=\n").unwrap_err();
-        let text = format!("{err}");
-        assert!(text.contains("EXTRACT") && text.contains("EXEC"), "{text}");
-    }
-
-    fn rule(text: &str) -> Rule {
-        parse("t.conf", text)
-            .expect(text)
-            .rules
-            .pop()
-            .expect("a rule")
-    }
-
-    fn observed(r: &Rule, line: &str, ts: u64) -> Vec<Sample> {
-        let preds = crate::grep::Preds::compile(r.preds.clone()).unwrap();
-        match observe(r, &preds, line.as_bytes(), ts, None) {
-            Outcome::Observed(v) => v,
-            Outcome::Skipped => Vec::new(),
-            Outcome::Dropped(why) => panic!("dropped: {why}"),
+    fn the_shipped_extractors_produce_the_committed_answers() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0;
+        for entry in std::fs::read_dir(root.join("packaging/extractors")).unwrap() {
+            let doc = entry.unwrap().path();
+            if doc.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let name = doc.file_stem().unwrap().to_str().unwrap().to_string();
+            let fixture = root.join(format!("tests/extractors/{name}.log"));
+            let golden = root.join(format!("tests/extractors/{name}.tally"));
+            assert!(
+                fixture.exists(),
+                "{name} ships with no fixture — an extractor nobody has run is one \
+                 nobody has checked. Write tests/extractors/{name}.log"
+            );
+            let docs = load_extractors(std::slice::from_ref(&doc)).unwrap();
+            let opts = TallyOpts {
+                extractors: vec![doc],
+                try_it: true,
+                check: false,
+                observations: false,
+                metrics: Vec::new(),
+                width_ms: None,
+                fold: None,
+            };
+            let text = std::fs::read(&fixture).unwrap();
+            let tried = try_text(&docs, &opts, &text).unwrap();
+            let report: String = tried
+                .seen
+                .iter()
+                .map(|(m, s)| {
+                    format!(
+                        "# {m}: claimed {} skipped {} dropped {}\n",
+                        s.claimed, s.skipped, s.dropped
+                    )
+                })
+                .collect();
+            let produced = format!("{report}{}", tried.tally);
+            if std::env::var("UPDATE_GOLDEN").is_ok() {
+                std::fs::write(&golden, &produced).unwrap();
+                checked += 1;
+                continue;
+            }
+            let committed = std::fs::read_to_string(&golden).unwrap_or_default();
+            assert_eq!(
+                committed,
+                produced,
+                "{name} no longer produces its committed answer. Review the diff, then:\n  \
+                 UPDATE_GOLDEN=1 cargo test --lib the_shipped_extractors_produce_the_committed_answers"
+            );
+            checked += 1;
         }
+        assert!(checked > 0, "no shipped extractors were checked");
     }
 
+    /// The contract is a FILE in the repository, not something a build
+    /// produces: it has to show up in a diff so a change to it is
+    /// reviewed rather than discovered by whoever ships an extractor.
     #[test]
-    fn logfmt_and_apache_decode_into_the_fields_a_rule_names() {
-        let r = rule("AXIS=logline\n[m]\nDECODE=logfmt\nLABELS=level\nSUM=ms\n");
-        let out = observed(&r, "level=warn ms=42 msg=\"a thing happened\"", 1000);
-        assert_eq!(
-            out[0].render(),
-            "1970-01-01T00:00:01.000Z 0s m level=warn sum=42"
+    fn the_committed_extractor_schema_matches_the_types() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/tally-extractor.schema.json"
         );
-
-        let r =
-            rule("AXIS=logline\n[m]\nDECODE=apache-combined\nLABELS=status method\nSUM=bytes\n");
-        let line =
-            r#"10.0.0.1 - - [06/Sep/2026:13:37:00 +0200] "GET /x HTTP/1.1" 200 5120 "-" "curl/8""#;
-        let out = observed(&r, line, 1000);
-        assert_eq!(
-            out[0].render(),
-            "1970-01-01T00:00:01.000Z 0s m method=GET status=200 sum=5120"
-        );
-    }
-
-    #[test]
-    fn an_absent_label_is_omitted_and_reads_as_empty() {
-        // The rule the selector already follows, one level down: an
-        // absent key is the empty string, so a series with no `status`
-        // is selectable by `status=`.
-        let r = rule("AXIS=logline\n[m]\nDECODE=logfmt\nLABELS=status\nCOUNT=\n");
-        let out = observed(&r, "msg=hello", 1000);
-        assert_eq!(out[0].render(), "1970-01-01T00:00:01.000Z 0s m count=1");
-    }
-
-    #[test]
-    fn a_histogram_is_cumulative_and_carries_its_total_on_inf() {
-        let r = rule("AXIS=logline\n[m]\nDECODE=logfmt\nOBSERVE=ms\nBUCKETS=10 100\n");
-        let out = observed(&r, "ms=40", 1000);
-        let rendered: Vec<String> = out.iter().map(|s| s.render()).collect();
-        assert_eq!(
-            rendered,
-            vec![
-                "1970-01-01T00:00:01.000Z 0s m le=100 count=1",
-                "1970-01-01T00:00:01.000Z 0s m le=+Inf count=1 sum=40",
-            ]
-        );
-        // Summable, therefore re-bucketable: the +Inf count is the
-        // number of observations and each `le` is a prefix of it.
-        let folded = Roller::fold(60_000, &out);
-        assert_eq!(folded.len(), 2);
-    }
-
-    #[test]
-    fn an_entry_that_matched_but_would_not_parse_is_dropped_by_name() {
-        let r = rule("AXIS=logline\n[m]\nDECODE=logfmt\nSUM=ms\n");
-        let preds = crate::grep::Preds::compile(r.preds.clone()).unwrap();
-        match observe(&r, &preds, b"ms=notanumber", 1000, None) {
-            Outcome::Dropped(why) => assert_eq!(why, "unparsed"),
-            _ => panic!("a measure that cannot be read is a drop, not a zero"),
+        let generated =
+            serde_json::to_string_pretty(&schemars::schema_for!(Extractor)).unwrap() + "\n";
+        if std::env::var("UPDATE_SCHEMA").is_ok() {
+            std::fs::write(path, &generated).unwrap();
+            return;
         }
-    }
-
-    #[test]
-    fn a_predicate_that_does_not_select_is_not_a_drop() {
-        // "This line is not mine" and "this line is mine and broken" are
-        // different facts; only the second is a loss worth counting.
-        let r = rule("AXIS=logline\n[m]\nHAS=ERROR\nCOUNT=\n");
-        let preds = crate::grep::Preds::compile(r.preds.clone()).unwrap();
-        assert!(matches!(
-            observe(&r, &preds, b"all is well", 1000, None),
-            Outcome::Skipped
-        ));
-        assert!(matches!(
-            observe(&r, &preds, b"ERROR the thing", 1000, None),
-            Outcome::Observed(_)
-        ));
+        let committed = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            committed, generated,
+            "the tally extractor's contract has changed. Review the diff, then:\n  \
+             UPDATE_SCHEMA=1 cargo test --lib the_committed_extractor_schema_matches_the_types"
+        );
     }
 
     fn tempdir() -> PathBuf {
@@ -2090,6 +2184,7 @@ mod tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("timberfs-tally-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
     }

@@ -626,34 +626,58 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         forest: Vec<PathBuf>,
     },
-    /// Metrics derived from a log: read a timberfs-records(5) stream on
-    /// stdin, apply the rules a set declares, and write tally lines on
-    /// stdout. Pipe them into a store of their own:
+    /// Metrics derived from a log. Reads a timberfs-records(5) stream on
+    /// stdin, applies the EXTRACTOR documents given, and writes tally
+    /// lines on stdout. Pipe them into a store of their own:
     ///
     ///   timberfs query --records app --from 13:00 \
-    ///     | timberfs tally --rules /etc/timberfs/tally.d \
-    ///     | timberfs append app-tally
+    ///     | timberfs tally --extractor /etc/timberfs/tally.extractors.d \
+    ///     | timberfs append --into backing/app-tally.log
     ///
-    /// The store that receives them stamps its chunks when the line
-    /// arrives, so a tally store's write axis is WHEN A NUMBER WAS
-    /// COMPUTED and its logline axis is WHICH MINUTE IT IS ABOUT.
+    /// An extractor is a named JSON document describing metrics read off
+    /// ONE SHAPE OF LINE. It carries no store selection: which stores get
+    /// measured is deployment, and a document that says nothing about
+    /// this host can be shipped and shared.
     Tally {
-        /// A rule file, or a directory of *.conf read whole (the shape
-        /// /etc/timberfs/tally.d has). ⚠ One process reads the whole
-        /// directory: two files may declare rules for one store, and a
-        /// store has one writer
-        #[arg(long, value_name = "PATH", required_unless_present = "fold")]
-        rules: Option<PathBuf>,
+        /// An extractor document, or a directory of *.json read whole.
+        /// Repeatable; a name claimed by two documents is refused
+        #[arg(long = "extractor", value_name = "PATH", required_unless_present_any = ["fold"])]
+        extractors: Vec<PathBuf>,
+        /// Validate the extractors and apply them to PLAIN LOG LINES on
+        /// stdin, for trying one against a real file:
+        ///
+        ///   cat /var/log/app.log | timberfs tally --try --extractor app.json
+        ///
+        /// Entries are assembled exactly as a store would (a stack trace
+        /// stays one entry). The tally lines go to stdout ALONE and the
+        /// per-metric report to stderr, so a --try run is diffable
+        /// against a golden file — which is how the extractors this
+        /// package ships are tested
+        #[arg(long = "try", conflicts_with_all = ["fold", "check"])]
+        try_it: bool,
+        /// Validate the extractors and describe them, reading nothing
+        #[arg(long, conflicts_with = "fold")]
+        check: bool,
+        /// Print the width-0s OBSERVATIONS instead of bucketing them: one
+        /// line per measurement per entry. The debugging path, and the
+        /// format --fold takes
+        #[arg(long)]
+        observations: bool,
+        /// Only these metrics — for recomputing one over history without
+        /// rewriting the rest. Repeatable
+        #[arg(long, value_name = "NAME")]
+        metric: Vec<String>,
         /// Read width-0s OBSERVATION lines on stdin and write buckets,
         /// instead of reading a records stream. What makes writing your
         /// own extractor a real answer: emit observations, pipe them
-        /// through here, and sealing, revisions and the citation span
-        /// are the ones that ship rather than yours to get right
-        #[arg(long, conflicts_with_all = ["rules", "observations", "metric", "store"])]
+        /// through here, and sealing, revisions and the citation span are
+        /// the ones that ship rather than yours to get right
+        #[arg(long, conflicts_with_all = ["extractors", "observations", "metric"])]
         fold: bool,
-        /// The bucket --fold produces
-        #[arg(long, value_name = "SPAN", default_value = "60s", requires = "fold")]
-        width: String,
+        /// The bucket: overrides the extractors' own window, or sizes
+        /// --fold's (default 60s)
+        #[arg(long, value_name = "SPAN")]
+        width: Option<String>,
         /// How long past a bucket's end --fold seals it
         #[arg(long, value_name = "SPAN", default_value = "2m", requires = "fold")]
         grace: String,
@@ -661,20 +685,6 @@ enum Command {
         /// bucket, which --fold emits as a revision
         #[arg(long, value_name = "SPAN", default_value = "1h", requires = "fold")]
         revise: String,
-        /// Print the width-0s OBSERVATIONS instead of bucketing them:
-        /// one line per measurement per entry. The debugging path, and
-        /// the format --fold takes
-        #[arg(long)]
-        observations: bool,
-        /// Only these metrics — for recomputing one over history without
-        /// rewriting the rest. Repeatable
-        #[arg(long, value_name = "NAME")]
-        metric: Vec<String>,
-        /// Which store the stream came from, when the stream cannot say.
-        /// A `query --records` answer names a path and carries no
-        /// labels, so a rule with a SELECT has nothing to match against
-        #[arg(long, value_name = "PATH")]
-        store: Option<PathBuf>,
     },
     /// Time-based rotation: move every chunk written before --cutoff into
     /// DEST (or drop it with --delete), relocating compressed frames
@@ -1836,30 +1846,39 @@ fn main() -> anyhow::Result<()> {
             grain::cmd_reindex(&file)?;
         }
         Command::Tally {
-            rules,
+            extractors,
+            try_it,
+            check,
+            observations,
+            metric,
             fold,
             width,
             grace,
             revise,
-            observations,
-            metric,
-            store,
-        } => tally::cmd_tally(&tally::TallyOpts {
-            rules,
-            fold: fold
-                .then(|| -> anyhow::Result<tally::FoldOpts> {
-                    Ok(tally::FoldOpts {
-                        width_ms: append::parse_duration_ms(&width)?,
-                        grace_ms: append::parse_duration_ms(&grace)?,
-                        revise_ms: append::parse_duration_ms(&revise)?,
-                        max_series: 1000,
+        } => {
+            let width_ms = width
+                .as_deref()
+                .map(append::parse_duration_ms)
+                .transpose()?;
+            tally::cmd_tally(&tally::TallyOpts {
+                extractors,
+                try_it,
+                check,
+                observations,
+                metrics: metric,
+                width_ms,
+                fold: fold
+                    .then(|| -> anyhow::Result<tally::FoldOpts> {
+                        Ok(tally::FoldOpts {
+                            width_ms: width_ms.unwrap_or(60_000),
+                            grace_ms: append::parse_duration_ms(&grace)?,
+                            revise_ms: append::parse_duration_ms(&revise)?,
+                            max_series: 1000,
+                        })
                     })
-                })
-                .transpose()?,
-            observations,
-            metrics: metric,
-            store,
-        })?,
+                    .transpose()?,
+            })?
+        }
         Command::Trim {
             store,
             select,

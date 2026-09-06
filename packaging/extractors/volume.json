@@ -1,0 +1,19 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "volume",
+  "description": "How much a log says, and how much of it is trouble. No parsing at all, so it applies to any log whatever its shape.",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000 },
+  "metrics": [
+    {
+      "name": "entries_logged",
+      "description": "entries a minute",
+      "measure": [{ "count": true, "unit": "entries" }]
+    },
+    {
+      "name": "errors_logged",
+      "description": "entries a minute naming an error level",
+      "claim": { "any": [{ "has": "ERROR", "caseless": true }, { "has": "FATAL", "caseless": true }, { "has": "SEVERE", "caseless": true }] },
+      "measure": [{ "count": true, "unit": "entries" }]
+    }
+  ]
+}

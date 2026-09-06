@@ -409,7 +409,7 @@ asymmetry is the whole point, and the numbers outlive the lines they came from.
 
 ```sh
 timberfs query --records apache-access --from '13:00' \
-  | timberfs tally --rules /etc/timberfs/tally.d \
+  | timberfs tally --extractor /usr/lib/timberfs/tally.extractors.d \
   | timberfs append --into backing/apache-access-tally.log
 ```
 

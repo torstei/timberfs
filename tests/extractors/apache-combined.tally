@@ -1,0 +1,12 @@
+# http_requests: claimed 5 skipped 1 dropped 0
+# http_bytes: claimed 5 skipped 1 dropped 0
+2026-09-06T11:37:00.000Z 0s !meta metric=http_requests unit=requests
+2026-09-06T11:37:00.000Z 0s !meta metric=http_bytes unit=B
+2026-09-06T11:37:00.000Z 60s http_bytes status=200 count=1 sum=2326 @0+95
+2026-09-06T11:37:00.000Z 60s http_bytes status=404 count=1 sum=209 @95+91
+2026-09-06T11:37:00.000Z 60s http_bytes status=500 count=1 sum=1180 @186+118
+2026-09-06T11:37:00.000Z 60s http_requests method=GET status=200 count=1 @0+95
+2026-09-06T11:37:00.000Z 60s http_requests method=GET status=404 count=1 @95+91
+2026-09-06T11:37:00.000Z 60s http_requests method=POST status=500 count=1 @186+118
+2026-09-06T11:38:00.000Z 60s http_bytes status=200 count=2 sum=2326 @304+172
+2026-09-06T11:38:00.000Z 60s http_requests method=GET status=200 count=2 @304+172

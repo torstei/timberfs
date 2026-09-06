@@ -1233,11 +1233,25 @@ it is found.
 from a pipe or from cron. `man timberfs`, **tally**, is the reference and
 [docs/plans/tally.md](plans/tally.md) is the design.
 
-Rules live in `/etc/timberfs/tally.d/*.conf`, copied from
-`/usr/share/doc/timberfs/examples/tally.conf.example`. ⚠ Unlike `file.d`, where
-a set is a unit of supervision, the whole directory is read by ONE process: two
-files may declare rules for one store, and a store has one writer. Split the
-files by topic, for editing.
+**Extractors** are JSON documents describing metrics read off one shape of
+line. The packaged set is `/usr/lib/timberfs/tally.extractors.d/` and a site's
+own go in `/etc/timberfs/tally.extractors.d/`; `--extractor` takes a file or a
+directory and is repeatable. They carry no store selection at all — which
+stores get measured is deployment, and belongs to a provisioning file that is
+not built yet, so for now the pipeline below names its own source.
+
+Try one against a real file before deploying it:
+
+```sh
+cat /var/log/apache2/access.log \
+  | timberfs tally --try --extractor /usr/lib/timberfs/tally.extractors.d/apache-combined.json
+```
+
+The tally lines go to stdout and a per-metric report — claimed, skipped,
+dropped — to stderr. ⚠ Read the **skipped** count: on a store carrying several
+line shapes it is the ordinary case and not a loss, while **dropped** means a
+line this metric claimed and could not read, and the numbers are then wrong
+rather than merely absent.
 
 The numbers go into a store of their own, one per source store:
 
@@ -1248,7 +1262,7 @@ timberfs create /var/log/timberfs/apache-access-tally/apache-access-tally.log \
     --set derived_op=tally --set logline_lag=1h
 
 timberfs query --records apache-access --from '13:00' \
-  | timberfs tally --rules /etc/timberfs/tally.d \
+  | timberfs tally --extractor /usr/lib/timberfs/tally.extractors.d \
   | timberfs append --into /var/log/timberfs/apache-access-tally/apache-access-tally.log
 ```
 
@@ -1270,9 +1284,9 @@ Three of those declarations are load-bearing:
   numbers long after the log they came from has been head-dropped. Size it in
   years where the log is sized in weeks.
 
-⚠ The source stream must carry ONE store. A `feed` stream carries each store's
-labels and needs nothing else; a `query --records` answer names a path only, so
-a rule with a `SELECT` has nothing to match against unless `--store` names it.
+⚠ Run one pipeline per source store: a tally store belongs to one log, and the
+provisioning that will derive them automatically — from a selection, with an
+`OUTPUT` template and the bark to declare — is the next thing to build.
 
 ## What a store declares about itself
 

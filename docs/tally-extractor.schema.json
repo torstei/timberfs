@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Extractor",
+  "description": "A named set of metrics read off ONE SHAPE OF LINE.\n\nIt carries no store selection, and that absence is the design: a\ndocument that says nothing about this host is an ARTEFACT — shippable,\nshareable, versioned — rather than configuration. Which stores get\nmeasured is the provisioning's business (docs/plans/tally.md).\n\n⚠ Its subject is a line SHAPE, never a store. A store carries many\nshapes at once — logfmt request lines beside stack traces beside a\nstartup banner — so each metric CLAIMS its own lines rather than\nassuming the store is uniform.",
+  "type": "object",
+  "properties": {
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Metric"
+      }
+    },
+    "name": {
+      "description": "What this document IS, declared here and never taken from the\nfilename: renaming a file must not change what a document is, the\nrule a metric name and a store identity already follow.",
+      "type": "string"
+    },
+    "v": {
+      "description": "The format version, matched exactly against `EXTRACTOR_VERSION`.",
+      "type": "string"
+    },
+    "window": {
+      "$ref": "#/$defs/Window"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "name",
+    "window",
+    "metrics"
+  ],
+  "$defs": {
+    "Axis": {
+      "description": "Which clock a bucket is on.",
+      "oneOf": [
+        {
+          "description": "The timestamps the lines themselves carry.",
+          "type": "string",
+          "const": "logline"
+        },
+        {
+          "description": "When the data arrived. ⚠ An entry's arrival is its CHUNK's, so a\nbucket on this axis is only as fine as a chunk.",
+          "type": "string",
+          "const": "write"
+        }
+      ]
+    },
+    "Claim": {
+      "description": "The lines a metric claims, in the query document's own vocabulary:\nevery `all` must match, at least one `any` must, and no `none` may.",
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Predicate"
+          }
+        },
+        "any": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Predicate"
+          }
+        },
+        "none": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Predicate"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Decoder": {
+      "description": "A line of known shape turned into fields.\n\n⚠ The list is CLOSED, and narrowly: a decoder exists only where the\nKEY SET IS OPEN and a regex therefore cannot express the shape.\n`logfmt` and `json` qualify — there is no capture group for a key you\ndo not know in advance. Anything POSITIONAL is what a regex does well\nand belongs in an `extract`; `apache-combined` is here because it is a\npublished grammar many sites share and easy to get subtly wrong by\nhand, not because it could not be written as one.",
+      "oneOf": [
+        {
+          "description": "`key=value` pairs. ⚠ The names are the PRODUCER's — the keys its\nown lines carry — so nothing here can know them.",
+          "type": "string",
+          "const": "logfmt"
+        },
+        {
+          "description": "A JSON object. ⚠ TOP LEVEL only: a nested object is skipped and\nthere is no path syntax.",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "NCSA common and combined. The decoder names the fields, being\npositional: host, ident, user, time, request, status, bytes,\nreferer, agent, plus method, path and protocol split out of the\nrequest line.",
+          "type": "string",
+          "const": "apache-combined"
+        }
+      ]
+    },
+    "FieldSource": {
+      "description": "Where a claimed line's fields come from. Exactly one is set.",
+      "type": "object",
+      "properties": {
+        "decode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Decoder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extract": {
+          "description": "A regex whose NAMED capture groups become the fields.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Histogram": {
+      "type": "object",
+      "properties": {
+        "buckets": {
+          "description": "Upper bounds, in the units of the field. ⚠ Buckets whose scale\ndoes not match the field's produce a well-formed histogram that\nmeans nothing, which is why `unit` is worth stating.",
+          "type": "array",
+          "items": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "field": {
+          "type": "string"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "buckets"
+      ]
+    },
+    "MeasureSpec": {
+      "description": "One measure. Exactly one of the five is set — and each one IS its own\ncoarsening rule, which is what lets a tape be re-bucketed without a\nschema.",
+      "type": "object",
+      "properties": {
+        "count": {
+          "description": "One per claimed entry. Takes no field.",
+          "type": "boolean"
+        },
+        "last": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unit": {
+          "description": "What the number IS — `ms`, `B`, `requests`. Free text, announced\nonce per run in a `!meta` marker, because the tape outlives the\ndocument that described it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Metric": {
+      "description": "One metric: which lines are mine, how to read one, and what to measure.",
+      "type": "object",
+      "properties": {
+        "cite": {
+          "description": "Record the source tape span each bucket counted. Default true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "claim": {
+          "description": "WHICH LINES ARE MINE. Absent means every entry, which is right for\na volume metric and wrong for anything that parses: without a\nclaim, \"this line is not mine\" and \"this line is mine and broken\"\ncannot be told apart.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Claim"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "description": "Shown where a comment could only be read in the file — in a\nlisting, in an error. Which is why the format has no comments.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fields": {
+          "description": "Where fields come from. Absent means none are read, which only a\nbare `count` can do.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "histogram": {
+          "description": "Cumulative buckets, emitted as one series per `le` — Prometheus's\nown encoding, so a quantile is interpolation over sums and needs\nno syntax of its own.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Histogram"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "measure": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MeasureSpec"
+          }
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Predicate": {
+      "description": "One predicate. Exactly one matcher is set.\n\nThe contract says what the caller wants to ASK, not what timberfs can\nanswer cheaply. `has` rides the token index; `substring` rides it on\nits interior whole words; `regex` cannot ride it at all — and none of\nthat changes what any of them MEAN. The index decides how much gets\nread, never what matches.",
+      "type": "object",
+      "properties": {
+        "caseless": {
+          "description": "Compare caselessly. Refused on `regex`, which says `(?i)` itself.",
+          "type": "boolean"
+        },
+        "has": {
+          "description": "A word-anchored phrase.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "regex": {
+          "description": "A regular expression, as given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "substring": {
+          "description": "A literal anywhere, even inside a longer word.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Window": {
+      "description": "The bucket every metric in this document is folded into.\n\nA DEFAULT, which a provisioning may override — the window is partly a\ndeployment choice (a busy host may want ten seconds where a quiet one\nwants sixty) and partly incomplete without a value.",
+      "type": "object",
+      "properties": {
+        "axis": {
+          "description": "Required, with no default, for the reason a query document's\n`window.axis` is: logline and write bucket differently, and a\ndefault is an assumption the next reader makes wrongly.",
+          "$ref": "#/$defs/Axis"
+        },
+        "grace_ms": {
+          "description": "How long past a bucket's end before it is sealed and written.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 120000,
+          "minimum": 0
+        },
+        "max_series": {
+          "description": "Distinct series per bucket, after which a `!cap` marker counts\nwhat was lost. Cardinality is where every metrics system dies.",
+          "type": "integer",
+          "format": "uint",
+          "default": 1000,
+          "minimum": 0
+        },
+        "revise_ms": {
+          "description": "How long after sealing a late entry may still restate it, as a\nrevision.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 3600000,
+          "minimum": 0
+        },
+        "width_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "axis",
+        "width_ms"
+      ]
+    }
+  }
+}

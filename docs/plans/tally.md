@@ -1,14 +1,15 @@
 # tally: metrics as a derived tape
 
-**Status: the first slice is BUILT, and the CONFIGURATION below is a redesign
-of it.** Built: the line format, the fold, `timberfs tally` reading a
-`timberfs-records(5)` stream and writing tally lines, and an INI rule file
-carrying both the definition and a `SELECT` (`timberfs.1`, **tally**).
-⚠ **That rule file is the thing being replaced** — see *the extractor and the
-provisioning*: definitions become named JSON documents with no selection in
-them, and a separate INI file provisions the tally stores. Nothing else in the
-first slice changes. Not built either: the consumer/follower half that fans out
-per store, the `samples` response kind, rollups. It rests on
+**Status: the EXTRACTOR half is built.** The line format, the fold, the JSON
+extractor document with its published schema
+([docs/tally-extractor.schema.json](../tally-extractor.schema.json)),
+`timberfs tally` reading a `timberfs-records(5)` stream, `--try` against a
+plain file, `--fold`, and two shipped extractors tested by their own `--try`
+output (`timberfs.1`, **tally**). ⚠ **The PROVISIONING half is not built** —
+which stores get a tally store, named how, declaring what, with which
+extractors applied. Until it is, a pipeline names its own source and the
+operator creates the tally store. Not built either: the consumer/follower half
+that fans out per store, the `samples` response kind, rollups. It rests on
 the follower registry and its position per store
 ([follower-selection.md](follower-selection.md)), the consumer protocol
 ([consumer-protocol.md](consumer-protocol.md)), store selection (`select.rs`),
@@ -19,7 +20,7 @@ by `append`, which already exists:
 
 ```sh
 timberfs query --records app --from 13:00 \
-  | timberfs tally --rules /etc/timberfs/tally.d \
+  | timberfs tally --extractor /usr/lib/timberfs/tally.extractors.d \
   | timberfs append --into backing/app-tally.log
 ```
 
@@ -337,8 +338,8 @@ Three things INI was actively costing, all the same cost:
 
 And a fourth that only structure can fix: **a unit has nowhere to live in INI**.
 `sum=8419221` says nothing about whether it is bytes or milliseconds, and the
-first draft of `tally.conf.example` shipped second-scale buckets over a
-millisecond field — a perfectly well-formed histogram that means nothing.
+first INI draft of the shipped apache example carried second-scale buckets over
+a millisecond field — a perfectly well-formed histogram that means nothing.
 
 **`claim` is the query document's `Predicate`, verbatim** — same `$defs`, same
 `has`/`substring`/`regex`/`caseless`. One vocabulary for matching an entry
@@ -465,14 +466,12 @@ different facts apart:
 * the line **is** this metric's and could not be read — a real defect, and the
   number is now wrong rather than merely absent.
 
-⚠ **The built slice conflates them, and it is a defect.** A decoder that cannot
-parse the line, and an `extract` that does not match, are both reported as
-`!drop` — so a logfmt metric over a store that is ten percent stack traces
-emits a drop counter proportional to the stack traces and meaning nothing is
-wrong. The distinction already exists one step earlier (a predicate that does
-not select is `Skipped`, never a drop) and simply is not carried through.
-The fix: a shape mismatch is a SKIP, and only *claimed, then unreadable* is a
-drop.
+**Fixed with the redesign**: a shape mismatch — a decoder that cannot parse the
+line, an `extract` that does not match — is a SKIP, and only *claimed, then
+unreadable* is a drop. Before that, a logfmt metric over a store that is ten
+percent stack traces emitted a drop counter proportional to the stack traces
+and meaning nothing was wrong. `--try` reports both counts separately, and the
+skipped one is the half worth reading on a mixed store.
 
 A metric with a decoder and NO claim cannot make the distinction at all —
 worth saying in the documentation rather than refusing, since a single-shape
@@ -495,7 +494,7 @@ what a regex does well and should be an `extract`.
 justification is a different one: not that it cannot be regexed (it can), but
 that it is a PUBLISHED grammar many sites share and one that is easy to get
 subtly wrong by hand. The evidence is this tree's own: the first
-`tally.conf.example` shipped a hand-written apache regex that matched nothing,
+the first hand-written apache regex shipped here matched nothing,
 over a `$` that does not mean what it looks like.
 
 **The list stops growing by PARAMETERISATION, not by plugins.** If a fourth
@@ -773,11 +772,11 @@ loss, recorded exactly — the same rule retention already follows.
   bucket still depends on, so a restart re-derives identical lines), creating
   the tally store with its labels, lineage and `logline_lag`, and writing the
   `!gap` marker from the registry's GAP.
-* **The configuration redesign itself** — the extractor document and its
-  schema, the provisioning file, `--dump-json`, and retiring the INI rule file
-  the first slice shipped.
-* **A shape mismatch must be a SKIP, not a drop** — the built slice reports
-  both as `!drop`, which makes the counter meaningless on a mixed store.
+* **The provisioning file** — `SELECT`, `OUTPUT`, `APPLY`, `DECLARE`, the
+  `OUTPUT` collision check, the derived `logline_lag`, and converge-not-cascade.
+  It needs the follower half to have anything to run it.
+* **`timberfs tally --dump-json`** — a generator, which the JSON form wants
+  much more than the INI form did: nobody should be escaping a regex by hand.
 * **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,
   `TIMEOUT`, `SPAN`, `MAX_SESSIONS`, and `Roller` keyed by a field value
   instead of a bucket start.
@@ -791,12 +790,12 @@ loss, recorded exactly — the same rule retention already follows.
 ## What must change elsewhere when this ships
 
 Done with the first slice: `timberfs.1` gains **tally** and `logline_lag`, the
-completions gain the verb, and `packaging/tally.conf.example` is the rule file
-to copy.
+completions gain the verb, and `packaging/extractors/` holds the shipped
+documents with their fixtures under `tests/extractors/`.
 
-Still owed, when the rest lands: `timberfs.1`'s **tally** section and
-`tally.conf.example` describe the INI rule file and must follow the redesign, a
-`timberfs-tally-extractor(5)` for the document; `use-cases.md`'s "No aggregation, no
+Done with the extractor half: `timberfs.1`'s **tally** section, the README, the
+deployment guide, the published schema, and the shipped extractors with their
+fixtures. Still owed: a `timberfs-tally-extractor(5)` for the document; `use-cases.md`'s "No aggregation, no
 dashboards, no alerting" (two of three survive); `concepts.md` gains **tally**,
 **observation**, **bucket**, **revision**, **logline lag**; `design.md` gains
 the line format and the `logline_lag` manifest key; a `timberfs-tally(5)` and a

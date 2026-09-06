@@ -5300,8 +5300,37 @@ binary_upgrade_restarts_mount() {
 tally_example_installed() {
     # A wrong asset path in Cargo.toml only shows up in the built package,
     # which is what this VM installs.
-    test -f /usr/share/doc/timberfs/examples/tally.conf.example \
+    test -f /usr/lib/timberfs/tally.extractors.d/volume.json \
+        && test -f /usr/lib/timberfs/tally.extractors.d/apache-combined.json \
+        && timberfs tally --check --extractor /usr/lib/timberfs/tally.extractors.d >/dev/null 2>&1 \
         && zcat /usr/share/man/man1/timberfs.1.gz | tr -d ' \n' | grep -q 'SStally'
+}
+
+tally_try_runs_a_shipped_extractor_against_a_file() {
+    # The tool an operator reaches for before deploying a document, and
+    # the one that tests the ones we ship. ⚠ The skipped count is the
+    # half worth reading: a store carries several line shapes, so "not
+    # mine" is ordinary and must never be counted as a loss.
+    local out err
+    printf '10.0.0.1 - - [06/Sep/2026:13:37:00 +0200] "GET /x HTTP/1.1" 200 2326\n2026-09-06T13:37:01Z level=info msg="another shape entirely"\n' \
+        > /tmp/vmtry.log
+    out=$(timberfs tally --try \
+            --extractor /usr/lib/timberfs/tally.extractors.d/apache-combined.json \
+            < /tmp/vmtry.log 2>/tmp/vmtry.err) || { cat /tmp/vmtry.err >&2; return 1; }
+    grep -q 'http_requests method=GET status=200 count=1' <<<"$out" || {
+        echo "$out" >&2
+        return 1
+    }
+    grep -q 'claimed 1, skipped 1, dropped 0' /tmp/vmtry.err || {
+        cat /tmp/vmtry.err >&2
+        return 1
+    }
+    # A document this build cannot read is refused, not half-understood.
+    sed 's/1\.0-EXPERIMENTAL/9.9-FUTURE/' \
+        /usr/lib/timberfs/tally.extractors.d/volume.json > /tmp/vmfuture.json
+    timberfs tally --check --extractor /tmp/vmfuture.json >/dev/null 2>&1 && return 1
+    rm -f /tmp/vmtry.log /tmp/vmtry.err /tmp/vmfuture.json
+    return 0
 }
 
 tally_derives_metrics_that_are_a_store_like_any_other() {
@@ -5309,7 +5338,7 @@ tally_derives_metrics_that_are_a_store_like_any_other() {
     # rests on: the numbers land in an ordinary store, so nothing new
     # reads them.
     local d=/var/log/timberfs/vmtally s=/var/log/timberfs/vmtallysrc
-    rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.conf
+    rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.json
     mkdir -p /etc/timberfs/tally.d
 
     timberfs create "$s/vmtallysrc.log" --set service=vmapp --index >/dev/null 2>&1 || return 1
@@ -5321,17 +5350,19 @@ tally_derives_metrics_that_are_a_store_like_any_other() {
     } > /tmp/vmtally.log
     timberfs import /tmp/vmtally.log --into "$s/vmtallysrc.log" >/dev/null 2>&1 || return 1
 
-    cat > /etc/timberfs/tally.d/vm.conf <<'CONF'
-SELECT=[service=vmapp]
-AXIS=logline
-WIDTH=60s
-GRACE=30s
-
-[requests]
-DECODE=logfmt
-LABELS=level
-COUNT=
-SUM=ms
+    cat > /etc/timberfs/tally.d/vm.json <<'CONF'
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "vmapp",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 30000 },
+  "metrics": [
+    { "name": "requests",
+      "claim":  { "all": [{ "substring": "level=" }] },
+      "fields": { "decode": "logfmt" },
+      "labels": ["level"],
+      "measure": [{ "count": true }, { "sum": "ms", "unit": "ms" }] }
+  ]
+}
 CONF
 
     # The distance this store's two clocks sit apart, without which a
@@ -5341,7 +5372,7 @@ CONF
     timberfs set "$d/vmtally.log" logline_lag=520w >/dev/null 2>&1 || return 1
 
     timberfs query --records "$s/vmtallysrc.log" 2>/dev/null \
-        | timberfs tally --rules /etc/timberfs/tally.d/vm.conf 2>/tmp/vmtally.err \
+        | timberfs tally --extractor /etc/timberfs/tally.d/vm.json 2>/tmp/vmtally.err \
         | timberfs append --into "$d/vmtally.log" >/dev/null 2>&1 || {
         cat /tmp/vmtally.err >&2
         return 1
@@ -5365,7 +5396,7 @@ CONF
         return 1
     }
 
-    rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.conf /tmp/vmtally.log
+    rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.json /tmp/vmtally.log
 }
 
 tally_fold_buckets_anybodys_observations() {
@@ -5376,22 +5407,15 @@ tally_fold_buckets_anybodys_observations() {
         | awk '{ match($0,/[0-9.]+ms$/); v=substr($0,RSTART,RLENGTH-2); print $1" 0s gc_pause count=1 sum="v }' \
         | timberfs tally --fold --width 60s --grace 0s \
         | grep -qx '2026-09-06T10:00:00.000Z 60s gc_pause count=2 sum=2' || return 1
-    # And a rule reaching for the hook that is not there gets the route
-    # that is, rather than "unknown key".
-    mkdir -p /etc/timberfs/tally.d
-    printf 'AXIS=logline\n[m]\nEXEC=/usr/local/lib/timberfs/tally/x\nCOUNT=\n' \
-        > /etc/timberfs/tally.d/vmexec.conf
-    local err
-    err=$(printf '' | timberfs tally --rules /etc/timberfs/tally.d/vmexec.conf 2>&1)
-    rm -f /etc/timberfs/tally.d/vmexec.conf
-    grep -q 'follower' <<<"$err" || { echo "$err" >&2; return 1; }
 }
 
-run_test "tally: example conf and man section installed by the package" tally_example_installed
+run_test "tally: shipped extractors and man section installed by the package" tally_example_installed
 run_test "tally: metrics derived into an ordinary store" \
     tally_derives_metrics_that_are_a_store_like_any_other
 run_test "tally: --fold buckets anybody's observations" \
     tally_fold_buckets_anybodys_observations
+run_test "tally: --try runs a shipped extractor against a plain file" \
+    tally_try_runs_a_shipped_extractor_against_a_file
 
 run_test "upgrade: appender self-exits, systemd restarts it on the new binary" binary_upgrade_restarts_appender
 run_test "upgrade: mount self-exits, remounts on the new binary" binary_upgrade_restarts_mount

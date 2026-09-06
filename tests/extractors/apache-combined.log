@@ -1,0 +1,6 @@
+10.0.0.1 - - [06/Sep/2026:13:37:00 +0200] "GET /index.html HTTP/1.1" 200 2326 "-" "curl/8.5.0"
+10.0.0.2 - - [06/Sep/2026:13:37:01 +0200] "GET /missing HTTP/1.1" 404 209 "-" "curl/8.5.0"
+10.0.0.1 - - [06/Sep/2026:13:37:40 +0200] "POST /api/v1/order HTTP/1.1" 500 1180 "https://example.com/" "Mozilla/5.0"
+10.0.0.3 - - [06/Sep/2026:13:38:05 +0200] "GET /favicon.ico HTTP/1.1" 200 -
+10.0.0.3 - - [06/Sep/2026:13:38:06 +0200] "GET /index.html HTTP/1.1" 200 2326 "-" "Mozilla/5.0"
+2026-09-06T13:38:07Z level=error msg="a line of another shape entirely"
