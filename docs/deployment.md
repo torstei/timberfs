@@ -1233,12 +1233,40 @@ it is found.
 from a pipe or from cron. `man timberfs`, **tally**, is the reference and
 [docs/plans/tally.md](plans/tally.md) is the design.
 
-**Extractors** are JSON documents describing metrics read off one shape of
-line. The packaged set is `/usr/lib/timberfs/tally.extractors.d/` and a site's
-own go in `/etc/timberfs/tally.extractors.d/`; `--extractor` takes a file or a
-directory and is repeatable. They carry no store selection at all — which
-stores get measured is deployment, and belongs to a provisioning file that is
-not built yet, so for now the pipeline below names its own source.
+Two files, and the split is the point. An **extractor** says HOW to measure one
+shape of line and carries no store selection, so it can be shipped and shared —
+the packaged set is `/usr/lib/timberfs/tally.extractors.d/`, a site's own go in
+`/etc/timberfs/tally.extractors.d/`, and a same-named file in `/etc` shadows
+the packaged one. A **provisioning** says WHICH stores get a tally store, and
+is about this host:
+
+```ini
+# /etc/timberfs/tally.d/apache.conf
+SELECT=[service=~apache-.*]
+OUTPUT={name}-tally
+APPLY=timberfs-apache-combined timberfs-volume
+DECLARE=index=true retain=730d retain_size=5G
+STORE_DIR=/var/log/timberfs
+```
+
+```sh
+timberfs tally --provision apache --dry-run    # what it would create
+timberfs tally --provision apache              # declare, converge, register
+systemctl enable --now timberfs-follower@tally-apache
+```
+
+⚠ The operator writes no follower and no command: `--provision` registers
+`tally-apache` with both derived from the file, so the two cannot drift. It is
+registered because that is where the position and the retention floor live.
+
+⚠ It converges and never cascades — a source store appearing gets its tally
+store on the next run, and a source store being deleted does **not** take its
+tally store, because outliving the log is the entire point. A `DECLARE` that
+has drifted from what is on disk is reported, never rewritten over an
+operator's `timberfs set`.
+
+⚠ `logline_lag` is derived, not typed, and `class!=tally` is folded into the
+selection so a provisioning cannot end up measuring its own output.
 
 Try one against a real file before deploying it:
 
@@ -1253,7 +1281,8 @@ line shapes it is the ordinary case and not a loss, while **dropped** means a
 line this metric claimed and could not read, and the numbers are then wrong
 rather than merely absent.
 
-The numbers go into a store of their own, one per source store:
+Under it, and what `--provision` automates, the numbers go into a store of
+their own, one per source store:
 
 ```sh
 timberfs create /var/log/timberfs/apache-access-tally/apache-access-tally.log \

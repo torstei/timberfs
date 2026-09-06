@@ -641,7 +641,11 @@ enum Command {
     Tally {
         /// An extractor document, or a directory of *.json read whole.
         /// Repeatable; a name claimed by two documents is refused
-        #[arg(long = "extractor", value_name = "PATH", required_unless_present_any = ["fold"])]
+        #[arg(
+            long = "extractor",
+            value_name = "PATH",
+            required_unless_present_any = ["fold", "provision"]
+        )]
         extractors: Vec<PathBuf>,
         /// Validate the extractors and apply them to PLAIN LOG LINES on
         /// stdin, for trying one against a real file:
@@ -667,6 +671,28 @@ enum Command {
         /// rewriting the rest. Repeatable
         #[arg(long, value_name = "NAME")]
         metric: Vec<String>,
+        /// Declare and converge a PROVISIONING by name — which stores get
+        /// a tally store, named how, declaring what, measured by which
+        /// extractors — from /etc/timberfs/tally.d/<SET>.conf, and
+        /// register the follower that will run it. The shape
+        /// `file-intake --check` has: it says what resolved
+        #[arg(long, value_name = "SET", conflicts_with_all = ["extractors", "fold", "try_it"])]
+        provision: Option<String>,
+        /// With --provision: report the plan and change nothing
+        #[arg(long, requires = "provision")]
+        dry_run: bool,
+        /// Where the provisioning and the site's extractors live
+        #[arg(
+            long,
+            value_name = "DIR",
+            default_value = "/etc/timberfs",
+            requires = "provision"
+        )]
+        etc: PathBuf,
+        /// Forests to resolve the selection against; default every
+        /// configured one
+        #[arg(long, value_name = "DIR", requires = "provision")]
+        forest: Vec<PathBuf>,
         /// Read width-0s OBSERVATION lines on stdin and write buckets,
         /// instead of reading a records stream. What makes writing your
         /// own extractor a real answer: emit observations, pipe them
@@ -1847,10 +1873,24 @@ fn main() -> anyhow::Result<()> {
             check,
             observations,
             metric,
+            provision,
+            dry_run,
+            etc,
+            forest,
             fold,
             width,
             grace,
         } => {
+            if let Some(set) = provision {
+                return tally::cmd_provision(
+                    &set,
+                    &tally::ProvisionOpts {
+                        etc,
+                        dry_run,
+                        forest,
+                    },
+                );
+            }
             let width_ms = width
                 .as_deref()
                 .map(append::parse_duration_ms)

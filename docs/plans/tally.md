@@ -893,10 +893,10 @@ loss, recorded exactly — the same rule retention already follows.
   bucket still depends on, so a restart re-derives identical lines), creating
   the tally store with its labels, lineage and `logline_lag`, and writing the
   `!gap` marker from the registry's GAP.
-* **The provisioning file** — `SELECT`, `OUTPUT`, `APPLY`, `DECLARE`, the
-  `OUTPUT` collision check, the derived `logline_lag`, converge-not-cascade,
-  the implicit `class!=tally`, and the derived follower registration. It needs
-  the follower half to have anything to run it, so the two land together.
+* **The follower half** — `timberfs tally --provision <set>` as the CONSUMER:
+  a multi-store feed stream in, one output store and one set of rollers per
+  source, a watermark per store, and the `!gap` marker from the registry. The
+  provisioning that registers it is built; nothing runs it yet.
 * **`timberfs tally --dump-json`** — a generator, which the JSON form wants
   much more than the INI form did: nobody should be escaping a regex by hand.
 * **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,

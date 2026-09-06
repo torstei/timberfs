@@ -1508,6 +1508,92 @@ buckets rather than doubling them.
 .TP
 .BI \-\-width " SPAN"
 Override the extractors' own window.
+.TP
+.BI \-\-provision " SET"
+Declare and converge a PROVISIONING by name, from
+.IR /etc/timberfs/tally.d/SET.conf ,
+and register the follower that will run it. The shape
+.B file\-intake \-\-check
+has: it says what resolved.
+.B \-\-dry\-run
+reports the plan and changes nothing;
+.B \-\-etc
+and
+.B \-\-forest
+move where it looks.
+.PP
+.RS
+.nf
+# /etc/timberfs/tally.d/apache.conf
+SELECT=[service=~apache\-.*]
+OUTPUT={name}\-tally
+APPLY=timberfs\-apache\-combined timberfs\-volume
+DECLARE=index=true retain=730d retain_size=5G
+STORE_DIR=/var/log/timberfs
+.fi
+.RE
+.PP
+.RS
+.nf
+timberfs tally \-\-provision apache
+systemctl enable \-\-now timberfs\-follower@tally\-apache
+.fi
+.RE
+.PP
+.RS
+An extractor says HOW to measure a shape of line and carries no store
+selection; a provisioning says WHICH stores get a tally store, named how
+.RB ( OUTPUT ,
+a template over
+.BR {name} ", " {host} ", " {service} " and " {id} ),
+declaring what
+.RB ( DECLARE ,
+the same KEY=VALUE string
+.B file.d
+takes), and measured by which documents
+.RB ( APPLY ,
+naming them rather than pointing at files).
+.B WIDTH
+overrides the extractors' own.
+.PP
+⚠ FLAT \(em one provisioning per file, where
+.B file.d
+has a section per store. A section there names one store; here the
+SELECTION already names a set, so a second section would only be a second
+selection, which is a second file and a second unit.
+.PP
+⚠ THE FILE IS THE INTERFACE AND THE FOLLOWER IS STATE. The operator
+writes neither the follower's selection nor its command: both are derived
+from the file, so the two cannot drift. It is registered because that is
+where the position and the retention floor live, and a program that
+writes those can get retention wrong silently.
+.PP
+⚠
+.B class!=tally
+is folded into the selection rather than left to an operator. A tally
+store inherits its source's provenance, so
+.B [service=~apache\-.*]
+matches the tally store it just created, whose every line a volume metric
+then claims, producing another store one level deeper, forever. Measuring
+a tally store is a ROLLUP, which is a different verb.
+.PP
+⚠ It CONVERGES and never cascades. A source store appearing gets its
+tally store on the next run; a source store being DELETED does not take
+its tally store, because outliving the log is the entire point. A
+.B DECLARE
+that has drifted from what is on disk is REPORTED, never rewritten \(em
+somebody ran
+.B timberfs set
+and meant it.
+.PP
+.B logline_lag
+is DERIVED from the applied extractors (their width plus their grace) and
+declared on every tally store, because a logline window narrower than the
+distance between its two clocks selects no chunk and answers nothing.
+Naming it in
+.B DECLARE
+overrides it, which is what a backfill needs.
+.RE
 .PP
 .B LATENESS
 .PP

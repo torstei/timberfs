@@ -1731,6 +1731,477 @@ fn note_drop(roller: &mut Roller, metric: &str, why: &'static str, at: Option<u6
     roller.add(&s);
 }
 
+// ------------------------------------------------------------ provisioning
+
+/// Where a site declares which stores get a tally store, under
+/// `/etc/timberfs`.
+pub const PROVISION_DIR: &str = "tally.d";
+
+/// Where extractor documents are looked up by NAME, in order — the
+/// packaged set first, the site's second, so a same-named FILE in `/etc`
+/// shadows the packaged one.
+pub const EXTRACTOR_DIR: &str = "tally.extractors.d";
+pub const PACKAGED_EXTRACTORS: &str = "/usr/lib/timberfs/tally.extractors.d";
+
+const SELECT: &str = "SELECT";
+const OUTPUT: &str = "OUTPUT";
+const APPLY: &str = "APPLY";
+const DECLARE: &str = "DECLARE";
+const STORE_DIR: &str = "STORE_DIR";
+const WIDTH: &str = "WIDTH";
+
+const PROVISION_KEYS: &[&str] = &[SELECT, OUTPUT, APPLY, DECLARE, STORE_DIR, WIDTH];
+
+/// One provisioning: which stores get a tally store, named how, declaring
+/// what, measured by which extractors.
+///
+/// ⚠ FLAT — one provisioning per file, where `file.d` has a section per
+/// store. A section there names one store; here the SELECTION already
+/// names a set, so a second section would only be a second selection,
+/// which is a second file and a second unit. That also keeps the follower
+/// simple: one selection, one process, one `timberfs-tally@<set>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Provision {
+    /// The file's name, which is the unit instance and the follower's.
+    pub set: String,
+    pub select: String,
+    /// A template over the SOURCE store's facts: `{name}`, `{host}`,
+    /// `{service}`, `{id}`.
+    pub output: String,
+    /// Extractor documents, by name.
+    pub apply: Vec<String>,
+    /// Declared on every tally store this provisioning creates, as
+    /// KEY=VALUE pairs — the same string `file.d` takes.
+    pub declare: Vec<String>,
+    pub store_dir: PathBuf,
+    pub width_ms: Option<u64>,
+}
+
+impl Provision {
+    pub fn parse(set: &str, text: &str) -> anyhow::Result<Provision> {
+        let mut select: Option<String> = None;
+        let mut output = "{name}-tally".to_string();
+        let mut apply: Vec<String> = Vec::new();
+        let mut declare: Vec<String> = Vec::new();
+        let mut store_dir = PathBuf::from("/var/log/timberfs");
+        let mut width_ms: Option<u64> = None;
+
+        for (i, raw) in text.lines().enumerate() {
+            let line = i + 1;
+            let t = raw.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            if t.starts_with('[') {
+                bail!(
+                    "{set}.conf:{line}: a provisioning has no sections — one selection per                      file, so a second is a second file and a second unit"
+                );
+            }
+            let Some((key, value)) = t.split_once('=') else {
+                bail!("{set}.conf:{line}: expected KEY=VALUE — got {t:?}");
+            };
+            let (key, value) = (key.trim(), value.trim());
+            if !PROVISION_KEYS.contains(&key) {
+                bail!(
+                    "{set}.conf:{line}: unknown key {key:?} — this build reads {}",
+                    PROVISION_KEYS.join(", ")
+                );
+            }
+            match key {
+                SELECT => {
+                    select = Some(
+                        crate::select::canonical(value)
+                            .with_context(|| format!("{set}.conf:{line}: {SELECT}"))?,
+                    )
+                }
+                OUTPUT => output = value.to_string(),
+                APPLY => apply = value.split_whitespace().map(str::to_string).collect(),
+                DECLARE => declare = value.split_whitespace().map(str::to_string).collect(),
+                STORE_DIR => store_dir = PathBuf::from(value),
+                _ => {
+                    let ms = crate::append::parse_duration_ms(value)
+                        .with_context(|| format!("{set}.conf:{line}: {WIDTH}"))?;
+                    if ms == 0 || !ms.is_multiple_of(1000) {
+                        bail!("{set}.conf:{line}: {WIDTH} is whole seconds and not zero");
+                    }
+                    width_ms = Some(ms)
+                }
+            }
+        }
+
+        let Some(select) = select else {
+            bail!("{set}.conf: no {SELECT} — a provisioning that names no stores measures none");
+        };
+        if apply.is_empty() {
+            bail!(
+                "{set}.conf: no {APPLY} — name the extractor documents to measure with,                  e.g. `{APPLY}=timberfs-apache-combined timberfs-volume`"
+            );
+        }
+        if !output.contains("{name}") && !output.contains("{id}") {
+            // Every source store would otherwise map to ONE output, which
+            // is several writers on one store — refused later, but the
+            // template is where the mistake was made.
+            bail!(
+                "{set}.conf: {OUTPUT}={output:?} names the same store for every source \
+                 — it must vary, so use {{name}} or {{id}}"
+            );
+        }
+        for kv in &declare {
+            if !kv.contains('=') {
+                bail!("{set}.conf: {DECLARE} takes KEY=VALUE pairs — got {kv:?}");
+            }
+        }
+        Ok(Provision {
+            set: set.to_string(),
+            select,
+            output,
+            apply,
+            declare,
+            store_dir,
+            width_ms,
+        })
+    }
+
+    pub fn load(etc: &Path, set: &str) -> anyhow::Result<Provision> {
+        let path = etc.join(PROVISION_DIR).join(format!("{set}.conf"));
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Provision::parse(set, &text)
+    }
+
+    /// The follower this provisioning registers. Derived, never typed:
+    /// the file is the interface and the registration is state.
+    pub fn follower_name(&self) -> String {
+        format!("tally-{}", self.set)
+    }
+
+    /// ⚠ `class!=tally` is folded in here rather than left to an
+    /// operator. A tally store inherits its source's provenance, so a
+    /// selection like `[service=~apache-.*]` matches the tally store it
+    /// just created, whose every line a volume metric then claims,
+    /// producing another store one level deeper, forever. Measuring a
+    /// tally store is a ROLLUP, which is a different verb.
+    pub fn selector(&self) -> anyhow::Result<String> {
+        let inner = self.select.trim_start_matches('[').trim_end_matches(']');
+        Ok(if inner.trim().is_empty() {
+            "[class=]".to_string()
+        } else {
+            format!("[{inner},class=]")
+        })
+    }
+
+    /// Where the extractors named by `APPLY` are looked up.
+    pub fn extractor_dirs(etc: &Path) -> Vec<PathBuf> {
+        vec![PathBuf::from(PACKAGED_EXTRACTORS), etc.join(EXTRACTOR_DIR)]
+            .into_iter()
+            .filter(|p| p.is_dir())
+            .collect()
+    }
+
+    /// The extractors this provisioning applies, in the order named.
+    pub fn extractors(&self, etc: &Path) -> anyhow::Result<Vec<Extractor>> {
+        let dirs = Provision::extractor_dirs(etc);
+        if dirs.is_empty() {
+            bail!(
+                "no extractor directory to search — expected {PACKAGED_EXTRACTORS} or                  {}",
+                etc.join(EXTRACTOR_DIR).display()
+            );
+        }
+        let available = load_extractors(&dirs)?;
+        self.apply
+            .iter()
+            .map(|want| {
+                available
+                    .iter()
+                    .find(|(_, d)| d.name == *want)
+                    .map(|(_, d)| d.clone())
+                    .with_context(|| {
+                        format!(
+                            "{}.conf: no extractor named {want:?} in {} — {APPLY} names                              DOCUMENTS, and this build found {}",
+                            self.set,
+                            dirs.iter()
+                                .map(|d| d.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(" and "),
+                            available
+                                .iter()
+                                .map(|(_, d)| d.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// The name of the tally store for one source, from the template.
+    pub fn output_for(&self, m: &crate::select::Match) -> anyhow::Result<String> {
+        let labels = crate::select::selectable_of(&m.dir, &m.name);
+        let field = |k: &str| -> String {
+            labels
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let out = self
+            .output
+            .replace("{name}", &m.handle)
+            .replace("{host}", &field("host"))
+            .replace("{service}", &field("service"))
+            .replace("{id}", m.id.as_deref().unwrap_or_default());
+        if out.contains('{') || out.contains('}') {
+            bail!(
+                "{}.conf: {OUTPUT}={:?} leaves a placeholder unfilled for {} — the fields                  are {{name}}, {{host}}, {{service}} and {{id}}",
+                self.set,
+                self.output,
+                m.handle
+            );
+        }
+        // A handle names a directory and a file, so it takes the
+        // character set a store name already has to survive being one.
+        if out.is_empty()
+            || !out
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            bail!(
+                "{}.conf: {OUTPUT} produced {out:?} for {}, which is not a store name \
+                 (letters, digits, _ - and .)",
+                self.set,
+                m.handle
+            );
+        }
+        Ok(out)
+    }
+}
+
+/// What a provisioning would do to one source store.
+pub struct Planned {
+    pub source: crate::select::Match,
+    pub output: String,
+    pub dest: PathBuf,
+    /// The bark this tally store should declare.
+    pub declare: Vec<String>,
+    /// Absent when the store is already there, so a run says CREATE or
+    /// EXISTS rather than doing both silently.
+    pub exists: bool,
+    /// Declared keys whose value on disk differs from what this
+    /// provisioning says. Reported, never rewritten: somebody ran
+    /// `timberfs set` and meant it.
+    pub drift: Vec<(String, String, String)>,
+}
+
+/// Resolve a provisioning against the stores that are actually there.
+///
+/// ⚠ Every source is checked for an OUTPUT collision, not for a
+/// SELECT overlap. Two provisionings may cover one store as long as they
+/// produce different tally stores; two producing the same one is two
+/// writers. Overlapping selections are not decidable in general, and two
+/// names being equal is.
+pub fn plan(p: &Provision, etc: &Path, dirs: &[PathBuf]) -> anyhow::Result<Vec<Planned>> {
+    let extractors = p.extractors(etc)?;
+    let lag_ms = extractors
+        .iter()
+        .map(|e| p.width_ms.unwrap_or(e.window.width_ms) + e.window.grace_ms)
+        .max()
+        .unwrap_or(0);
+
+    let sel = crate::select::Selector::parse(&p.selector()?)?;
+    let mut out: Vec<Planned> = Vec::new();
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    for m in crate::select::resolve(dirs, &sel) {
+        let name = p.output_for(&m)?;
+        if let Some(other) = claimed.insert(name.clone(), m.handle.clone()) {
+            bail!(
+                "{}.conf: {} and {} both produce {name} — one tally store, two writers. \
+                 {OUTPUT} must vary with the source",
+                p.set,
+                other,
+                m.handle
+            );
+        }
+        let dest = p.store_dir.join(&name).join(format!("{name}.log"));
+
+        // Inherited provenance, then what this provisioning declares,
+        // then the facts only the provisioning knows.
+        let source_bark = crate::bark::load(&m.dir, &m.name).unwrap_or_default();
+        let mut declare: Vec<String> = crate::bark::provenance(&source_bark)
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
+            .collect();
+        declare.push("class=tally".to_string());
+        declare.push("derived_op=tally".to_string());
+        if let Some(id) = &m.id {
+            declare.push(format!("derived_from={id}"));
+        }
+        // ⚠ DERIVED, never typed. A tally store's two clocks sit a
+        // bucket-and-a-grace apart by construction, and a logline window
+        // narrower than that selects no chunk and answers nothing —
+        // which reads exactly like a quiet minute.
+        declare.push(format!("logline_lag={}s", lag_ms.div_ceil(1000)));
+        for kv in &p.declare {
+            let key = kv.split_once('=').map(|(k, _)| k).unwrap_or(kv);
+            declare.retain(|had| had.split_once('=').map(|(k, _)| k) != Some(key));
+            declare.push(kv.clone());
+        }
+        declare.sort();
+
+        let (dir, base) = (
+            dest.parent().expect("a dest has a parent").to_path_buf(),
+            format!("{name}.log"),
+        );
+        let exists = crate::format::rings_path(&dir, &base).exists();
+        let mut drift = Vec::new();
+        if exists {
+            let have = crate::bark::load(&dir, &base).unwrap_or_default();
+            for kv in &declare {
+                let Some((k, want)) = kv.split_once('=') else {
+                    continue;
+                };
+                let is = have.get(k).map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                });
+                if is.as_deref() != Some(want) {
+                    drift.push((
+                        k.to_string(),
+                        is.unwrap_or_else(|| "(absent)".to_string()),
+                        want.to_string(),
+                    ));
+                }
+            }
+        }
+        out.push(Planned {
+            source: m,
+            output: name,
+            dest,
+            declare,
+            exists,
+            drift,
+        });
+    }
+    Ok(out)
+}
+
+pub struct ProvisionOpts {
+    pub etc: PathBuf,
+    pub dry_run: bool,
+    /// Forests to resolve the selection against; empty means every
+    /// configured one.
+    pub forest: Vec<PathBuf>,
+}
+
+/// `timberfs tally --check <set>`: declare, converge, and say what
+/// resolved — the shape `file-intake --check` has.
+///
+/// ⚠ Converges and never cascades. A source store appearing gets its
+/// tally store; a source store being DELETED does not take its tally
+/// store, because outliving the log is the entire point.
+pub fn cmd_provision(set: &str, opts: &ProvisionOpts) -> anyhow::Result<()> {
+    let p = Provision::load(&opts.etc, set)?;
+    let extractors = p.extractors(&opts.etc)?;
+    let dirs = if opts.forest.is_empty() {
+        crate::forest::forest_dirs()
+    } else {
+        opts.forest.clone()
+    };
+    let planned = plan(&p, &opts.etc, &dirs)?;
+
+    println!("{set} — {} ({})", p.select, p.follower_name());
+    println!(
+        "  measure  {}",
+        extractors
+            .iter()
+            .map(|e| format!(
+                "{} ({})",
+                e.name,
+                e.metrics
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    if planned.is_empty() {
+        // "Matched nothing" and "nothing was searched" are different
+        // answers, so the searched set is named.
+        println!(
+            "  stores   none — {} searched {} director{}",
+            p.select,
+            dirs.len(),
+            if dirs.len() == 1 { "y" } else { "ies" }
+        );
+    }
+    for pl in &planned {
+        let what = if pl.exists { "exists" } else { "CREATE" };
+        println!(
+            "  {:<8} {} -> {}",
+            what,
+            pl.source.handle,
+            pl.dest.display()
+        );
+        for (k, is, want) in &pl.drift {
+            // Reported, never rewritten: somebody ran `timberfs set`.
+            println!("           ⚠ {k} is {is}, this provisioning says {want}");
+        }
+        if !pl.exists && !opts.dry_run {
+            crate::bark::cmd_create(&pl.dest, false, false, None, None, false, &pl.declare, true)?;
+        }
+    }
+
+    if opts.dry_run {
+        println!("  follower {} would be registered", p.follower_name());
+        return Ok(());
+    }
+    register_follower(&p)?;
+    println!("  follower {} registered", p.follower_name());
+    Ok(())
+}
+
+/// The follower, derived from the file and kept in step with it.
+///
+/// The operator writes neither its selection nor its command: the file is
+/// the interface and the registration is STATE — which is also why there
+/// is no drift to detect between them.
+fn register_follower(p: &Provision) -> anyhow::Result<()> {
+    let name = p.follower_name();
+    let command = vec![
+        "timberfs".to_string(),
+        "tally".to_string(),
+        "--provision".to_string(),
+        p.set.clone(),
+    ];
+    let select = p.selector()?;
+    let reg = crate::follower::registry_dir();
+    match crate::follower::Declaration::load(&reg, &name) {
+        Ok(mut have) => {
+            if have.select == select && have.command == command {
+                return Ok(());
+            }
+            have.select = select;
+            have.command = command;
+            have.save(&reg)
+        }
+        Err(_) => crate::follower::cmd_create(
+            &name,
+            crate::follower::CreateOpts {
+                select: Some(select),
+                store: None,
+                retaining: false,
+                follow_from: None,
+                enable: false,
+                start: false,
+                dry_run: false,
+                command,
+            },
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2327,6 +2798,71 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no shipped extractors were checked");
+    }
+
+    fn provision(text: &str) -> anyhow::Result<Provision> {
+        Provision::parse("t", text)
+    }
+
+    #[test]
+    fn a_provisioning_names_stores_and_extractors_or_it_measures_nothing() {
+        assert!(provision("APPLY=timberfs-volume\n").is_err(), "no SELECT");
+        assert!(provision("SELECT=[]\n").is_err(), "no APPLY");
+        assert!(provision("SELECT=[]\nAPPLY=timberfs-volume\n").is_ok());
+
+        // A section header is the shape `file.d` has and this does not:
+        // one selection per file, so a second is a second file and a
+        // second unit.
+        let err = provision("[apache]\nSELECT=[]\nAPPLY=x\n").unwrap_err();
+        assert!(format!("{err}").contains("no sections"), "{err}");
+
+        let err = provision("SELECT=[]\nAPPLY=x\nWIDHT=60s\n").unwrap_err();
+        assert!(format!("{err}").contains("unknown key"), "{err}");
+    }
+
+    #[test]
+    fn an_output_template_that_does_not_vary_is_refused_at_the_template() {
+        // Every source would map to one store, which is several writers
+        // on one tally store. Refused where the mistake was MADE rather
+        // than as a collision three stores later.
+        let err = provision("SELECT=[]\nAPPLY=x\nOUTPUT=one-tally\n").unwrap_err();
+        assert!(format!("{err}").contains("must vary"), "{err}");
+        assert!(provision("SELECT=[]\nAPPLY=x\nOUTPUT={name}.tally\n").is_ok());
+    }
+
+    #[test]
+    fn a_tally_selection_excludes_tally_stores_without_being_asked() {
+        // ⚠ A tally store inherits its source's provenance, so
+        // `[service=~apache-.*]` matches the tally store it just created,
+        // whose every line a volume metric then claims — producing
+        // another store one level deeper, forever. Implicit, because an
+        // operator who forgot it would not find out for a week.
+        let p = provision("SELECT=[service=~apache-.*]\nAPPLY=x\n").unwrap();
+        let sel = p.selector().unwrap();
+        assert!(sel.contains("class="), "{sel}");
+
+        let apache = crate::select::Selector::parse(&sel).unwrap();
+        let mut source = serde_json::Map::new();
+        source.insert("service".into(), serde_json::json!("apache-access"));
+        assert!(apache.matches(&source), "the source store is followed");
+
+        let mut its_output = source.clone();
+        its_output.insert("class".into(), serde_json::json!("tally"));
+        assert!(
+            !apache.matches(&its_output),
+            "a tally store is never a source: that is a rollup, and a different verb"
+        );
+
+        // …and `[]` narrows the same way rather than becoming everything.
+        let all = provision("SELECT=[]\nAPPLY=x\n").unwrap();
+        let sel = crate::select::Selector::parse(&all.selector().unwrap()).unwrap();
+        assert!(!sel.matches(&its_output), "{:?}", all.selector());
+    }
+
+    #[test]
+    fn the_follower_is_derived_from_the_file_and_never_typed() {
+        let p = provision("SELECT=[class=audit]\nAPPLY=x\n").unwrap();
+        assert_eq!(p.follower_name(), "tally-t");
     }
 
     /// The contract is a FILE in the repository, not something a build
