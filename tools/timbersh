@@ -197,6 +197,7 @@ HELP = """
   tail   <kind> from <source> [where ...];
   graph  <metric>[, <metric>...] from <source> [by LABEL] [where ...]
          [quantile Q] [rate] [png 'FILE'];
+  graph  <metric> against <metric> from <source> [...];
 
     `into view` puts the ANSWER on the pager's screen instead of on the
     terminal: multi-line entries stay whole, Tab and Enter search as
@@ -214,7 +215,12 @@ HELP = """
     `graph` draws metrics from a TALLY store (see `man timberfs`, tally)
     across the fleet. Several, comma-separated, share one picture -- and
     the UNIT decides the axis, so two response times share one while a
-    count and a byte total do not. A tally line is text, so it is a `loglines` read
+    count and a byte total do not.
+
+    `graph Y against X` is a SCATTER -- one point per bucket -- and is
+    the honest plot for "are these two related": two lines on a shared
+    time axis invites seeing a relationship that is not there, where a
+    cloud stays a cloud. A tally line is text, so it is a `loglines` read
     and a plot of what came back. ⚠ The HOST is a label like any other:
     a fleet answer that merged two of them would be two series a reader
     takes for one, so `by host` keeps them apart and leaving it out sums
@@ -833,6 +839,7 @@ SUBJECTS = ["entry", "chunk", "logline", "written"]
 FORMS = """
     select <kind> from <source> <clauses...>
     graph  <metric> from <source> <graphclauses...>
+    graph  <metric> against <metric> from <source> <graphclauses...>
     tail   <kind> from <source> <tailclauses...>
     view   <source> <at...>
     declare <name> cursor for <statement...>
@@ -1655,11 +1662,28 @@ class Shell:
             raise ValueError(
                 "graph <metric>[, <metric>...] from <source> [by <label>] "
                 "[where logline since 'T'] [quantile 0.95] [rate] [png 'FILE']")
-        metrics = [m for t in toks[1:at] for m in t[1].split(",") if m]
+        conds, by, opts, i = [], [], {}, at + 2
+        head_words = [t[1] for t in toks[1:at]]
+        versus = next((n for n, w in enumerate(head_words)
+                       if w.lower() == "against"), None)
+        if versus is not None:
+            # A SCATTER: one point per bucket, x the metric after
+            # `against`. The honest plot for "are these two related" —
+            # two lines on a shared time axis, especially on two scales,
+            # is the one that invites seeing a relationship that is not
+            # there.
+            metrics = [m for w in head_words[:versus] for m in w.split(",") if m]
+            x_of = [m for w in head_words[versus + 1:] for m in w.split(",") if m]
+            if len(metrics) != 1 or len(x_of) != 1:
+                raise ValueError(
+                    "`against` pairs ONE metric with one other: "
+                    "graph <y> against <x> from <source>")
+            opts["against"] = x_of[0]
+        else:
+            metrics = [m for w in head_words for m in w.split(",") if m]
         if not metrics:
             raise ValueError("graph what? name a metric before `from`")
         terms = self.source(toks[at + 1])
-        conds, by, opts, i = [], [], {}, at + 2
         while i < len(toks):
             w = toks[i][1].lower()
             if w == ";":
@@ -1727,28 +1751,45 @@ class Shell:
             facts.setdefault(m, {})
             facts[m].setdefault("unit", units.get(m))
 
-        lines, ylabel, y2label, on_y2 = timbergraph.terms(
-            samples, metrics, tuple(by), None, None, opts.get("rate", False),
-            opts.get("quantile"), facts)
-
-        title = (facts[metrics[0]].get("description") if len(metrics) == 1
-                 else None) or ", ".join(metrics)
-        every = sorted({ts for a in lines.values() for ts in a})
-        window = (every[0], every[-1]) if every else (0, 0)
-        marks = [(m.ts, m.metric) for m in markers
-                 if m.metric in timbergraph.TROUBLE
-                 and window[0] <= m.ts <= window[1]
-                 and m.labels.get("metric") in metrics]
+        scatter_x = opts.get("against")
+        if scatter_x:
+            facts.setdefault(scatter_x, {})
+            facts[scatter_x].setdefault("unit", units.get(scatter_x))
+            lines, xlabel, ylabel, dropped = timbergraph.against(
+                samples, metrics[0], scatter_x, tuple(by), None, None,
+                opts.get("rate", False), opts.get("quantile"), facts)
+            title = f"{metrics[0]} against {scatter_x}"
+            if dropped:
+                print(f"! {dropped} bucket(s) held one of them and not the "
+                      f"other, and are not points")
+            y2label, on_y2, marks = None, (), []
+        else:
+            lines, ylabel, y2label, on_y2 = timbergraph.terms(
+                samples, metrics, tuple(by), None, None, opts.get("rate", False),
+                opts.get("quantile"), facts)
+            title = (facts[metrics[0]].get("description") if len(metrics) == 1
+                     else None) or ", ".join(metrics)
+            every = sorted({ts for a in lines.values() for ts in a})
+            window = (every[0], every[-1]) if every else (0, 0)
+            marks = [(m.ts, m.metric) for m in markers
+                     if m.metric in timbergraph.TROUBLE
+                     and window[0] <= m.ts <= window[1]
+                     and m.labels.get("metric") in metrics]
 
         dest = opts.get("png") or opts.get("svg")
         terminal = "pngcairo" if "png" in opts else "svg" if "svg" in opts else "dumb"
         size = ((1000, 500) if dest else timbergraph.terminal_size())
-        text = timbergraph.script(lines, title, ylabel, terminal, size, marks,
-                                  dest, y2label, on_y2)
+        if scatter_x:
+            text = timbergraph.scatter(lines, title, xlabel, ylabel, terminal,
+                                       size, dest)
+        else:
+            text = timbergraph.script(lines, title, ylabel, terminal, size,
+                                      marks, dest, y2label, on_y2)
         drawn = timbergraph.draw(text, terminal)
         if drawn:
             sys.stdout.write(drawn)
-        timbergraph.note_markers(markers, window, sys.stdout)
+        if not scatter_x:
+            timbergraph.note_markers(markers, window, sys.stdout)
         if dest:
             print(f"wrote {dest}")
 

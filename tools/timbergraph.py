@@ -316,6 +316,102 @@ def quantile(samples, q, by=(), where=None):
     return lines
 
 
+def one(samples, metric, by=(), where=None, field=None, rate=False,
+        want_quantile=None, facts=None):
+    """One metric, as `(measure, {series: {ts: value}}, unit)`.
+
+    The judgement a plot has to make about a single metric, in one place:
+    what may be aggregated, what a histogram needs, and what the numbers
+    are measured in.
+    """
+    facts = facts or {}
+    chosen = matching(samples, metric, where)
+    if want_quantile is not None and is_histogram(chosen):
+        got = quantile(chosen, want_quantile, tuple(by), where)
+        what = f"p{want_quantile * 100:g}"
+    elif is_histogram(chosen) and "le" not in by:
+        raise Bad(
+            f"{metric} is a cumulative `le` ladder, and summing one "
+            f"multiplies the count. Ask for a quantile, or draw the "
+            f"ladder itself (by le)"
+        )
+    else:
+        what, got = series(chosen, metric, tuple(by), where, field, rate)
+    unit = facts.get(metric, {}).get("unit") or ""
+    if rate:
+        unit = f"{unit}/s" if unit else "per second"
+    return what, got, unit
+
+
+def render_width(ms):
+    """As the writer renders it: whole seconds."""
+    return f"{ms // 1000}s"
+
+
+def widths(samples, metric):
+    return {s.width_ms for s in samples if s.metric == metric}
+
+
+def against(samples, y_metric, x_metric, by=(), where=None, field=None,
+            rate=False, want_quantile=None, facts=None):
+    """One point per BUCKET: x is one metric, y the other.
+
+    ⚠ This is the honest plot for "are these two related". Two lines on a
+    shared time axis — especially on two y scales — is the picture that
+    invites seeing a relationship that is not there, because almost any
+    pair can be made to look correlated by choosing the scales. A cloud
+    stays a cloud.
+    """
+    wx, wy = widths(samples, x_metric), widths(samples, y_metric)
+    if wx != wy or len(wx) != 1:
+        raise Bad(
+            f"{y_metric} is bucketed at "
+            + ", ".join(render_width(w) for w in sorted(wy) or [0])
+            + f" and {x_metric} at "
+            + ", ".join(render_width(w) for w in sorted(wx) or [0])
+            + " — points that are not pairs are not a scatter. Re-bucket one "
+              "to the other's width first"
+        )
+    xwhat, xlines, xunit = one(samples, x_metric, by, where, field, rate,
+                               want_quantile, facts)
+    ywhat, ylines, yunit = one(samples, y_metric, by, where, field, rate,
+                               want_quantile, facts)
+
+    # ⚠ Each side must resolve to ONE series, or be paired by the same
+    # labels. Otherwise the pairing is whichever series happened to sort
+    # first, which is a picture of nothing.
+    if set(xlines) != set(ylines):
+        only_x = sorted(name(k) for k in set(xlines) - set(ylines))
+        only_y = sorted(name(k) for k in set(ylines) - set(xlines))
+        raise Bad(
+            f"the two sides do not pair: {x_metric} has "
+            + (", ".join(only_x) or "none") + f" that {y_metric} does not, and "
+            + (", ".join(only_y) or "none") + " the other way. Name the labels "
+              "they share with `by`, or narrow with `where`"
+        )
+
+    points, dropped = {}, 0
+    for key in sorted(xlines):
+        at_x, at_y = xlines[key], ylines[key]
+        for ts in sorted(at_x):
+            if ts not in at_y:
+                # ⚠ Counted, never quietly halved: a bucket present on one
+                # side and absent on the other is not a pair, and how many
+                # were like that is the reader's business.
+                dropped += 1
+                continue
+            points.setdefault(key, []).append((at_x[ts], at_y[ts], ts))
+        dropped += sum(1 for ts in at_y if ts not in at_x)
+    if not points:
+        raise Bad(
+            f"no bucket holds both {x_metric} and {y_metric} — they were "
+            f"measured over different windows"
+        )
+    label = lambda what, unit, m: f"{m} {what} ({unit})" if unit else f"{m} {what}"
+    return (points, label(xwhat, xunit, x_metric),
+            label(ywhat, yunit, y_metric), dropped)
+
+
 def terms(samples, metrics, by=(), where=None, field=None, rate=False,
           want_quantile=None, facts=None):
     """Every metric asked for, as one set of lines ready to draw.
@@ -332,21 +428,8 @@ def terms(samples, metrics, by=(), where=None, field=None, rate=False,
     facts = facts or {}
     lines, units, several = {}, {}, len(metrics) > 1
     for metric in metrics:
-        chosen = matching(samples, metric, where)
-        if want_quantile is not None and is_histogram(chosen):
-            got = quantile(chosen, want_quantile, tuple(by), where)
-            what = f"p{want_quantile * 100:g}"
-        elif is_histogram(chosen) and "le" not in by:
-            raise Bad(
-                f"{metric} is a cumulative `le` ladder, and summing one "
-                f"multiplies the count. Ask for a quantile, or draw the "
-                f"ladder itself (by le)"
-            )
-        else:
-            what, got = series(chosen, metric, tuple(by), where, field, rate)
-        unit = facts.get(metric, {}).get("unit") or ""
-        if rate:
-            unit = f"{unit}/s" if unit else "per second"
+        what, got, unit = one(samples, metric, by, where, field, rate,
+                              want_quantile, facts)
         units[metric] = (unit, what)
         for key, at in got.items():
             lines[(metric,) + tuple(key) if several else tuple(key)] = at
@@ -522,6 +605,46 @@ def script(lines, title, ylabel, terminal, size, marks=(), output=None,
     return "\n".join(out) + "\n"
 
 
+def scatter(points, title, xlabel, ylabel, terminal, size, output=None):
+    """A scatter, with its data inline like any other script here.
+
+    ⚠ Not a time axis: time becomes the COLOUR instead, where the
+    terminal has one — so a relationship that drifted looks different
+    from one that held, which a cloud of undated points cannot show.
+    """
+    if not points:
+        raise Bad("nothing to draw")
+    coloured = terminal != "dumb" and len(points) == 1
+    out = [
+        f"# timbergraph {VERSION} — re-runs on its own: gnuplot -p THIS",
+        f"set terminal {terminal} size {size[0]},{size[1]} noenhanced",
+    ]
+    if output:
+        out.append(f"set output {gp_quote(output)}")
+    out += [
+        "set datafile separator '\t'",
+        f"set title {gp_quote(title)}",
+        f"set xlabel {gp_quote(xlabel)}",
+        f"set ylabel {gp_quote(ylabel)}",
+        "set grid",
+        "set key outside below width 2",
+    ]
+    if coloured:
+        out += ["set cbdata time", "set timefmt '%s'", "set format cb '%H:%M'",
+                "set cblabel 'when'", "unset key"]
+    plots = ", ".join(
+        f"'-' using 1:2:3 with points palette pt 7 ps 0.7 notitle" if coloured
+        else f"'-' using 1:2 with points title {gp_quote(name(k))}"
+        for k in sorted(points)
+    )
+    out.append("plot " + plots)
+    for k in sorted(points):
+        for x, y, ts in points[k]:
+            out.append(f"{x}\t{y}\t{local_epoch(ts)}")
+        out.append("e")
+    return "\n".join(out) + "\n"
+
+
 def name(key):
     return ",".join(k for k in key if k) or "all"
 
@@ -629,6 +752,10 @@ def main(argv=None):
     ap.add_argument("--field", help="which measure (count, sum, min, max, last)")
     ap.add_argument("--rate", action="store_true",
                     help="divide by the bucket width: per second")
+    ap.add_argument("--against", metavar="METRIC",
+                    help="a SCATTER: one point per bucket, x this metric and "
+                         "y the one named by -m. The honest plot for `are "
+                         "these two related`")
     ap.add_argument("--quantile", type=float, metavar="Q",
                     help="of a histogram's cumulative ladder, e.g. 0.95")
     ap.add_argument("--using", action="append", default=[], metavar="PATH",
@@ -672,53 +799,73 @@ def main(argv=None):
         where[k] = v
 
     facts = extractor_facts(args.using)
+    if args.against:
+        metrics = metrics + [args.against]
     for m in metrics:
         facts.setdefault(m, {})
         facts[m].setdefault("unit", tape_units(markers).get(m))
 
-    lines, ylabel, y2label, on_y2 = terms(
-        samples, metrics, tuple(args.by), where, args.field, args.rate,
-        args.quantile, facts,
-    )
-    first = facts.get(metrics[0], {})
-    title = (first.get("description") if len(metrics) == 1 else None) \
-        or ", ".join(metrics)
-    every = sorted({ts for at in lines.values() for ts in at})
-    window = (every[0], every[-1]) if every else (0, 0)
+    if args.against:
+        if len(metrics) != 2:
+            raise Bad("--against takes one -m and one --against, not more")
+        points, xlabel, ylabel, dropped = against(
+            samples, metrics[0], args.against, tuple(args.by), where,
+            args.field, args.rate, args.quantile, facts)
+        title = f"{metrics[0]} against {args.against}"
+        every = sorted({ts for pts in points.values() for _, _, ts in pts})
+        window = (every[0], every[-1]) if every else (0, 0)
+        if dropped:
+            print(f"⚠ {dropped} bucket(s) held one of them and not the other, "
+                  f"and are not points", file=sys.stderr)
+        y2label, on_y2, lines = None, (), points
+    else:
+        lines, ylabel, y2label, on_y2 = terms(
+            samples, metrics, tuple(args.by), where, args.field, args.rate,
+            args.quantile, facts,
+        )
+        first = facts.get(metrics[0], {})
+        title = (first.get("description") if len(metrics) == 1 else None) \
+            or ", ".join(metrics)
+        every = sorted({ts for at in lines.values() for ts in at})
+        window = (every[0], every[-1]) if every else (0, 0)
 
     if args.tsv:
         with open(args.tsv, "w", encoding="utf-8") as fh:
-            fh.write("series\tepoch_ms\tvalue\n")
-            for k in sorted(lines):
-                for ts in sorted(lines[k]):
-                    fh.write(f"{name(k)}\t{ts}\t{lines[k][ts]}\n")
+            if args.against:
+                fh.write("series\tx\ty\tepoch_ms\n")
+                for k in sorted(lines):
+                    for x, y, ts in lines[k]:
+                        fh.write(f"{name(k)}\t{x}\t{y}\t{ts}\n")
+            else:
+                fh.write("series\tepoch_ms\tvalue\n")
+                for k in sorted(lines):
+                    for ts in sorted(lines[k]):
+                        fh.write(f"{name(k)}\t{ts}\t{lines[k][ts]}\n")
 
     marks = [(s.ts, s.metric) for s in markers
              if s.metric in TROUBLE
              and window[0] <= s.ts <= window[1]
              and s.labels.get("metric") in metrics]
 
-    if args.png or args.svg:
-        dest = args.png or args.svg
-        size = (args.width or 1000, args.height or 500)
-        text_out = script(lines, title, ylabel,
-                          "pngcairo" if args.png else "svg", size, marks, dest,
-                          y2label, on_y2)
-    elif args.window:
-        size = (args.width or 900, args.height or 500)
-        text_out = script(lines, title, ylabel, "qt", size, marks, None,
-                          y2label, on_y2)
+    dest = args.png or args.svg
+    terminal = ("pngcairo" if args.png else "svg" if args.svg
+                else "qt" if args.window else "dumb")
+    if terminal == "dumb":
+        size = (args.width or terminal_size()[0],
+                args.height or terminal_size()[1])
     else:
-        size = (args.width or terminal_size()[0], args.height or terminal_size()[1])
-        text_out = script(lines, title, ylabel, "dumb", size, marks, None,
+        size = (args.width or (900 if args.window else 1000),
+                args.height or 500)
+    if args.against:
+        text_out = scatter(lines, title, xlabel, ylabel, terminal, size, dest)
+    else:
+        text_out = script(lines, title, ylabel, terminal, size, marks, dest,
                           y2label, on_y2)
 
     if args.gnuplot:
         with open(args.gnuplot, "w", encoding="utf-8") as fh:
             fh.write(text_out)
 
-    terminal = ("pngcairo" if args.png else "svg" if args.svg
-                else "qt" if args.window else "dumb")
     drawn = draw(text_out, terminal)
     if drawn:
         sys.stdout.write(drawn)

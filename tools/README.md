@@ -597,6 +597,31 @@ Several metrics go on one graph, comma-separated — which is how two stores
 answer at once, since `[class=tally]` covers both and the metric name is what
 tells them apart.
 
+### `against` — are these two actually related?
+
+```
+timberfs=# graph http_latency against http_requests from [class=tally] quantile 0.95;
+```
+
+One point per bucket: x is one metric, y the other. ⚠ **This is the honest plot
+for that question.** Two lines on a shared time axis — especially on two y
+scales — is the picture that *invites* seeing a relationship that is not there,
+because almost any pair can be made to look correlated by choosing the scales.
+A cloud stays a cloud, and the shape of a real relationship (linear? a knee?)
+is visible where two time lines never show it.
+
+In an image, time becomes the **colour**, so a relationship that drifted looks
+different from one that held.
+
+It is strict about three things, all for one reason — a point that is not a
+pair is not data:
+
+- **buckets must be the same width**, or the points are not pairs;
+- **each side must resolve to one series**, or pair on labels named with `by`,
+  or the pairing is whichever series happened to sort first;
+- **a bucket present on one side only is dropped and counted**, never quietly
+  halved.
+
 ⚠ **The UNIT decides the axis, and it alone** — it is what makes two numbers
 comparable. Two response times share one; a request count and a byte total do
 not, so the second goes on the right and the legend says so. Drawing them as

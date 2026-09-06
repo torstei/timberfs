@@ -143,6 +143,46 @@ def test_two_metrics_share_a_graph_and_a_unit_decides_the_axis():
     check("one axis", None, y2)
 
 
+def test_a_scatter_pairs_buckets_and_refuses_what_is_not_a_pair():
+    """The honest plot for "are these related": two lines on a shared
+    time axis, especially on two scales, is the picture that invites
+    seeing a relationship that is not there. A cloud stays a cloud."""
+    both = (
+        "2026-09-06T13:37:00.000Z 60s a count=10\n"
+        "2026-09-06T13:37:00.000Z 60s b count=1\n"
+        "2026-09-06T13:38:00.000Z 60s a count=20\n"
+        "2026-09-06T13:38:00.000Z 60s b count=2\n"
+        # ⚠ A bucket on one side only is not a pair.
+        "2026-09-06T13:39:00.000Z 60s a count=30\n"
+    )
+    samples, _ = g.read(both)
+    points, xlabel, ylabel, dropped = g.against(samples, "b", "a")
+    check("paired", [(10.0, 1.0), (20.0, 2.0)],
+          [(x, y) for x, y, _ in points[()]])
+    check("counted, not halved", 1, dropped)
+    check("x is named", True, "a" in xlabel)
+    check("y is named", True, "b" in ylabel)
+
+
+def test_a_scatter_refuses_widths_that_are_not_pairs():
+    """Points from buckets of different widths are not pairs, so they
+    are not a scatter."""
+    mixed = ("2026-09-06T13:37:00.000Z 60s a count=1\n"
+             "2026-09-06T13:37:00.000Z 300s b count=1\n")
+    samples, _ = g.read(mixed)
+    raises("mixed widths", lambda: g.against(samples, "b", "a"), "not pairs")
+
+
+def test_a_scatter_refuses_sides_that_do_not_pair():
+    """Otherwise the pairing is whichever series happened to sort
+    first, which is a picture of nothing."""
+    lopsided = ("2026-09-06T13:37:00.000Z 60s a host=x count=1\n"
+                "2026-09-06T13:37:00.000Z 60s b host=y count=1\n")
+    samples, _ = g.read(lopsided)
+    raises("no shared series", lambda: g.against(samples, "b", "a", by=("host",)),
+           "do not pair")
+
+
 def test_the_unit_comes_from_the_tape_or_the_document():
     _, markers = g.read(TALLY)
     check("from the tape", {"http_requests": "requests"}, g.tape_units(markers))

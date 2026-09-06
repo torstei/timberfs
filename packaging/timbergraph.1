@@ -104,6 +104,26 @@ a metric that states both being one that measures what it sums.
 Divide by the bucket width: per second. Refused on a measure that is not
 a total.
 .TP
+.BI \-\-against " METRIC"
+A SCATTER: one point per bucket, x this metric and y the one named by
+.BR \-m .
+⚠ THE HONEST PLOT FOR "ARE THESE TWO RELATED". Two lines on a shared
+time axis \(em especially on two y scales \(em is the picture that
+INVITES seeing a relationship that is not there, since almost any pair
+can be made to look correlated by choosing the scales. A cloud stays a
+cloud, and the SHAPE of a real relationship is visible where two time
+lines never show it. In an image, time becomes the colour, so a
+relationship that drifted looks different from one that held.
+.PP
+.RS
+Strict about three things, all because a point that is not a pair is not
+data: the buckets must be the same WIDTH; each side must resolve to one
+series or pair on labels named with
+.BR \-\-by ;
+and a bucket present on one side only is DROPPED AND COUNTED, never
+quietly halved.
+.RE
+.TP
 .BI \-\-quantile " Q"
 Of a histogram's cumulative ladder, interpolated inside the bucket it
 falls in \(em which is what additive data supports, and the reason a

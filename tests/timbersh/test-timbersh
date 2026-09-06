@@ -471,6 +471,28 @@ def a_graph_refuses_a_cumulative_ladder_rather_than_multiplying_it():
 
 
 @test
+def a_scatter_pairs_two_metrics_bucket_by_bucket():
+    """`against` is the honest plot for "are these related" — two lines
+    on a shared time axis is the one that invites seeing a relationship
+    that is not there. Refused when the buckets are not pairs."""
+    mixed = ("2026-09-06T13:37:00.000Z 60s a count=1\n"
+             "2026-09-06T13:37:00.000Z 300s b count=1\n")
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": mixed}}).run(
+        "graph b against a from [class=tally];")
+    assert "not pairs" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_scatter_pairs_exactly_two_metrics():
+    lines = "2026-09-06T13:37:00.000Z 60s a count=1\n"
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": lines}}).run(
+        "graph a, b against c from [class=tally];")
+    assert "ONE metric" in s.out, s.out
+    s.cleanup()
+
+
+@test
 def a_graph_says_when_it_read_no_tally_lines_at_all():
     """"Nothing matched" and "that store holds a log, not numbers" are
     different answers, and the second is the one somebody new makes."""

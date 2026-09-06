@@ -851,6 +851,14 @@ Measured on two hosts holding one store: 90 with `by status by host`, 180
 without. Merging is legitimate as a fleet TOTAL; doing it without being asked
 was not.
 
+⚠ **`against` is the plot that answers what two metrics are usually drawn FOR.**
+Two lines on a shared time axis, especially on two y scales, is the picture
+that invites seeing a relationship that is not there — almost any pair can be
+made to look correlated by choosing the scales. A scatter of one point per
+bucket either shows a relationship or shows a cloud, and shows its SHAPE, which
+two time lines never do. Same doctrine as the rest of this note: a plot may be
+approximate, but it must not invite a conclusion the data does not carry.
+
 ### The extractor document is a plot spec
 
 A grapher that does not know the contract gets a histogram WRONG, not merely
