@@ -689,13 +689,10 @@ enum Command {
         /// the follower whose command this is
         #[arg(long, value_name = "SET", conflicts_with_all = ["extractors", "fold", "try_it", "provision"])]
         run: Option<String>,
-        /// Where the provisioning and the site's extractors live
-        #[arg(
-            long,
-            value_name = "DIR",
-            default_value = "/etc/timberfs",
-            requires = "provision"
-        )]
+        /// Where the provisioning and the site's extractors live. Also
+        /// read by --try and --check, which resolve an extractor NAME
+        /// against it
+        #[arg(long, value_name = "DIR", default_value = "/etc/timberfs")]
         etc: PathBuf,
         /// Forests to resolve the selection against; default every
         /// configured one

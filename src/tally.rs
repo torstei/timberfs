@@ -1433,10 +1433,38 @@ pub fn resolve_extractors(args: &[PathBuf], etc: &Path) -> anyhow::Result<Vec<Pa
         {
             Some(p) => out.push(p),
             None => {
+                // ⚠ A directory is listed only if it EXISTS, so on a host
+                // where none does the list is empty — and a resolution
+                // failure naming nowhere tells the reader nothing about
+                // where to put the file.
+                if dirs.is_empty() {
+                    bail!(
+                        "no extractor {name:?} — it is not a path that exists, and there \
+                         is no extractor directory to search: none of \
+                         {PACKAGED_EXTRACTORS} (the timberfs package), {} or \
+                         ~/.config/timberfs/{EXTRACTOR_DIR} exists",
+                        etc.join(EXTRACTOR_DIR).display(),
+                    );
+                }
+                // ⚠ What is listed is the FILE STEM, because that is
+                // what this lookup takes — a provisioning's APPLY names
+                // the DOCUMENT instead, and the two can differ on a
+                // site's own file. Naming the document here would print
+                // a word that does not resolve.
                 let known = load_extractors(&dirs)
                     .map(|docs| {
                         docs.iter()
-                            .map(|(_, d)| d.name.clone())
+                            .map(|(p, d)| {
+                                let stem = p
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                if stem == d.name {
+                                    stem
+                                } else {
+                                    format!("{stem} (the document {:?})", d.name)
+                                }
+                            })
                             .collect::<Vec<_>>()
                             .join(", ")
                     })
@@ -1449,7 +1477,7 @@ pub fn resolve_extractors(args: &[PathBuf], etc: &Path) -> anyhow::Result<Vec<Pa
                         .collect::<Vec<_>>()
                         .join(", "),
                     if known.is_empty() {
-                        String::new()
+                        ", which hold none".to_string()
                     } else {
                         format!(", which hold {known}")
                     }
@@ -3343,6 +3371,37 @@ mod tests {
         );
         std::fs::remove_dir_all(&packaged).ok();
         std::fs::remove_dir_all(&site).ok();
+    }
+
+    #[test]
+    fn a_name_that_resolves_nowhere_says_where_it_looked() {
+        // A directory is listed only if it EXISTS, so on a host with
+        // none the list is empty — and the failure then named nowhere at
+        // all, which tells a reader nothing about where to put the file.
+        let empty = tempdir();
+        let err = resolve_extractors(&[PathBuf::from("nope")], &empty)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(PACKAGED_EXTRACTORS), "{err}");
+        assert!(err.contains(EXTRACTOR_DIR), "{err}");
+
+        let site = empty.join(EXTRACTOR_DIR);
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(
+            site.join("x.json"),
+            doc(r#"{"name":"m","measure":[{"count":true}]}"#),
+        )
+        .unwrap();
+        let err = resolve_extractors(&[PathBuf::from("nope")], &empty)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&site.display().to_string()), "{err}");
+        // The FILE STEM, because that is what this lookup takes. The
+        // document is named `t`, and printing that would print a word
+        // that does not resolve.
+        assert!(err.contains("which hold x "), "{err}");
+        assert!(err.contains(r#"the document "t""#), "{err}");
+        std::fs::remove_dir_all(&empty).ok();
     }
 
     /// Every extractor this repository SHIPS, run against a fixture and

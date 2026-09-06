@@ -1435,6 +1435,13 @@ later shadowing earlier \(em so a document can be tried without root, and
 shadow a shipped one while it is.
 .RS
 .PP
+⚠ The NAME here is the FILE's,
+.IB name .json \fR,
+where a provisioning's
+.B APPLY
+names the DOCUMENT. Keeping the two the same is what everything shipped
+does and what a fork of one should.
+.PP
 ⚠ That last one is a READER's. A
 .B \-\-provision
 never looks in a home directory: it runs as a service, creating stores

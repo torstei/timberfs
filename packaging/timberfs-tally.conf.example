@@ -69,7 +69,8 @@ APPLY=timberfs-apache-combined timberfs-volume
 # Read a log through a document and print the tally it produces, writing no
 # store at all:
 #
-#   timberfs tally --try timberfs-apache-combined < /var/log/apache2/access.log
+#   timberfs tally --try --extractor timberfs-apache-combined \
+#       < /var/log/apache2/access.log
 #
 # That is also how a document of your own is developed: a metric that
 # claimed lines and matched none says so, which a store quietly holding no
