@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Where a site's rules live, under `/etc/timberfs`.
 pub const CONF_DIR: &str = "tally.d";
@@ -407,6 +407,19 @@ impl Roller {
 
     pub fn watermark(&self) -> u64 {
         self.watermark
+    }
+
+    /// Move the watermark without adding anything.
+    ///
+    /// ⚠ For a LIVE reader only. Event time advances when events arrive,
+    /// which is what makes a backfill deterministic — and what leaves a
+    /// quiet log's last buckets unsealed forever, since nothing is
+    /// coming to push them out. So a follower that has heard nothing for
+    /// a while lets WALL CLOCK stand in for event time; a backfill never
+    /// goes quiet before its end, so it never calls this and behaves as
+    /// it always did.
+    pub fn advance(&mut self, by_ms: u64) {
+        self.watermark = self.watermark.saturating_add(by_ms);
     }
 
     /// The oldest source byte any OPEN bucket still depends on. A
@@ -1521,6 +1534,22 @@ impl Run {
         emit(out, batch)
     }
 
+    /// Let wall clock stand in for event time on a quiet stream, and
+    /// write whatever that seals.
+    fn idle(&mut self, by_ms: u64, out: &mut impl Write) -> anyhow::Result<()> {
+        let mut batch: Vec<Sample> = Vec::new();
+        for l in self.live.iter_mut() {
+            if l.roller.watermark() == 0 {
+                // Nothing has ever arrived, so there is no event time to
+                // advance from and nothing could be sealed anyway.
+                continue;
+            }
+            l.roller.advance(by_ms);
+            batch.extend(l.roller.drain(false));
+        }
+        emit(out, batch)
+    }
+
     fn finish(&mut self, out: &mut impl Write, observations: bool) -> anyhow::Result<()> {
         if observations {
             return Ok(());
@@ -1749,8 +1778,14 @@ const APPLY: &str = "APPLY";
 const DECLARE: &str = "DECLARE";
 const STORE_DIR: &str = "STORE_DIR";
 const WIDTH: &str = "WIDTH";
+const FROM: &str = "FOLLOW_FROM";
 
-const PROVISION_KEYS: &[&str] = &[SELECT, OUTPUT, APPLY, DECLARE, STORE_DIR, WIDTH];
+const PROVISION_KEYS: &[&str] = &[SELECT, OUTPUT, APPLY, DECLARE, STORE_DIR, WIDTH, FROM];
+
+/// Just enough of a store to fill a template from a `source` record.
+struct Named<'a> {
+    handle: &'a str,
+}
 
 /// One provisioning: which stores get a tally store, named how, declaring
 /// what, measured by which extractors.
@@ -1775,6 +1810,16 @@ pub struct Provision {
     pub declare: Vec<String>,
     pub store_dir: PathBuf,
     pub width_ms: Option<u64>,
+    /// Where a store this provisioning has never measured is picked up.
+    ///
+    /// ⚠ `begin` by default, where a follower's own default is
+    /// `discovery`. A metric that can be computed over the log you
+    /// ALREADY HAVE is the property this whole thing is for, and
+    /// `discovery` would silently skip it for every store older than the
+    /// provisioning — which is every store, the first time. The cost is
+    /// one pass over what the source still holds; `FOLLOW_FROM=end` is
+    /// for somebody who does not want it.
+    pub follow_from: crate::ship::FollowFrom,
 }
 
 impl Provision {
@@ -1785,6 +1830,7 @@ impl Provision {
         let mut declare: Vec<String> = Vec::new();
         let mut store_dir = PathBuf::from("/var/log/timberfs");
         let mut width_ms: Option<u64> = None;
+        let mut follow_from = crate::ship::FollowFrom::Begin;
 
         for (i, raw) in text.lines().enumerate() {
             let line = i + 1;
@@ -1818,6 +1864,16 @@ impl Provision {
                 APPLY => apply = value.split_whitespace().map(str::to_string).collect(),
                 DECLARE => declare = value.split_whitespace().map(str::to_string).collect(),
                 STORE_DIR => store_dir = PathBuf::from(value),
+                FROM => {
+                    follow_from = match value {
+                        "begin" => crate::ship::FollowFrom::Begin,
+                        "end" => crate::ship::FollowFrom::End,
+                        "discovery" => crate::ship::FollowFrom::Discovery,
+                        other => {
+                            bail!("{set}.conf:{line}: {FROM}={other:?} is begin, end or discovery")
+                        }
+                    }
+                }
                 _ => {
                     let ms = crate::append::parse_duration_ms(value)
                         .with_context(|| format!("{set}.conf:{line}: {WIDTH}"))?;
@@ -1859,6 +1915,7 @@ impl Provision {
             declare,
             store_dir,
             width_ms,
+            follow_from,
         })
     }
 
@@ -1937,19 +1994,53 @@ impl Provision {
     /// The name of the tally store for one source, from the template.
     pub fn output_for(&self, m: &crate::select::Match) -> anyhow::Result<String> {
         let labels = crate::select::selectable_of(&m.dir, &m.name);
-        let field = |k: &str| -> String {
-            labels
-                .get(k)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string()
+        self.output_from(&m.handle, &labels, m.id.as_deref())
+    }
+
+    /// The same, from what a `source` record carries — a running consumer
+    /// has labels and a path, never a `Match`.
+    pub fn output_from(
+        &self,
+        handle: &str,
+        labels: &Map<String, Value>,
+        id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let m = Named { handle };
+        // ⚠ An EMPTY substitution is refused rather than left as a hole.
+        // `{host}` on a store that declares none produced
+        // `.apache-access-tally` — a hidden directory — and a template
+        // of nothing but absent fields would collapse every source onto
+        // one store, which is several writers on one tally store.
+        let field = |k: &str, from: &str| -> anyhow::Result<String> {
+            let v = labels.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+            if v.is_empty() {
+                bail!(
+                    "{}.conf: {OUTPUT}={:?} wants {{{k}}}, and {} declares none",
+                    self.set,
+                    self.output,
+                    from
+                );
+            }
+            Ok(v.to_string())
         };
-        let out = self
-            .output
-            .replace("{name}", &m.handle)
-            .replace("{host}", &field("host"))
-            .replace("{service}", &field("service"))
-            .replace("{id}", m.id.as_deref().unwrap_or_default());
+        let mut out = self.output.replace("{name}", m.handle);
+        if out.contains("{host}") {
+            out = out.replace("{host}", &field("host", handle)?);
+        }
+        if out.contains("{service}") {
+            out = out.replace("{service}", &field("service", handle)?);
+        }
+        if out.contains("{id}") {
+            let Some(id) = id.filter(|i| !i.is_empty()) else {
+                bail!(
+                    "{}.conf: {OUTPUT}={:?} wants {{id}}, and {handle} has no identity — \
+                     `timberfs identity <store> --mint` gives it one",
+                    self.set,
+                    self.output
+                );
+            };
+            out = out.replace("{id}", id);
+        }
         if out.contains('{') || out.contains('}') {
             bail!(
                 "{}.conf: {OUTPUT}={:?} leaves a placeholder unfilled for {} — the fields                  are {{name}}, {{host}}, {{service}} and {{id}}",
@@ -2040,6 +2131,7 @@ pub fn plan(p: &Provision, etc: &Path, dirs: &[PathBuf]) -> anyhow::Result<Vec<P
         // narrower than that selects no chunk and answers nothing —
         // which reads exactly like a quiet minute.
         declare.push(format!("logline_lag={}s", lag_ms.div_ceil(1000)));
+        declare.push("wal=true".to_string());
         for kv in &p.declare {
             let key = kv.split_once('=').map(|(k, _)| k).unwrap_or(kv);
             declare.retain(|had| had.split_once('=').map(|(k, _)| k) != Some(key));
@@ -2157,7 +2249,7 @@ pub fn cmd_provision(set: &str, opts: &ProvisionOpts) -> anyhow::Result<()> {
         println!("  follower {} would be registered", p.follower_name());
         return Ok(());
     }
-    register_follower(&p)?;
+    register_follower(&p, &opts.etc)?;
     println!("  follower {} registered", p.follower_name());
     Ok(())
 }
@@ -2167,14 +2259,23 @@ pub fn cmd_provision(set: &str, opts: &ProvisionOpts) -> anyhow::Result<()> {
 /// The operator writes neither its selection nor its command: the file is
 /// the interface and the registration is STATE — which is also why there
 /// is no drift to detect between them.
-fn register_follower(p: &Provision) -> anyhow::Result<()> {
+fn register_follower(p: &Provision, etc: &Path) -> anyhow::Result<()> {
     let name = p.follower_name();
-    let command = vec![
+    // ⚠ The RUNTIME, not this verb. `--provision` converges and exits;
+    // what a follower execs must consume.
+    let mut command = vec![
         "timberfs".to_string(),
         "tally".to_string(),
-        "--provision".to_string(),
+        "--run".to_string(),
         p.set.clone(),
     ];
+    // ⚠ Carried when it is not the default, or a provisioning converged
+    // elsewhere registers a follower that cannot find its own file — and
+    // finds that out at the far end of a systemd unit.
+    if etc != Path::new("/etc/timberfs") {
+        command.push("--etc".to_string());
+        command.push(etc.display().to_string());
+    }
     let select = p.selector()?;
     let reg = crate::follower::registry_dir();
     match crate::follower::Declaration::load(&reg, &name) {
@@ -2192,7 +2293,7 @@ fn register_follower(p: &Provision) -> anyhow::Result<()> {
                 select: Some(select),
                 store: None,
                 retaining: false,
-                follow_from: None,
+                follow_from: Some(p.follow_from),
                 enable: false,
                 start: false,
                 dry_run: false,
@@ -2200,6 +2301,355 @@ fn register_follower(p: &Provision) -> anyhow::Result<()> {
             },
         ),
     }
+}
+
+// ---------------------------------------------------------------- the run
+
+/// One source store being measured: its output store, held open with the
+/// writer's lock, and the metrics folding into it.
+struct Sink {
+    name: String,
+    /// Held for as long as this runs. One writer per store is the rule
+    /// every writer in this tree follows.
+    _lock: std::fs::File,
+    store: crate::store::Store,
+    run: Run,
+    /// The end of the last entry delivered, which is where a position
+    /// goes when nothing is open.
+    delivered_to: Option<u64>,
+    reported: Option<u64>,
+}
+
+impl Sink {
+    /// What this store's position may safely be moved to.
+    ///
+    /// ⚠ The oldest byte any OPEN bucket depends on, and only otherwise
+    /// the last byte delivered. A bucket that has not sealed can still
+    /// change, and a restart must be able to re-derive it — which it can,
+    /// because re-reading those entries produces the identical lines.
+    fn watermark(&self) -> Option<u64> {
+        self.run
+            .live
+            .iter()
+            .filter_map(|l| l.roller.safe_offset())
+            .min()
+            .or(self.delivered_to)
+    }
+
+    fn write(&mut self, lines: &[u8], now_ms: u64) -> anyhow::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let cfg = self.store.cfg;
+        let f = self
+            .store
+            .files
+            .get_mut(&self.name)
+            .expect("the store was created with this name");
+        // Stamped NOW, which is what makes a tally store's write axis
+        // "when this was computed" and its logline axis "which minute
+        // this is about".
+        f.append_stamped(lines, now_ms, &cfg)?;
+        // ⚠ Flushed here rather than left to an age timer this loop does
+        // not run: a tally batch is one bucket sealing, arriving a
+        // minute apart, so nothing would become a chunk — and a minute's
+        // numbers would sit unqueryable in a buffer until the next one.
+        f.flush_chunk(&cfg)?;
+        Ok(())
+    }
+}
+
+impl TallyOpts {
+    /// What a `--run` needs of them: no extractor paths (the provisioning
+    /// names its documents), no metric narrowing, and the width it
+    /// declares.
+    fn for_run(width_ms: Option<u64>) -> TallyOpts {
+        TallyOpts {
+            extractors: Vec::new(),
+            try_it: false,
+            check: false,
+            observations: false,
+            metrics: Vec::new(),
+            width_ms,
+            fold: None,
+        }
+    }
+}
+
+/// How long a run waits to hear anything before letting wall clock stand
+/// in for event time. Shorter than any sensible `grace`, so it is the
+/// clock that ticks rather than the thing that decides.
+const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many of those in a row mean the producer has STOPPED, at which
+/// point everything held is sealed.
+///
+/// ⚠ Without it the tail of a quiet log waits for `grace` of TICKS —
+/// six minutes of ticking to cross a two-minute grace — and a log that
+/// never speaks again never gets its last minutes at all. An entry
+/// arriving after this is displaced, which is the same rule as any other
+/// late entry, so nothing new is being decided here.
+const QUIET_TICKS: u32 = 5;
+
+pub struct RunOpts {
+    pub etc: PathBuf,
+    /// Where a tally store is created if the provisioning has not run —
+    /// which it may not have, for a store that appeared since.
+    pub create: bool,
+}
+
+/// `timberfs tally --run <set>`: the CONSUMER a tally follower execs.
+///
+/// Reads `timberfs-records(5)` on stdin, writes tally lines into one
+/// store per source, and reports a watermark per source on stdout. It
+/// never writes tally lines to stdout: that channel belongs to the
+/// consumer protocol.
+pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
+    let p = Provision::load(&opts.etc, set)?;
+    let docs: Vec<(PathBuf, Extractor)> = p
+        .extractors(&opts.etc)?
+        .into_iter()
+        .map(|d| (PathBuf::from(format!("{}.conf", p.set)), d))
+        .collect();
+    let axis = axis_of(&docs)?;
+
+    let stdout = std::io::stdout();
+    let mut reports = stdout.lock();
+    // Every consumer declares itself before it is fed anything.
+    write!(reports, "\x1ehello\x1fv=1\x1freads=records\0")?;
+    reports.flush()?;
+
+    // Read on a thread so the main loop can notice SILENCE, which is
+    // what a quiet log looks like and what nothing else here can see.
+    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<Option<crate::records::Rec>>>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut reader = crate::records::Reader::new(stdin.lock());
+        loop {
+            match reader.next_rec() {
+                Ok(Some(r)) => {
+                    if tx.send(Ok(Some(r))).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Ok(None));
+                    break;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut sinks: BTreeMap<String, Sink> = BTreeMap::new();
+    let mut known: BTreeMap<String, (String, Map<String, Value>)> = BTreeMap::new();
+    let mut ended = false;
+    let mut quiet: u32 = 0;
+
+    loop {
+        let rec = match rx.recv_timeout(IDLE_TICK) {
+            Ok(Ok(Some(r))) => r,
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => return Err(e),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                quiet += 1;
+                let now = crate::store::now_ms();
+                for (id, sink) in sinks.iter_mut() {
+                    let mut lines: Vec<u8> = Vec::new();
+                    if quiet == QUIET_TICKS {
+                        sink.run.finish(&mut lines, false)?;
+                    } else if quiet < QUIET_TICKS {
+                        sink.run.idle(IDLE_TICK.as_millis() as u64, &mut lines)?;
+                    }
+                    sink.write(&lines, now)?;
+                    report(&mut reports, id, sink)?;
+                }
+                continue;
+            }
+        };
+        quiet = 0;
+        match rec {
+            crate::records::Rec::Source(fields) => {
+                let get = |k: &str| fields.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+                let (Some(id), Some(path)) = (get("id"), get("path")) else {
+                    continue;
+                };
+                let labels = get("labels")
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                    .and_then(|v| match v {
+                        Value::Object(m) => Some(m),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let handle = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| crate::forest::handle_of_logical(n).to_string())
+                    .unwrap_or(path);
+                known.insert(id, (handle, labels));
+            }
+            crate::records::Rec::Entry(e) => {
+                let Some(id) = e.id.clone() else {
+                    bail!(
+                        "an entry with no store identity — a tally run writes one store per \
+                         SOURCE store, so it cannot place an entry it cannot attribute"
+                    );
+                };
+                if !sinks.contains_key(&id) {
+                    let (handle, labels) = known
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| (id.clone(), Map::new()));
+                    let sink = open_sink(&p, &docs, &id, &handle, &labels, opts)?;
+                    sinks.insert(id.clone(), sink);
+                }
+                let sink = sinks.get_mut(&id).expect("just inserted");
+                let mut lines: Vec<u8> = Vec::new();
+                sink.run.feed(&e, axis, &mut lines, false)?;
+                let now = crate::store::now_ms();
+                sink.write(&lines, now)?;
+                if let Some(off) = e.offset {
+                    sink.delivered_to = Some(off + e.payload.len() as u64);
+                }
+                report(&mut reports, &id, sink)?;
+            }
+            crate::records::Rec::End(_) => ended = true,
+            _ => {}
+        }
+    }
+
+    // End of the feed: seal everything held, so a stopped follower leaves
+    // no half-counted minute behind.
+    for (id, sink) in sinks.iter_mut() {
+        let mut lines: Vec<u8> = Vec::new();
+        sink.run.finish(&mut lines, false)?;
+        let now = crate::store::now_ms();
+        sink.write(&lines, now)?;
+        let cfg = sink.store.cfg;
+        if let Some(f) = sink.store.files.get_mut(&sink.name) {
+            f.flush_chunk(&cfg)?;
+        }
+        sink.reported = None;
+        report(&mut reports, id, sink)?;
+    }
+    reports.flush()?;
+    if !ended {
+        bail!("the record stream ended without stream-end — the answer is truncated");
+    }
+    Ok(())
+}
+
+/// A position moves only when it has somewhere new to go: a report per
+/// entry would be one write per entry for a number that changes once a
+/// bucket.
+fn report(out: &mut impl Write, id: &str, sink: &mut Sink) -> anyhow::Result<()> {
+    let Some(at) = sink.watermark() else {
+        return Ok(());
+    };
+    if sink.reported == Some(at) {
+        return Ok(());
+    }
+    sink.reported = Some(at);
+    write!(out, "\x1eprogress\x1fid={id}\x1foffset={at}\0")?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Open — creating if the provisioning has not caught up — the tally
+/// store one source writes into.
+fn open_sink(
+    p: &Provision,
+    docs: &[(PathBuf, Extractor)],
+    id: &str,
+    handle: &str,
+    labels: &Map<String, Value>,
+    opts: &RunOpts,
+) -> anyhow::Result<Sink> {
+    let output = p.output_from(handle, labels, Some(id))?;
+    let dest = p.store_dir.join(&output).join(format!("{output}.log"));
+    let dir = dest.parent().expect("a dest has a parent").to_path_buf();
+    let _ = &output;
+    let name = format!("{output}.log");
+
+    if !crate::format::rings_path(&dir, &name).exists() {
+        if !opts.create {
+            bail!(
+                "no tally store {} for {handle} — run `timberfs tally --provision {}` \
+                 first",
+                dest.display(),
+                p.set
+            );
+        }
+        // A store that appeared since the provisioning last ran is the
+        // case this exists for: an intake mints stores on first sight,
+        // and a metric that waited for a human would miss the day.
+        let declare = declared_for(p, docs, id, labels);
+        crate::bark::cmd_create(&dest, false, false, None, None, false, &declare, true)?;
+    }
+
+    let cfg = crate::store::Config {
+        chunk_size: 256 * 1024,
+        level: 3,
+        // A tally line is small and rare; waiting five seconds for a
+        // chunk would leave a minute's numbers unqueryable for no gain.
+        flush_age_ms: 60_000,
+    };
+    let lock = crate::append::take_writer_lock(&dir, &name, 0.0)?
+        .with_context(|| crate::append::writer_conflict(&dir, &name, 0.0))?;
+    let mut store = crate::store::Store {
+        dir: dir.clone(),
+        cfg,
+        files: BTreeMap::new(),
+    };
+    store.create(&name)?;
+
+    Ok(Sink {
+        name,
+        _lock: lock,
+        store,
+        run: Run::new(docs, &TallyOpts::for_run(p.width_ms))?,
+        delivered_to: None,
+        reported: None,
+    })
+}
+
+/// The bark a tally store declares: its source's provenance, the facts
+/// only a provisioning knows, then whatever it declares itself.
+fn declared_for(
+    p: &Provision,
+    docs: &[(PathBuf, Extractor)],
+    id: &str,
+    labels: &Map<String, Value>,
+) -> Vec<String> {
+    let lag_ms = docs
+        .iter()
+        .map(|(_, e)| p.width_ms.unwrap_or(e.window.width_ms) + e.window.grace_ms)
+        .max()
+        .unwrap_or(0);
+    let mut declare: Vec<String> = crate::bark::provenance(labels)
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
+        .collect();
+    declare.push("class=tally".to_string());
+    declare.push("derived_op=tally".to_string());
+    declare.push(format!("derived_from={id}"));
+    declare.push(format!("logline_lag={}s", lag_ms.div_ceil(1000)));
+    // ⚠ A tally store is worth a WAL where a log may not be: recomputing
+    // a lost minute means re-reading the source from a reset position,
+    // and losing one silently is worse than the second of fsync it costs
+    // on a store that takes a handful of lines a minute.
+    declare.push("wal=true".to_string());
+    for kv in &p.declare {
+        let key = kv.split_once('=').map(|(k, _)| k).unwrap_or(kv);
+        declare.retain(|had| had.split_once('=').map(|(k, _)| k) != Some(key));
+        declare.push(kv.clone());
+    }
+    declare.sort();
+    declare
 }
 
 #[cfg(test)]
@@ -2857,6 +3307,74 @@ mod tests {
         let all = provision("SELECT=[]\nAPPLY=x\n").unwrap();
         let sel = crate::select::Selector::parse(&all.selector().unwrap()).unwrap();
         assert!(!sel.matches(&its_output), "{:?}", all.selector());
+    }
+
+    #[test]
+    fn an_output_template_is_filled_from_what_a_source_record_carries() {
+        let p = provision("SELECT=[]\nAPPLY=x\nOUTPUT={host}.{name}-tally\n").unwrap();
+        let mut labels = Map::new();
+        labels.insert("host".into(), serde_json::json!("web01"));
+        assert_eq!(
+            p.output_from("apache-access", &labels, Some("abc"))
+                .unwrap(),
+            "web01.apache-access-tally"
+        );
+
+        // ⚠ A field the source does not carry is REFUSED by name. It
+        // produced `.apache-access-tally` — a hidden directory — and a
+        // template of nothing but absent fields would collapse every
+        // source onto one store.
+        let err = p
+            .output_from("apache-access", &Map::new(), None)
+            .unwrap_err();
+        assert!(format!("{err}").contains("declares none"), "{err}");
+    }
+
+    #[test]
+    fn a_tally_store_declares_what_only_the_provisioning_knows() {
+        let p = provision("SELECT=[]\nAPPLY=x\nDECLARE=retain=30d wal=false\n").unwrap();
+        let doc = parsed(r#"{"name":"m","measure":[{"count":true}]}"#).unwrap();
+        let docs = vec![(PathBuf::from("t"), doc)];
+        let mut labels = Map::new();
+        labels.insert("service".into(), serde_json::json!("apache-access"));
+        labels.insert("index".into(), serde_json::json!(true));
+        let got = declared_for(&p, &docs, "src-id", &labels);
+
+        assert!(got.contains(&"class=tally".to_string()));
+        assert!(got.contains(&"derived_from=src-id".to_string()));
+        assert!(
+            got.contains(&"service=apache-access".to_string()),
+            "{got:?}"
+        );
+        // A SETTING is not provenance and must not be inherited: the
+        // source's index choice is not the tally store's.
+        assert!(!got.iter().any(|k| k == "index=true"), "{got:?}");
+        // ⚠ DERIVED — width 60s + grace 120s. Typed, it would be wrong
+        // the first time somebody changed a window.
+        assert!(got.contains(&"logline_lag=180s".to_string()), "{got:?}");
+        // …and DECLARE has the last word, even over a default this
+        // thinks is a good idea.
+        assert!(got.contains(&"retain=30d".to_string()));
+        assert!(got.contains(&"wal=false".to_string()), "{got:?}");
+        assert!(!got.iter().any(|k| k == "wal=true"), "{got:?}");
+    }
+
+    #[test]
+    fn wall_clock_stands_in_for_event_time_only_when_asked() {
+        // A backfill never goes quiet before its end, so it never
+        // advances and behaves as it always did. A follower on a log that
+        // has stopped would otherwise hold its last minutes forever.
+        let mut r = Roller::new(60_000, 30_000, 1000);
+        r.add(&s("2026-09-06T13:37:10.000Z 0s m count=1"));
+        assert!(r.drain(false).is_empty());
+        r.advance(120_000);
+        assert_eq!(
+            r.drain(false)
+                .iter()
+                .map(|s| s.render())
+                .collect::<Vec<_>>(),
+            vec!["2026-09-06T13:37:00.000Z 60s m count=1"]
+        );
     }
 
     #[test]

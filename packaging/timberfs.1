@@ -1590,9 +1590,50 @@ and meant it.
 is DERIVED from the applied extractors (their width plus their grace) and
 declared on every tally store, because a logline window narrower than the
 distance between its two clocks selects no chunk and answers nothing.
-Naming it in
+So is
+.BR wal=true ,
+because losing a minute's numbers silently is worse than the fsync it
+costs on a store that takes a handful of lines a minute. Naming either in
 .B DECLARE
 overrides it, which is what a backfill needs.
+.PP
+.B FOLLOW_FROM
+is
+.B begin
+by default, where a follower's own default is
+.BR discovery :
+a metric that can be computed over the log you ALREADY HAVE is what this
+is for, and
+.B discovery
+would silently skip it for every store older than the provisioning \(em
+which is every store, the first time. The cost is one pass over what the
+source still holds.
+.RE
+.TP
+.BI \-\-run " SET"
+RUN a provisioning: the consumer a tally follower execs. Reads a records
+stream on stdin, writes tally lines into one store per SOURCE store, and
+reports a watermark per store on stdout \(em which is the consumer
+protocol's channel, so no tally line ever goes there. Not typed by hand:
+.B \-\-provision
+registers the follower whose command this is.
+.PP
+.RS
+⚠ A position moves only when a bucket does. It may not pass the oldest
+byte an OPEN bucket depends on, because what has not sealed can still
+change and a restart must be able to re-derive it \(em which it can, by
+re-reading exactly those entries. So a run lags the live edge by about
+its
+.BR grace ,
+and no more.
+.PP
+⚠ On the logline axis event time only advances when events ARRIVE, which
+is what makes a backfill deterministic and what would leave a quiet log's
+last buckets unsealed forever. So a run that has heard nothing for a few
+seconds lets wall clock stand in for event time, and one that has heard
+nothing for ten seconds seals everything it holds: the producer has
+stopped. An entry arriving after that is displaced, which is the rule
+every late entry already follows.
 .RE
 .PP
 .B LATENESS

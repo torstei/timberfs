@@ -1,19 +1,16 @@
 # tally: metrics as a derived tape
 
-**Status: the EXTRACTOR half is built, lateness included.** The line format, the fold, the JSON
+**Status: BUILT, end to end.** The line format, the fold, the JSON
 extractor document with its published schema
 ([docs/tally-extractor.schema.json](../tally-extractor.schema.json)),
 `timberfs tally` reading a `timberfs-records(5)` stream, `--try` against a
 plain file, `--fold`, seal-once with displacement and the `!late` marker, and
 two shipped extractors tested by their own `--try` output (`timberfs.1`,
-**tally**). ⚠ **The PROVISIONING half is not built** —
-which stores get a tally store, named how, declaring what, with which
-extractors applied. Its shape is settled below and its file is the whole
-interface: the follower it registers is derived, so no command is typed. Until
-it is built, a pipeline names its own source and the operator creates the tally
-store. Not built either: the consumer/follower half
-that fans out per store, the `samples` response kind, rollups. It rests on
-the follower registry and its position per store
+**tally**). The PROVISIONING is built too: `timberfs tally --provision <set>` converges the
+tally stores and registers a follower whose selection and command are both
+derived from the file, and `--run` is the consumer that follower execs. Not
+built: the `samples` response kind, rollups, the session, and the `!gap`
+marker. It rests on the follower registry and its position per store
 ([follower-selection.md](follower-selection.md)), the consumer protocol
 ([consumer-protocol.md](consumer-protocol.md)), store selection (`select.rs`),
 derived-store lineage (`.bark`), and head-drop retention.
@@ -893,10 +890,9 @@ loss, recorded exactly — the same rule retention already follows.
   bucket still depends on, so a restart re-derives identical lines), creating
   the tally store with its labels, lineage and `logline_lag`, and writing the
   `!gap` marker from the registry's GAP.
-* **The follower half** — `timberfs tally --provision <set>` as the CONSUMER:
-  a multi-store feed stream in, one output store and one set of rollers per
-  source, a watermark per store, and the `!gap` marker from the registry. The
-  provisioning that registers it is built; nothing runs it yet.
+* **The `!gap` marker** — the registry reports a GAP when retention dropped
+  chunks a follower had not read, and nothing writes it into the tally store
+  yet. Until it does, a hole in the numbers and a quiet period look alike.
 * **`timberfs tally --dump-json`** — a generator, which the JSON form wants
   much more than the INI form did: nobody should be escaping a regex by hand.
 * **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,

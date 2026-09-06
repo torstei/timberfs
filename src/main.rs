@@ -644,7 +644,7 @@ enum Command {
         #[arg(
             long = "extractor",
             value_name = "PATH",
-            required_unless_present_any = ["fold", "provision"]
+            required_unless_present_any = ["fold", "provision", "run"]
         )]
         extractors: Vec<PathBuf>,
         /// Validate the extractors and apply them to PLAIN LOG LINES on
@@ -681,6 +681,14 @@ enum Command {
         /// With --provision: report the plan and change nothing
         #[arg(long, requires = "provision")]
         dry_run: bool,
+        /// RUN a provisioning: the consumer a tally follower execs. Reads
+        /// a records stream on stdin, writes tally lines into one store
+        /// per SOURCE store, and reports a watermark per store on stdout
+        /// — which is the consumer protocol's channel, so no tally line
+        /// ever goes there. Not typed by hand: `--provision` registers
+        /// the follower whose command this is
+        #[arg(long, value_name = "SET", conflicts_with_all = ["extractors", "fold", "try_it", "provision"])]
+        run: Option<String>,
         /// Where the provisioning and the site's extractors live
         #[arg(
             long,
@@ -1875,12 +1883,16 @@ fn main() -> anyhow::Result<()> {
             metric,
             provision,
             dry_run,
+            run,
             etc,
             forest,
             fold,
             width,
             grace,
         } => {
+            if let Some(set) = run {
+                return tally::cmd_run(&set, &tally::RunOpts { etc, create: true });
+            }
             if let Some(set) = provision {
                 return tally::cmd_provision(
                     &set,

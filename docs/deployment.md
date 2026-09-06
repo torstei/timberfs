@@ -1255,6 +1255,14 @@ timberfs tally --provision apache              # declare, converge, register
 systemctl enable --now timberfs-follower@tally-apache
 ```
 
+That is the whole deployment: the follower it registered runs `timberfs tally
+--run apache`, which reads the stores the selection matches and writes one
+tally store per source. ⚠ `FOLLOW_FROM` is `begin` by default, where a
+follower's own default is `discovery` — a metric computed over the log you
+already have is what this is for, and `discovery` would skip it for every store
+older than the provisioning, which is every store the first time. The cost is
+one pass over what the source still holds.
+
 ⚠ The operator writes no follower and no command: `--provision` registers
 `tally-apache` with both derived from the file, so the two cannot drift. It is
 registered because that is where the position and the retention floor live.
@@ -1313,9 +1321,8 @@ Three of those declarations are load-bearing:
   numbers long after the log they came from has been head-dropped. Size it in
   years where the log is sized in weeks.
 
-⚠ Run one pipeline per source store: a tally store belongs to one log, and the
-provisioning that will derive them automatically — from a selection, with an
-`OUTPUT` template and the bark to declare — is the next thing to build.
+That pipeline is what `--provision` automates; run it by hand for a one-off
+backfill, or for a store no provisioning covers.
 
 ## What a store declares about itself
 
