@@ -642,8 +642,25 @@ enum Command {
         /// /etc/timberfs/tally.d has). ⚠ One process reads the whole
         /// directory: two files may declare rules for one store, and a
         /// store has one writer
-        #[arg(long, value_name = "PATH")]
-        rules: PathBuf,
+        #[arg(long, value_name = "PATH", required_unless_present = "fold")]
+        rules: Option<PathBuf>,
+        /// Read width-0s OBSERVATION lines on stdin and write buckets,
+        /// instead of reading a records stream. What makes writing your
+        /// own extractor a real answer: emit observations, pipe them
+        /// through here, and sealing, revisions and the citation span
+        /// are the ones that ship rather than yours to get right
+        #[arg(long, conflicts_with_all = ["rules", "observations", "metric", "store"])]
+        fold: bool,
+        /// The bucket --fold produces
+        #[arg(long, value_name = "SPAN", default_value = "60s", requires = "fold")]
+        width: String,
+        /// How long past a bucket's end --fold seals it
+        #[arg(long, value_name = "SPAN", default_value = "2m", requires = "fold")]
+        grace: String,
+        /// How long after sealing a late observation may still restate a
+        /// bucket, which --fold emits as a revision
+        #[arg(long, value_name = "SPAN", default_value = "1h", requires = "fold")]
+        revise: String,
         /// Print the width-0s OBSERVATIONS instead of bucketing them:
         /// one line per measurement per entry. The debugging path, and
         /// the format an EXEC extractor is expected to emit
@@ -1820,11 +1837,25 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Tally {
             rules,
+            fold,
+            width,
+            grace,
+            revise,
             observations,
             metric,
             store,
         } => tally::cmd_tally(&tally::TallyOpts {
             rules,
+            fold: fold
+                .then(|| -> anyhow::Result<tally::FoldOpts> {
+                    Ok(tally::FoldOpts {
+                        width_ms: append::parse_duration_ms(&width)?,
+                        grace_ms: append::parse_duration_ms(&grace)?,
+                        revise_ms: append::parse_duration_ms(&revise)?,
+                        max_series: 1000,
+                    })
+                })
+                .transpose()?,
             observations,
             metrics: metric,
             store,

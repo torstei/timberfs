@@ -245,7 +245,9 @@ around the spike. A revision extends the span.
 
 ## Where the numbers go
 
-**One tally store per source store**, named `<source name>-tally` by default,
+**A tally store belongs to ONE source store** — many-to-one, so a site's own
+extractor may write a second one beside the rules' — named `<source name>-tally`
+by default,
 its `.bark` carrying `class=tally`, `derived_from=<source id>`,
 `derived_op=tally`, and the source's provenance inherited as derived stores
 already inherit it. Per-source rather than one per extractor because lineage
@@ -338,9 +340,9 @@ will never be fed, rather than quietly measuring nothing.
 
 ## Site-specific extractors, and how they are addressed
 
-Five levels, and the first two cover most of what anyone writes. Levels 4 and 5
-are NOT BUILT; level 4 is the one to build next, and it is what stops level 5
-from being the answer to everything a regex cannot do.
+Four levels, and the first two cover most of what anyone writes. Level 4 is NOT
+BUILT and is the one to build next; there is no level 5, and the section after
+it says why.
 
 1. **A predicate and nothing else.** `COUNT=` over entries a predicate
    selected: entries logged, bytes logged, errors logged, "how often does this
@@ -358,13 +360,10 @@ from being the answer to everything a regex cannot do.
    regex over one entry cannot express because the answer is spread across
    several: a ZGC cycle is ~48 separately-stamped lines, a request duration is
    a `BEGIN` and a `COMPLETE` sharing an id. Not built; see below.
-5. **A program.** `EXEC=/usr/local/lib/timberfs/tally/whatever` — the ceiling,
-   not the first stop. Not built.
-
-**Addressed by absolute path, with no search path** — the decision `file.d`
-made for `SOURCE` and for the same reason: with a search path, which program
-you get depends on install order. `/usr/local/lib/timberfs/tally/` is a
-convention for where to put them, not a lookup.
+Beyond that is not a level of this rule language at all — see **an extractor
+that needs a program is a follower**, below. `EXEC` stays a RESERVED key that
+says so, rather than an unknown one: reaching for it is a reasonable instinct
+and deserves an answer.
 
 ### The session: the fold applied twice
 
@@ -430,9 +429,11 @@ harder before it is built.
 An external lookup; arithmetic beyond max−min (a ratio of two fields); a real
 parser (a binary format, a deep JSON path); a sketch (distinct counting needs a
 mergeable one — a plain distinct count is not additive and so is not storable);
-and grouping by something that is not a captured field. The wall moves a long
-way out, which is the point: `EXEC` should be where expressiveness ends, not
-where cross-entry state begins.
+and grouping by something that is not a captured field. Each of those is a
+FOLLOWER of its own rather than a level of this rule language, which is what
+the section after next is about. The session matters because it moves that
+wall a long way out: writing a program should be where expressiveness ends,
+not where cross-entry state begins.
 
 ### Where state lives, and why extraction has none
 
@@ -469,53 +470,53 @@ lines — a Java stack trace is NOT this, an entry already carries its
 continuations), and distinct counting. Those are programs, and the
 non-determinism is then visibly the program's rather than the format's.
 
-### How an EXEC would run, when there is one
+### An extractor that needs a program is a follower
 
-Recorded because the reasoning is what showed that level 4 should exist: all of
-it is scaffolding around an OPAQUE box, and none of it is about the metric. A
-session needs none of it.
+An `EXEC` would exist to let a foreign program take part in timberfs's tally
+run. But **the tally run is itself just a consumer**, so the generality is
+already there one level up: a program that needs state across entries registers
+as its own follower, reads the same records stream every consumer gets, and
+writes a tally store of its own.
 
-**Once, for the life of the run** — a coprocess, not a callback. Per entry
-would be a fork per line: 47 a second on one measured access log at its quiet
-rate, and far more on a busy one.
+Every axis favours that over a coprocess, and the comparison is the argument:
 
-- **One per (rule, store)**, which is the granularity a rule instance already
-  has, since a tally store belongs to one source store.
-- **Fed the stream AFTER the rule's predicate**, which is both the optimisation
-  and what keeps the program simple: a GC reader narrows to the ~60% of lines
-  it parses before a line reaches it. A rule whose program must COUNT what the
-  predicate excludes states no predicate — it is declared per rule, so the
-  author decides.
-- **It answers with width-`0s` observation lines and nothing else.**
+| | an `EXEC` coprocess | its own follower |
+| --- | --- | --- |
+| lifecycle | supervision hand-rolled inside tally | `timberfs-follower@name`, systemd's |
+| watermark | an `!at` marker invented for it | the consumer protocol's `progress`, which already means exactly that |
+| failure | takes the whole tally run with it | isolated to one follower |
+| processes | (stores × EXEC rules) | one per destination — the follower model's point |
+| visible in | a conf file | `follower list` |
 
-⚠ **The citation is the receipt.** Nothing can see inside the coprocess, so
-nothing knows which entries it has accounted for — except that an observation
-cites the tape span it came from. A program holding a half-assembled cycle
-emits, when it finally does, a citation covering the whole span, and
-`safe_offset` therefore holds the watermark at the start of the open cycle. A
-restart re-reads exactly what the program had not finished with.
+The `!at` marker is the tell. It was being invented to say *"I have consumed
+this far and made nothing of it"* — which is `progress`, in a second and worse
+protocol, one level down.
 
-⚠ **Which needs a way to say "seen this far, nothing came of it"**, or a
-program that consumes ten thousand entries and emits nothing pins the watermark
-at the first of them. That is a marker in the grammar that already exists —
-`!at offset=…` — and it is the consumer protocol's `progress` one level down.
-An EXEC is a mini-consumer.
+⚠ **The objection that dissolves.** "One tally store per source store" would
+make a site's own extractor and timberfs's rules two writers for one store. But
+that rule's purpose is lineage, per-source retention, a citation needing no
+per-line store id, and cardinality bounded by store count — and MANY-TO-ONE
+keeps all four. Several tally stores deriving from one log is a fleet view,
+which is a read-time merge by selection and already works. So the rule is: **a
+tally store belongs to ONE source store; a source store may have several.**
 
-**Failure needs no policy of its own.** If it exits, the rule's numbers stop,
-that is recorded, and the run fails; the follower restarts it from the safe
-offset. A restart-in-place policy would risk a silent gap or a double count
-where the position machinery already gets it right.
+What is genuinely lost is a SHARED READ of the tape: three site extractors as
+three followers read the log three times. Real, and the accepted cost of the
+follower model everywhere else in this tree.
 
-The open cost is process count — (stores matched) × (EXEC rules) coprocesses on
-a large fan-out. Lazy spawn on the first matching entry and an idle exit are the
-answers, and both can wait for a fleet that has one.
+**`timberfs tally --fold` is what makes this a real answer** rather than an
+invitation to reimplement the hard parts. A program emits width-`0s`
+observations and pipes them through the fold that ships, so sealing, revisions,
+the citation span and the series cap are not its problem:
 
-**Named by what they produce, never by where they came from.** The metric name
-is the section name, declared; the rule file's name does not appear in the tape.
-Deriving a metric name from a file would mean renaming a file rewrites the
-meaning of history — the same rule as identity never being derived from a path.
-Two rule files defining one metric name for one store is a **collision, refused
-at startup naming both files**, rather than a merge or a last-one-wins.
+```sh
+my-gc-extractor | timberfs tally --fold --width 60s | timberfs append --into …
+```
+
+⚠ A line the fold cannot read is FATAL, and so is one that is already a bucket.
+A fold that quietly dropped a tenth of its input would report numbers that are
+WRONG rather than missing, and nothing downstream could tell; accepting a
+bucket line as an observation would double every count on a re-run.
 
 ### Rule drift
 
@@ -627,11 +628,12 @@ loss, recorded exactly — the same rule retention already follows.
 * **The session (level 4)** — the next thing to build, and the reason `EXEC`
   can wait: `GROUP`, `CLOSE`, `TIMEOUT`, `SPAN`, `MAX_SESSIONS`, and `Roller`
   keyed by a field value instead of a bucket start.
-* **`EXEC` is parsed and refused at run time, not yet spawned.** The
-  observation format it answers in is settled and `--observations` prints it;
-  what is missing is the coprocess plumbing, and the `!at` marker that lets one
-  release the watermark over entries it consumed and made nothing of. It should
-  stay unbuilt until something real needs a level the session cannot reach.
+* **`EXEC` is gone**, and `--fold` is what replaced it: the boundary is a pipe
+  and a text format rather than a coprocess protocol. The key stays reserved so
+  that reaching for it gets an answer.
+* **Re-bucketing an existing tape** is the same fold and needs its own flag —
+  `--fold` deliberately refuses a line that is already a bucket rather than
+  guessing which was meant.
 
 ## What must change elsewhere when this ships
 

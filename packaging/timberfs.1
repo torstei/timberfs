@@ -83,6 +83,10 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .RB [ \-\-metric
 .IR NAME ]
 .br
+.B timberfs tally \-\-fold
+.RB [ \-\-width
+.IR SPAN ]
+.br
 .B timberfs follower create
 .I NAME
 .B \-\-store
@@ -1335,6 +1339,34 @@ what an
 extractor is expected to emit, which makes this both the debugging path
 and the way to learn the format.
 .TP
+.B \-\-fold
+Read width-\fB0s\fR OBSERVATION lines on stdin and write buckets,
+instead of reading a records stream \(em the fold on its own, for a
+program that produced observations some other way:
+.PP
+.RS
+.nf
+my\-gc\-extractor | timberfs tally \-\-fold \-\-width 60s | timberfs append \-\-into ...
+.fi
+.RE
+.PP
+.RS
+This is what makes writing your own extractor a real answer rather than
+an invitation to reimplement the hard parts: sealing, revisions, the
+citation span and the series cap are the ones that ship.
+.B \-\-width ,
+.B \-\-grace
+and
+.B \-\-revise
+size the window.
+.PP
+⚠ A line the fold cannot read is FATAL, and so is one that is already a
+bucket. A fold that quietly dropped a tenth of its input would report
+numbers that are WRONG rather than missing, and nothing downstream could
+tell; accepting a bucket line as an observation would double every count
+on a re-run.
+.RE
+.TP
 .BI \-\-metric " NAME"
 Only this metric, repeatable \(em for recomputing one over history
 without rewriting the rest. A recompute is idempotent: the newest line
@@ -1419,12 +1451,19 @@ and a
 .B COMPLETE
 sharing an id. That is a SESSION \(em a window keyed by a field value
 rather than by time \(em and it is NOT BUILT.
+.PP
+⚠ There is no external-extractor hook and there will not be one. A
+program that needs state across entries is a CONSUMER, and that already
+has a lifecycle, a watermark rule and a registry: register it as a
+FOLLOWER, have it write a tally store of its own, and pipe its
+observations through
+.B \-\-fold
+so it need not bucket them itself. Several tally stores may derive from
+one log; a reader selects across them.
 .B EXEC
-(an external program) is declared for what a session would still not
-reach, and is not built either: a rule stating one is REFUSED at load,
-rather than accepted and then measuring nothing.
+stays a reserved key that says so.
 .B docs/plans/tally.md
-has both.
+has the reasoning.
 .PP
 Everything else is declared per rule or inherited from the preamble:
 .BR WIDTH ,

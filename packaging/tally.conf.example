@@ -100,7 +100,14 @@ BUCKETS=0.05 0.1 0.5 1 5 10 120
 # is a SESSION: a window keyed by a field value rather than by time. It is
 # not built; docs/plans/tally.md has the design.
 #
-# EXEC=<absolute path> is declared for what a session would still not
-# reach (an external lookup, a real parser) and is not built either: a
-# rule stating one is REFUSED at load rather than accepted and then
-# measuring nothing.
+# Beyond that there is no hook here at all, deliberately. A program that
+# needs state across entries is a CONSUMER, which already has a
+# lifecycle, a watermark rule and a registry — so register it as a
+# follower, have it write a tally store of its own, and pipe its
+# observations through the fold that ships:
+#
+#   my-gc-extractor | timberfs tally --fold --width 60s \
+#     | timberfs append --into /var/log/timberfs/app-gc/app-gc.log
+#
+# Several tally stores may derive from one log; a reader selects across
+# them. EXEC= stays a reserved key that says this.

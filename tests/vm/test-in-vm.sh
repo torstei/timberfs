@@ -5368,9 +5368,30 @@ CONF
     rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.conf /tmp/vmtally.log
 }
 
+tally_fold_buckets_anybodys_observations() {
+    # There is no external-extractor hook: a program that needs state
+    # across entries writes its own store, and this is the fold it does
+    # not have to reimplement. An awk one-liner is a whole extractor.
+    printf '2026-09-06T10:00:01Z GC(1) Pause Mark Start 0.5ms\n2026-09-06T10:00:44Z GC(1) Pause Mark End 1.5ms\n' \
+        | awk '{ match($0,/[0-9.]+ms$/); v=substr($0,RSTART,RLENGTH-2); print $1" 0s gc_pause count=1 sum="v }' \
+        | timberfs tally --fold --width 60s --grace 0s \
+        | grep -qx '2026-09-06T10:00:00.000Z 60s gc_pause count=2 sum=2' || return 1
+    # And a rule reaching for the hook that is not there gets the route
+    # that is, rather than "unknown key".
+    mkdir -p /etc/timberfs/tally.d
+    printf 'AXIS=logline\n[m]\nEXEC=/usr/local/lib/timberfs/tally/x\nCOUNT=\n' \
+        > /etc/timberfs/tally.d/vmexec.conf
+    local err
+    err=$(printf '' | timberfs tally --rules /etc/timberfs/tally.d/vmexec.conf 2>&1)
+    rm -f /etc/timberfs/tally.d/vmexec.conf
+    grep -q 'follower' <<<"$err" || { echo "$err" >&2; return 1; }
+}
+
 run_test "tally: example conf and man section installed by the package" tally_example_installed
 run_test "tally: metrics derived into an ordinary store" \
     tally_derives_metrics_that_are_a_store_like_any_other
+run_test "tally: --fold buckets anybody's observations" \
+    tally_fold_buckets_anybodys_observations
 
 run_test "upgrade: appender self-exits, systemd restarts it on the new binary" binary_upgrade_restarts_appender
 run_test "upgrade: mount self-exits, remounts on the new binary" binary_upgrade_restarts_mount

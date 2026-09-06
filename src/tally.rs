@@ -530,11 +530,6 @@ pub enum Fields {
     Entry,
     Decode(Decoder),
     Extract(Box<regex::bytes::Regex>),
-    /// The escape hatch: a program fed the records stream, answering
-    /// with width-`0s` observation lines. An ABSOLUTE path, with no
-    /// search path — which program you get must not depend on install
-    /// order (the rule `file.d` follows for `SOURCE`).
-    Exec(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -582,7 +577,6 @@ impl Rule {
                 Fields::Entry => "entry".to_string(),
                 Fields::Decode(d) => format!("{d:?}"),
                 Fields::Extract(r) => r.as_str().to_string(),
-                Fields::Exec(p) => p.display().to_string(),
             },
             self.labels,
             self.measures,
@@ -889,13 +883,18 @@ pub fn parse(file: &str, text: &str) -> anyhow::Result<RuleSet> {
                 }
                 one_source(cur, EXTRACT, Fields::Extract(Box::new(re)))?
             }
-            EXEC => {
-                let p = PathBuf::from(value);
-                if !p.is_absolute() {
-                    bail!("{file}:{line}: {EXEC} {value} must be an absolute path");
-                }
-                one_source(cur, EXEC, Fields::Exec(p))?
-            }
+            // A RESERVED key rather than an unknown one: reaching for it
+            // is a reasonable instinct, and the answer is a route that
+            // already exists rather than a missing feature.
+            EXEC => bail!(
+                "{file}:{line}: [{}] states {EXEC} — there is no external extractor and \
+                 there will not be one. A program that needs state across entries is a \
+                 CONSUMER: register it as a follower, have it write a tally store of its \
+                 own, and pipe its width-0s observations through `timberfs tally --fold` \
+                 so it need not bucket them itself. Several tally stores may derive from \
+                 one log; a reader selects across them. See docs/plans/tally.md",
+                cur.metric
+            ),
             LABELS => cur.labels = words(),
             COUNT => {
                 if !flag()? {
@@ -973,21 +972,6 @@ fn close(o: Open, d: &Defaults, file: &str) -> anyhow::Result<Rule> {
         );
     }
     let fields = o.fields.unwrap_or(Fields::Entry);
-    // Accepted by the parser and refused here, rather than accepted and
-    // then measuring nothing: a rule that silently produces no
-    // observations is a metric nobody is collecting, and nothing later
-    // says so. The shape is declared in docs/plans/tally.md; what should
-    // reach for it first is the SESSION, which is not built either.
-    if let Fields::Exec(p) = &fields {
-        bail!(
-            "{file}:{at}: [{}] declares {EXEC}={} — an external extractor is not built \
-             yet. Cross-entry state (a cycle spread over many lines, a duration from two \
-             entries sharing an id) is what the session form will cover; see \
-             docs/plans/tally.md",
-            o.metric,
-            p.display()
-        );
-    }
     if matches!(fields, Fields::Entry) {
         let needs: Vec<&str> = o
             .measures
@@ -1235,10 +1219,6 @@ pub fn observe(
             }
             out
         }
-        // Unreachable: the rule parser refuses an EXEC rule outright.
-        // A program's observations would arrive on its own stdout, so
-        // nothing would be extracted here either way.
-        Fields::Exec(_) => return Outcome::Skipped,
     };
 
     // An absent label is OMITTED, which reads as the empty string in
@@ -1315,7 +1295,17 @@ pub fn observe(
 // -------------------------------------------------------------- the command
 
 pub struct TallyOpts {
-    pub rules: PathBuf,
+    /// Absent under `--fold`, which needs no rules: it buckets lines
+    /// somebody else produced.
+    pub rules: Option<PathBuf>,
+    /// Read width-`0s` OBSERVATION lines on stdin and write buckets,
+    /// instead of reading a records stream.
+    ///
+    /// This is what makes "write your own extractor" a real answer
+    /// rather than an invitation to reimplement sealing, revisions and
+    /// the citation span: a program emits observations, pipes them
+    /// through here, and the fold is the one that ships.
+    pub fold: Option<FoldOpts>,
     /// Print the width-`0s` observations instead of bucketing them —
     /// the debugging path, and the way to learn what an `EXEC`
     /// extractor is expected to emit.
@@ -1327,6 +1317,61 @@ pub struct TallyOpts {
     pub store: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct FoldOpts {
+    pub width_ms: u64,
+    pub grace_ms: u64,
+    pub revise_ms: u64,
+    pub max_series: usize,
+}
+
+/// Bucket observation lines from stdin. The metric, labels and measures
+/// are the input's; only the window is this side's.
+///
+/// ⚠ A line that does not parse is FATAL, not skipped. A fold that
+/// quietly dropped a tenth of its input would report numbers that are
+/// wrong rather than missing, and nothing downstream could tell.
+pub fn cmd_fold(o: &FoldOpts) -> anyhow::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    fold_stream(o, stdin.lock(), &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
+pub fn fold_stream(
+    o: &FoldOpts,
+    input: impl std::io::BufRead,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let mut roller = Roller::new(o.width_ms, o.grace_ms, o.revise_ms, o.max_series);
+    for (n, line) in input.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let s = Sample::parse(&line).with_context(|| format!("stdin line {}", n + 1))?;
+        if s.width_ms != 0 {
+            // Re-bucketing a tape is legitimate and is the same fold, but
+            // it must be asked for knowingly: silently accepting a
+            // 60s line into a 60s fold would double every count on a
+            // re-run.
+            bail!(
+                "stdin line {}: width {} — `--fold` takes OBSERVATIONS (width 0s). \
+                 Re-bucketing an existing tape is the same operation and will be its \
+                 own flag.",
+                n + 1,
+                render_width(s.width_ms)
+            );
+        }
+        roller.add(&s);
+        emit(out, roller.drain(false))?;
+    }
+    emit(out, roller.drain(true))?;
+    Ok(())
+}
+
 struct Live<'a> {
     rule: &'a Rule,
     preds: crate::grep::Preds,
@@ -1334,7 +1379,13 @@ struct Live<'a> {
 }
 
 pub fn cmd_tally(opts: &TallyOpts) -> anyhow::Result<()> {
-    let set = load(&opts.rules)?;
+    if let Some(fold) = &opts.fold {
+        return cmd_fold(fold);
+    }
+    let Some(rules) = &opts.rules else {
+        bail!("--rules names what to measure; --fold buckets observations somebody else made");
+    };
+    let set = load(rules)?;
     let stdin = std::io::stdin();
     let mut reader = crate::records::Reader::new(stdin.lock());
     let stdout = std::io::stdout();
@@ -1731,17 +1782,66 @@ mod tests {
     }
 
     #[test]
-    fn an_exec_rule_is_refused_rather_than_measuring_nothing() {
-        // The failure being prevented: EXEC parsed, the rule loaded, and
-        // every entry silently producing no observation — a metric
-        // nobody is collecting, which nothing downstream can report.
+    fn exec_is_reserved_and_points_at_the_route_that_exists() {
+        // There is no external extractor and there will not be one: a
+        // program that needs state across entries is a CONSUMER, which
+        // already has a lifecycle, a watermark rule and a registry. The
+        // key stays reserved because reaching for it is a reasonable
+        // instinct that deserves an answer rather than "unknown key".
         let err = parse(
             "t.conf",
             "AXIS=logline\n[m]\nEXEC=/usr/local/lib/timberfs/tally/x\nCOUNT=\n",
         )
         .unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("not built"), "{text}");
+        assert!(
+            text.contains("follower") && text.contains("--fold"),
+            "{text}"
+        );
+    }
+
+    fn folded(input: &str, width_ms: u64) -> anyhow::Result<String> {
+        let o = FoldOpts {
+            width_ms,
+            grace_ms: 0,
+            revise_ms: 0,
+            max_series: 1000,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        fold_stream(&o, std::io::Cursor::new(input.as_bytes()), &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn fold_buckets_observations_anybody_produced() {
+        // The whole reason there is no EXEC: a program emits
+        // observations and the fold that ships does the rest, so nobody
+        // reimplements sealing, revisions or the citation span.
+        let out = folded(
+            "2026-09-06T10:00:01.000Z 0s gc_pause count=1 sum=0.5\n\
+             2026-09-06T10:00:44.000Z 0s gc_pause count=1 sum=1.5\n",
+            60_000,
+        )
+        .unwrap();
+        assert_eq!(out, "2026-09-06T10:00:00.000Z 60s gc_pause count=2 sum=2\n");
+    }
+
+    #[test]
+    fn fold_refuses_a_line_it_cannot_read_and_one_already_bucketed() {
+        // Fatal, not skipped: a fold that quietly dropped a tenth of its
+        // input would report numbers that are WRONG rather than missing,
+        // and nothing downstream could tell.
+        let err = folded(
+            "2026-09-06T10:00:01.000Z 0s m count=1\nnot a sample\n",
+            60_000,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("line 2"), "{err}");
+
+        // And a bucket line is not an observation: accepting one would
+        // double every count on a re-run.
+        let err = folded("2026-09-06T10:00:00.000Z 60s m count=3\n", 60_000).unwrap_err();
+        assert!(format!("{err}").contains("OBSERVATIONS"), "{err}");
     }
 
     #[test]

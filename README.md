@@ -599,11 +599,21 @@ COUNT=
 
 Fields come from a predicate alone (`COUNT=` over what `HAS`/`ANY`/`REGEX`
 selected — no parsing at all, which is most generic metrics), a `DECODE` for a
-format somebody else standardised, an `EXTRACT` regex with named captures for
-one nobody did, or an `EXEC` program for what a regex over one entry cannot
-express. A program is fed the same records stream and answers with **width-`0s`
-observation lines** — the same grammar, one measurement per entry — so it owns
-extraction and nothing else. `man timberfs`, **tally**, is the reference.
+format somebody else standardised, or an `EXTRACT` regex with named captures
+for one nobody did.
+
+There is deliberately no hook for an external program: one that needs state
+across entries is a **consumer**, which already has a lifecycle, a watermark
+rule and a registry. Register it as a follower, have it write a tally store of
+its own — several may derive from one log, and a reader selects across them —
+and pipe its **width-`0s` observation lines** through the fold that ships,
+rather than reimplementing sealing and revisions:
+
+```sh
+my-gc-extractor | timberfs tally --fold --width 60s | timberfs append --into ...
+```
+
+`man timberfs`, **tally**, is the reference.
 
 ⚠ Declare `logline_lag` on the tally store. Its lines are numbers about a minute
 that closed some minutes ago, so its two clocks sit far apart, and a
