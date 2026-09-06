@@ -2220,6 +2220,15 @@ say so, as the other intakes do.
 .BR \-\-index ", " \-\-wal
 The receiving store's OWN policy. Settings never travel; only labels and
 identity do.
+.TP
+.BR \-\-route " " LABEL ", " \-\-replica
+Accepted and IGNORED, so a unit written against an older timberfs still
+starts; each warns, and both will be removed.
+.B \-\-route
+named the destination by a label, which is what keying on identity
+replaces;
+.B \-\-replica
+asked for the numbering and origin a destination now always keeps.
 .SS frames\-send
 Ship stores over the same wire. Sends what the receiver says it LACKS, so
 re-running is a no-op rather than a re-send \(em the receiver's position
