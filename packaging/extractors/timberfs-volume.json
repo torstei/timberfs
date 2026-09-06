@@ -1,0 +1,13 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "timberfs-volume",
+  "description": "Measurements that need no knowledge of a log's format, and therefore apply to any store.",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000 },
+  "metrics": [
+    {
+      "name": "entries_logged",
+      "description": "entries a minute",
+      "measure": [{ "count": true, "unit": "entries" }]
+    }
+  ]
+}

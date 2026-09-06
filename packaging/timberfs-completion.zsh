@@ -48,6 +48,7 @@ _timberfs_commands() {
         'trim:enforce a store'\''s declared retention once, now'
         'rotate:move or drop chunks written before a cutoff'
         'feed:read a selection and hand the records to a consumer'
+        'tally:derive metrics from a records stream'
         'follower:manage the registered followers'
         'forward-intake:receive the Fluentd Forward protocol over TCP'
         'otlp-intake:receive OTLP/HTTP logs from OpenTelemetry senders'

@@ -5295,6 +5295,210 @@ binary_upgrade_restarts_mount() {
     return $rc
 }
 
+# ---------------------------------------------------------------- tally
+
+tally_example_installed() {
+    # A wrong asset path in Cargo.toml only shows up in the built package,
+    # which is what this VM installs.
+    test -f /usr/lib/timberfs/tally.extractors.d/timberfs-volume.json \
+        && test -f /usr/lib/timberfs/tally.extractors.d/timberfs-apache-combined.json \
+        && timberfs tally --check --extractor /usr/lib/timberfs/tally.extractors.d >/dev/null 2>&1 \
+        && zcat /usr/share/man/man1/timberfs.1.gz | tr -d ' \n' | grep -q 'SStally'
+}
+
+tally_try_runs_a_shipped_extractor_against_a_file() {
+    # The tool an operator reaches for before deploying a document, and
+    # the one that tests the ones we ship. ⚠ The skipped count is the
+    # half worth reading: a store carries several line shapes, so "not
+    # mine" is ordinary and must never be counted as a loss.
+    local out err
+    printf '10.0.0.1 - - [06/Sep/2026:13:37:00 +0200] "GET /x HTTP/1.1" 200 2326\n2026-09-06T13:37:01Z level=info msg="another shape entirely"\n' \
+        > /tmp/vmtry.log
+    out=$(timberfs tally --try \
+            --extractor /usr/lib/timberfs/tally.extractors.d/timberfs-apache-combined.json \
+            < /tmp/vmtry.log 2>/tmp/vmtry.err) || { cat /tmp/vmtry.err >&2; return 1; }
+    grep -q 'http_requests method=GET status=200 count=1' <<<"$out" || {
+        echo "$out" >&2
+        return 1
+    }
+    grep -q 'claimed 1, skipped 1, dropped 0' /tmp/vmtry.err || {
+        cat /tmp/vmtry.err >&2
+        return 1
+    }
+    # A document this build cannot read is refused, not half-understood.
+    sed 's/1\.0-EXPERIMENTAL/9.9-FUTURE/' \
+        /usr/lib/timberfs/tally.extractors.d/timberfs-volume.json > /tmp/vmfuture.json
+    timberfs tally --check --extractor /tmp/vmfuture.json >/dev/null 2>&1 && return 1
+    rm -f /tmp/vmtry.log /tmp/vmtry.err /tmp/vmfuture.json
+    return 0
+}
+
+tally_derives_metrics_that_are_a_store_like_any_other() {
+    # End to end, and the claim being tested is the one the whole design
+    # rests on: the numbers land in an ordinary store, so nothing new
+    # reads them.
+    local d=/var/log/timberfs/vmtally s=/var/log/timberfs/vmtallysrc
+    rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.json
+    mkdir -p /etc/timberfs/tally.d
+
+    timberfs create "$s/vmtallysrc.log" --set service=vmapp --index >/dev/null 2>&1 || return 1
+    {
+        printf '2026-09-06T10:00:01Z level=info ms=5 msg=ok\n'
+        printf '2026-09-06T10:00:20Z level=warn ms=40 msg=slow\n'
+        printf '2026-09-06T10:00:40Z level=info ms=7 msg=ok\n'
+        printf '2026-09-06T10:02:00Z level=info ms=9 msg=ok\n'
+    } > /tmp/vmtally.log
+    timberfs import /tmp/vmtally.log --into "$s/vmtallysrc.log" >/dev/null 2>&1 || return 1
+
+    cat > /etc/timberfs/tally.d/vm.json <<'CONF'
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "vmapp",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 30000 },
+  "metrics": [
+    { "name": "requests",
+      "claim":  { "all": [{ "substring": "level=" }] },
+      "fields": { "decode": "logfmt" },
+      "labels": ["level"],
+      "measure": [{ "count": true }, { "sum": "ms", "unit": "ms" }] }
+  ]
+}
+CONF
+
+    # The distance this store's two clocks sit apart, without which a
+    # logline window selects no chunk at all. GRACE + REVISE for a live
+    # tally; for a BACKFILL like this one, however old the data is.
+    timberfs create "$d/vmtally.log" --set class=tally --index >/dev/null 2>&1 || return 1
+    timberfs set "$d/vmtally.log" logline_lag=520w >/dev/null 2>&1 || return 1
+
+    timberfs query --records "$s/vmtallysrc.log" 2>/dev/null \
+        | timberfs tally --extractor /etc/timberfs/tally.d/vm.json 2>/tmp/vmtally.err \
+        | timberfs append --into "$d/vmtally.log" >/dev/null 2>&1 || {
+        cat /tmp/vmtally.err >&2
+        return 1
+    }
+
+    # Two info entries in the first minute, 5 + 7 ms between them.
+    timberfs query "$d/vmtally.log" 2>/dev/null \
+        | grep -q '^2026-09-06T10:00:00.000Z 60s requests level=info count=2 sum=12 @' || {
+        timberfs query "$d/vmtally.log" >&2
+        return 1
+    }
+    # …and the bucket is findable by the minute it DESCRIBES, which is the
+    # half the declared lag buys.
+    # RFC3339 with the zone spelled out: a NAIVE stamp is parsed in the
+    # READER's timezone, so this would pass in a UTC VM and fail anywhere
+    # else — the store's stamps are UTC whatever the host is set to.
+    timberfs query "$d/vmtally.log" \
+        --from '2026-09-06T10:02:00Z' --to '2026-09-06T10:03:00Z' 2>/dev/null \
+        | grep -q 'count=1' || {
+        echo "a logline window over the buckets found nothing" >&2
+        return 1
+    }
+
+    rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.json /tmp/vmtally.log
+}
+
+tally_fold_buckets_anybodys_observations() {
+    # There is no external-extractor hook: a program that needs state
+    # across entries writes its own store, and this is the fold it does
+    # not have to reimplement. An awk one-liner is a whole extractor.
+    printf '2026-09-06T10:00:01Z GC(1) Pause Mark Start 0.5ms\n2026-09-06T10:00:44Z GC(1) Pause Mark End 1.5ms\n' \
+        | awk '{ match($0,/[0-9.]+ms$/); v=substr($0,RSTART,RLENGTH-2); print $1" 0s gc_pause count=1 sum="v }' \
+        | timberfs tally --fold --width 60s --grace 0s \
+        | grep -qx '2026-09-06T10:00:00.000Z 60s gc_pause count=2 sum=2' || return 1
+}
+
+tally_provisioning_end_to_end() {
+    # The whole loop from a config file: a provisioning declares which
+    # stores get a tally store, the follower it registers writes them,
+    # and the numbers come back out of an ordinary query.
+    local src=/var/log/timberfs/vmprov d=/var/log/timberfs/vmprov-tally
+    rm -rf "$src" "$d" /etc/timberfs/tally.d/vmprov.conf /var/lib/timberfs/followers/tally-vmprov
+    mkdir -p /etc/timberfs/tally.d
+
+    timberfs create "$src/vmprov.log" --set service=vmprov --set host=vmhost --index \
+        >/dev/null 2>&1 || return 1
+    {
+        printf '10.0.0.1 - - [06/Sep/2026:10:00:01 +0000] "GET /a HTTP/1.1" 200 100\n'
+        printf '10.0.0.2 - - [06/Sep/2026:10:00:02 +0000] "GET /b HTTP/1.1" 500 200\n'
+        printf '10.0.0.3 - - [06/Sep/2026:10:00:03 +0000] "GET /c HTTP/1.1" 200 -\n'
+    } > /tmp/vmprov.log
+    timberfs import /tmp/vmprov.log --into "$src/vmprov.log" >/dev/null 2>&1 || return 1
+
+    cat > /etc/timberfs/tally.d/vmprov.conf <<'CONF'
+SELECT=[service=vmprov]
+OUTPUT={name}-tally
+APPLY=timberfs-apache-combined
+DECLARE=index=true retain=730d
+CONF
+
+    timberfs tally --provision vmprov > /tmp/vmprov.out 2>&1 || {
+        cat /tmp/vmprov.out >&2
+        return 1
+    }
+    grep -q 'CREATE' /tmp/vmprov.out || { cat /tmp/vmprov.out >&2; return 1; }
+    # ⚠ Derived, not typed: a logline window narrower than the distance
+    # between a tally store's two clocks answers nothing.
+    jq -e '.class == "tally" and .logline_lag == "180s" and .derived_op == "tally"' \
+        "$d/vmprov-tally.log.bark" >/dev/null || {
+        cat "$d/vmprov-tally.log.bark" >&2
+        return 1
+    }
+    # The command is DERIVED — the operator typed no follower.
+    timberfs follower status tally-vmprov 2>&1 | grep -q 'timberfs tally --run vmprov' || {
+        timberfs follower status tally-vmprov >&2
+        return 1
+    }
+
+    # The producer is quiet, so the run seals what it holds and exits on
+    # the timeout; 25s is comfortably past the ten it waits.
+    timeout 25 timberfs follower run tally-vmprov >/dev/null 2>&1
+    timberfs query "$d/vmprov-tally.log" 2>/dev/null > /tmp/vmprov.tally
+    grep -q 'http_requests method=GET status=200 count=2' /tmp/vmprov.tally || {
+        cat /tmp/vmprov.tally >&2
+        return 1
+    }
+    # CLF writes `-` for a zero-byte response, which is zero and not
+    # unreadable: 100 + 200 + 0.
+    grep -q 'http_bytes status=200 count=2 sum=100' /tmp/vmprov.tally || {
+        cat /tmp/vmprov.tally >&2
+        return 1
+    }
+
+    # ⚠ A second pass must not recount: the position is the follower's.
+    local before after
+    before=$(wc -l < /tmp/vmprov.tally)
+    timeout 20 timberfs follower run tally-vmprov >/dev/null 2>&1
+    after=$(timberfs query "$d/vmprov-tally.log" 2>/dev/null | wc -l)
+    [ "$before" = "$after" ] || {
+        echo "recounted: $before then $after" >&2
+        return 1
+    }
+
+    # ⚠ And a tally store is never its own source, or the provisioning
+    # measures its own output one store deeper each run.
+    timberfs tally --provision vmprov 2>&1 | grep -q 'vmprov-tally ->' && {
+        echo "the provisioning picked up its own output" >&2
+        return 1
+    }
+
+    rm -rf "$src" "$d" /etc/timberfs/tally.d/vmprov.conf /tmp/vmprov.log /tmp/vmprov.out \
+        /tmp/vmprov.tally
+    timberfs follower delete tally-vmprov --yes >/dev/null 2>&1
+    return 0
+}
+
+run_test "tally: shipped extractors and man section installed by the package" tally_example_installed
+run_test "tally: metrics derived into an ordinary store" \
+    tally_derives_metrics_that_are_a_store_like_any_other
+run_test "tally: --fold buckets anybody's observations" \
+    tally_fold_buckets_anybodys_observations
+run_test "tally: --try runs a shipped extractor against a plain file" \
+    tally_try_runs_a_shipped_extractor_against_a_file
+run_test "tally: a provisioning creates the store and the follower writes it" \
+    tally_provisioning_end_to_end
+
 run_test "upgrade: appender self-exits, systemd restarts it on the new binary" binary_upgrade_restarts_appender
 run_test "upgrade: mount self-exits, remounts on the new binary" binary_upgrade_restarts_mount
 run_test "apt-get purge removes package" purge_package
@@ -5302,6 +5506,7 @@ run_test "purge keeps user conf and data, drops package files" purge_correct
 
 # Health checks run LAST: a test that leaks disk turns a clear failure into
 # confusing cascades (a full /tmp made query fail silently, empty-stderr),
+
 # so assert the filesystems aren't near-full and surface it as its own test.
 health_filesystems_not_full() {
     local fs pct

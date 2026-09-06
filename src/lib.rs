@@ -45,3 +45,4 @@ pub mod ship;
 pub mod sink;
 pub mod store;
 pub mod store_json;
+pub mod tally;

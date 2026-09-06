@@ -1,0 +1,24 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "timberfs-apache-combined",
+  "description": "NCSA common and combined access logs, the format Apache and nginx write by default. A log whose LogFormat has been changed needs an extractor of its own with a fields.extract regex. Requests are labelled by status, so an error rate is a selection over http_requests rather than a metric of its own.",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000 },
+  "metrics": [
+    {
+      "name": "http_requests",
+      "description": "requests a minute by status and method",
+      "claim": { "all": [{ "regex": "\" \\d{3} " }] },
+      "fields": { "decode": "apache-combined" },
+      "labels": ["status", "method"],
+      "measure": [{ "count": true, "unit": "requests" }]
+    },
+    {
+      "name": "http_bytes",
+      "description": "response bytes a minute by status",
+      "claim": { "all": [{ "regex": "\" \\d{3} " }] },
+      "fields": { "decode": "apache-combined" },
+      "labels": ["status"],
+      "measure": [{ "count": true }, { "sum": "bytes", "unit": "B" }]
+    }
+  ]
+}

@@ -20,7 +20,7 @@ _timberfs() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
 
-    local subcommands="mount umount create set append import export query info index list identity reindex trim rotate feed forest follower forward-intake otlp-intake incus-intake frames-intake frames-send"
+    local subcommands="mount umount create set append import export query info index list identity reindex trim rotate feed tally forest follower forward-intake otlp-intake incus-intake frames-intake frames-send"
     local follower_verbs="create list status update delete run"
     local forest_verbs="create list remove"
 
@@ -108,7 +108,8 @@ _timberfs() {
         --rotated | --socket | --project | --key | --prefix | --only | --endpoint | \
         --keep | --drain-every | --idle | --timeout | --from-chunk | --wait-for-writer | \
         --deadline | --positions | --batch-size | --follow-from | --delete-empty | \
-        --look-in | --etc)
+        --look-in | --etc | --extractor | --metric | --width | --grace | \
+        --provision | --run)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;

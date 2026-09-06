@@ -397,6 +397,35 @@ the contract being two file descriptors.
 where the retention floor lives, so a program that could write it could get
 retention wrong silently, where one that reports cannot.
 
+## Keep the numbers after the log is gone
+
+⚠ **Experimental** — see `man timberfs`, **tally**.
+
+The log is sized in weeks and the questions asked of it are sized in years:
+*was this slower than last quarter, is this error new, what did traffic do
+before the incident*. Deriving metrics from the log and keeping them in a store
+of their own answers those on 50 MB where the log needed 300 GB — retention
+asymmetry is the whole point, and the numbers outlive the lines they came from.
+
+```sh
+timberfs query --records apache-access --from '13:00' \
+  | timberfs tally --extractor /usr/lib/timberfs/tally.extractors.d \
+  | timberfs append --into backing/apache-access-tally.log
+```
+
+*Why not ship them to a metrics system:* two things do not survive the trip.
+**A metric can be added retroactively** here — an extractor is a reader with a
+position, so a rule written today runs over a month of tape, where anything
+sampling a live process has only what it was already collecting. And **a sample
+cites the log**: each bucket records the span of source tape it counted, so the
+spike opens the lines that made it, which no external time series can do.
+
+*What it costs:* a second read of the log, and the discipline that every stored
+value must coarsen by addition (or min/max/newest) — so counters are stored as
+deltas, durations as `sum`+`count` and histogram buckets, and never as an
+average or a percentile. That constraint is what makes any wider bucket the
+narrower ones combined.
+
 ## Hand an investigation to someone else
 
 A filtered slice, with its provenance, as one self-describing file — queryable
@@ -426,7 +455,11 @@ Named limits, so the compositions above are not read as more than they are.
   `--severity-regex`. If you need fields parsed into attributes, that is what a
   collector's operators are for; put one downstream.
 - **No query language.** Time windows and named predicates, composed with Unix
-  pipes. No aggregation, no dashboards, no alerting.
+  pipes. No dashboards and no alerting. Aggregation exists in exactly one place
+  and deliberately not in the read path: `timberfs tally` reduces entries to
+  buckets when they are extracted, and a reader may then select series and
+  combine buckets into wider ones — no `rate()`, no read-time percentile, and
+  no expression to write.
 - **One writer per store, and data arrives in log order.** `import` stitches
   historical files into order; live ingestion is in order by definition.
 - **No TLS on any network path**, and no gRPC on :4317. Loopback or a private

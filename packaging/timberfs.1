@@ -76,6 +76,17 @@ timberfs \- append-only, transparently compressed, write-time-indexed filesystem
 .I STORE
 .RB [ \-\-dry\-run ]
 .br
+.B timberfs tally
+.B \-\-rules
+.I PATH
+.RB [ \-\-observations ]
+.RB [ \-\-metric
+.IR NAME ]
+.br
+.B timberfs tally \-\-fold
+.RB [ \-\-width
+.IR SPAN ]
+.br
 .B timberfs follower create
 .I NAME
 .B \-\-store
@@ -282,9 +293,10 @@ neither. Known settings are parse-checked
 .RI ( "an absolute directory, SUPERSEDED by the follower registry \(em see"
 .BR FOLLOWERS ));
 .BR timestamp_regex ,
-.B timestamp_format
-and
+.BR timestamp_format ,
 .B timestamp_utc
+and
+.B logline_lag
 are parse-checked too (see THE TWO CLOCKS); anything else is free-form
 provenance
 .RB ( host =...),
@@ -1246,6 +1258,419 @@ resent. No hello, no run.
 Small enough to implement in a shell script, which is the point of it
 being a protocol at all.
 .RE
+.SS tally
+.B timberfs tally
+.B \-\-extractor
+.I PATH
+reads a
+.BR timberfs\-records (5)
+stream on stdin, applies the EXTRACTOR documents given, and writes TALLY
+LINES on stdout: metrics derived from the log \(em requests a minute,
+bytes transferred, errors logged, the spread of a duration. It writes no
+store itself, so the numbers land in one of their own the way anything
+else does:
+.PP
+.RS
+.nf
+timberfs query \-\-records app \-\-from 13:00 \\
+  | timberfs tally \-\-extractor /etc/timberfs/tally.extractors.d \\
+  | timberfs append \-\-into backing/app\-tally.log
+.fi
+.RE
+.PP
+⚠ EXPERIMENTAL. The document format and the flags may still move; see
+.B docs/plans/tally.md
+for what is settled and what is not.
+.PP
+A tally line is a bucket:
+.PP
+.RS
+.nf
+2026\-09\-06T13:37:00.000Z 60s http_requests status=500 vhost=example.com count=42 @1994848392+51221
+.fi
+.RE
+.PP
+\(em a stamp (the bucket's START, on the axis its extractor declared), a
+width, a metric name, labels, and one or more of exactly five MEASURES:
+.BR count ,
+.BR sum ,
+.BR min ,
+.BR max ,
+.BR last .
+Five, because each one IS its own coarsening rule \(em count and sum
+add, min and max take the extreme, last takes the newer \(em so a wider
+bucket is the narrower ones combined and the tape needs no schema for a
+reader to know it. A measure that could not be combined that way could
+not be re-bucketed, which is why there is no
+.B avg
+and no stored percentile: an average does not average, and a p95 does
+not add. A histogram is written instead, as one series per
+.B le
+label, and a quantile becomes interpolation over sums.
+.PP
+The trailing
+.BI @ offset + len
+is the CITATION: the span of the SOURCE store's tape this bucket
+counted. It is a range to read and not the set of entries \(em a metric
+matching one line in a hundred cites the ninety\-nine between them \(em
+so the spike in a graph opens the log around it.
+.PP
+.B THE EXTRACTOR DOCUMENT
+.PP
+.RS
+.nf
+{
+  "v": "1.0\-EXPERIMENTAL",
+  "name": "app\-requests",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000 },
+  "metrics": [
+    { "name": "requests",
+      "claim":  { "all": [{ "regex": "^\\\\S+ level=" }] },
+      "fields": { "decode": "logfmt" },
+      "labels": ["level", "tenant"],
+      "measure": [{ "count": true, "unit": "requests" }] }
+  ]
+}
+.fi
+.RE
+.PP
+A named set of metrics read off ONE SHAPE OF LINE. It carries NO STORE
+SELECTION, and that absence is the design: a document that says nothing
+about this host is an artefact \(em shippable, shareable, versioned \(em
+rather than configuration. Which stores get measured is deployment, and
+belongs to the provisioning that is not built yet
+.RB ( docs/plans/tally.md ).
+The schema is
+.BR docs/tally\-extractor.schema.json ;
+an unknown member is an error, and so is a
+.B v
+this build does not read.
+.PP
+⚠ ITS SUBJECT IS A LINE SHAPE, NEVER A STORE. A store carries many
+shapes at once \(em logfmt request lines beside stack traces beside a
+startup banner \(em so each metric CLAIMS its own lines with a predicate
+in the query document's own vocabulary
+.RB ( has ,
+.BR substring ,
+.BR regex ,
+.BR caseless ).
+Without a claim, "this line is not mine" and "this line is mine and
+broken" cannot be told apart: the first is the ordinary case on a mixed
+store and is silently skipped, while the second is a real loss and emits
+a
+.B !drop
+marker counting what it cost.
+.PP
+Fields come from one of three places.
+.B claim
+alone, with a bare
+.BR count ,
+needs no parsing and is most of what a generic metric wants.
+.B "fields.decode"
+.RB ( logfmt ,
+.BR json ,
+.BR apache\-combined )
+reads a line of known shape.
+.B "fields.extract"
+is a regex whose NAMED captures become the fields, which is what most
+in-house formats need.
+.PP
+⚠ WHERE THE FIELD NAMES COME FROM DIFFERS BY SOURCE.
+.B logfmt
+and
+.B json
+take them from the PRODUCER \(em they are the keys its own lines carry,
+so a line reading
+.B "level=info ms=1500"
+offers exactly
+.BR level " and " ms ,
+and renaming one in the application renames it here.
+.B extract
+names them itself.
+.B apache\-combined
+is positional, so the DECODER assigns them:
+.BR host ", " ident ", " user ", " time ", " request ", " status ", "
+.BR bytes ", " referer ", " agent ,
+plus
+.BR method ", " path " and " protocol .
+Where the source names its own fields, a metric naming one it cannot
+produce is REFUSED at load, listing what it can have; where the producer
+names them there is nothing to check against, so a misspelling is only
+visible at run time as a
+.B !drop
+counter.
+.PP
+⚠ The decoder list is CLOSED, and narrowly: a decoder exists only where
+the KEY SET IS OPEN and a regex therefore cannot express the shape.
+Anything positional belongs in an
+.BR extract ;
+.B apache\-combined
+is there because it is a published grammar many sites share and one that
+is easy to get subtly wrong by hand. ⚠
+.B json
+reads only the TOP level: a nested object is skipped and there is no
+path syntax.
+.PP
+⚠ There is no external-extractor hook and there will not be one. A
+program that needs state across entries is a CONSUMER, and that already
+has a lifecycle, a watermark rule and a registry: register it as a
+FOLLOWER, have it write a tally store of its own, and pipe its
+observations through
+.B \-\-fold
+so it need not bucket them itself. Several tally stores may derive from
+one log; a reader selects across them.
+.TP
+.BI \-\-extractor " PATH"
+A document, or a directory of
+.B *.json
+read whole. Repeatable. A name claimed by two documents is refused,
+naming both \(em which definition a number came from must not depend on
+readdir order. A directory given LATER shadows an earlier one by FILE
+NAME, so
+.B "\-\-extractor /usr/lib/timberfs/tally.extractors.d \-\-extractor /etc/timberfs/tally.extractors.d"
+means the packaged set with the site's edits winning; forking a shipped
+document means keeping its filename.
+.PP
+.RS
+⚠ Every name this package ships begins with
+.BR timberfs\- ,
+and nothing else does. Names live in one flat namespace and a collision
+is refused, so without a reserved prefix a name added in a later release
+could break a deployment whose own document already used it.
+.RE
+.TP
+.B \-\-try
+Validate the extractors and apply them to PLAIN LOG LINES on stdin,
+for trying one against a real file:
+.PP
+.RS
+.nf
+cat /var/log/app.log | timberfs tally \-\-try \-\-extractor app.json
+.fi
+.RE
+.PP
+.RS
+Entries are assembled exactly as a store would assemble them, so a stack
+trace stays ONE entry and a claim written against a store behaves the
+same here. The tally lines go to stdout ALONE and a per-metric report
+(claimed, skipped, dropped) to stderr, so a
+.B \-\-try
+run is diffable against a golden file \(em which is how the extractors
+this package ships are tested. ⚠ An extractor on the
+.B write
+axis cannot be tried against a file: plain lines carry no arrival time.
+.RE
+.TP
+.B \-\-check
+Validate the extractors and describe them, reading nothing.
+.TP
+.B \-\-observations
+Print the width-\fB0s\fR OBSERVATIONS instead of bucketing them: one line
+per measurement per entry, in the same grammar. An observation is a
+bucket of no width, so bucketing is the fold over them and coarsening a
+tape is the same fold \(em one operation, three call sites. It is also
+exactly what
+.B \-\-fold
+takes.
+.TP
+.B \-\-fold
+Read width-\fB0s\fR OBSERVATION lines on stdin and write buckets,
+instead of reading a records stream \(em the fold on its own, for a
+program that produced observations some other way:
+.PP
+.RS
+.nf
+my\-gc\-extractor | timberfs tally \-\-fold \-\-width 60s | timberfs append \-\-into ...
+.fi
+.RE
+.PP
+.RS
+This is what makes writing your own extractor a real answer rather than
+an invitation to reimplement the hard parts: sealing, displacement, the
+citation span and the series cap are the ones that ship.
+.B \-\-width
+and
+.B \-\-grace
+size the window.
+.PP
+⚠ A line the fold cannot read is FATAL, and so is one that is already a
+bucket. A fold that quietly dropped a tenth of its input would report
+numbers that are WRONG rather than missing, and nothing downstream could
+tell; accepting a bucket line as an observation would double every count
+on a re-run.
+.RE
+.TP
+.BI \-\-metric " NAME"
+Only this metric, repeatable \(em for recomputing one over history
+without rewriting the rest. A recompute is idempotent: the newest line
+for a bucket wins, so re-running an extractor over a window replaces its
+buckets rather than doubling them.
+.TP
+.BI \-\-width " SPAN"
+Override the extractors' own window.
+.TP
+.BI \-\-provision " SET"
+Declare and converge a PROVISIONING by name, from
+.IR /etc/timberfs/tally.d/SET.conf ,
+and register the follower that will run it. The shape
+.B file\-intake \-\-check
+has: it says what resolved.
+.B \-\-dry\-run
+reports the plan and changes nothing;
+.B \-\-etc
+and
+.B \-\-forest
+move where it looks.
+.PP
+.RS
+.nf
+# /etc/timberfs/tally.d/apache.conf
+SELECT=[service=~apache\-.*]
+OUTPUT={name}\-tally
+APPLY=timberfs\-apache\-combined timberfs\-volume
+DECLARE=index=true retain=730d retain_size=5G
+STORE_DIR=/var/log/timberfs
+.fi
+.RE
+.PP
+.RS
+.nf
+timberfs tally \-\-provision apache
+systemctl enable \-\-now timberfs\-follower@tally\-apache
+.fi
+.RE
+.PP
+.RS
+An extractor says HOW to measure a shape of line and carries no store
+selection; a provisioning says WHICH stores get a tally store, named how
+.RB ( OUTPUT ,
+a template over
+.BR {name} ", " {host} ", " {service} " and " {id} ),
+declaring what
+.RB ( DECLARE ,
+the same KEY=VALUE string
+.B file.d
+takes), and measured by which documents
+.RB ( APPLY ,
+naming them rather than pointing at files).
+.B WIDTH
+overrides the extractors' own.
+.PP
+⚠ FLAT \(em one provisioning per file, where
+.B file.d
+has a section per store. A section there names one store; here the
+SELECTION already names a set, so a second section would only be a second
+selection, which is a second file and a second unit.
+.PP
+⚠ THE FILE IS THE INTERFACE AND THE FOLLOWER IS STATE. The operator
+writes neither the follower's selection nor its command: both are derived
+from the file, so the two cannot drift. It is registered because that is
+where the position and the retention floor live, and a program that
+writes those can get retention wrong silently.
+.PP
+⚠
+.B class!=tally
+is folded into the selection rather than left to an operator. A tally
+store inherits its source's provenance, so
+.B [service=~apache\-.*]
+matches the tally store it just created, whose every line a volume metric
+then claims, producing another store one level deeper, forever. Measuring
+a tally store is a ROLLUP, which is a different verb.
+.PP
+⚠ It CONVERGES and never cascades. A source store appearing gets its
+tally store on the next run; a source store being DELETED does not take
+its tally store, because outliving the log is the entire point. A
+.B DECLARE
+that has drifted from what is on disk is REPORTED, never rewritten \(em
+somebody ran
+.B timberfs set
+and meant it.
+.PP
+.B logline_lag
+is DERIVED from the applied extractors (their width plus their grace) and
+declared on every tally store, because a logline window narrower than the
+distance between its two clocks selects no chunk and answers nothing.
+So is
+.BR wal=true ,
+because losing a minute's numbers silently is worse than the fsync it
+costs on a store that takes a handful of lines a minute. Naming either in
+.B DECLARE
+overrides it, which is what a backfill needs.
+.PP
+.B FOLLOW_FROM
+is
+.B begin
+by default, where a follower's own default is
+.BR discovery :
+a metric that can be computed over the log you ALREADY HAVE is what this
+is for, and
+.B discovery
+would silently skip it for every store older than the provisioning \(em
+which is every store, the first time. The cost is one pass over what the
+source still holds.
+.RE
+.TP
+.BI \-\-run " SET"
+RUN a provisioning: the consumer a tally follower execs. Reads a records
+stream on stdin, writes tally lines into one store per SOURCE store, and
+reports a watermark per store on stdout \(em which is the consumer
+protocol's channel, so no tally line ever goes there. Not typed by hand:
+.B \-\-provision
+registers the follower whose command this is.
+.PP
+.RS
+⚠ A position moves only when a bucket does. It may not pass the oldest
+byte an OPEN bucket depends on, because what has not sealed can still
+change and a restart must be able to re-derive it \(em which it can, by
+re-reading exactly those entries. So a run lags the live edge by about
+its
+.BR grace ,
+and no more.
+.PP
+⚠ On the logline axis event time only advances when events ARRIVE, which
+is what makes a backfill deterministic and what would leave a quiet log's
+last buckets unsealed forever. So a run that has heard nothing for a few
+seconds lets wall clock stand in for event time, and one that has heard
+nothing for ten seconds seals everything it holds: the producer has
+stopped. An entry arriving after that is displaced, which is the rule
+every late entry already follows.
+.RE
+.PP
+.B LATENESS
+.PP
+A bucket is sealed once the watermark has passed its end by
+.BR grace ,
+written, and evicted. An entry whose own bucket has ALREADY sealed \(em
+a request stamped at its start and written at completion, a long-lived
+connection putting an ancient stamp in a recent chunk \(em is DISPLACED
+into the current bucket rather than dropped, so a count metric's sum over
+a window still equals the number of entries. Nothing ever re-opens a
+sealed bucket.
+.PP
+⚠ What that costs is that the entry lands under a stamp that is not when
+the event happened, and the line it lands in cannot show it. So the
+displacement is stated beside it:
+.PP
+.RS
+.nf
+2026\-09\-06T13:41:00.000Z 60s !late metric=entries_logged count=1 max=180000
+.fi
+.RE
+.PP
+.B count
+is how many were displaced into that bucket and
+.B max
+the
+.B grace
+that would have been needed to keep the worst of them \(em which is the
+number to act on.
+.PP
+⚠ A tally store's two clocks sit far apart BY CONSTRUCTION \(em its
+lines are numbers about a minute that closed some minutes ago \(em so
+declare
+.B logline_lag
+on it (see THE TWO CLOCKS) or a logline-time window will select no chunk
+and answer nothing.
 .SS list
 .TP
 .BI \-\-select " EXPR"
@@ -3242,6 +3667,20 @@ the CONTENT, so unlike settings they inherit into derived artifacts.
 Do not backfill historical data through
 .B append
 (its index gets today's write times): import the file instead.
+.PP
+The minute of widening is a GUESS, and a store that knows better says so:
+.B logline_lag
+declares how far a line's own stamp may sit from the moment it was
+written, and chunk selection is widened by that instead. It exists
+because the guess has a class of store it cannot cover \(em one whose
+producer stamps a line long before writing it. A TALLY store is the
+clearest case: its lines are numbers about a minute that closed some
+minutes earlier (its width, plus the sealing grace), and a backfilled
+one's are about last month. Without the
+declaration a logline-time window over such a store selects no chunk at
+all and answers nothing, which reads exactly like an empty minute.
+Widening both ways only ever costs I/O \(em the per-entry verification
+keeps the output exactly inside the window asked for.
 .SH TIME FORMATS
 .I TIME
 arguments accept RFC 3339

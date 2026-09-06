@@ -879,6 +879,22 @@ here.
   already use — the failure worth catching is the ABSENCE, not the parse
   error. Came out of documenting the manifest as read-not-edited (PR #156);
   the documentation is not the fix.
+- **Metrics as a derived tape (`tally`)**: metrics extracted FROM the log
+  — requests per minute, bytes transferred, errors logged, GC pause time —
+  written into a store of their own, one per source store. The extractor is
+  a CONSUMER, so it needs no new lifecycle object and inherits a position
+  per store, which is what lets a metric be added retroactively over
+  history; a metrics system that samples a running process cannot backfill.
+  The reason to materialise at all is retention asymmetry: the numbers are
+  computable from the log, and what makes them worth keeping is that the
+  log's head goes and they should not. The property no external metrics
+  system can have is that a sample CITES the entries it counted, by tape
+  offset, so a spike opens the log around it. One invariant decides the
+  format — every stored value must coarsen by addition or by
+  min/max/newest — which forces deltas over cumulative counters (a
+  head-drop takes a cumulative base), `sum`+`count` over averages, and
+  histogram buckets over quantiles. Design note:
+  [docs/plans/tally.md](docs/plans/tally.md).
 - **Expose the index in-band**: a virtual `.idx` twin file or ioctl so tools
   can query through the mount without knowing the backing dir.
 - **tail(1) fast-path**: negative-offset "time seek" via `llseek` hooks.

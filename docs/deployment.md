@@ -1227,6 +1227,103 @@ store left to its own live writer.
 The older `cursors=<dir>` key still works and is reported as superseded wherever
 it is found.
 
+## Deriving metrics from a log — `timberfs tally`
+
+⚠ **Experimental**, and not yet a unit: there is no follower half, so this runs
+from a pipe or from cron. `man timberfs`, **tally**, is the reference and
+[docs/plans/tally.md](plans/tally.md) is the design.
+
+Two files, and the split is the point. An **extractor** says HOW to measure one
+shape of line and carries no store selection, so it can be shipped and shared —
+the packaged set is `/usr/lib/timberfs/tally.extractors.d/`, a site's own go in
+`/etc/timberfs/tally.extractors.d/`, and a same-named file in `/etc` shadows
+the packaged one. A **provisioning** says WHICH stores get a tally store, and
+is about this host:
+
+```ini
+# /etc/timberfs/tally.d/apache.conf
+SELECT=[service=~apache-.*]
+OUTPUT={name}-tally
+APPLY=timberfs-apache-combined timberfs-volume
+DECLARE=index=true retain=730d retain_size=5G
+STORE_DIR=/var/log/timberfs
+```
+
+```sh
+timberfs tally --provision apache --dry-run    # what it would create
+timberfs tally --provision apache              # declare, converge, register
+systemctl enable --now timberfs-follower@tally-apache
+```
+
+That is the whole deployment: the follower it registered runs `timberfs tally
+--run apache`, which reads the stores the selection matches and writes one
+tally store per source. ⚠ `FOLLOW_FROM` is `begin` by default, where a
+follower's own default is `discovery` — a metric computed over the log you
+already have is what this is for, and `discovery` would skip it for every store
+older than the provisioning, which is every store the first time. The cost is
+one pass over what the source still holds.
+
+⚠ The operator writes no follower and no command: `--provision` registers
+`tally-apache` with both derived from the file, so the two cannot drift. It is
+registered because that is where the position and the retention floor live.
+
+⚠ It converges and never cascades — a source store appearing gets its tally
+store on the next run, and a source store being deleted does **not** take its
+tally store, because outliving the log is the entire point. A `DECLARE` that
+has drifted from what is on disk is reported, never rewritten over an
+operator's `timberfs set`.
+
+⚠ `logline_lag` is derived, not typed, and `class!=tally` is folded into the
+selection so a provisioning cannot end up measuring its own output.
+
+Try one against a real file before deploying it:
+
+```sh
+cat /var/log/apache2/access.log \
+  | timberfs tally --try --extractor /usr/lib/timberfs/tally.extractors.d/timberfs-apache-combined.json
+```
+
+The tally lines go to stdout and a per-metric report — claimed, skipped,
+dropped — to stderr. ⚠ Read the **skipped** count: on a store carrying several
+line shapes it is the ordinary case and not a loss, while **dropped** means a
+line this metric claimed and could not read, and the numbers are then wrong
+rather than merely absent.
+
+Under it, and what `--provision` automates, the numbers go into a store of
+their own, one per source store:
+
+```sh
+timberfs create /var/log/timberfs/apache-access-tally/apache-access-tally.log \
+    --index --retain 730d \
+    --set class=tally --set service=apache-access --set host="$(hostname -s)" \
+    --set derived_op=tally --set logline_lag=1h
+
+timberfs query --records apache-access --from '13:00' \
+  | timberfs tally --extractor /usr/lib/timberfs/tally.extractors.d \
+  | timberfs append --into /var/log/timberfs/apache-access-tally/apache-access-tally.log
+```
+
+Three of those declarations are load-bearing:
+
+- **`class=tally`** is how a reader tells the numbers from the log. It matters
+  the other way round too: a tally store inherits the source's labels, so
+  `[service=~apache-.*]` now matches *both*, and a follower shipping apache logs
+  onward would start shipping tally lines. Narrow such a selection with
+  `class!=tally` — an absent key reads as the empty string, so that already
+  excludes every store on disk today.
+- **`logline_lag`** is how far a line's own stamp may sit from the moment it was
+  written: the bucket width plus `grace` for a live tally, and however old the
+  data is for a backfill. Chunk selection is widened by it in place of the one-minute guess,
+  and without it a logline-time window over the buckets selects no chunk at all
+  and answers nothing — which reads exactly like a quiet minute. `timberfs info`
+  reports the declared value, because that failure is otherwise silent.
+- **`retain`** is the whole point of materialising: the tally store keeps its
+  numbers long after the log they came from has been head-dropped. Size it in
+  years where the log is sized in weeks.
+
+That pipeline is what `--provision` automates; run it by hand for a one-off
+backfill, or for a store no provisioning covers.
+
 ## What a store declares about itself
 
 A manifest holds two kinds of key, and mixing them up is the thing that makes a

@@ -445,7 +445,27 @@ pub fn select_chunks(
 /// can verify entries exactly: catches lines written slightly before or
 /// after the stamps they carry (buffered producers), while the filter
 /// keeps the OUTPUT exactly inside the asked window.
+///
+/// The DEFAULT, and a guess. A store that knows the distance declares
+/// `logline_lag` and this is not consulted — see
+/// `bark::logline_lag_ms`.
 pub(crate) const WIDEN_MS: u64 = 60_000;
+
+/// The window CHUNK selection runs on: what was asked, widened by the
+/// distance this store's two clocks may sit apart.
+///
+/// `WIDEN_MS` is the guess for a store that says nothing. One that
+/// declares `logline_lag` is taken at its word — a tally store's lines
+/// are numbers about a minute that closed some minutes earlier, and a
+/// backfilled one's are about last month, which no guess can cover.
+pub(crate) fn widened(
+    from_ms: u64,
+    to_ms: u64,
+    bark: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> (u64, u64) {
+    let widen = crate::bark::logline_lag_ms(bark).unwrap_or(WIDEN_MS);
+    (from_ms.saturating_sub(widen), to_ms.saturating_add(widen))
+}
 
 /// A whole search, as one value.
 ///
@@ -1093,12 +1113,13 @@ fn query_entries<W: Write>(
             crate::import::Extractor::new(tf.regex.as_deref(), tf.format.as_deref(), tf.utc)?;
         // Widened selection, then a probe: can this store's lines be
         // parsed at all? If not, no filter — and no widening either.
+        let (widened_from, widened_to) = widened(from_ms, to_ms, source.bark.as_ref());
         let (selected, _) = select_chunks(
             f,
             &source.records,
             source.seq_at_open,
-            from_ms.saturating_sub(WIDEN_MS),
-            to_ms.saturating_add(WIDEN_MS),
+            widened_from,
+            widened_to,
             from_chunk,
             has,
             any,
@@ -3005,10 +3026,17 @@ pub fn cmd_info(input: &Path, json: bool) -> anyhow::Result<()> {
     } else if let Some(pt) = &pattern {
         println!("  pattern   {pt}");
     }
-    if !provenance.is_empty() || index_declared {
+    // The declared lag is reported because its failure is SILENT: a
+    // window narrower than the distance between the two clocks selects
+    // no chunk, and reads exactly like a quiet minute.
+    let lag = bark.get("logline_lag").and_then(|v| v.as_str());
+    if !provenance.is_empty() || index_declared || lag.is_some() {
         let mut parts: Vec<String> = provenance.iter().map(|(k, v)| format!("{k}={v}")).collect();
         if index_declared {
             parts.push("index declared".to_string());
+        }
+        if let Some(lag) = lag {
+            parts.push(format!("logline lag {lag}"));
         }
         println!("  manifest  {}", parts.join(", "));
     }
@@ -3520,6 +3548,33 @@ mod numbering_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_store_may_declare_how_far_its_two_clocks_sit_apart() {
+        // Chunk selection runs on the WRITE clock and a logline window is
+        // verified per entry, so a store whose lines are stamped long
+        // before they are written is pruned by the guess that bridges
+        // them. A TALLY store is exactly that store — its lines are
+        // numbers about a minute that closed some minutes ago, and a
+        // backfill's are about last month — so it says the distance
+        // rather than being guessed at.
+        let hour = 3_600_000u64;
+        let (from, to) = (10 * hour, 11 * hour);
+
+        let (a, b) = widened(from, to, None);
+        assert_eq!((a, b), (from - WIDEN_MS, to + WIDEN_MS), "the guess stands");
+
+        let mut bark = serde_json::Map::new();
+        bark.insert("logline_lag".to_string(), serde_json::json!("8h"));
+        let (a, b) = widened(from, to, Some(&bark));
+        assert_eq!((a, b), (from - 8 * hour, to + 8 * hour));
+
+        // A value that does not parse is not a licence to read nothing:
+        // fall back to the guess rather than to zero widening.
+        bark.insert("logline_lag".to_string(), serde_json::json!("later"));
+        let (a, b) = widened(from, to, Some(&bark));
+        assert_eq!((a, b), (from - WIDEN_MS, to + WIDEN_MS));
+    }
 
     #[test]
     fn an_omitted_field_means_unbounded_not_empty() {

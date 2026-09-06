@@ -1,6 +1,7 @@
 use timberfs::{
     append, bark, export, feed, follow, follower, forest, forward, fs, grain, import, incus,
     incus_intake, list, note, otlp_intake, query, querydoc, rotate, select, ship, sink, store,
+    tally,
 };
 
 use std::path::PathBuf;
@@ -624,6 +625,96 @@ enum Command {
         /// Forests to search with --select; default: every configured one
         #[arg(long, value_name = "DIR")]
         forest: Vec<PathBuf>,
+    },
+    /// Metrics derived from a log. Reads a timberfs-records(5) stream on
+    /// stdin, applies the EXTRACTOR documents given, and writes tally
+    /// lines on stdout. Pipe them into a store of their own:
+    ///
+    ///   timberfs query --records app --from 13:00 \
+    ///     | timberfs tally --extractor /etc/timberfs/tally.extractors.d \
+    ///     | timberfs append --into backing/app-tally.log
+    ///
+    /// An extractor is a named JSON document describing metrics read off
+    /// ONE SHAPE OF LINE. It carries no store selection: which stores get
+    /// measured is deployment, and a document that says nothing about
+    /// this host can be shipped and shared.
+    Tally {
+        /// An extractor document, or a directory of *.json read whole.
+        /// Repeatable; a name claimed by two documents is refused
+        #[arg(
+            long = "extractor",
+            value_name = "PATH",
+            required_unless_present_any = ["fold", "provision", "run"]
+        )]
+        extractors: Vec<PathBuf>,
+        /// Validate the extractors and apply them to PLAIN LOG LINES on
+        /// stdin, for trying one against a real file:
+        ///
+        ///   cat /var/log/app.log | timberfs tally --try --extractor app.json
+        ///
+        /// Entries are assembled exactly as a store would (a stack trace
+        /// stays one entry). The tally lines go to stdout ALONE and the
+        /// per-metric report to stderr, so a --try run is diffable
+        /// against a golden file — which is how the extractors this
+        /// package ships are tested
+        #[arg(long = "try", conflicts_with_all = ["fold", "check"])]
+        try_it: bool,
+        /// Validate the extractors and describe them, reading nothing
+        #[arg(long, conflicts_with = "fold")]
+        check: bool,
+        /// Print the width-0s OBSERVATIONS instead of bucketing them: one
+        /// line per measurement per entry. The debugging path, and the
+        /// format --fold takes
+        #[arg(long)]
+        observations: bool,
+        /// Only these metrics — for recomputing one over history without
+        /// rewriting the rest. Repeatable
+        #[arg(long, value_name = "NAME")]
+        metric: Vec<String>,
+        /// Declare and converge a PROVISIONING by name — which stores get
+        /// a tally store, named how, declaring what, measured by which
+        /// extractors — from /etc/timberfs/tally.d/<SET>.conf, and
+        /// register the follower that will run it. The shape
+        /// `file-intake --check` has: it says what resolved
+        #[arg(long, value_name = "SET", conflicts_with_all = ["extractors", "fold", "try_it"])]
+        provision: Option<String>,
+        /// With --provision: report the plan and change nothing
+        #[arg(long, requires = "provision")]
+        dry_run: bool,
+        /// RUN a provisioning: the consumer a tally follower execs. Reads
+        /// a records stream on stdin, writes tally lines into one store
+        /// per SOURCE store, and reports a watermark per store on stdout
+        /// — which is the consumer protocol's channel, so no tally line
+        /// ever goes there. Not typed by hand: `--provision` registers
+        /// the follower whose command this is
+        #[arg(long, value_name = "SET", conflicts_with_all = ["extractors", "fold", "try_it", "provision"])]
+        run: Option<String>,
+        /// Where the provisioning and the site's extractors live
+        #[arg(
+            long,
+            value_name = "DIR",
+            default_value = "/etc/timberfs",
+            requires = "provision"
+        )]
+        etc: PathBuf,
+        /// Forests to resolve the selection against; default every
+        /// configured one
+        #[arg(long, value_name = "DIR", requires = "provision")]
+        forest: Vec<PathBuf>,
+        /// Read width-0s OBSERVATION lines on stdin and write buckets,
+        /// instead of reading a records stream. What makes writing your
+        /// own extractor a real answer: emit observations, pipe them
+        /// through here, and sealing, revisions and the citation span are
+        /// the ones that ship rather than yours to get right
+        #[arg(long, conflicts_with_all = ["extractors", "observations", "metric"])]
+        fold: bool,
+        /// The bucket: overrides the extractors' own window, or sizes
+        /// --fold's (default 60s)
+        #[arg(long, value_name = "SPAN")]
+        width: Option<String>,
+        /// How long past a bucket's end --fold seals it
+        #[arg(long, value_name = "SPAN", default_value = "2m", requires = "fold")]
+        grace: String,
     },
     /// Time-based rotation: move every chunk written before --cutoff into
     /// DEST (or drop it with --delete), relocating compressed frames
@@ -1783,6 +1874,56 @@ fn main() -> anyhow::Result<()> {
         Command::Reindex { file } => {
             let file = forest::resolve_source(&file)?;
             grain::cmd_reindex(&file)?;
+        }
+        Command::Tally {
+            extractors,
+            try_it,
+            check,
+            observations,
+            metric,
+            provision,
+            dry_run,
+            run,
+            etc,
+            forest,
+            fold,
+            width,
+            grace,
+        } => {
+            if let Some(set) = run {
+                return tally::cmd_run(&set, &tally::RunOpts { etc, create: true });
+            }
+            if let Some(set) = provision {
+                return tally::cmd_provision(
+                    &set,
+                    &tally::ProvisionOpts {
+                        etc,
+                        dry_run,
+                        forest,
+                    },
+                );
+            }
+            let width_ms = width
+                .as_deref()
+                .map(append::parse_duration_ms)
+                .transpose()?;
+            tally::cmd_tally(&tally::TallyOpts {
+                extractors,
+                try_it,
+                check,
+                observations,
+                metrics: metric,
+                width_ms,
+                fold: fold
+                    .then(|| -> anyhow::Result<tally::FoldOpts> {
+                        Ok(tally::FoldOpts {
+                            width_ms: width_ms.unwrap_or(60_000),
+                            grace_ms: append::parse_duration_ms(&grace)?,
+                            max_series: 1000,
+                        })
+                    })
+                    .transpose()?,
+            })?
         }
         Command::Trim {
             store,

@@ -291,6 +291,7 @@ pub const NOT_PROVENANCE: &[&str] = &[
     "timestamp_regex",
     "timestamp_format",
     "timestamp_utc",
+    "logline_lag",
     "command",
     "pattern",
     // Which tape this pair holds — an ADDRESS, not provenance, and the
@@ -344,6 +345,22 @@ pub fn origin_id(map: &Map<String, Value>) -> Option<String> {
 /// exactly as declared — flattening a dotted key like `service.name` is a
 /// consumer's concern (Loki requires it, timberfs does not), and doing it
 /// here would lose the key the operator actually wrote.
+/// How far a line's own stamp may sit from the moment it was written,
+/// as the store declares it.
+///
+/// Chunk selection is on the WRITE clock and a logline window is
+/// verified per entry, so the two are bridged by widening the selection
+/// — a guess of a minute where nothing says otherwise. A store whose
+/// producer stamps a line long before it writes it can say so instead,
+/// and the commonest such store is a TALLY: its lines are numbers about
+/// a minute that closed some minutes earlier, and a backfill's are about
+/// last month. Widening both ways only ever costs I/O; the per-entry
+/// verification keeps the answer exact.
+pub fn logline_lag_ms(map: Option<&Map<String, Value>>) -> Option<u64> {
+    let v = map?.get("logline_lag")?.as_str()?;
+    crate::append::parse_duration_ms(v).ok()
+}
+
 pub fn provenance(map: &Map<String, Value>) -> Map<String, Value> {
     map.iter()
         .filter(|(k, _)| !NOT_PROVENANCE.contains(&k.as_str()))
@@ -371,6 +388,7 @@ const NON_INHERITED: &[&str] = &[
     "retain",
     "retain_size",
     "retain_unconsumed",
+    "logline_lag",
 ];
 
 /// Window bounds are operation facts, recorded as RFC3339 UTC.
@@ -884,6 +902,10 @@ pub fn declare(
                 crate::append::parse_size_bytes(&v)?;
                 Value::String(v)
             }
+            "logline_lag" => {
+                crate::append::parse_duration_ms(&v)?;
+                Value::String(v)
+            }
             _ if BOOLEAN_KEYS.contains(&k) => declared_value(k, &v)?,
             "timestamp_regex" => {
                 let re = regex::Regex::new(&v)
@@ -943,6 +965,26 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_logline_lag_is_read_and_a_bad_one_is_not_guessed_at() {
+        // Absent and unreadable must reach the caller the same way — as
+        // "nothing declared" — so the guess stands rather than a widening
+        // of zero, which would silently answer a window with nothing.
+        assert_eq!(
+            logline_lag_ms(Some(&map(&[("logline_lag", Value::String("8h".into()))]))),
+            Some(8 * 3_600_000)
+        );
+        assert_eq!(logline_lag_ms(Some(&map(&[]))), None);
+        assert_eq!(
+            logline_lag_ms(Some(&map(&[("logline_lag", Value::String("soon".into()))]))),
+            None
+        );
+        assert_eq!(
+            logline_lag_ms(Some(&map(&[("logline_lag", Value::Bool(true))]))),
+            None
+        );
+    }
+
+    #[test]
     fn provenance_is_where_the_entries_came_from_not_what_the_store_is() {
         let m = map(&[
             // identity, lineage, settings, content format — the store
@@ -956,6 +998,7 @@ mod tests {
             ("retain_unconsumed", Value::Bool(true)),
             ("cursors", Value::String("/var/lib/timberfs".into())),
             ("timestamp_utc", Value::Bool(true)),
+            ("logline_lag", Value::String("1h".into())),
             ("wal", Value::Bool(true)),
             // One hop's bookkeeping, not provenance: under fan-in these
             // name only ONE of the origins.

@@ -549,6 +549,103 @@ timberfs-records` is the reference; the store's own labels arrive with the
 entries as a `source` record, so a consumer needs no access to the store it is
 being fed.
 
+## Deriving metrics (`timberfs tally`)
+
+⚠ **Experimental** — the document format may still move.
+
+The numbers in a log outlive the log: requests a minute, bytes transferred,
+errors logged, the spread of a duration. `timberfs tally` reads a records
+stream, applies **extractor** documents, and writes **tally lines** — which go
+into a store of their own, so nothing new reads them:
+
+```sh
+timberfs query --records apache-access --from 13:00 \
+  | timberfs tally --extractor /usr/lib/timberfs/tally.extractors.d \
+  | timberfs append --into backing/apache-access-tally.log
+
+timberfs query apache-access-tally --from 13:00 --to 14:00
+2026-09-06T13:37:00.000Z 60s http_requests status=500 method=GET count=42 @1994848392+51221
+```
+
+A stamp (the bucket's start), a width, a metric, labels, and one or more of
+exactly five **measures**: `count`, `sum`, `min`, `max`, `last`. Five, because
+each one *is* its own coarsening rule — count and sum add, min and max take the
+extreme, last takes the newer — so a wider bucket is the narrower ones combined
+and the tape needs no schema for a reader to know it. Which is also why there is
+no `avg` and no stored percentile: an average does not average and a p95 does
+not add, so a histogram is written as one series per `le` and a quantile becomes
+interpolation over sums.
+
+Two things fall out that a metrics system beside the log cannot have. **A metric
+can be added retroactively**: an extractor is a reader with a position, so a
+document written today runs over a month of tape. And **a sample cites the
+log** — that trailing `@offset+len` is the span of the source store's tape the
+bucket counted, so the spike in a graph opens the lines that made it.
+
+### An extractor is a document, not configuration
+
+```json
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "app-requests",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000 },
+  "metrics": [
+    { "name": "requests",
+      "claim":  { "all": [{ "regex": "^\\S+ level=" }] },
+      "fields": { "decode": "logfmt" },
+      "labels": ["level", "tenant"],
+      "measure": [{ "count": true, "unit": "requests" }] }
+  ]
+}
+```
+
+It describes metrics read off **one shape of line** and carries **no store
+selection** — which is what makes it shippable: a document that says nothing
+about this host can be published, shared and versioned. Which stores get
+measured is deployment, and belongs to a provisioning file that is not built
+yet.
+
+⚠ Its subject is a *line shape*, never a store — a store carries logfmt request
+lines beside stack traces beside a startup banner — so every metric **claims**
+its own lines. Without a claim, "this line is not mine" (the ordinary case on a
+mixed store, silently skipped) and "this line is mine and broken" (a real loss,
+counted in a `!drop` marker) cannot be told apart.
+
+Fields come from a claim alone with a bare `count` (no parsing at all, which is
+most generic metrics), a `decode` for a format somebody else standardised
+(`logfmt`, `json`, `apache-combined`), or an `extract` regex with named captures
+for one nobody did.
+
+### Trying one against a real file
+
+```sh
+cat /var/log/app.log | timberfs tally --try --extractor app-requests.json
+```
+
+validates the document, compiles its regexes, assembles entries exactly as a
+store would (a stack trace stays one entry), and prints the tally. The lines go
+to stdout alone and a per-metric report — claimed, skipped, dropped — to stderr,
+so a `--try` run is diffable against a golden file. That is how the extractors
+in this repository are tested, and it is already earning its keep: the apache
+fixture caught CLF's `-` (a zero-byte response) being read as unreadable.
+
+There is deliberately no hook for an external program: one that needs state
+across entries is a **consumer**, which already has a lifecycle, a watermark
+rule and a registry. Register it as a follower, have it write a tally store of
+its own — several may derive from one log, and a reader selects across them —
+and pipe its **width-`0s` observation lines** through the fold that ships:
+
+```sh
+my-gc-extractor | timberfs tally --fold --width 60s | timberfs append --into ...
+```
+
+`man timberfs`, **tally**, is the reference; the schema is
+`docs/tally-extractor.schema.json`.
+
+⚠ Declare `logline_lag` on the tally store. Its lines are numbers about a minute
+that closed some minutes ago, so its two clocks sit far apart, and a
+logline-time window over it otherwise selects no chunk and answers nothing.
+
 ## Replicating to another timberfs (`frames-send`)
 
 OTLP above ships **entries** to anything that speaks the protocol. When the far
