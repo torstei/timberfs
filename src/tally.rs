@@ -1895,7 +1895,7 @@ struct Named<'a> {
 /// store. A section there names one store; here the SELECTION already
 /// names a set, so a second section would only be a second selection,
 /// which is a second file and a second unit. That also keeps the follower
-/// simple: one selection, one process, one `timberfs-tally@<set>`.
+/// simple: one selection, one process, one `timberfs-follower@tally-<set>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Provision {
     /// The file's name, which is the unit instance and the follower's.
@@ -2294,7 +2294,7 @@ pub struct ProvisionOpts {
     pub forest: Vec<PathBuf>,
 }
 
-/// `timberfs tally --check <set>`: declare, converge, and say what
+/// `timberfs tally --provision <set>`: declare, converge, and say what
 /// resolved — the shape `file-intake --check` has.
 ///
 /// ⚠ Converges and never cascades. A source store appearing gets its
@@ -3258,6 +3258,34 @@ mod tests {
         std::env::remove_var("XDG_CONFIG_HOME");
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&etc).ok();
+    }
+
+    #[test]
+    fn the_shipped_provisioning_example_parses() {
+        // An example nobody can copy is worse than none: it is read as
+        // the syntax and then blamed on the parser.
+        let text = include_str!("../packaging/timberfs-tally.conf.example");
+        let p = Provision::parse("apache", text).unwrap();
+        assert_eq!(
+            p.select,
+            crate::select::canonical("[service=~apache-.*]").unwrap()
+        );
+        assert_eq!(p.output, "{name}-tally");
+        assert!(p.apply.contains(&"timberfs-volume".to_string()));
+        // Every commented key is a key this build still reads.
+        for line in text.lines() {
+            let t = line.trim_start_matches('#').trim();
+            let Some((key, _)) = t.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.chars().all(|c| c.is_ascii_uppercase() || c == '_') && !key.is_empty() {
+                assert!(
+                    PROVISION_KEYS.contains(&key),
+                    "the example writes {key:?}, which this build does not read"
+                );
+            }
+        }
     }
 
     #[test]

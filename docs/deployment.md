@@ -1229,8 +1229,8 @@ it is found.
 
 ## Deriving metrics from a log — `timberfs tally`
 
-⚠ **Experimental**, and not yet a unit: there is no follower half, so this runs
-from a pipe or from cron. `man timberfs`, **tally**, is the reference and
+⚠ **Experimental** — the document format and the flags may still move.
+`man timberfs`, **tally**, is the reference and
 [docs/plans/tally.md](plans/tally.md) is the design.
 
 Two files, and the split is the point. An **extractor** says HOW to measure one
@@ -1248,6 +1248,10 @@ APPLY=timberfs-apache-combined timberfs-volume
 DECLARE=index=true retain=730d retain_size=5G
 STORE_DIR=/var/log/timberfs
 ```
+
+An annotated one carrying every key, `WIDTH` and `FOLLOW_FROM` included, is
+installed at
+`/usr/share/doc/timberfs/examples/timberfs-tally.conf.example`.
 
 ```sh
 timberfs tally --provision apache --dry-run    # what it would create

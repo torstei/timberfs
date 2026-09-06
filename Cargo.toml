@@ -105,6 +105,7 @@ assets = [
     # The ANSWER's contract, beside the request's. A client that can be
     # refused for an unknown member deserves a way to check what came back.
     ["docs/query-answer.schema.json", "usr/share/doc/timberfs/", "644"],
+    ["docs/tally-extractor.schema.json", "usr/share/doc/timberfs/", "644"],
     # The query-document examples. Shipped because a format nobody can
     # see worked examples of is one nobody uses: the schema says what is
     # legal, these say what is USEFUL.
@@ -139,6 +140,7 @@ assets = [
     ["packaging/timberfs-follow.conf.example", "usr/share/doc/timberfs/examples/timberfs-follow.conf.example", "644"],
     ["packaging/timberfs-file.conf.example", "usr/share/doc/timberfs/examples/timberfs-file.conf.example", "644"],
     ["packaging/timberfs-follower.conf.example", "usr/share/doc/timberfs/examples/timberfs-follower.conf.example", "644"],
+    ["packaging/timberfs-tally.conf.example", "usr/share/doc/timberfs/examples/timberfs-tally.conf.example", "644"],
     ["packaging/extractors/timberfs-volume.json", "usr/lib/timberfs/tally.extractors.d/timberfs-volume.json", "644"],
     ["packaging/extractors/timberfs-apache-combined.json", "usr/lib/timberfs/tally.extractors.d/timberfs-apache-combined.json", "644"],
     ["packaging/extractors/timberfs-nginx-combined.json", "usr/lib/timberfs/tally.extractors.d/timberfs-nginx-combined.json", "644"],

@@ -430,8 +430,8 @@ DECLARE=index=true retain=730d retain_size=5G
 ```
 
 ```sh
-timberfs tally --check apache          # declare, converge, say what resolved
-systemctl enable --now timberfs-tally@apache
+timberfs tally --provision apache      # declare, converge, register the follower
+systemctl enable --now timberfs-follower@tally-apache
 ```
 
 INI here for the reason it is wrong for definitions: this file is ABOUT THIS
@@ -457,7 +457,7 @@ to know which" — but here the destination is a TIMBERFS STORE, and timberfs
 knows exactly how to write one. Feeding itself through a pipe protocol designed
 for foreign programs is ceremony.
 
-So `timberfs tally --check apache` REGISTERS the follower — named `tally-apache`,
+So `timberfs tally --provision apache` REGISTERS the follower — named `tally-apache`,
 its selection and its command both DERIVED from the file — and the operator
 never writes either. The registration still exists, because that is where the
 position and the retention floor live and a program that writes those can get

@@ -1,0 +1,76 @@
+# Example provisioning for tally — which stores get a store of METRICS
+# derived from their lines, named how, measured by which extractors.
+#
+# Copy to /etc/timberfs/tally.d/<set>.conf, converge it, and start it by
+# that name:
+#
+#   timberfs tally --provision apache --dry-run   # what it would create
+#   timberfs tally --provision apache             # declare, converge, register
+#   systemctl enable --now timberfs-follower@tally-apache
+#
+# ⚠ FLAT — no sections. The SELECTION already names a set of stores, so a
+# second section would only be a second selection, which is a second file
+# and a second unit.
+#
+# The two objects are separate on purpose: an EXTRACTOR (a JSON document in
+# tally.extractors.d) describes metrics read off ONE SHAPE OF LINE and says
+# nothing about hosts, and THIS file is about this host and selects nothing
+# about the format. Neither is derivable from the other.
+
+# --- which stores ----------------------------------------------------------
+
+# A selection, in the same syntax query and follower take. Every store it
+# matches gets a tally store; a store that starts matching later gets one at
+# the next converge.
+SELECT=[service=~apache-.*]
+
+# --- where the numbers go --------------------------------------------------
+
+# The output store's name, as a template over the SOURCE store's facts:
+# {name}, {host}, {service}, {id}. It must vary — a template naming one
+# store for every source is several writers on one store — and a fact the
+# source does not carry is refused by name rather than substituted empty.
+OUTPUT={name}-tally
+
+# Each store is <STORE_DIR>/<output>/<output>.log, one directory per store,
+# as every other intake writes them.
+STORE_DIR=/var/log/timberfs
+
+# Properties DECLARED on the tally store, as KEY=VALUE pairs. Keep it FAR
+# longer than the log: metrics are a hundredth of the volume and the reason
+# to have them is the question asked next year.
+DECLARE=index=true retain=730d retain_size=5G
+
+# --- what to measure -------------------------------------------------------
+
+# The extractor documents to apply, by name — resolved against
+# /etc/timberfs/tally.extractors.d then /usr/lib/timberfs/tally.extractors.d,
+# so a local file of the same name replaces a shipped one. Names, not paths:
+# what a metric MEANS should not depend on where the file sat.
+#
+# ⚠ Every document applied to one set must define distinct metric names —
+# two defining one name would fold two measurements into one series, and
+# that is refused rather than silently summed.
+APPLY=timberfs-apache-combined timberfs-volume
+
+# The bucket width, overriding the extractors' own default. Whole seconds.
+# Narrower buckets are more rows and a finer graph; a tape is coarsened by
+# the same fold that built it, so widening later is always possible and
+# narrowing later is not.
+#WIDTH=30s
+
+# Where a newly registered follower starts reading its source: begin (the
+# whole store, the default), end, or discovery. ⚠ `discovery` silently skips
+# the history of every store older than this file.
+#FOLLOW_FROM=begin
+
+# --- checking an extractor before provisioning anything --------------------
+#
+# Read a log through a document and print the tally it produces, writing no
+# store at all:
+#
+#   timberfs tally --try timberfs-apache-combined < /var/log/apache2/access.log
+#
+# That is also how a document of your own is developed: a metric that
+# claimed lines and matched none says so, which a store quietly holding no
+# numbers does not.
