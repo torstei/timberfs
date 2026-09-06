@@ -338,8 +338,8 @@ fn check_metric(name: &str) -> anyhow::Result<()> {
 // ---------------------------------------------------------------- the fold
 
 type Key = (u64, String, Vec<(String, String)>);
-/// A bucket across widths: what a revision replaces, and the only thing
-/// two lines have to agree on to be the same bucket said twice.
+/// A bucket across widths: the only thing two lines have to agree on to
+/// be the same bucket said twice, which is what `resolve` keys on.
 type Revised = (u64, u64, String, Vec<(String, String)>);
 
 #[derive(Default)]
@@ -348,11 +348,19 @@ struct Bucket {
     cite_lo: Option<u64>,
     cite_hi: Option<u64>,
     /// The oldest source byte folded in here — what a consumer's
-    /// watermark may not pass while this bucket can still change.
+    /// watermark may not pass while this bucket is still open.
     off_lo: Option<u64>,
-    emitted: bool,
-    dirty: bool,
+}
+
+/// What a bucket LOST or was HANDED, per metric rather than per series:
+/// one marker for the bucket, not one per label set.
+#[derive(Default)]
+struct Marks {
     capped: u64,
+    late: u64,
+    /// The largest `grace` that would have kept a displaced entry in its
+    /// own bucket, which is exactly the number to act on.
+    late_max: u64,
 }
 
 /// Observations in, buckets out. Also the coarsener: feeding it buckets
@@ -360,31 +368,37 @@ struct Bucket {
 ///
 /// Sealing runs off the WATERMARK — the greatest stamp seen — rather
 /// than a wall clock, so a backfill of last month behaves exactly as the
-/// live run did and a test is deterministic.
+/// live run did and a test is deterministic. A bucket is sealed once,
+/// written, and evicted; nothing re-opens one.
 pub struct Roller {
     width_ms: u64,
     grace_ms: u64,
-    revise_ms: u64,
     max_series: usize,
     buckets: BTreeMap<Key, Bucket>,
+    marks: BTreeMap<(u64, String), Marks>,
     watermark: u64,
 }
 
 impl Roller {
-    pub fn new(width_ms: u64, grace_ms: u64, revise_ms: u64, max_series: usize) -> Roller {
+    pub fn new(width_ms: u64, grace_ms: u64, max_series: usize) -> Roller {
         Roller {
             width_ms: width_ms.max(1),
             grace_ms,
-            revise_ms,
             max_series,
             buckets: BTreeMap::new(),
+            marks: BTreeMap::new(),
             watermark: 0,
         }
     }
 
-    /// A one-shot fold with no sealing, for coarsening a closed set.
+    /// A one-shot fold over a CLOSED set, for coarsening a tape.
+    ///
+    /// ⚠ A grace of `u64::MAX` rather than zero: nothing seals until the
+    /// forced drain, so nothing is DISPLACED either. A batch fold is
+    /// handed its input whole and must not reorder it into the current
+    /// bucket the way a stream legitimately does.
     pub fn fold(width_ms: u64, samples: &[Sample]) -> Vec<Sample> {
-        let mut r = Roller::new(width_ms, 0, 0, usize::MAX);
+        let mut r = Roller::new(width_ms, u64::MAX, usize::MAX);
         for s in samples {
             r.add(s);
         }
@@ -395,17 +409,50 @@ impl Roller {
         self.watermark
     }
 
-    /// The oldest source byte any held bucket still depends on. A
-    /// consumer may not report past this: a bucket that can still be
-    /// revised must be reconstructible after a restart, and re-reading
-    /// those entries re-derives the identical lines.
+    /// The oldest source byte any OPEN bucket still depends on. A
+    /// consumer may not report past this: what is still open can still
+    /// change, and re-reading those entries after a restart re-derives
+    /// the identical lines.
     pub fn safe_offset(&self) -> Option<u64> {
         self.buckets.values().filter_map(|b| b.off_lo).min()
     }
 
+    /// Has this bucket start already sealed under the current watermark?
+    ///
+    /// Decided by the same predicate `drain` seals on, so it does not
+    /// depend on how often anyone drains.
+    fn sealed(&self, start: u64) -> bool {
+        self.watermark >= (start + self.width_ms).saturating_add(self.grace_ms)
+    }
+
+    /// Where a stamp belongs, and how late it was if that is not its own
+    /// bucket.
+    ///
+    /// ⚠ A late entry is DISPLACED into the current bucket, never
+    /// dropped and never re-opening a sealed one — so a count metric's
+    /// sum over a window still equals the number of entries. What it
+    /// costs is that the entry lands under a stamp that is not when the
+    /// event happened, which is why the displacement is recorded.
+    fn place(&self, ts: u64) -> (u64, Option<u64>) {
+        let own = ts - ts % self.width_ms;
+        if self.sealed(own) {
+            let current = self.watermark - self.watermark % self.width_ms;
+            // The grace that would have been needed to keep it.
+            (current, Some(self.watermark - (own + self.width_ms)))
+        } else {
+            (own, None)
+        }
+    }
+
     pub fn add(&mut self, s: &Sample) {
         self.watermark = self.watermark.max(s.ts);
-        let start = s.ts - s.ts % self.width_ms;
+        let (start, late) = self.place(s.ts);
+        // A marker about a bucket is not itself displaceable data.
+        if let Some(by) = late.filter(|_| !s.is_marker()) {
+            let m = self.marks.entry((start, s.metric.clone())).or_default();
+            m.late += 1;
+            m.late_max = m.late_max.max(by);
+        }
         let key = (start, s.metric.clone(), s.labels.clone());
         if !self.buckets.contains_key(&key) {
             let in_bucket = self
@@ -415,18 +462,11 @@ impl Roller {
                 .count();
             if in_bucket >= self.max_series {
                 // Bounded loss, recorded exactly — the rule retention
-                // already follows. Charged to any bucket at this start,
-                // so the count survives even when the cap is hit by a
-                // series that never gets one of its own.
-                if let Some((_, b)) = self
-                    .buckets
-                    .range_mut((start, String::new(), Vec::new())..)
-                    .take_while(|((t, _, _), _)| *t == start)
-                    .next()
-                {
-                    b.capped += 1;
-                    b.dirty = true;
-                }
+                // already follows.
+                self.marks
+                    .entry((start, s.metric.clone()))
+                    .or_default()
+                    .capped += 1;
                 return;
             }
         }
@@ -444,44 +484,55 @@ impl Roller {
             b.cite_hi = Some(b.cite_hi.map_or(off + len, |hi| hi.max(off + len)));
             b.off_lo = Some(b.off_lo.map_or(off, |lo| lo.min(off)));
         }
-        b.dirty = true;
     }
 
-    /// Every bucket the watermark has left behind: first when it seals,
-    /// again as a REVISION if a late observation changed it, and then
-    /// evicted once nothing more can arrive for it.
+    /// Every bucket the watermark has left behind, written once and
+    /// evicted, with whatever markers that bucket owes.
     pub fn drain(&mut self, force: bool) -> Vec<Sample> {
         let mut out = Vec::new();
         let mut evict: Vec<Key> = Vec::new();
-        for (key, b) in self.buckets.iter_mut() {
-            let end = key.0 + self.width_ms;
-            if !force && self.watermark < end.saturating_add(self.grace_ms) {
+        for (key, b) in self.buckets.iter() {
+            if !force && !self.sealed(key.0) {
                 continue;
             }
-            if b.dirty {
-                let mut s = Sample::new(key.0, self.width_ms, &key.1);
-                s.labels = key.2.clone();
-                s.fields = b.fields.iter().map(|(f, (v, _))| (*f, *v)).collect();
-                if let (Some(lo), Some(hi)) = (b.cite_lo, b.cite_hi) {
-                    s.cite = Some((lo, hi - lo));
-                }
-                out.push(s);
-                if b.capped > 0 {
-                    out.push(
-                        Sample::new(key.0, self.width_ms, "!cap")
-                            .label("metric", &key.1)
-                            .field(Field::Count, b.capped as f64),
-                    );
-                }
-                b.emitted = true;
-                b.dirty = false;
+            let mut s = Sample::new(key.0, self.width_ms, &key.1);
+            s.labels = key.2.clone();
+            s.fields = b.fields.iter().map(|(f, (v, _))| (*f, *v)).collect();
+            if let (Some(lo), Some(hi)) = (b.cite_lo, b.cite_hi) {
+                s.cite = Some((lo, hi - lo));
             }
-            if force || self.watermark >= end.saturating_add(self.grace_ms + self.revise_ms) {
-                evict.push(key.clone());
-            }
+            out.push(s);
+            evict.push(key.clone());
         }
         for k in evict {
             self.buckets.remove(&k);
+        }
+        let due: Vec<(u64, String)> = self
+            .marks
+            .keys()
+            .filter(|(start, _)| force || self.sealed(*start))
+            .cloned()
+            .collect();
+        for k in due {
+            let m = self.marks.remove(&k).expect("just listed");
+            if m.capped > 0 {
+                out.push(
+                    Sample::new(k.0, self.width_ms, "!cap")
+                        .label("metric", &k.1)
+                        .field(Field::Count, m.capped as f64),
+                );
+            }
+            if m.late > 0 {
+                // A displacement is invisible in the line it lands in,
+                // so it is stated beside it: how many, and the grace
+                // that would have kept the worst of them.
+                out.push(
+                    Sample::new(k.0, self.width_ms, "!late")
+                        .label("metric", &k.1)
+                        .field(Field::Count, m.late as f64)
+                        .field(Field::Max, m.late_max as f64),
+                );
+            }
         }
         out
     }
@@ -550,12 +601,13 @@ pub struct Window {
     pub axis: Axis,
     pub width_ms: u64,
     /// How long past a bucket's end before it is sealed and written.
+    ///
+    /// ⚠ The ONLY mechanism for lateness. An entry whose bucket has
+    /// already sealed is displaced into the current one and counted in a
+    /// `!late` marker; nothing re-opens a sealed bucket, so a position
+    /// lags by this and no more.
     #[serde(default = "default_grace")]
     pub grace_ms: u64,
-    /// How long after sealing a late entry may still restate it, as a
-    /// revision.
-    #[serde(default = "default_revise")]
-    pub revise_ms: u64,
     /// Distinct series per bucket, after which a `!cap` marker counts
     /// what was lost. Cardinality is where every metrics system dies.
     #[serde(default = "default_max_series")]
@@ -564,9 +616,6 @@ pub struct Window {
 
 fn default_grace() -> u64 {
     120_000
-}
-fn default_revise() -> u64 {
-    3_600_000
 }
 fn default_max_series() -> usize {
     1000
@@ -1017,12 +1066,7 @@ impl Metric {
                 .as_ref()
                 .map(|h| (h.field.clone(), sorted(&h.buckets))),
             cite: self.cite.unwrap_or(true),
-            roller: Roller::new(
-                window.width_ms,
-                window.grace_ms,
-                window.revise_ms,
-                window.max_series,
-            ),
+            roller: Roller::new(window.width_ms, window.grace_ms, window.max_series),
             announced: false,
             seen: Seen::default(),
         })
@@ -1271,7 +1315,6 @@ pub struct TallyOpts {
 pub struct FoldOpts {
     pub width_ms: u64,
     pub grace_ms: u64,
-    pub revise_ms: u64,
     pub max_series: usize,
 }
 
@@ -1294,7 +1337,7 @@ pub fn fold_stream(
     input: impl std::io::BufRead,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
-    let mut roller = Roller::new(o.width_ms, o.grace_ms, o.revise_ms, o.max_series);
+    let mut roller = Roller::new(o.width_ms, o.grace_ms, o.max_series);
     for (n, line) in input.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -1788,42 +1831,71 @@ mod tests {
     }
 
     #[test]
-    fn a_late_entry_revises_the_bucket_it_belongs_to() {
-        // The reason the tape is append-only and the reader resolves:
-        // a stamp can arrive after its bucket sealed (a request logged
-        // at its START and written at completion), and the answer is a
-        // new complete line, not a delta.
-        let mut r = Roller::new(60_000, 30_000, 3_600_000, 1000);
+    fn a_late_entry_is_displaced_into_the_current_bucket() {
+        // ⚠ Lateness is a DISPLACEMENT, never a loss: a count metric's
+        // sum over a window still equals the number of entries. What it
+        // costs is that the entry lands under a stamp that is not when
+        // the event happened, which is why the marker states it.
+        let mut r = Roller::new(60_000, 30_000, 1000);
         r.add(&s("2026-09-06T13:37:10.000Z 0s m count=1"));
         assert!(
             r.drain(false).is_empty(),
             "not sealed while the grace stands"
         );
+
         r.add(&s("2026-09-06T13:39:00.000Z 0s m count=1"));
         let sealed = r.drain(false);
-        assert_eq!(sealed.len(), 1);
-        assert_eq!(sealed[0].render(), "2026-09-06T13:37:00.000Z 60s m count=1");
-
-        r.add(&s("2026-09-06T13:37:30.000Z 0s m count=1"));
-        let revised = r.drain(false);
-        assert_eq!(revised.len(), 1);
         assert_eq!(
-            revised[0].render(),
-            "2026-09-06T13:37:00.000Z 60s m count=2"
+            sealed.iter().map(|s| s.render()).collect::<Vec<_>>(),
+            vec!["2026-09-06T13:37:00.000Z 60s m count=1"]
         );
 
-        // …and the newest line wins, which is also what makes a
-        // recompute idempotent rather than doubling.
-        let resolved = resolve(vec![sealed[0].clone(), revised[0].clone()]);
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].render(), revised[0].render());
+        // Its own bucket is gone, so it joins the one the watermark is
+        // in — and nothing re-opens what was already written.
+        r.add(&s("2026-09-06T13:37:30.000Z 0s m count=1"));
+        let out = r.drain(true);
+        let rendered: Vec<String> = out.iter().map(|s| s.render()).collect();
+        assert!(
+            rendered.contains(&"2026-09-06T13:39:00.000Z 60s m count=2".to_string()),
+            "{rendered:?}"
+        );
+        // 13:37:30's bucket ended at 13:38:00 and the watermark was
+        // 13:39:00, so a grace of 60s would have kept it.
+        assert!(
+            rendered.contains(
+                &"2026-09-06T13:39:00.000Z 60s !late metric=m count=1 max=60000".to_string()
+            ),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|l| l.starts_with("2026-09-06T13:37:00")),
+            "a sealed bucket is never written twice: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_batch_fold_never_displaces() {
+        // Coarsening is handed a CLOSED set, so it must not reorder its
+        // input into "the current bucket" the way a stream legitimately
+        // does — a grace of u64::MAX is what keeps a batch a batch.
+        let out = Roller::fold(
+            60_000,
+            &[
+                s("2026-09-06T13:39:00.000Z 0s m count=1"),
+                s("2026-09-06T13:37:00.000Z 0s m count=1"),
+            ],
+        );
+        assert_eq!(out.len(), 2, "two buckets, neither displaced");
+        assert!(out.iter().all(|s| !s.is_marker()), "{out:?}");
     }
 
     #[test]
     fn a_bucket_holds_the_oldest_byte_it_still_depends_on() {
         // What a consumer's watermark may not pass: a bucket that can
         // still be revised must be reconstructible after a restart.
-        let mut r = Roller::new(60_000, 0, 0, 1000);
+        let mut r = Roller::new(60_000, u64::MAX, 1000);
         let mut a = s("2026-09-06T13:37:10.000Z 0s m count=1");
         a.cite = Some((4096, 100));
         let mut b = s("2026-09-06T13:37:20.000Z 0s m count=1");
@@ -1840,7 +1912,7 @@ mod tests {
 
     #[test]
     fn the_series_cap_is_recorded_rather_than_silent() {
-        let mut r = Roller::new(60_000, 0, 0, 2);
+        let mut r = Roller::new(60_000, u64::MAX, 2);
         for i in 0..5 {
             r.add(
                 &Sample::new(1_788_700_000_000, 0, "m")
@@ -2079,7 +2151,7 @@ mod tests {
         // It was charged to the WATERMARK, which is zero until some
         // observation lands — so a metric whose every entry drops put all
         // of them at the epoch, which is exactly the one worth reading.
-        let mut r = Roller::new(60_000, 0, 0, 1000);
+        let mut r = Roller::new(60_000, u64::MAX, 1000);
         note_drop(&mut r, "m", "unreadable", Some(1_788_700_000_000));
         let out = r.drain(true);
         assert_eq!(out.len(), 1);
@@ -2094,8 +2166,9 @@ mod tests {
     fn folded(input: &str, width_ms: u64) -> anyhow::Result<String> {
         let o = FoldOpts {
             width_ms,
-            grace_ms: 0,
-            revise_ms: 0,
+            // Nothing seals until end of input, so a test's ordering is
+            // its own business rather than the roller's.
+            grace_ms: u64::MAX,
             max_series: 1000,
         };
         let mut out: Vec<u8> = Vec::new();

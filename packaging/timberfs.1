@@ -1486,12 +1486,11 @@ my\-gc\-extractor | timberfs tally \-\-fold \-\-width 60s | timberfs append \-\-
 .PP
 .RS
 This is what makes writing your own extractor a real answer rather than
-an invitation to reimplement the hard parts: sealing, revisions, the
+an invitation to reimplement the hard parts: sealing, displacement, the
 citation span and the series cap are the ones that ship.
-.B \-\-width ,
-.B \-\-grace
+.B \-\-width
 and
-.B \-\-revise
+.B \-\-grace
 size the window.
 .PP
 ⚠ A line the fold cannot read is FATAL, and so is one that is already a
@@ -1509,6 +1508,35 @@ buckets rather than doubling them.
 .TP
 .BI \-\-width " SPAN"
 Override the extractors' own window.
+.PP
+.B LATENESS
+.PP
+A bucket is sealed once the watermark has passed its end by
+.BR grace ,
+written, and evicted. An entry whose own bucket has ALREADY sealed \(em
+a request stamped at its start and written at completion, a long-lived
+connection putting an ancient stamp in a recent chunk \(em is DISPLACED
+into the current bucket rather than dropped, so a count metric's sum over
+a window still equals the number of entries. Nothing ever re-opens a
+sealed bucket.
+.PP
+⚠ What that costs is that the entry lands under a stamp that is not when
+the event happened, and the line it lands in cannot show it. So the
+displacement is stated beside it:
+.PP
+.RS
+.nf
+2026\-09\-06T13:41:00.000Z 60s !late metric=entries_logged count=1 max=180000
+.fi
+.RE
+.PP
+.B count
+is how many were displaced into that bucket and
+.B max
+the
+.B grace
+that would have been needed to keep the worst of them \(em which is the
+number to act on.
 .PP
 ⚠ A tally store's two clocks sit far apart BY CONSTRUCTION \(em its
 lines are numbers about a minute that closed some minutes ago \(em so
@@ -3520,8 +3548,8 @@ written, and chunk selection is widened by that instead. It exists
 because the guess has a class of store it cannot cover \(em one whose
 producer stamps a line long before writing it. A TALLY store is the
 clearest case: its lines are numbers about a minute that closed some
-minutes earlier (the sealing grace, plus however long a revision may
-arrive), and a backfilled one's are about last month. Without the
+minutes earlier (its width, plus the sealing grace), and a backfilled
+one's are about last month. Without the
 declaration a logline-time window over such a store selects no chunk at
 all and answers nothing, which reads exactly like an empty minute.
 Widening both ways only ever costs I/O \(em the per-entry verification

@@ -302,7 +302,7 @@
           "$ref": "#/$defs/Axis"
         },
         "grace_ms": {
-          "description": "How long past a bucket's end before it is sealed and written.",
+          "description": "How long past a bucket's end before it is sealed and written.\n\n⚠ The ONLY mechanism for lateness. An entry whose bucket has\nalready sealed is displaced into the current one and counted in a\n`!late` marker; nothing re-opens a sealed bucket, so a position\nlags by this and no more.",
           "type": "integer",
           "format": "uint64",
           "default": 120000,
@@ -313,13 +313,6 @@
           "type": "integer",
           "format": "uint",
           "default": 1000,
-          "minimum": 0
-        },
-        "revise_ms": {
-          "description": "How long after sealing a late entry may still restate it, as a\nrevision.",
-          "type": "integer",
-          "format": "uint64",
-          "default": 3600000,
           "minimum": 0
         },
         "width_ms": {

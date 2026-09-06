@@ -5,3 +5,5 @@
 2026-09-06T13:37:20Z WARN retrying
 2026-09-06T13:38:00Z error lowercase levels happen too
 2026-09-06T13:38:30Z INFO recovered
+2026-09-06T13:41:00Z INFO the frontier moves on
+2026-09-06T13:37:05Z INFO arrived long after its own minute had closed

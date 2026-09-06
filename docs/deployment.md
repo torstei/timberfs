@@ -1275,8 +1275,8 @@ Three of those declarations are load-bearing:
   `class!=tally` — an absent key reads as the empty string, so that already
   excludes every store on disk today.
 - **`logline_lag`** is how far a line's own stamp may sit from the moment it was
-  written: `GRACE` + `REVISE` for a live tally, and however old the data is for
-  a backfill. Chunk selection is widened by it in place of the one-minute guess,
+  written: the bucket width plus `grace` for a live tally, and however old the
+  data is for a backfill. Chunk selection is widened by it in place of the one-minute guess,
   and without it a logline-time window over the buckets selects no chunk at all
   and answers nothing — which reads exactly like a quiet minute. `timberfs info`
   reports the declared value, because that failure is otherwise silent.

@@ -681,10 +681,6 @@ enum Command {
         /// How long past a bucket's end --fold seals it
         #[arg(long, value_name = "SPAN", default_value = "2m", requires = "fold")]
         grace: String,
-        /// How long after sealing a late observation may still restate a
-        /// bucket, which --fold emits as a revision
-        #[arg(long, value_name = "SPAN", default_value = "1h", requires = "fold")]
-        revise: String,
     },
     /// Time-based rotation: move every chunk written before --cutoff into
     /// DEST (or drop it with --delete), relocating compressed frames
@@ -1854,7 +1850,6 @@ fn main() -> anyhow::Result<()> {
             fold,
             width,
             grace,
-            revise,
         } => {
             let width_ms = width
                 .as_deref()
@@ -1872,7 +1867,6 @@ fn main() -> anyhow::Result<()> {
                         Ok(tally::FoldOpts {
                             width_ms: width_ms.unwrap_or(60_000),
                             grace_ms: append::parse_duration_ms(&grace)?,
-                            revise_ms: append::parse_duration_ms(&revise)?,
                             max_series: 1000,
                         })
                     })
