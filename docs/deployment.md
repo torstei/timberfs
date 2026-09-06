@@ -1277,8 +1277,8 @@ tally store, because outliving the log is the entire point. A `DECLARE` that
 has drifted from what is on disk is reported, never rewritten over an
 operator's `timberfs set`.
 
-⚠ `logline_lag` is derived, not typed, and `class!=tally` is folded into the
-selection so a provisioning cannot end up measuring its own output.
+⚠ `class!=tally` is folded into the selection, so a provisioning cannot end up
+measuring its own output.
 
 Try one against a real file before deploying it:
 
@@ -1300,14 +1300,20 @@ their own, one per source store:
 timberfs create /var/log/timberfs/apache-access-tally/apache-access-tally.log \
     --index --retain 730d \
     --set class=tally --set service=apache-access --set host="$(hostname -s)" \
-    --set derived_op=tally --set logline_lag=1h
+    --set derived_op=tally
 
 timberfs query --records apache-access --from '13:00' \
   | timberfs tally --extractor /usr/lib/timberfs/tally.extractors.d \
   | timberfs append --into /var/log/timberfs/apache-access-tally/apache-access-tally.log
 ```
 
-Three of those declarations are load-bearing:
+⚠ Shown for the mechanics; prefer `--provision` for a store you will keep.
+`append` stamps arrival, as it does for any pipe, so this store's chunks carry
+the moment the numbers were computed rather than the minutes they are about,
+and `--from`/`--to` over it will not find them. A tally store the provisioning
+writes carries the buckets, and needs nothing declared to be queried by them.
+
+Two of those declarations are load-bearing:
 
 - **`class=tally`** is how a reader tells the numbers from the log. It matters
   the other way round too: a tally store inherits the source's labels, so
@@ -1315,12 +1321,6 @@ Three of those declarations are load-bearing:
   onward would start shipping tally lines. Narrow such a selection with
   `class!=tally` — an absent key reads as the empty string, so that already
   excludes every store on disk today.
-- **`logline_lag`** is how far a line's own stamp may sit from the moment it was
-  written: the bucket width plus `grace` for a live tally, and however old the
-  data is for a backfill. Chunk selection is widened by it in place of the one-minute guess,
-  and without it a logline-time window over the buckets selects no chunk at all
-  and answers nothing — which reads exactly like a quiet minute. `timberfs info`
-  reports the declared value, because that failure is otherwise silent.
 - **`retain`** is the whole point of materialising: the tally store keeps its
   numbers long after the log they came from has been head-dropped. Size it in
   years where the log is sized in weeks.

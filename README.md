@@ -213,9 +213,6 @@ time the log talks about: chunks are selected on the store's clock, then every
 entry is verified against its own logline stamp. Where a producer's two clocks
 diverge — Apache logs a request's start time and writes the line when the
 request completes — that selection leans on a widening of about a minute.
-A store whose two clocks sit further apart says so: `timberfs set <store>
-logline_lag=8h` widens the selection by what that store actually needs
-instead of by the guess.
 See [Two clocks](docs/deployment.md#two-clocks-and-when-they-diverge).
 
 ## Beyond the getting-started path
@@ -659,10 +656,6 @@ my-gc-extractor | timberfs tally --fold --width 60s | timberfs append --into ...
 
 `man timberfs`, **tally**, is the reference; the schema is
 `docs/tally-extractor.schema.json`.
-
-⚠ Declare `logline_lag` on the tally store. Its lines are numbers about a minute
-that closed some minutes ago, so its two clocks sit far apart, and a
-logline-time window over it otherwise selects no chunk and answers nothing.
 
 ## Replicating to another timberfs (`frames-send`)
 

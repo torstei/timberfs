@@ -1369,9 +1369,9 @@ pub fn fold_stream(
             );
         }
         roller.add(&s);
-        emit(out, roller.drain(false))?;
+        let _ = emit(out, roller.drain(false))?;
     }
-    emit(out, roller.drain(true))?;
+    let _ = emit(out, roller.drain(true))?;
     Ok(())
 }
 
@@ -1605,8 +1605,9 @@ impl Run {
         axis: Axis,
         out: &mut impl Write,
         observations: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<(u64, u64)>> {
         let mut batch: Vec<Sample> = Vec::new();
+        let mut meta: Option<(u64, u64)> = None;
         for l in self.live.iter_mut() {
             let ts = match axis {
                 Axis::Logline => e.ts,
@@ -1637,6 +1638,7 @@ impl Run {
                     if !l.announced {
                         l.announced = true;
                         if let Some(u) = &l.unit {
+                            meta = span(meta, Some((ts, ts)));
                             writeln!(
                                 out,
                                 "{}",
@@ -1660,12 +1662,12 @@ impl Run {
                 batch.extend(l.roller.drain(false));
             }
         }
-        emit(out, batch)
+        Ok(span(meta, emit(out, batch)?))
     }
 
     /// Let wall clock stand in for event time on a quiet stream, and
     /// write whatever that seals.
-    fn idle(&mut self, by_ms: u64, out: &mut impl Write) -> anyhow::Result<()> {
+    fn idle(&mut self, by_ms: u64, out: &mut impl Write) -> anyhow::Result<Option<(u64, u64)>> {
         let mut batch: Vec<Sample> = Vec::new();
         for l in self.live.iter_mut() {
             if l.roller.watermark() == 0 {
@@ -1679,9 +1681,13 @@ impl Run {
         emit(out, batch)
     }
 
-    fn finish(&mut self, out: &mut impl Write, observations: bool) -> anyhow::Result<()> {
+    fn finish(
+        &mut self,
+        out: &mut impl Write,
+        observations: bool,
+    ) -> anyhow::Result<Option<(u64, u64)>> {
         if observations {
-            return Ok(());
+            return Ok(None);
         }
         let mut batch: Vec<Sample> = Vec::new();
         for l in self.live.iter_mut() {
@@ -1758,7 +1764,9 @@ pub fn cmd_tally(opts: &TallyOpts) -> anyhow::Result<()> {
     let mut ended = false;
     while let Some(rec) = reader.next_rec()? {
         match rec {
-            crate::records::Rec::Entry(e) => run.feed(&e, axis, &mut out, opts.observations)?,
+            crate::records::Rec::Entry(e) => {
+                run.feed(&e, axis, &mut out, opts.observations)?;
+            }
             crate::records::Rec::End(_) => ended = true,
             _ => {}
         }
@@ -1868,12 +1876,27 @@ fn entries_of_text(text: &[u8]) -> anyhow::Result<Vec<crate::records::EntryRec>>
 }
 
 /// One batch of sealed buckets, in time order.
-fn emit(out: &mut impl Write, mut batch: Vec<Sample>) -> anyhow::Result<()> {
+///
+/// Reports the BUCKET WINDOW it wrote, which is what stamps the chunk:
+/// a tally store's write axis is the minutes its lines are about.
+fn emit(out: &mut impl Write, mut batch: Vec<Sample>) -> anyhow::Result<Option<(u64, u64)>> {
     batch.sort_by(|a, b| (a.ts, &a.metric, &a.labels).cmp(&(b.ts, &b.metric, &b.labels)));
+    let window = match (batch.first(), batch.last()) {
+        (Some(f), Some(l)) => Some((f.ts, l.ts)),
+        _ => None,
+    };
     for s in batch {
         writeln!(out, "{}", s.render())?;
     }
-    Ok(())
+    Ok(window)
+}
+
+/// Two windows as one, either of which may be absent.
+fn span(a: Option<(u64, u64)>, b: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    match (a, b) {
+        (Some((af, al)), Some((bf, bl))) => Some((af.min(bf), al.max(bl))),
+        (some, None) | (None, some) => some,
+    }
 }
 
 /// ⚠ Stamped with the ENTRY's own time where there is one. Charging it
@@ -2228,13 +2251,9 @@ pub struct Planned {
 /// writers. Overlapping selections are not decidable in general, and two
 /// names being equal is.
 pub fn plan(p: &Provision, etc: &Path, dirs: &[PathBuf]) -> anyhow::Result<Vec<Planned>> {
-    let extractors = p.extractors(etc)?;
-    let lag_ms = extractors
-        .iter()
-        .map(|e| p.width_ms.unwrap_or(e.window.width_ms) + e.window.grace_ms)
-        .max()
-        .unwrap_or(0);
-
+    // Resolved for its refusals: a provisioning naming an extractor this
+    // host does not have is a plan that cannot run.
+    let _ = p.extractors(etc)?;
     let sel = crate::select::Selector::parse(&p.selector()?)?;
     let mut out: Vec<Planned> = Vec::new();
     let mut claimed: BTreeMap<String, String> = BTreeMap::new();
@@ -2263,11 +2282,6 @@ pub fn plan(p: &Provision, etc: &Path, dirs: &[PathBuf]) -> anyhow::Result<Vec<P
         if let Some(id) = &m.id {
             declare.push(format!("derived_from={id}"));
         }
-        // ⚠ DERIVED, never typed. A tally store's two clocks sit a
-        // bucket-and-a-grace apart by construction, and a logline window
-        // narrower than that selects no chunk and answers nothing —
-        // which reads exactly like a quiet minute.
-        declare.push(format!("logline_lag={}s", lag_ms.div_ceil(1000)));
         declare.push("wal=true".to_string());
         for kv in &p.declare {
             let key = kv.split_once('=').map(|(k, _)| k).unwrap_or(kv);
@@ -2473,20 +2487,26 @@ impl Sink {
             .or(self.delivered_to)
     }
 
-    fn write(&mut self, lines: &[u8], now_ms: u64) -> anyhow::Result<()> {
+    fn write(&mut self, lines: &[u8], window: Option<(u64, u64)>) -> anyhow::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
+        let Some((first_ms, last_ms)) = window else {
+            bail!("tally lines carrying no bucket window — every rendered line has a stamp");
+        };
         let cfg = self.store.cfg;
         let f = self
             .store
             .files
             .get_mut(&self.name)
             .expect("the store was created with this name");
-        // Stamped NOW, which is what makes a tally store's write axis
-        // "when this was computed" and its logline axis "which minute
-        // this is about".
-        f.append_stamped(lines, now_ms, &cfg)?;
+        // ⚠ Stamped with the BUCKETS, not the clock: a tally store's two
+        // axes are the same minutes, so a logline-time query selects
+        // chunks exactly. Stamping the moment of computation instead put
+        // the axes GRACE apart and made every such query miss its own
+        // chunks. Both receive intakes stamp the sender's event time for
+        // the same reason.
+        f.append_windowed(lines, first_ms, last_ms, &cfg)?;
         // ⚠ Flushed here rather than left to an age timer this loop does
         // not run: a tally batch is one bucket sealing, arriving a
         // minute apart, so nothing would become a chunk — and a minute's
@@ -2595,15 +2615,16 @@ pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 quiet += 1;
-                let now = crate::store::now_ms();
                 for (id, sink) in sinks.iter_mut() {
                     let mut lines: Vec<u8> = Vec::new();
-                    if quiet == QUIET_TICKS {
-                        sink.run.finish(&mut lines, false)?;
+                    let window = if quiet == QUIET_TICKS {
+                        sink.run.finish(&mut lines, false)?
                     } else if quiet < QUIET_TICKS {
-                        sink.run.idle(IDLE_TICK.as_millis() as u64, &mut lines)?;
-                    }
-                    sink.write(&lines, now)?;
+                        sink.run.idle(IDLE_TICK.as_millis() as u64, &mut lines)?
+                    } else {
+                        None
+                    };
+                    sink.write(&lines, window)?;
                     report(&mut reports, id, sink)?;
                 }
                 continue;
@@ -2647,9 +2668,8 @@ pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
                 }
                 let sink = sinks.get_mut(&id).expect("just inserted");
                 let mut lines: Vec<u8> = Vec::new();
-                sink.run.feed(&e, axis, &mut lines, false)?;
-                let now = crate::store::now_ms();
-                sink.write(&lines, now)?;
+                let window = sink.run.feed(&e, axis, &mut lines, false)?;
+                sink.write(&lines, window)?;
                 if let Some(off) = e.offset {
                     sink.delivered_to = Some(off + e.payload.len() as u64);
                 }
@@ -2664,9 +2684,8 @@ pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
     // no half-counted minute behind.
     for (id, sink) in sinks.iter_mut() {
         let mut lines: Vec<u8> = Vec::new();
-        sink.run.finish(&mut lines, false)?;
-        let now = crate::store::now_ms();
-        sink.write(&lines, now)?;
+        let window = sink.run.finish(&mut lines, false)?;
+        sink.write(&lines, window)?;
         let cfg = sink.store.cfg;
         if let Some(f) = sink.store.files.get_mut(&sink.name) {
             f.flush_chunk(&cfg)?;
@@ -2725,7 +2744,7 @@ fn open_sink(
         // A store that appeared since the provisioning last ran is the
         // case this exists for: an intake mints stores on first sight,
         // and a metric that waited for a human would miss the day.
-        let declare = declared_for(p, docs, id, labels);
+        let declare = declared_for(p, id, labels);
         crate::bark::cmd_create(&dest, false, false, None, None, false, &declare, true)?;
     }
 
@@ -2757,17 +2776,7 @@ fn open_sink(
 
 /// The bark a tally store declares: its source's provenance, the facts
 /// only a provisioning knows, then whatever it declares itself.
-fn declared_for(
-    p: &Provision,
-    docs: &[(PathBuf, Extractor)],
-    id: &str,
-    labels: &Map<String, Value>,
-) -> Vec<String> {
-    let lag_ms = docs
-        .iter()
-        .map(|(_, e)| p.width_ms.unwrap_or(e.window.width_ms) + e.window.grace_ms)
-        .max()
-        .unwrap_or(0);
+fn declared_for(p: &Provision, id: &str, labels: &Map<String, Value>) -> Vec<String> {
     let mut declare: Vec<String> = crate::bark::provenance(labels)
         .iter()
         .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
@@ -2775,7 +2784,6 @@ fn declared_for(
     declare.push("class=tally".to_string());
     declare.push("derived_op=tally".to_string());
     declare.push(format!("derived_from={id}"));
-    declare.push(format!("logline_lag={}s", lag_ms.div_ceil(1000)));
     // ⚠ A tally store is worth a WAL where a log may not be: recomputing
     // a lost minute means re-reading the source from a reset position,
     // and losing one silently is worse than the second of fsync it costs
@@ -3555,12 +3563,10 @@ mod tests {
     #[test]
     fn a_tally_store_declares_what_only_the_provisioning_knows() {
         let p = provision("SELECT=[]\nAPPLY=x\nDECLARE=retain=30d wal=false\n").unwrap();
-        let doc = parsed(r#"{"name":"m","measure":[{"count":true}]}"#).unwrap();
-        let docs = vec![(PathBuf::from("t"), doc)];
         let mut labels = Map::new();
         labels.insert("service".into(), serde_json::json!("apache-access"));
         labels.insert("index".into(), serde_json::json!(true));
-        let got = declared_for(&p, &docs, "src-id", &labels);
+        let got = declared_for(&p, "src-id", &labels);
 
         assert!(got.contains(&"class=tally".to_string()));
         assert!(got.contains(&"derived_from=src-id".to_string()));
@@ -3571,14 +3577,54 @@ mod tests {
         // A SETTING is not provenance and must not be inherited: the
         // source's index choice is not the tally store's.
         assert!(!got.iter().any(|k| k == "index=true"), "{got:?}");
-        // ⚠ DERIVED — width 60s + grace 120s. Typed, it would be wrong
-        // the first time somebody changed a window.
-        assert!(got.contains(&"logline_lag=180s".to_string()), "{got:?}");
         // …and DECLARE has the last word, even over a default this
         // thinks is a good idea.
         assert!(got.contains(&"retain=30d".to_string()));
         assert!(got.contains(&"wal=false".to_string()), "{got:?}");
         assert!(!got.iter().any(|k| k == "wal=true"), "{got:?}");
+    }
+
+    #[test]
+    fn what_is_written_reports_the_minutes_it_is_about() {
+        // The window this returns is what stamps the chunk, so a tally
+        // store's write axis is the minutes its lines describe and a
+        // logline-time query selects its chunks exactly. Stamping the
+        // moment of computation instead put the two axes a bucket and a
+        // grace apart, and a query for the minute the numbers describe
+        // then read no chunk at all — which reads like a quiet minute.
+        let docs = vec![(
+            PathBuf::from("t"),
+            parsed(r#"{"name":"m","measure":[{"count":true,"unit":"x"}]}"#).unwrap(),
+        )];
+        let opts = TallyOpts::for_run(None);
+        let mut run = Run::new(&docs, &opts).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+
+        // Nothing has sealed, but the `!meta` line went out and carries a
+        // stamp — so the window must cover it or the chunk holding it is
+        // stamped from somewhere else entirely.
+        let first = entries_of_text(b"2026-09-06T13:37:10.000Z hello\n").unwrap();
+        let meta = run.feed(&first[0], Axis::Logline, &mut out, false).unwrap();
+        assert_eq!(
+            meta,
+            Some((
+                crate::query::parse_time("2026-09-06T13:37:10Z").unwrap(),
+                crate::query::parse_time("2026-09-06T13:37:10Z").unwrap()
+            ))
+        );
+
+        // Two buckets seal at the end: the window is the first and the
+        // last, not the moment they were folded.
+        let later = entries_of_text(b"2026-09-06T13:39:10.000Z hello\n").unwrap();
+        run.feed(&later[0], Axis::Logline, &mut out, false).unwrap();
+        let sealed = run.finish(&mut out, false).unwrap();
+        assert_eq!(
+            sealed,
+            Some((
+                crate::query::parse_time("2026-09-06T13:37:00Z").unwrap(),
+                crate::query::parse_time("2026-09-06T13:39:00Z").unwrap()
+            ))
+        );
     }
 
     #[test]
