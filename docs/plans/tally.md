@@ -249,44 +249,26 @@ still resolve a window before answering it. Bounded by series × buckets, not by
 entries. A **`--follow` of a tally store delivers unresolved lines and must say
 so**, exactly as a live-edge entry carries no chunk number.
 
-## A tally store has two clocks too, and they are FAR apart
+## A tally store's chunks are stamped with the buckets
 
-The bucket stamp is on the declared axis; the store's own chunks are stamped
-when the line was appended. So `axis: "write"` asks *when was this computed*
-and `axis: "logline"` asks *which minute is this about* — and a revision
-written an hour late is findable on the first.
+A chunk's window is the min/max of the bucket stamps in it, not the moment the
+lines were folded. So both of a tally store's clocks are the minutes its lines
+are about, and `--from`/`--to` selects its chunks exactly — a backfill of last
+month lands in chunks stamped last month, where selection prunes.
 
-⚠ **That gap breaks the read path, and building it is what showed how.** Chunk
-selection runs on the write clock and is widened by a guess of a minute before
-each entry is verified against its own stamp — which assumes the two clocks are
-close. A tally store's are close only by accident: its lines are numbers about
-a minute that closed `GRACE` ago, a revision's are older still, and a
-backfill's are about last month. Measured on the first tally store built here:
-a logline-time query for the minute the numbers describe read **0 of 1 chunks**
-and answered nothing, which is indistinguishable from an empty minute.
+⚠ The alternative was measured and is why this is written down: stamping the
+moment of computation put the two axes a bucket and a grace apart, and a query
+for the minute the numbers describe read **0 of 1 chunks** and answered
+nothing — indistinguishable from an empty minute. A backfill made it
+unbounded.
 
-The fix is a declaration rather than a bigger guess: **`logline_lag` in the
-`.bark`** says how far a line's own stamp may sit from the moment it was
-written, and chunk selection is widened by that instead of by `WIDEN_MS`.
-Declaring `logline_lag=8h` on that same store made the same query read the
-chunk and answer exactly. It is general, not tally's: the roadmap's
-zone-map entry describes the same failure for an arrival-stamped Apache store
-whose lines carry request-START times, and today that leans on the same guess.
-Widening both ways only ever costs I/O — the per-entry verification keeps the
-output exact — and the per-chunk logline range the zone-map sidecar would add
-makes the declaration unnecessary rather than wrong.
+The same rule the receive intakes follow: they stamp the sender's event time,
+so a received store has no arrival axis of its own either.
 
-A tally writer knows its own lag exactly (`grace`, plus the width of the bucket
-being closed), so it should declare it on the store it creates.
-
-⚠ **A BACKFILL's lag is unbounded** — its lines are about whenever the source
-data is from — so a store that has been backfilled must declare a lag wide
-enough to cover it, and a wide lag means chunk selection prunes nothing and
-every logline-time query becomes a full scan of the tape. That is the honest
-cost of a declaration standing in for an index, and it is the argument for the
-zone-map sidecar: a per-chunk logline range answers the same question exactly,
-and would make the declaration unnecessary rather than merely generous.
-`info` reports the declared lag, because its failure mode is silent.
+⚠ **A tally piped through `append` is stamped on arrival**, as any pipe is, so
+a logline-time window over such a store finds nothing. That is `append`'s
+meaning and not tally's — a store you will query by the minutes it describes
+is written by a provisioning.
 
 ⚠ **`AXIS=write` buckets at CHUNK granularity**, because the only arrival stamp
 an entry carries is its chunk's write window. On a busy log a chunk is a second
@@ -488,10 +470,6 @@ Five rules fall out:
   permissive than "one tally follower per store" and exactly as safe — and it
   is checkable at load, where overlapping input selections are not decidable in
   general.
-* ⚠ **`logline_lag` is DERIVED, not typed.** It is the `width + grace` of the
-  applied extractors, and the provisioning knows both. Making an operator write
-  it invites precisely the failure this note records twice. `DECLARE` may
-  override it, which is what a backfill needs.
 * **Provisioning CONVERGES and does not cascade.** A source store appearing
   gets its tally store on the next tick (`--check` to declare and say what
   resolved, as `file-intake` does). A source store being DELETED does not take
@@ -1037,8 +1015,8 @@ loss, recorded exactly — the same rule retention already follows.
 * **The follower half**: fanning out per source store, the watermark rule
   (`Roller::safe_offset` is already the answer — the oldest byte any held
   bucket still depends on, so a restart re-derives identical lines), creating
-  the tally store with its labels, lineage and `logline_lag`, and writing the
-  `!gap` marker from the registry's GAP.
+  the tally store with its labels and lineage, and writing the `!gap` marker
+  from the registry's GAP.
 * **The `!gap` marker** — the registry reports a GAP when retention dropped
   chunks a follower had not read, and nothing writes it into the tally store
   yet. Until it does, a hole in the numbers and a quiet period look alike.
@@ -1066,7 +1044,7 @@ loss, recorded exactly — the same rule retention already follows.
 
 ## What must change elsewhere when this ships
 
-Done with the first slice: `timberfs.1` gains **tally** and `logline_lag`, the
+Done with the first slice: `timberfs.1` gains **tally**, the
 completions gain the verb, and `packaging/extractors/` holds the shipped
 documents with their fixtures under `tests/extractors/`.
 
@@ -1074,7 +1052,7 @@ Done with the extractor half: `timberfs.1`'s **tally** section, the README, the
 deployment guide, the published schema, and the shipped extractors with their
 fixtures. Still owed: a `timberfs-tally-extractor(5)` for the document; `use-cases.md`'s "No aggregation, no
 dashboards, no alerting" (two of three survive); `concepts.md` gains **tally**,
-**observation**, **bucket**, **revision**, **logline lag**; `design.md` gains
-the line format and the `logline_lag` manifest key; a `timberfs-tally(5)` and a
+**observation** and **bucket**; `design.md` gains the line format; a
+`timberfs-tally(5)` and a
 `tally.d` section in `deployment.md`; and `timberfs-query-document(5)` gains
 `series`, `step` and the `samples` kind.

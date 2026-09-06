@@ -293,10 +293,9 @@ neither. Known settings are parse-checked
 .RI ( "an absolute directory, SUPERSEDED by the follower registry \(em see"
 .BR FOLLOWERS ));
 .BR timestamp_regex ,
-.BR timestamp_format ,
-.B timestamp_utc
+.B timestamp_format
 and
-.B logline_lag
+.B timestamp_utc
 are parse-checked too (see THE TWO CLOCKS); anything else is free-form
 provenance
 .RB ( host =...),
@@ -1610,16 +1609,12 @@ somebody ran
 .B timberfs set
 and meant it.
 .PP
-.B logline_lag
-is DERIVED from the applied extractors (their width plus their grace) and
-declared on every tally store, because a logline window narrower than the
-distance between its two clocks selects no chunk and answers nothing.
-So is
-.BR wal=true ,
-because losing a minute's numbers silently is worse than the fsync it
-costs on a store that takes a handful of lines a minute. Naming either in
+.B wal=true
+is declared on every tally store, because losing a minute's numbers
+silently is worse than the fsync it costs on a store that takes a handful
+of lines a minute. Naming it in
 .B DECLARE
-overrides it, which is what a backfill needs.
+overrides that.
 .PP
 .B FOLLOW_FROM
 is
@@ -1689,12 +1684,13 @@ the
 that would have been needed to keep the worst of them \(em which is the
 number to act on.
 .PP
-⚠ A tally store's two clocks sit far apart BY CONSTRUCTION \(em its
-lines are numbers about a minute that closed some minutes ago \(em so
-declare
-.B logline_lag
-on it (see THE TWO CLOCKS) or a logline-time window will select no chunk
-and answer nothing.
+⚠ A tally store's chunks are stamped with the BUCKETS, so both its clocks
+are the minutes its lines are about and
+.BR \-\-from / \-\-to
+selects them exactly. A tally piped through
+.B append
+instead is stamped on arrival, as any pipe is, and a logline-time window
+over that store finds nothing.
 .SS list
 .TP
 .BI \-\-select " EXPR"
@@ -3692,19 +3688,12 @@ Do not backfill historical data through
 .B append
 (its index gets today's write times): import the file instead.
 .PP
-The minute of widening is a GUESS, and a store that knows better says so:
-.B logline_lag
-declares how far a line's own stamp may sit from the moment it was
-written, and chunk selection is widened by that instead. It exists
-because the guess has a class of store it cannot cover \(em one whose
-producer stamps a line long before writing it. A TALLY store is the
-clearest case: its lines are numbers about a minute that closed some
-minutes earlier (its width, plus the sealing grace), and a backfilled
-one's are about last month. Without the
-declaration a logline-time window over such a store selects no chunk at
-all and answers nothing, which reads exactly like an empty minute.
-Widening both ways only ever costs I/O \(em the per-entry verification
-keeps the output exactly inside the window asked for.
+The minute of widening is a GUESS, and it only ever costs I/O \(em the
+per-entry verification keeps the output exactly inside the window asked
+for. It covers a producer that writes a line slightly after the stamp it
+carries; a store whose two clocks sit further apart than that is written
+by an intake that stamps the line's own time, so its axes coincide and
+there is nothing to bridge.
 .SH TIME FORMATS
 .I TIME
 arguments accept RFC 3339

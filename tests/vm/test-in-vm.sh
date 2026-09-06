@@ -5365,11 +5365,7 @@ tally_derives_metrics_that_are_a_store_like_any_other() {
 }
 CONF
 
-    # The distance this store's two clocks sit apart, without which a
-    # logline window selects no chunk at all. GRACE + REVISE for a live
-    # tally; for a BACKFILL like this one, however old the data is.
     timberfs create "$d/vmtally.log" --set class=tally --index >/dev/null 2>&1 || return 1
-    timberfs set "$d/vmtally.log" logline_lag=520w >/dev/null 2>&1 || return 1
 
     timberfs query --records "$s/vmtallysrc.log" 2>/dev/null \
         | timberfs tally --extractor /etc/timberfs/tally.d/vm.json 2>/tmp/vmtally.err \
@@ -5384,17 +5380,11 @@ CONF
         timberfs query "$d/vmtally.log" >&2
         return 1
     }
-    # …and the bucket is findable by the minute it DESCRIBES, which is the
-    # half the declared lag buys.
-    # RFC3339 with the zone spelled out: a NAIVE stamp is parsed in the
-    # READER's timezone, so this would pass in a UTC VM and fail anywhere
-    # else — the store's stamps are UTC whatever the host is set to.
-    timberfs query "$d/vmtally.log" \
-        --from '2026-09-06T10:02:00Z' --to '2026-09-06T10:03:00Z' 2>/dev/null \
-        | grep -q 'count=1' || {
-        echo "a logline window over the buckets found nothing" >&2
-        return 1
-    }
+    # ⚠ No logline window is asked of THIS store. The tally went through
+    # `append`, which stamps arrival like any pipe does, so its chunks
+    # carry the moment they were appended and not the minutes they are
+    # about. A tally store written by a PROVISIONING carries the buckets
+    # — see tally_provisioning_end_to_end.
 
     rm -rf "$d" "$s" /etc/timberfs/tally.d/vm.json /tmp/vmtally.log
 }
@@ -5438,9 +5428,7 @@ CONF
         return 1
     }
     grep -q 'CREATE' /tmp/vmprov.out || { cat /tmp/vmprov.out >&2; return 1; }
-    # ⚠ Derived, not typed: a logline window narrower than the distance
-    # between a tally store's two clocks answers nothing.
-    jq -e '.class == "tally" and .logline_lag == "180s" and .derived_op == "tally"' \
+    jq -e '.class == "tally" and .derived_op == "tally"' \
         "$d/vmprov-tally.log.bark" >/dev/null || {
         cat "$d/vmprov-tally.log.bark" >&2
         return 1
@@ -5463,6 +5451,22 @@ CONF
     # unreadable: 100 + 200 + 0.
     grep -q 'http_bytes status=200 count=2 sum=100' /tmp/vmprov.tally || {
         cat /tmp/vmprov.tally >&2
+        return 1
+    }
+    # ⚠ The buckets are findable by the MINUTE THEY ARE ABOUT, with
+    # nothing declared. The source lines are from 2026-09-06 and this ran
+    # today, so a store stamped when the numbers were computed would need
+    # a declared lag of however old the data is — which is why the chunk
+    # carries the bucket window instead.
+    #
+    # RFC3339 with the zone spelled out: a NAIVE stamp is parsed in the
+    # READER's timezone, so this would pass in a UTC VM and fail anywhere
+    # else — the store's stamps are UTC whatever the host is set to.
+    timberfs query "$d/vmprov-tally.log" \
+        --from '2026-09-06T10:00:00Z' --to '2026-09-06T10:01:00Z' 2>/dev/null \
+        | grep -q 'http_requests method=GET status=200 count=2' || {
+        echo "a logline window over the buckets found nothing" >&2
+        timberfs query "$d/vmprov-tally.log" >&2
         return 1
     }
 
