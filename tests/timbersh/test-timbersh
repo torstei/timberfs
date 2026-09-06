@@ -458,6 +458,21 @@ def a_graph_makes_the_fleet_a_dimension_rather_than_merging_it():
 
 
 @test
+def a_graph_refuses_a_host_label_it_would_have_to_write_over():
+    """The shell adds `host` itself, so a metric that already carries one
+    would be two meanings in one label. The refusal has to survive being
+    RAISED — it names the metric, and naming the wrong variable turns the
+    diagnosis into a NameError from inside the shell."""
+    labelled = "2026-09-06T13:37:00.000Z 60s heap host=one last=100\n"
+    s = Session({h: {"stores": [store("t", ID_A)], "loglines": labelled}
+                 for h in ("a", "b")}, hosts=["a", "b"]).run(
+        "graph heap from [class=tally];")
+    assert "already carry" in s.out, s.out
+    assert "graph heap from" in s.out, s.out
+    s.cleanup()
+
+
+@test
 def a_graph_refuses_a_cumulative_ladder_rather_than_multiplying_it():
     """`le` series are cumulative, so stacking them multiplies the count
     — the one a grapher gets WRONG rather than ugly."""

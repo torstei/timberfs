@@ -197,7 +197,7 @@ HELP = """
   select <kind> from <source> [where ...] [limit N [chunks]] [into view];
   tail   <kind> from <source> [where ...];
   graph  <metric>[, <metric>...] from <source> [by LABEL] [where ...]
-         [quantile Q] [rate] [png 'FILE'];
+         [quantile Q] [rate] [using <name>] [png 'FILE'|svg 'FILE'];
   graph  <metric> against <metric> from <source> [...];
   graph  <metric> from <source> extracting <name> where ... ;
 
@@ -1676,7 +1676,8 @@ class Shell:
         if at is None or at < 2 or at + 1 >= len(toks):
             raise ValueError(
                 "graph <metric>[, <metric>...] from <source> [by <label>] "
-                "[where logline since 'T'] [quantile 0.95] [rate] [png 'FILE']")
+                "[where logline since 'T'] [quantile 0.95] [rate] "
+                "[using <name>] [png 'FILE'|svg 'FILE']")
         conds, by, opts, i = [], [], {}, at + 2
         head_words = [t[1] for t in toks[1:at]]
         versus = next((n for n, w in enumerate(head_words)
@@ -1766,7 +1767,7 @@ class Shell:
                     raise ValueError(
                         f"these samples already carry a `host` label, so the "
                         f"fleet cannot be one too — read one host at a time "
-                        f"(`graph {metric} from [host=...]`)")
+                        f"(`graph {metrics[0]} from [host=...]`)")
                 if host:
                     sample.labels["host"] = host
             samples += got
