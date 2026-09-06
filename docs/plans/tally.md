@@ -1,9 +1,14 @@
 # tally: metrics as a derived tape
 
-**Status: the first slice is BUILT** — the line format, the fold, the rule
-file and `timberfs tally`, which reads a `timberfs-records(5)` stream and
-writes tally lines (`timberfs.1`, **tally**). Not built: the consumer/follower
-half that fans out per store, the `samples` response kind, rollups. It rests on
+**Status: the first slice is BUILT, and the CONFIGURATION below is a redesign
+of it.** Built: the line format, the fold, `timberfs tally` reading a
+`timberfs-records(5)` stream and writing tally lines, and an INI rule file
+carrying both the definition and a `SELECT` (`timberfs.1`, **tally**).
+⚠ **That rule file is the thing being replaced** — see *the extractor and the
+provisioning*: definitions become named JSON documents with no selection in
+them, and a separate INI file provisions the tally stores. Nothing else in the
+first slice changes. Not built either: the consumer/follower half that fans out
+per store, the `samples` response kind, rollups. It rests on
 the follower registry and its position per store
 ([follower-selection.md](follower-selection.md)), the consumer protocol
 ([consumer-protocol.md](consumer-protocol.md)), store selection (`select.rs`),
@@ -246,11 +251,11 @@ around the spike. A revision extends the span.
 ## Where the numbers go
 
 **A tally store belongs to ONE source store** — many-to-one, so a site's own
-extractor may write a second one beside the rules' — named `<source name>-tally`
-by default,
-its `.bark` carrying `class=tally`, `derived_from=<source id>`,
-`derived_op=tally`, and the source's provenance inherited as derived stores
-already inherit it. Per-source rather than one per extractor because lineage
+consumer may write a second one beside the provisioned one — named by that
+provisioning's `OUTPUT` template, `{name}-tally` by default, its `.bark`
+carrying `class=tally`, `derived_from=<source id>`, `derived_op=tally`,
+whatever the provisioning's `DECLARE` states, and the source's provenance
+inherited as derived stores already inherit it. Per-source rather than one per provisioning because lineage
 travels, retention is then per-source, a fleet view over tally stores works
 exactly as over logs, the citation needs no per-line store id, and cardinality
 is bounded by the store count rather than by a label space.
@@ -264,108 +269,218 @@ for every store on disk today (an absent key reads as the empty string), and
 it has just joined**, by name. The registry can answer that precisely; a
 warning at the moment of creation is worth more than a sentence in a manual.
 
-## Configuring it: `tally.d`
+## The extractor and the provisioning: two objects, two formats
 
-Two halves with two owners, so two files. **Which stores** is the follower's
-`select` — the existing vocabulary, unchanged. **What to extract** is a rule
-file, shaped like `file.d/<set>.conf`: a preamble of defaults and a section per
-rule, where — as `[exim-main]` names a store there — **the section name is the
-metric name**.
+The first slice put four different things in one INI file: which STORES, which
+LINES, how to READ one, and what to MEASURE. Only the first is deployment; the
+other three are a definition, and fusing them makes the definition
+**unshippable** — nobody can publish "how to measure an apache access log"
+if the file also asserts which stores it applies to on somebody else's host.
+
+⚠ **And the subject of a definition is a LINE SHAPE, not a store.** A store
+carries many shapes at once — an app log has logfmt request lines and stack
+traces and startup banners, a GC log has ~48 shapes inside one cycle, anything
+syslog-ish aggregates many programs. Any design that says "this store is
+logfmt" is wrong, which is why the shape is never declared on the store and
+never in the `.bark` beside `timestamp_regex`, tempting as that looked.
+
+| what | where it lives | why |
+| --- | --- | --- |
+| which **stores** | the provisioning | deployment; changes per host and per week |
+| which **lines** | the extractor's `claim` predicate | part of the definition — a definition must claim its lines |
+| how to **read** a claimed line | `decode` / `extract` | the shape |
+| what to **measure** | `count`/`sum`/`histogram`… | the policy |
+
+### The extractor: a named JSON document
+
+```json
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "apache-access",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000,
+              "revise_ms": 3600000 },
+  "metrics": [
+    { "name": "http_requests",
+      "description": "requests by status and method",
+      "claim":  { "all": [{ "regex": "\" \\d{3} " }] },
+      "fields": { "decode": "apache-combined" },
+      "labels": ["status", "method"],
+      "measure": [{ "count": true }] },
+    { "name": "http_latency",
+      "claim":  { "all": [{ "regex": "\" \\d{3} " }] },
+      "fields": { "extract": "\" (?P<status>\\d{3}) (?P<ms>\\d+) " },
+      "labels": ["status"],
+      "histogram": { "field": "ms", "unit": "ms",
+                     "buckets": [10, 50, 100, 500, 2000] } }
+  ]
+}
+```
+
+**JSON and not INI, and the argument is the missing `SELECT`.** Once a file
+says nothing about this host it stops being configuration and becomes an
+ARTEFACT — shipped, shared, versioned, schema-checked — and this tree already
+has a format for that: the query document, with its published schema,
+`deny_unknown_fields`, and a `--dump-json` that renders flags into it so the
+two cannot drift. `file.d` is INI because it genuinely is deployment; an
+extractor is not.
+
+Three things INI was actively costing, all the same cost:
+
+* `LABELS=level tenant`, `BUCKETS=10 50 100`, `ANY=error FATAL` are LISTS
+  smuggled through scalars and re-split at the far end — the thing that made a
+  timbersh target's `cmd` a list rather than a command line.
+* `EXTRACT=` holds a regex raw in a format with no quoting rule, and values are
+  trimmed, so a pattern ending in `\s` is silently mangled.
+* No nesting, so a histogram's `OBSERVE`+`BUCKETS` are two keys that must be
+  kept in step, and the SESSION (`GROUP`/`CLOSE`/`TIMEOUT` plus its own
+  measures) strains it further.
+
+And a fourth that only structure can fix: **a unit has nowhere to live in INI**.
+`sum=8419221` says nothing about whether it is bytes or milliseconds, and the
+first draft of `tally.conf.example` shipped second-scale buckets over a
+millisecond field — a perfectly well-formed histogram that means nothing.
+
+**`claim` is the query document's `Predicate`, verbatim** — same `$defs`, same
+`has`/`substring`/`regex`/`caseless`. One vocabulary for matching an entry
+across both documents, which is worth more than the format change on its own.
+
+**The name is declared INSIDE**, never taken from the filename: renaming a file
+must not change what a document IS, the same rule a metric name and a store
+identity already follow. Two documents claiming one name is refused, naming
+both files.
+
+⚠ **What JSON costs, honestly**: regexes double-escape (`\\S`, `\\d{3}`),
+there are no comments, and it is a second idiom in `/etc/timberfs`. The first
+two have one answer, and it is the one this tree already committed to once —
+a GENERATOR. `timberfs tally --dump-json` from flags, as `query --dump-json`
+renders a search: you do not write the document, you generate one and edit it,
+and it escapes correctly by construction. `description` per metric replaces
+comments with something better, because a description can be SHOWN — in a
+listing, in an error — where a comment can only be read in the file.
+
+### The provisioning: which stores get one, and what it looks like
 
 ```ini
 # /etc/timberfs/tally.d/apache.conf
+STORE_DIR=/var/log/timberfs
+
+[apache]
 SELECT=[service=~apache-.*]
-AXIS=logline
-WIDTH=60s
-GRACE=2m
-DECLARE=index=true retain=730d retain_size=5G
-
-[http_requests]
-DECODE=apache-combined
-LABELS=vhost status
-COUNT=
-
-[http_bytes]
-DECODE=apache-combined
-LABELS=vhost
-SUM=bytes
-COUNT=
-
-[http_latency]
-DECODE=apache-combined
-LABELS=vhost
-OBSERVE=ms
-BUCKETS=0.05 0.1 0.5 1 5 10 120
+OUTPUT={name}-tally
+APPLY=apache-access volume
+DECLARE=class=tally index=true retain=730d retain_size=5G
+#WIDTH=30s          # overrides the extractors' own default
 ```
 
-```ini
-# /etc/timberfs/tally.d/generic.conf — anything, anywhere
-SELECT=[]
-AXIS=write
-WIDTH=60s
+INI here for the reason it is wrong for definitions: this file is ABOUT THIS
+HOST, hand-edited, and it is `file.d`'s shape — a preamble, a section per
+subject, `DECLARE` for the bark.
 
-[entries_logged]
-COUNT=
+It is a store-PROVISIONING rule, not merely a binding, and that is what it buys:
+`forward-intake --auto-create` and `otlp-intake` mint source stores on first
+sight, so without this every new service arrives with no tally store until
+somebody runs `timberfs create` by hand. Same argument that killed
+store-declared shapes.
 
-[errors_logged]
-ANY=ERROR FATAL SEVERE
-COUNT=
-```
+**`{name}`** is the template spelling this tree already proposes for
+attribution labels (`--label '{host}'`), so `{name}`, `{host}`, `{service}`
+and `{id}` are the fields.
 
-Section keys: the store selection (`SELECT`), the entry predicate (`HAS`,
-`ANY`, `SUBSTRING`, `REGEX` and their `NOT_` forms — `timber-filter`'s
-vocabulary, so one language for matching an entry), the field source
-(`DECODE` or `EXTRACT`), what becomes a label (`LABELS`), the measures
-(`COUNT`, `SUM`, `MIN`, `MAX`, `LAST`, or `OBSERVE` + `BUCKETS` for a
-histogram), and the axis/width/grace/citation knobs, each inherited from the
-preamble.
+Four rules fall out:
 
-Drop-ins split the way systemd's do: `/usr/lib/timberfs/tally.d/` for what a
-package ships, `/etc/timberfs/tally.d/` for the site, a same-named file in
-`/etc` replacing the packaged one **wholly** — never merged, for the reason
-`file.d`'s `DECLARE` is not merged: a partial-merge rule is one nobody can
-predict from reading the file.
+* ⚠ **The collision check is on `OUTPUT`, not on `SELECT`.** Two provisionings
+  may cover one source store as long as they produce DIFFERENT tally stores;
+  two producing the same one is two writers and is refused. That is more
+  permissive than "one tally follower per store" and exactly as safe — and it
+  is checkable at load, where overlapping input selections are not decidable in
+  general.
+* ⚠ **`logline_lag` is DERIVED, not typed.** It is `grace + revise` of the
+  applied extractors, and the provisioning knows both. Making an operator write
+  it invites precisely the failure this note records twice. `DECLARE` may
+  override it, which is what a backfill needs.
+* **Provisioning CONVERGES and does not cascade.** A source store appearing
+  gets its tally store on the next tick (`--check` to declare and say what
+  resolved, as `file-intake` does). A source store being DELETED does not take
+  its tally store — that is the retention asymmetry the whole thing exists for.
+  A `DECLARE` that has drifted from what is on disk is reported, never silently
+  rewritten over an operator's `timberfs set`.
+* **`APPLY` composes**, so "applies to everything" stops being a predicate: the
+  generic set (`entries_logged`, `errors_logged`) is just another named
+  document listed beside the specific one, rather than an extractor carrying a
+  `[]` selection that would collide with every other.
 
-⚠ **Unlike `file.d`, the directory is read by ONE process.** A set there is a
-unit of supervision; here it cannot be, because two rule files may match one
-source store and there is one writer per store. So: one `timberfs tally`
-follower per host, reading the whole directory, and the files split by topic
-for editing rather than for `systemctl`. A second tally follower whose rules'
-store selections intersect the first's is refused.
+Extractors live in **`tally.extractors.d`** — `/usr/lib/timberfs/` for what a
+package ships, `/etc/timberfs/` for the site, a same-named file in `/etc`
+replacing the packaged one wholly. Provisioning is site-only, in
+`/etc/timberfs/tally.d/`, which keeps the plain `.d` name for the deployment
+file exactly as `file.d` has it. "Extractor" and not "rule" for the document,
+because RULE already means one metric inside one, and one word meaning two
+things is how a format becomes hard to talk about.
 
-The follower's selection is the SUBJECT and a rule's `SELECT` narrows within
-it — the same relation `timbersh`'s session window has with a statement's. A
-rule reaching outside is reported at startup, naming the stores it wants and
-will never be fed, rather than quietly measuring nothing.
+### What this leaves open
 
-## Site-specific extractors, and how they are addressed
+* **The window override is recorded only halfway.** A width is in every tally
+  line, so a reader sees which applied; `grace` and `revise` are not, and a
+  bucket sealed under a different grace is not distinguishable from one that
+  was not.
+* **`timberfs tally --dump-json`** does not exist, and the JSON form is much
+  worse without it than the INI form was.
+* **`type=` vs `class=`.** Settled as `class=tally` — but the tree is already
+  inconsistent, `concepts.md` documenting `--select 'type=console,host=web01'`
+  where the README uses `[class=audit]` and `[class=container]`. Worth making
+  one of them the example everywhere.
+
+## How a metric reads a line: four levels
 
 Four levels, and the first two cover most of what anyone writes. Level 4 is NOT
 BUILT and is the one to build next; there is no level 5, and the section after
 it says why.
 
-1. **A predicate and nothing else.** `COUNT=` over entries a predicate
-   selected: entries logged, bytes logged, errors logged, "how often does this
-   exception appear". No parsing at all, and generic across every log — which
-   is why `generic.conf` above is pointed at `[]`.
-2. **A named decoder.** `DECODE=logfmt|json|apache-combined` turns a line into
-   fields a rule names. The list is CLOSED, and the criterion for being in it
-   is narrow — see below.
-3. **A regex with named captures.** `EXTRACT=^\S+ (?P<status>\d{3}) (?P<ms>\d+)`
-   — the universal escape for a format nobody standardised, which is most
-   in-house logs. Site-specific extraction is almost always this line.
+1. **A claim and nothing else.** `{"count": true}` over the entries the
+   `claim` predicate selected: entries logged, bytes logged, errors logged,
+   "how often does this exception appear". No parsing at all, and generic
+   across every log — which is what the `volume` extractor is.
+2. **A named decoder.** `"fields": {"decode": "logfmt|json|apache-combined"}`
+   turns a claimed line into fields the metric names. The list is CLOSED, and
+   the criterion for being in it is narrow — see below.
+3. **A regex with named captures.** `"fields": {"extract": "…(?P<ms>\\d+)…"}` —
+   the universal escape for a format nobody standardised, which is most
+   in-house logs. Site-specific extraction is almost always this one line.
 4. **A session** — a window keyed by a FIELD rather than by time, for what a
    regex over one entry cannot express because the answer is spread across
    several: a ZGC cycle is ~48 separately-stamped lines, a request duration is
    a `BEGIN` and a `COMPLETE` sharing an id. Not built; see below.
-Beyond that is not a level of this rule language at all — see **an extractor
-that needs a program is a follower**, below. `EXEC` stays a RESERVED key that
-says so, rather than an unknown one: reaching for it is a reasonable instinct
-and deserves an answer.
+
+Beyond that is not a level of this language at all — see **an extractor that
+needs a program is a follower**, below.
+
+### The claim is what makes a metric safe on a mixed store
+
+⚠ **A store carries many line shapes, so a metric must say which are its own.**
+That is what `claim` is for, and without it the machinery cannot tell two
+different facts apart:
+
+* the line is **not this metric's** — an ordinary event on a mixed store, and
+  not a loss;
+* the line **is** this metric's and could not be read — a real defect, and the
+  number is now wrong rather than merely absent.
+
+⚠ **The built slice conflates them, and it is a defect.** A decoder that cannot
+parse the line, and an `extract` that does not match, are both reported as
+`!drop` — so a logfmt metric over a store that is ten percent stack traces
+emits a drop counter proportional to the stack traces and meaning nothing is
+wrong. The distinction already exists one step earlier (a predicate that does
+not select is `Skipped`, never a drop) and simply is not carried through.
+The fix: a shape mismatch is a SKIP, and only *claimed, then unreadable* is a
+drop.
+
+A metric with a decoder and NO claim cannot make the distinction at all —
+worth saying in the documentation rather than refusing, since a single-shape
+store is common enough to be legitimate.
 
 ### What may be a decoder, and why the list is closed
 
-The rule that keeps `DECODE` from becoming a taxonomy of everyone's log
+The rule that keeps `decode` from becoming a taxonomy of everyone's log
 formats — one variant per customer, which is the mistake the follower's `type`
 field made before it became a command:
 
@@ -374,7 +489,7 @@ field made before it became a command:
 
 `logfmt` and `json` qualify: there is no capture group for a key you do not
 know in advance. Everything POSITIONAL — a fixed grammar with fixed slots — is
-what a regex does well and should be an `EXTRACT`.
+what a regex does well and should be an `extract`.
 
 ⚠ Which makes **`apache-combined` the anomaly in its own list**, and its
 justification is a different one: not that it cannot be regexed (it can), but
@@ -658,6 +773,11 @@ loss, recorded exactly — the same rule retention already follows.
   bucket still depends on, so a restart re-derives identical lines), creating
   the tally store with its labels, lineage and `logline_lag`, and writing the
   `!gap` marker from the registry's GAP.
+* **The configuration redesign itself** — the extractor document and its
+  schema, the provisioning file, `--dump-json`, and retiring the INI rule file
+  the first slice shipped.
+* **A shape mismatch must be a SKIP, not a drop** — the built slice reports
+  both as `!drop`, which makes the counter meaningless on a mixed store.
 * **The session (level 4)** — the next thing to build: `GROUP`, `CLOSE`,
   `TIMEOUT`, `SPAN`, `MAX_SESSIONS`, and `Roller` keyed by a field value
   instead of a bucket start.
@@ -674,7 +794,9 @@ Done with the first slice: `timberfs.1` gains **tally** and `logline_lag`, the
 completions gain the verb, and `packaging/tally.conf.example` is the rule file
 to copy.
 
-Still owed, when the rest lands: `use-cases.md`'s "No aggregation, no
+Still owed, when the rest lands: `timberfs.1`'s **tally** section and
+`tally.conf.example` describe the INI rule file and must follow the redesign, a
+`timberfs-tally-extractor(5)` for the document; `use-cases.md`'s "No aggregation, no
 dashboards, no alerting" (two of three survive); `concepts.md` gains **tally**,
 **observation**, **bucket**, **revision**, **logline lag**; `design.md` gains
 the line format and the `logline_lag` manifest key; a `timberfs-tally(5)` and a
