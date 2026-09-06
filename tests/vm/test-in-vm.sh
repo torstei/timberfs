@@ -5300,8 +5300,8 @@ binary_upgrade_restarts_mount() {
 tally_example_installed() {
     # A wrong asset path in Cargo.toml only shows up in the built package,
     # which is what this VM installs.
-    test -f /usr/lib/timberfs/tally.extractors.d/volume.json \
-        && test -f /usr/lib/timberfs/tally.extractors.d/apache-combined.json \
+    test -f /usr/lib/timberfs/tally.extractors.d/timberfs-volume.json \
+        && test -f /usr/lib/timberfs/tally.extractors.d/timberfs-apache-combined.json \
         && timberfs tally --check --extractor /usr/lib/timberfs/tally.extractors.d >/dev/null 2>&1 \
         && zcat /usr/share/man/man1/timberfs.1.gz | tr -d ' \n' | grep -q 'SStally'
 }
@@ -5315,7 +5315,7 @@ tally_try_runs_a_shipped_extractor_against_a_file() {
     printf '10.0.0.1 - - [06/Sep/2026:13:37:00 +0200] "GET /x HTTP/1.1" 200 2326\n2026-09-06T13:37:01Z level=info msg="another shape entirely"\n' \
         > /tmp/vmtry.log
     out=$(timberfs tally --try \
-            --extractor /usr/lib/timberfs/tally.extractors.d/apache-combined.json \
+            --extractor /usr/lib/timberfs/tally.extractors.d/timberfs-apache-combined.json \
             < /tmp/vmtry.log 2>/tmp/vmtry.err) || { cat /tmp/vmtry.err >&2; return 1; }
     grep -q 'http_requests method=GET status=200 count=1' <<<"$out" || {
         echo "$out" >&2
@@ -5327,7 +5327,7 @@ tally_try_runs_a_shipped_extractor_against_a_file() {
     }
     # A document this build cannot read is refused, not half-understood.
     sed 's/1\.0-EXPERIMENTAL/9.9-FUTURE/' \
-        /usr/lib/timberfs/tally.extractors.d/volume.json > /tmp/vmfuture.json
+        /usr/lib/timberfs/tally.extractors.d/timberfs-volume.json > /tmp/vmfuture.json
     timberfs tally --check --extractor /tmp/vmfuture.json >/dev/null 2>&1 && return 1
     rm -f /tmp/vmtry.log /tmp/vmtry.err /tmp/vmfuture.json
     return 0

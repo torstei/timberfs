@@ -1244,7 +1244,7 @@ Try one against a real file before deploying it:
 
 ```sh
 cat /var/log/apache2/access.log \
-  | timberfs tally --try --extractor /usr/lib/timberfs/tally.extractors.d/apache-combined.json
+  | timberfs tally --try --extractor /usr/lib/timberfs/tally.extractors.d/timberfs-apache-combined.json
 ```
 
 The tally lines go to stdout and a per-metric report — claimed, skipped,

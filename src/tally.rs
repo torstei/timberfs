@@ -1305,8 +1305,27 @@ pub fn fold_stream(
     Ok(())
 }
 
+/// The prefix reserved for what this package ships.
+///
+/// Names live in one flat namespace and a collision is refused, so
+/// without a reserved prefix a site writing its own `apache-combined`
+/// would find ours in the way — and a name we add in a later release
+/// could break a deployment that was working. The promise is one-sided
+/// and enforced by a test: everything shipped here carries the prefix,
+/// and nothing else does.
+pub const SHIPPED_PREFIX: &str = "timberfs-";
+
 /// Every extractor named, with duplicate names refused across files.
+///
+/// ⚠ A directory given LATER SHADOWS an earlier one by FILE NAME, which
+/// is what makes `--extractor /usr/lib/… --extractor /etc/…` mean "the
+/// packaged set, with the site's edits winning". Shadowing is by
+/// filename and refusal is by declared NAME, deliberately: forking a
+/// shipped document means keeping its filename, while two unrelated
+/// documents claiming one name is an ambiguity nobody should resolve by
+/// readdir order.
 pub fn load_extractors(paths: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Extractor)>> {
+    let mut by_file: BTreeMap<std::ffi::OsString, PathBuf> = BTreeMap::new();
     let mut files: Vec<PathBuf> = Vec::new();
     for p in paths {
         if p.is_dir() {
@@ -1319,11 +1338,18 @@ pub fn load_extractors(paths: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Extrac
             if found.is_empty() {
                 bail!("no *.json under {}", p.display());
             }
-            files.extend(found);
+            for f in found {
+                if let Some(name) = f.file_name() {
+                    by_file.insert(name.to_os_string(), f);
+                }
+            }
         } else {
+            // Named outright rather than swept: taken as given, and never
+            // shadowed by a directory.
             files.push(p.clone());
         }
     }
+    files.extend(by_file.into_values());
     let mut out: Vec<(PathBuf, Extractor)> = Vec::new();
     for f in files {
         let doc = Extractor::load(&f)?;
@@ -2087,6 +2113,63 @@ mod tests {
 
         let err = folded("2026-09-06T10:00:00.000Z 60s m count=3\n", 60_000).unwrap_err();
         assert!(format!("{err}").contains("OBSERVATIONS"), "{err}");
+    }
+
+    #[test]
+    fn everything_shipped_carries_the_reserved_prefix() {
+        // A one-sided promise, enforced rather than remembered: names
+        // live in one flat namespace and a collision is refused, so a
+        // name added in a later release could otherwise break a
+        // deployment whose own document already used it.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for entry in std::fs::read_dir(root.join("packaging/extractors")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let doc = Extractor::load(&path).unwrap();
+            assert!(
+                doc.name.starts_with(SHIPPED_PREFIX),
+                "{} is named {:?} — everything shipped from here carries {SHIPPED_PREFIX}",
+                path.display(),
+                doc.name
+            );
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            assert_eq!(
+                stem,
+                doc.name,
+                "{} declares a name its filename does not match — the name is what \
+                 counts, but a reader looking for one should find it",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_directory_shadows_an_earlier_one_by_filename() {
+        // What makes `--extractor /usr/lib/… --extractor /etc/…` mean
+        // "the packaged set, with the site's edits winning". Forking a
+        // shipped document means keeping its filename.
+        let packaged = tempdir();
+        let site = tempdir();
+        std::fs::write(
+            packaged.join("x.json"),
+            doc(r#"{"name":"m","measure":[{"count":true}]}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            site.join("x.json"),
+            doc(r#"{"name":"m","description":"the site's","measure":[{"count":true}]}"#),
+        )
+        .unwrap();
+        let loaded = load_extractors(&[packaged.clone(), site.clone()]).unwrap();
+        assert_eq!(loaded.len(), 1, "shadowed, not collided");
+        assert_eq!(
+            loaded[0].1.metrics[0].description.as_deref(),
+            Some("the site's")
+        );
+        std::fs::remove_dir_all(&packaged).ok();
+        std::fs::remove_dir_all(&site).ok();
     }
 
     /// Every extractor this repository SHIPS, run against a fixture and

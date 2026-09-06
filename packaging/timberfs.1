@@ -1425,8 +1425,19 @@ A document, or a directory of
 .B *.json
 read whole. Repeatable. A name claimed by two documents is refused,
 naming both \(em which definition a number came from must not depend on
-readdir order. The packaged set is
-.BR /usr/lib/timberfs/tally.extractors.d/ .
+readdir order. A directory given LATER shadows an earlier one by FILE
+NAME, so
+.B "\-\-extractor /usr/lib/timberfs/tally.extractors.d \-\-extractor /etc/timberfs/tally.extractors.d"
+means the packaged set with the site's edits winning; forking a shipped
+document means keeping its filename.
+.PP
+.RS
+⚠ Every name this package ships begins with
+.BR timberfs\- ,
+and nothing else does. Names live in one flat namespace and a collision
+is refused, so without a reserved prefix a name added in a later release
+could break a deployment whose own document already used it.
+.RE
 .TP
 .B \-\-try
 Validate the extractors and apply them to PLAIN LOG LINES on stdin,

@@ -406,13 +406,23 @@ Four rules fall out:
   A `DECLARE` that has drifted from what is on disk is reported, never silently
   rewritten over an operator's `timberfs set`.
 * **`APPLY` composes**, so "applies to everything" stops being a predicate: the
-  generic set (`entries_logged`, `errors_logged`) is just another named
-  document listed beside the specific one, rather than an extractor carrying a
-  `[]` selection that would collide with every other.
+  generic set (`timberfs-volume`) is just another named document listed beside
+  the specific one, rather than an extractor carrying a `[]` selection that
+  would collide with every other.
 
 Extractors live in **`tally.extractors.d`** — `/usr/lib/timberfs/` for what a
-package ships, `/etc/timberfs/` for the site, a same-named file in `/etc`
-replacing the packaged one wholly. Provisioning is site-only, in
+package ships, `/etc/timberfs/` for the site, a same-named FILE in `/etc`
+shadowing the packaged one wholly (shadowing by filename, refusal by declared
+name: forking a shipped document means keeping its filename, while two
+unrelated documents claiming one name is an ambiguity nobody should resolve by
+readdir order).
+
+⚠ **Every name this package ships begins with `timberfs-`, and nothing else
+does.** Names live in one flat namespace and a collision is refused, so without
+a reserved prefix a site writing its own `apache-combined` finds ours in the
+way — and a name added in a later release could break a deployment whose own
+document already used it. A one-sided promise, enforced by a test rather than
+remembered. Provisioning is site-only, in
 `/etc/timberfs/tally.d/`, which keeps the plain `.d` name for the deployment
 file exactly as `file.d` has it. "Extractor" and not "rule" for the document,
 because RULE already means one metric inside one, and one word meaning two
@@ -438,9 +448,24 @@ BUILT and is the one to build next; there is no level 5, and the section after
 it says why.
 
 1. **A claim and nothing else.** `{"count": true}` over the entries the
-   `claim` predicate selected: entries logged, bytes logged, errors logged,
-   "how often does this exception appear". No parsing at all, and generic
-   across every log — which is what the `volume` extractor is.
+   `claim` predicate selected: entries logged, "how often does this exception
+   appear". No parsing at all.
+
+   ⚠ **Only a bare count is genuinely format-free**, which is why
+   `timberfs-volume` contains exactly one metric. A generic *errors_logged*
+   claiming `ERROR`/`FATAL` was shipped and withdrawn: whether a line is an
+   error is SEMANTICS, and semantics come from the format. The token can sit in
+   a URL, in a message about error handling, or in a stack trace's text, while a
+   log writing `severity=3` or a syslog priority has real errors such a claim
+   never sees. It belongs in an extractor that knows the shape — and for an
+   access log it is not even a metric, since `http_requests` labels by status
+   and 5xx is a read-time selection over the same series.
+
+   If a format-free error metric is ever wanted, the honest basis is the
+   severity heuristic timberfs ALREADY applies on the OTLP path
+   (`otlp::Severity::of()`, which is also what Grafana's `detected_level`
+   wanted), exposed as a derived pseudo-field — one answer to "what level is
+   this line", not two.
 2. **A named decoder.** `"fields": {"decode": "logfmt|json|apache-combined"}`
    turns a claimed line into fields the metric names. The list is CLOSED, and
    the criterion for being in it is narrow — see below.
