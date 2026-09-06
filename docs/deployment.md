@@ -1237,16 +1237,19 @@ fleet view hard to build later.
 `retain_unconsumed`, `cursors`) and content format (`timestamp_*`).
 
 The `id` also lives in the `.rings` header, because the backing pair is the
-store: lose the manifest and the data still says what it is. The manifest is the
-source of truth and the header its mirror, so a store predating that field is
-stamped on its next write, and `timberfs create --if-not-exists` completes a pair
-that carries none — which the shipped `timberfs-follow@.service` already runs on
-every start. Where the two disagree, every writer refuses, because no writer can
-know which identity a follower's cursors mean. `timberfs identity <store>` reports
-that state and exits non-zero on it; `--keep index` (the pair, and the usual
-answer after a manifest was hand-edited or restored), `--keep manifest`, or
-`--mint` for a pair with no identity at all, resolve it. Stop the store's writer
-first — repair rewrites the same header a head-drop does.
+store: lose the manifest and the data still says what it is. The id is minted
+when the PAIR is created, so every store has one from its first byte — a bare
+`append` writes no manifest and is a store all the same — and a manifest written
+later ADOPTS the pair's id rather than minting a second, which is what stops the
+two sides from ever naming different stores. A pair from a timberfs that predates
+this carries none until something mints one: `timberfs identity <store> --mint`,
+or `timberfs create --if-not-exists`, which the shipped `timberfs-follow@.service`
+runs on every start. Where the two disagree, every writer refuses, because no
+writer can know which identity a follower's cursors mean. `timberfs identity
+<store>` reports that state and exits non-zero on it; `--keep index` (the pair,
+and the usual answer after a manifest was hand-edited or restored), `--keep
+manifest`, or `--mint` for a pair with no identity at all, resolve it. Stop the
+store's writer first — repair rewrites the same header a head-drop does.
 
 **Where its entries *came from*** — everything else. Free-form, yours, and the
 only part a fleet view should select on. `timberfs list --json` exposes it under

@@ -45,14 +45,27 @@ DECLARE=index=true retain=90d
 #   SOURCE=/var/log/exim4/mainlog
 #   DECLARE=index=true retain=90d format=exim-main
 #
-# and for the other two Exim logs, each its own instance and retention:
+# ⚠ A SYSTEM with several logs wants timberfs-file@ instead. Exim writes
+# mainlog, rejectlog and paniclog; one instance of THIS unit per file is
+# three of these files, three units and three processes, and states exim's
+# retention policy three times — free to drift three ways. A set states it
+# once, and each section still has its own name, labels and retention:
 #
-#   /etc/timberfs/follow-exim-reject.conf:
+#   /etc/timberfs/file.d/exim.conf:
+#     DECLARE=index=true retain=90d
+#     [exim-main]
+#     SOURCE=/var/log/exim4/mainlog
+#     [exim-reject]
 #     SOURCE=/var/log/exim4/rejectlog
-#     DECLARE=index=true retain=365d format=exim-reject
-#   /etc/timberfs/follow-exim-panic.conf:
+#     DECLARE=index=true retain=365d
+#     [exim-panic]
 #     SOURCE=/var/log/exim4/paniclog
-#     DECLARE=index=true retain=365d format=exim-panic
+#     DECLARE=index=true retain=365d wal=true
+#
+#   systemctl enable --now timberfs-file@exim
+#
+# See timberfs-file.conf.example beside this one. THIS unit stays the right
+# answer for a genuinely single-file subject.
 #
 # Apache, with the vhost in the line so one instance covers every site:
 #

@@ -64,6 +64,16 @@ trace in the index and only a recording binary can have counted them.
 stack trace included, not one line.
 → `timber-filter(1)`, `timberfs-records(5)`
 
+**file intake** — a NAMED SET of one system's log files, tailed into a store
+each by one process (`timberfs file-intake exim`). The set is declared in
+`/etc/timberfs/file.d/<set>.conf`, a section per source whose name is the
+store's, inheriting the preamble's labels and retention and overriding what
+differs — so exim's three logs are one config, one unit and one process rather
+than three of each. The producer keeps writing its own files; timberfs reads
+them, so nothing of timberfs sits in the producer's write path.
+→ [deployment](deployment.md#a-systems-logs-are-a-set--timberfs-file),
+[plan](plans/file-intake.md)
+
 **fleet view** — one query across many stores, each line prefixed with the
 store it came from. A read-time view of files this machine can reach,
 deliberately not a cluster. Plain text interleaves the stores by their chunks'
@@ -137,9 +147,10 @@ window. The one primitive a log workload needs that POSIX lacks, and what makes
 this a filesystem for logs rather than a rotation scheme.
 → [design](design.md), [design](design.md#custom-indexes-the-grain-token-index)
 
-**identity** — a store's `.bark` `id`: a UUID minted on first write, constant
-across renames, moves and hosts. A follower records the stores it reads by
-identity, never by path — a store can move, and a path can come to hold a different store. It is
+**identity** — a store's `id`: a UUID minted when the backing pair is created,
+constant across renames, moves and hosts. A follower records the stores it reads
+by identity, never by path — a store can move, and a path can come to hold a
+different store. It is
 the only value both stable and unique, so it is what a store IS, where the handle
 is what you call it and **provenance** is how you find it. `list` prints its
 leading 8 characters — a UUID's first group — and `info` takes that back, in full
@@ -148,8 +159,10 @@ or as any prefix of 4 or more; an ambiguous prefix is refused rather than picked
 
 It lives in the `.rings` header as well as the manifest, because the backing
 **pair** is the store: lose the sidecar and the data still says what it is. The
-manifest is the source of truth and the header its mirror, so a store predating
-the field is stamped on its next write. Where the two disagree, every writer
+id is minted when the PAIR is created, so a store has one before any manifest
+exists — a bare `append` writes no manifest and is a store all the same — and a
+manifest written later ADOPTS it rather than minting a second. A store predating
+that field is stamped on its next write. Where the two disagree, every writer
 refuses — no writer can know which identity the cursors mean — and
 `timberfs identity` reports it and takes the operator's answer: `--keep index`
 (the pair, the usual answer after a manifest was hand-edited or restored),
@@ -157,8 +170,9 @@ refuses — no writer can know which identity the cursors mean — and
 only reports, exiting non-zero when the store is not in one consistent state.
 → [design](design.md#the-bark-manifest), [receiving end](plans/receiving-end.md)
 
-**intake** — a way in: plain text, the records stream, Fluentd Forward, OTLP, or
-frames. A store's path says what it *is*, never which intake wrote it.
+**intake** — a way in: plain text, the records stream, a file a producer keeps
+writing, Fluentd Forward, OTLP, or frames. A store's path says what it *is*,
+never which intake wrote it.
 → [deployment](deployment.md#one-layout-no-intake-in-the-path)
 
 **interest axis** — the third retention axis, `retain_unconsumed`: keep what
