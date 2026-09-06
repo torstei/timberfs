@@ -154,6 +154,16 @@ pub enum Frame {
         runs: Vec<Run>,
         reason: String,
     },
+    /// This stream is over: the store left the sender's selection, or is
+    /// gone. Empty payload — there is nothing to say beyond which stream,
+    /// which the header carries.
+    ///
+    /// A receiver holds the writer locks and an open store for every
+    /// stream it has accepted, so without an end those accumulate for as
+    /// long as the connection lives. An older peer skips the kind by its
+    /// length and keeps the session until the connection drops, which is
+    /// what it did before this existed.
+    StreamClose,
     /// A kind this build does not know, kept whole. The payload length is
     /// what made that possible, and dropping it is safe by construction:
     /// an additive type cannot be load-bearing for an older peer.
@@ -168,14 +178,15 @@ impl Frame {
             Frame::Coverage { .. } => 3,
             Frame::Accepted { .. } => 4,
             Frame::Conflict { .. } => 5,
+            Frame::StreamClose => 6,
             Frame::Unknown { kind, .. } => *kind,
         }
     }
 }
 
-/// A frame and the stream it belongs to. Stream 0 is the only stream on a
-/// connection that never multiplexes, so a 1:1 transport pays 4 bytes and
-/// no design.
+/// A frame and the stream it belongs to. A connection carrying one store
+/// uses stream 0 and pays 4 bytes for the field; one carrying a selection
+/// opens a stream per store and pays nothing more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Framed {
     pub stream: u32,
@@ -327,6 +338,7 @@ pub fn encode(f: &Framed, out: &mut Vec<u8>) {
             put_u32(&mut payload, reason.len() as u32);
             payload.extend_from_slice(reason.as_bytes());
         }
+        Frame::StreamClose => {}
         Frame::Unknown { payload: p, .. } => payload.extend_from_slice(p),
     }
     put_u32(out, f.stream);
@@ -537,6 +549,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(Framed, usize)>, FrameError> {
                 reason,
             }
         }
+        6 => Frame::StreamClose,
         other => Frame::Unknown {
             kind: other,
             payload: payload.to_vec(),

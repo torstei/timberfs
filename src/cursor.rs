@@ -483,6 +483,23 @@ impl Positions {
         }))
     }
 
+    /// This consumer's place in ONE store, as the single-store shape —
+    /// so a survey reads a selection's file and a cursor the same way.
+    /// `n` is 0: a chunk boundary is where a frames position sits, and a
+    /// count within a chunk is what the entries path records.
+    pub fn for_store(&self, id: &str) -> Option<Cursor> {
+        let at = self.at.get(id)?;
+        Some(Cursor {
+            consumer: self.consumer.clone(),
+            store: id.to_string(),
+            path: at.path.clone(),
+            seq: at.chunk,
+            n: 0,
+            wl: at.wl,
+            delivered: at.delivered,
+        })
+    }
+
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let mut stores = Map::new();
         for (id, a) in &self.at {
@@ -848,11 +865,17 @@ impl Survey {
     }
 }
 
-/// Every cursor in `dir` that is a position in the store `anchor`
+/// Every position in `dir` that is a place in the store `anchor`
 /// identifies, placed against that store's chunks and ranked
-/// furthest-behind first. Read-only and never fatal: a cursor for
+/// furthest-behind first. Read-only and never fatal: a position in
 /// another store is simply not ours, and the `.tmp` of an in-flight
 /// `save` is skipped rather than counted as damage.
+///
+/// Either FILE shape counts: a `cursor.json` is one consumer's place in
+/// one store, a `positions.json` is one consumer's place in each of a
+/// selection's stores. A directory holds whatever the consumers writing
+/// into it write, and reading only one shape reported the other as
+/// damage.
 pub fn consumers_in(dir: &Path, anchor: &str, records: &[ChunkRecord]) -> std::io::Result<Survey> {
     let mut consumers = Vec::new();
     let mut unreadable = 0usize;
@@ -864,7 +887,16 @@ pub fn consumers_in(dir: &Path, anchor: &str, records: &[ChunkRecord]) -> std::i
         .collect();
     entries.sort();
     for path in entries {
-        match Cursor::load(&path) {
+        let found = match Cursor::load(&path) {
+            Ok(c) => Ok(c),
+            // Not a cursor: it may still be a selection's positions,
+            // which is one file holding a place per store.
+            Err(e) => match Positions::load(&path) {
+                Ok(held) => Ok(held.and_then(|p| p.for_store(anchor))),
+                Err(_) => Err(e),
+            },
+        };
+        match found {
             Ok(Some(c)) if c.store == anchor => {
                 let name = if c.consumer.is_empty() {
                     path.file_stem()
@@ -1198,6 +1230,36 @@ mod tests {
         assert_eq!(sv.worst().unwrap().name, "behind");
         assert_eq!(sv.held_bytes(), 30);
         assert_eq!(sv.gapped().count(), 0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A selection's positions file in a declared cursors directory is a
+    /// consumer's place like any other. Read only as a cursor it was
+    /// counted as damage — a `frames-send --select` reporting itself as
+    /// one unreadable file.
+    #[test]
+    fn a_selections_positions_are_a_consumer_of_each_store_it_names() {
+        let dir = scratch("positions");
+        let mut held = Positions::new("frames-send");
+        held.advance("id-a", "/logs/a.log", 10, Some(1), 4_000, 7);
+        held.advance("id-b", "/logs/b.log", 0, Some(0), 1_000, 1);
+        held.save(&dir.join("frames.positions")).unwrap();
+
+        let sv = consumers_in(&dir, "id-a", &three()).unwrap();
+        assert_eq!(sv.unreadable, 0, "a positions file is not damage");
+        assert_eq!(sv.consumers.len(), 1);
+        let c = &sv.consumers[0];
+        assert_eq!(c.name, "frames-send");
+        assert_eq!(c.cursor.seq, Some(1));
+        assert_eq!(c.cursor.delivered, 7);
+        // The other store's entry is not this store's consumer.
+        assert_eq!(
+            consumers_in(&dir, "id-c", &three())
+                .unwrap()
+                .consumers
+                .len(),
+            0
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

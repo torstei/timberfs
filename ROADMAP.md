@@ -295,8 +295,16 @@ here.
   OTLP (2.34 MB vs 2.58 MB) while the CPU is not: 0.04 s against 6.17 s,
   and that work lands on the machine serving production traffic. Framed,
   sidecar-extensible, and multiplexable in the protocol before it is on
-  the wire. Design note:
-  [docs/plans/native-replication.md](docs/plans/native-replication.md).
+  the wire. One connection now carries a SELECTION — a stream per matching
+  store, the same `[]` predicate a follower takes — and the store's
+  identity travels with it, so a replica IS the store rather than a
+  derivative wearing a second name: the destination is found by looking up
+  that id, which is what closes the four routing collisions
+  `receiving-end.md` measured. Design notes:
+  [docs/plans/native-replication.md](docs/plans/native-replication.md) for
+  the wire and
+  [docs/plans/frames-selection.md](docs/plans/frames-selection.md) for the
+  selection, the multiplexing and the receiving end's naming policy.
 - **Paging a bounded search** — SHIPPED in 0.24.0. A `position` record per
   examined store carries an absolute offset on that store's tape, and
   handing them back as the request's `cursor` resumes exactly there. A

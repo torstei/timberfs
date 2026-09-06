@@ -314,12 +314,13 @@ merged batch is one request carrying one group per store — the resource
 attributes stay per store, which is the whole point of forwarding a set.
 `otlp::render` emits a single-element list today.
 
-The frames wire is one stream per connection; the stream id is in every frame
-but multiplexing waits on per-stream flow control, since one stalled store
-must not block the rest. So a frames follower holds one connection per store
-from one process — the unit count is what collapses, not the socket count.
-It needs no positions at all: a frames sender resumes from the receiver's
-coverage.
+The frames wire multiplexes too, and for this section's own reason — see
+[frames-selection.md](frames-selection.md). One stalled store blocking the rest
+was the objection, and it assumed an independence a shared destination does not
+have. So a frames sender takes the same `--select` and opens a stream per store
+on ONE connection. It needs no positions to resume: the receiver's coverage is
+authoritative, and what it writes is a cache for the retention and reporting
+columns.
 
 One destination means one queue, so a stalled endpoint stalls every store in
 the selection. That is the right coupling — they share the destination — and

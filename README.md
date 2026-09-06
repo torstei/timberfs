@@ -546,11 +546,12 @@ chunks, verbatim:
 ```sh
 # on the archive
 timberfs frames-intake --forest default --listen 0.0.0.0:4319 \
-    --route service --auto-create --replica --index
+    --auto-create --index
 
-# on the node
+# on the node: one store, or a selection of them over one connection
 timberfs frames-send /var/log/timberfs/apache-error/apache-error.log \
     --endpoint archive:4319
+timberfs frames-send --select '[type=apache]' --endpoint archive:4319 --follow
 ```
 
 Nothing is decompressed at either end, so the destination's `.trunk` is
@@ -559,11 +560,11 @@ on the replica skips chunks exactly as it does at home. Re-running sends
 nothing: the receiver's position is authoritative, so a sender keeps no cursor
 of its own and cannot re-send.
 
-With `--replica` the destination also keeps the sender's chunk numbers and
-records its origin, so a chunk answers to the same address at both ends; without
-it, the destination renumbers and claims no origin. The two travel together or
-not at all. Declared as a follower — `-- timberfs frames-send --endpoint …` —
-retention releases a prefix only once the far end has acknowledged it.
+A replica **is** the store, in another place: it keeps the sender's identity
+and its chunk numbers, so a chunk answers to the same address at both ends.
+That is also how the archive knows where a stream belongs — the store here that
+declares `origin_id=<that id>` — so nothing routes by a label, and two hosts
+whose logs are both called `apache-error` do not merge.
 
 Frames replicate, records merge: interleaving two sources into one store needs
 decoding, which is the entries path's job. See **REPLICATION** in

@@ -43,6 +43,16 @@ run_test() {
     fi
 }
 
+# Make a pair look like one an older timberfs created: the store-id field
+# of the .rings header zeroed, which `header_store_id` reads as carrying
+# none. A pair is stamped when it is created, so this is the only way a
+# store without an identity still comes about -- and the only way to test
+# what the tools do with one.
+strip_carried_identity() {
+    python3 -c "
+f = open('$1','r+b'); f.seek(48); f.write(bytes(16)); f.close()"
+}
+
 BACKING=/var/log/timberfs-backing/test
 MNT=/var/log/testlogs
 
@@ -2363,6 +2373,9 @@ identity_reports_and_repairs_the_three_broken_states() {
     local d=/var/log/timberfs/vmident
     rm -rf "$d"
     printf 'no manifest here\n' | timberfs append --into "$d/vmident.log" --quiet 2>/dev/null || return 1
+    # A pair is stamped when it is created, so an identity-less store is
+    # one an older timberfs made -- which is exactly who --mint is for.
+    strip_carried_identity "$d/vmident.log.rings"
 
     # 1. Nothing on either side: not a store. Reporting exits non-zero, so
     #    this doubles as the check a script runs.
@@ -2482,35 +2495,39 @@ p = '$d/vmid.log.bark'
 m = json.load(open(p)); m['id'] = '$bark_id'
 json.dump(m, open(p,'w'), indent=1)"
 
-    # `create --if-not-exists` completes a pair that has no identity: it
-    # has not been created yet in the only sense that matters, so reporting
-    # "nothing created" at it would be reporting success at doing nothing.
+    # A BARE `append` declares nothing, so it writes no manifest -- and the
+    # pair is still a store, because identity is stamped when the pair is
+    # created rather than when something first declares a property. That is
+    # the commonest store there is, and every reader keyed on identity (a
+    # cursor, a follower, a query document, a replica's destination) was
+    # blind to it while this waited on a manifest.
     local bare=/var/log/timberfs/vmbareid
     rm -rf "$bare"
     printf 'no manifest here\n' | timberfs append --into "$bare/vmbareid.log" --quiet 2>/dev/null || return 1
     [ -e "$bare/vmbareid.log.bark" ] && { echo "bare append wrote a manifest?" >&2; return 1; }
-    timberfs create --if-not-exists "$bare/vmbareid.log" > /tmp/vmine.out 2>&1 || return 1
-    grep -q 'minted one' /tmp/vmine.out || { cat /tmp/vmine.out >&2; return 1; }
     local minted
-    minted=$(jq -r .id "$bare/vmbareid.log.bark") || return 1
-    # ...and the pair carries it, not just the manifest.
-    python3 - "$bare/vmbareid.log.rings" "$minted" <<'PYMINT'
-import sys
-b = open(sys.argv[1], 'rb').read()[48:64]
-h = b.hex()
-got = '-'.join([h[0:8], h[8:12], h[12:16], h[16:20], h[20:32]])
-sys.exit(0 if got == sys.argv[2] else 1)
-PYMINT
-    [ $? -eq 0 ] || { echo "header did not get the minted id" >&2; return 1; }
+    minted=$(timberfs info --json "$bare/vmbareid.log" | jq -r '.id // "NONE"')
+    [ "$minted" != NONE ] || { echo "a bare append left no identity" >&2; return 1; }
+
+    # `create --if-not-exists` then writes the manifest, which ADOPTS the
+    # pair's id rather than minting a second: two ids for one store is what
+    # the next open refuses outright.
+    timberfs create --if-not-exists "$bare/vmbareid.log" > /tmp/vmine.out 2>&1 || return 1
+    grep -q 'recovered its identity from the index' /tmp/vmine.out \
+        || { cat /tmp/vmine.out >&2; return 1; }
+    [ "$(jq -r .id "$bare/vmbareid.log.bark")" = "$minted" ] \
+        || { echo "the manifest minted a second id" >&2; return 1; }
     # Idempotent: a second run has nothing to do.
     timberfs create --if-not-exists "$bare/vmbareid.log" 2>&1 | grep -q 'nothing created' || return 1
-    # Manifest lost, pair intact: the identity is RECOVERED, not re-minted,
-    # because the pair is the store.
+    # Neither side carrying one -- a pair an older timberfs created. THAT
+    # is what has not been created yet in the only sense that matters, so
+    # reporting "nothing created" at it would be success at doing nothing.
     rm "$bare/vmbareid.log.bark"
+    strip_carried_identity "$bare/vmbareid.log.rings"
     timberfs create --if-not-exists "$bare/vmbareid.log" > /tmp/vmine2.out 2>&1 || return 1
-    grep -q 'recovered its identity from the index' /tmp/vmine2.out || { cat /tmp/vmine2.out >&2; return 1; }
-    [ "$(jq -r .id "$bare/vmbareid.log.bark")" = "$minted" ] \
-        || { echo "re-minted instead of recovering" >&2; return 1; }
+    grep -q 'minted one' /tmp/vmine2.out || { cat /tmp/vmine2.out >&2; return 1; }
+    [ "$(jq -r .id "$bare/vmbareid.log.bark")" != "$minted" ] \
+        || { echo "recovered an identity that was gone from both sides" >&2; return 1; }
     # And the data is still there.
     timberfs query "$bare/vmbareid.log" 2>/dev/null | grep -q 'no manifest here' || return 1
 
@@ -2656,6 +2673,9 @@ catalogue_fields_are_a_projection_of_list() {
     rm -f /var/log/timberfs/vmbare/vmbare.log.*
     mkdir -p /var/log/timberfs/vmbare
     printf 'no manifest here\n' | timberfs append --into /var/log/timberfs/vmbare/vmbare.log --quiet 2>/dev/null
+    # A pair made HERE carries an identity, so this is one an older build
+    # left behind -- the only store that still has none.
+    strip_carried_identity /var/log/timberfs/vmbare/vmbare.log.rings
     timberfs list --json /var/log/timberfs \
         | jq -e '.[] | select(.handle == "vmbare") | .id == null and (.labels | length == 0)' \
             > /dev/null || return 1
@@ -4140,15 +4160,17 @@ forest_list_command() {
     find /var/log/timberfs -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
     printf '2026-07-08T09:00:00 INFO web one\n2026-07-08T09:00:01 INFO web two\n' \
         | timberfs append --into /var/log/timberfs/web/web.log --quiet || return 1
+    strip_carried_identity /var/log/timberfs/web/web.log.rings
     printf '2026-07-08T09:05:00 INFO db one\n' \
         | timberfs append --into /var/log/timberfs/db/db.log --quiet || return 1
 
     local out names dir_names
     out=$(timberfs list) || return 1
     echo "$out" | head -1 | grep -qE '^ID[[:space:]]+NAME' || return 1
-    # Both stores here were made by a bare `append`, which declares
-    # nothing and so writes no manifest: the ID column is structural, so
-    # they show a dash rather than the column disappearing.
+    # `web` was made by a bare `append` and then stripped of the identity
+    # its pair is stamped with, so it stands for a store an older build
+    # left: the ID column is structural, so it shows a dash rather than
+    # the column disappearing.
     echo "$out" | grep -qE '^-[[:space:]]+web[[:space:]]' || return 1
     # a row for each, with a real (non-"empty") SPAN — both stores have data
     echo "$out" | grep -E '[[:space:]]web[[:space:]]+default[[:space:]]' | grep -q ' \.\. ' || return 1
@@ -4336,19 +4358,23 @@ frames_follower_ships_and_releases_the_head() {
     }
 
     timberfs frames-intake --into-dir $d/archive --listen 127.0.0.1:4320 \
-        --route service --auto-create --replica >$d/intake.log 2>&1 &
+        --auto-create >$d/intake.log 2>&1 &
     local pid=$!
     sleep 1
     timeout 5 timberfs frames-send $d/node/src.log --endpoint 127.0.0.1:4320 \
-        --follow --cursor $d/cursors/src.cursor >$d/run.log 2>&1
+        --follow --positions $d/cursors/src.positions >$d/run.log 2>&1
     kill $pid 2>/dev/null
     sleep 1
 
-    # The cursor holds the FAR END's acknowledged position, and the lag
-    # renders as caught up rather than decades behind (wl unset).
-    jq -e '.consumer == "frames-send" and .seq == 3 and .n == 0 and .wl > 0' \
-        $d/cursors/src.cursor > /dev/null || {
-        cat $d/cursors/src.cursor
+    # The positions hold the FAR END's acknowledged position, keyed by the
+    # store's identity, and the lag renders as caught up rather than
+    # decades behind (wl unset).
+    local sid
+    sid=$(timberfs info $d/node/src.log --json | jq -r .id)
+    jq -e --arg id "$sid" \
+        '.consumer == "frames-send" and .stores[$id].chunk == 3 and .stores[$id].wl > 0' \
+        $d/cursors/src.positions > /dev/null || {
+        cat $d/cursors/src.positions
         return 1
     }
     # The store's own view finds it, through the key it declared: who is
@@ -4366,23 +4392,32 @@ frames_follower_ships_and_releases_the_head() {
         timberfs trim $d/node/src.log
         return 1
     }
-    timberfs info $d/archive/folwire.log/folwire.log | grep -q "4 chunk(s)"
+    # The replica lives under the store's identity, wears it, and keeps
+    # the name the source gave it -- which nothing at this end could have
+    # reconstructed, the path being a uuid.
+    timberfs info $d/archive/$sid/$sid | grep -q "4 chunk(s)" || {
+        timberfs info $d/archive/$sid/$sid
+        return 1
+    }
+    jq -e --arg id "$sid" '.id == $id and .origin_id == $id and .name == "src"' \
+        $d/archive/$sid/$sid.bark >/dev/null || {
+        cat $d/archive/$sid/$sid.bark
+        return 1
+    }
 }
 
 frames_fleet_two_nodes_one_archive() {
     # The COMPOSED story, which no per-verb test covers: two hosts, each
-    # with two logs, replicating into one archive. Every verb below is
-    # tested on its own elsewhere; what this asserts is that the setup an
-    # operator actually performs produces the right four stores -- and
-    # what happens when the routing is wrong, which is the mistake the
-    # shape invites.
+    # with two logs, replicating into one archive -- over ONE connection
+    # per host, and with the labels that used to collide left exactly as
+    # they are. Every verb below is tested on its own elsewhere.
     local d=/tmp/framesfleet
-    rm -rf $d; mkdir -p $d/apache01 $d/apache02 $d/archive-a $d/archive-b
+    rm -rf $d; mkdir -p $d/apache01 $d/apache02 $d/archive
     local h s i
     for h in apache01 apache02; do
         for s in apache-error apache-access; do
             timberfs create $d/$h/$s.log --index \
-                --set host=$h --set service=$s --set stream=$h.$s >/dev/null 2>&1 || return 1
+                --set host=$h --set service=$s --set type=apache >/dev/null 2>&1 || return 1
             for i in 1 2 3; do
                 printf '2026-06-0%dT10:00:00Z %s %s entry %d tok%s%04d\n' \
                     "$i" "$h" "$s" "$i" "${h#apache}" "$i" \
@@ -4391,63 +4426,39 @@ frames_fleet_two_nodes_one_archive() {
         done
     done
 
-    # ROUTING ON `service` IS THE MISTAKE: both hosts call their error log
-    # apache-error, so both route to one store. The first lands; the second
-    # is refused and NAMES the origin already there, which is the whole
-    # point of one-store-one-origin.
-    #
-    # Without that check the failure is quiet in either of two ways, and
-    # measured with the guard disabled it is the second: apache02 is told
-    # the archive "already has everything" -- because its own chunks 0..2
-    # match the coverage apache01 established -- so its logs silently ship
-    # NOWHERE. Where the numbering does not line up they merge instead, and
-    # the manifest then describes only one of the two hosts.
-    timberfs frames-intake --into-dir $d/archive-a --listen 127.0.0.1:4330 \
-        --route service --auto-create --replica >$d/a.log 2>&1 &
-    local pid_a=$!
-    sleep 1
-    timberfs frames-send $d/apache01/apache-error.log --endpoint 127.0.0.1:4330 2>&1 \
-        | grep -q "sent 3 chunk" || { kill $pid_a; cat $d/a.log; return 1; }
-    sleep 1
-    timberfs frames-send $d/apache02/apache-error.log --endpoint 127.0.0.1:4330 2>&1 \
-        | grep -q "one store" || {
-        timberfs frames-send $d/apache02/apache-error.log --endpoint 127.0.0.1:4330
-        kill $pid_a
-        return 1
-    }
-    kill $pid_a 2>/dev/null
-    sleep 1
-    # apache01's data only: the refusal wrote nothing.
-    timberfs query $d/archive-a/apache-error.log/apache-error.log 2>/dev/null \
-        | grep -q apache02 && { echo "apache02 data leaked in" >&2; return 1; }
-
-    # THE WORKING SHAPE: route on a label whose value is unique per stream.
-    timberfs frames-intake --into-dir $d/archive-b --listen 127.0.0.1:4331 \
-        --route stream --auto-create --replica --index >$d/b.log 2>&1 &
-    local pid_b=$!
+    # ⚠ BOTH HOSTS CALL THEIR ERROR LOG apache-error, with the same
+    # `service` label -- which is the collision routing by label could not
+    # survive: the first landed and the second was refused as a second
+    # origin, or merged where the numbering happened to line up. Keyed by
+    # IDENTITY there is nothing to collide: four stores, four ids.
+    timberfs frames-intake --into-dir $d/archive --listen 127.0.0.1:4331 \
+        --auto-create --index >$d/a.log 2>&1 &
+    local pid=$!
     sleep 1
     for h in apache01 apache02; do
-        for s in apache-error apache-access; do
-            timberfs frames-send $d/$h/$s.log --endpoint 127.0.0.1:4331 2>&1 \
-                | grep -q "sent 3 chunk" || { kill $pid_b; cat $d/b.log; return 1; }
-            sleep 0.3
-        done
+        # One connection per host carries both of its logs.
+        timberfs frames-send --select '[type=apache]' --look-in $d/$h \
+            --endpoint 127.0.0.1:4331 2>&1 \
+            | grep -q "from 2 store(s)" || { kill $pid; cat $d/a.log; return 1; }
+        sleep 0.3
     done
-    kill $pid_b 2>/dev/null
+    kill $pid 2>/dev/null
     sleep 1
 
     # Four stores, each byte-identical, each still saying which host it is
-    # -- the label travelled, the settings did not.
-    local n=0
+    # -- the labels travelled, the settings did not.
+    local n=0 id
     for h in apache01 apache02; do
         for s in apache-error apache-access; do
-            local dst=$d/archive-b/$h.$s.log/$h.$s.log
+            id=$(timberfs info $d/$h/$s.log --json | jq -r .id)
+            local dst=$d/archive/$id/$id
             cmp -s $d/$h/$s.log.trunk $dst.trunk || {
                 echo "$h.$s trunk differs" >&2
                 return 1
             }
-            jq -e --arg h "$h" --arg s "$s" \
-                '.host == $h and .service == $s and has("origin_id")' $dst.bark >/dev/null || {
+            jq -e --arg h "$h" --arg s "$s" --arg id "$id" \
+                '.host == $h and .service == $s and .id == $id and .origin_id == $id
+                 and .name == $s and (has("derived_from") | not)' $dst.bark >/dev/null || {
                 cat $dst.bark
                 return 1
             }
@@ -4455,15 +4466,16 @@ frames_fleet_two_nodes_one_archive() {
         done
     done
     [ "$n" = 4 ] || return 1
-    # And the archive lists exactly those four.
-    [ "$(timberfs list $d/archive-b --names 2>/dev/null | wc -l)" = 4 ] || {
-        timberfs list $d/archive-b
+    # And the archive lists exactly those four, by the names that travelled
+    # rather than by the uuids they live under.
+    [ "$(timberfs list $d/archive --names 2>/dev/null | wc -l)" = 4 ] || {
+        timberfs list $d/archive
         return 1
     }
     # The shipped index works on the far side, per host.
-    timberfs query $d/archive-b/apache02.apache-error.log/apache02.apache-error.log \
-        --has tok020002 2>&1 | grep -q "1 of 3 chunk" || {
-        timberfs query $d/archive-b/apache02.apache-error.log/apache02.apache-error.log --has tok020002
+    id=$(timberfs info $d/apache02/apache-error.log --json | jq -r .id)
+    timberfs query $d/archive/$id/$id --has tok020002 2>&1 | grep -q "1 of 3 chunk" || {
+        timberfs query $d/archive/$id/$id --has tok020002
         return 1
     }
     rm -rf $d
@@ -4504,10 +4516,11 @@ frames_unit_socket_activates() {
             | timberfs append --into $FRAMES_UNIT_SRC --quiet 2>/dev/null
     done
 
-    # The shipped unit has no --auto-create, so an undeclared stream is
-    # refused -- and the sender is TOLD, which is what the handshake buys.
+    # The shipped unit has no --auto-create, so a stream never received
+    # here is refused -- and the sender is TOLD, which is what the
+    # handshake buys, naming both ways out.
     timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
-        | grep -q "refused the stream" || {
+        | grep -q -- "--auto-create" || {
         timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319
         return 1
     }
@@ -4516,10 +4529,14 @@ frames_unit_socket_activates() {
 }
 
 frames_unit_replicates_into_a_declared_store() {
-    # The operator provisions the destination; the sender's retry lands.
-    # The shipped unit passes --replica, so this is a replica: same bytes,
-    # same numbering, origin recorded.
-    timberfs create --wal /var/log/timberfs/unitwire.log/unitwire.log >/dev/null 2>&1 || return 1
+    # The operator provisions the destination, which is now done by naming
+    # the ORIGIN it holds rather than by naming the store: the key is the
+    # identity, so the receiving policy is declared against that. The
+    # sender's retry then lands.
+    local sid
+    sid=$(timberfs info $FRAMES_UNIT_SRC --json | jq -r .id)
+    timberfs create --wal /var/log/timberfs/unitwire.log/unitwire.log \
+        --set origin_id=$sid >/dev/null 2>&1 || return 1
     timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319 2>&1 \
         | grep -q "sent 3 chunk" || {
         timberfs frames-send $FRAMES_UNIT_SRC --endpoint 127.0.0.1:4319
@@ -4532,8 +4549,10 @@ frames_unit_replicates_into_a_declared_store() {
         echo "trunk differs" >&2
         return 1
     }
-    # --replica means the origin travelled and the numbering was preserved.
-    jq -e '.origin_id == (input | .id)' $dst.bark $FRAMES_UNIT_SRC.bark >/dev/null || {
+    # The operator's store keeps the identity it was given -- only a
+    # destination this receiver creates inherits the sender's.
+    jq -e --arg id "$sid" '.origin_id == $id and .id != $id and .wal == true' \
+        $dst.bark >/dev/null || {
         cat $dst.bark
         return 1
     }
@@ -4583,7 +4602,7 @@ frames_wire_replicates_a_store_byte_for_byte() {
     done
 
     timberfs frames-intake --into-dir $d/archive --listen 127.0.0.1:4319 \
-        --route service --auto-create --replica --index >$d/intake.log 2>&1 &
+        --auto-create --index >$d/intake.log 2>&1 &
     local pid=$!
     sleep 1
 
@@ -4596,7 +4615,11 @@ frames_wire_replicates_a_store_byte_for_byte() {
     sleep 1
     kill $pid 2>/dev/null; sleep 1
 
-    local dst=$d/archive/vmwire.log/vmwire.log
+    # The replica lives under the identity it shares with its source, the
+    # path being opaque -- `timberfs list` is what answers where a store is.
+    local sid
+    sid=$(timberfs info $d/node/src.log --json | jq -r .id)
+    local dst=$d/archive/$sid/$sid
     # Byte-identical trunk AND grain -- nothing recompressed, nothing
     # re-tokenized.
     local ext
@@ -4606,9 +4629,11 @@ frames_wire_replicates_a_store_byte_for_byte() {
             return 1
         }
     done
-    # The origin travelled and the numbering was preserved together.
-    jq -e '.origin_id == (input | .id) and .derived_op == "receive"' \
-        "$dst.bark" "$d/node/src.log.bark" > /dev/null || {
+    # The identity travelled with the numbering, and the name with it --
+    # a replica IS the store, so it derives from nothing.
+    jq -e --arg id "$sid" '.id == $id and .origin_id == $id and .name == "src"
+           and .derived_op == "receive" and (has("derived_from") | not)' \
+        "$dst.bark" > /dev/null || {
         cat "$dst.bark"
         return 1
     }
@@ -4697,9 +4722,9 @@ run_test "import: shipped segment merges verbatim, idempotently" import_segment_
 run_test "import: identity and labels cross the hop, policy does not" import_carries_identity_across_the_hop
 run_test "frames wire: a store replicates over a socket byte for byte" frames_wire_replicates_a_store_byte_for_byte
 run_test "frames wire: the far end's position is recorded and reported, not obeyed" frames_follower_ships_and_releases_the_head
-run_test "frames fleet: two nodes, one archive, and the routing mistake" frames_fleet_two_nodes_one_archive
+run_test "frames fleet: two nodes, one archive, one connection each, no collision" frames_fleet_two_nodes_one_archive
 run_test "frames unit: installed by the package, and documented" frames_unit_installed
-run_test "frames unit: socket activates, undeclared stream refused" frames_unit_socket_activates
+run_test "frames unit: socket activates, an unreceived store refused" frames_unit_socket_activates
 run_test "frames unit: replicates into a declared store" frames_unit_replicates_into_a_declared_store
 run_test "frames unit: the socket outlives a service restart" frames_unit_survives_a_restart
 run_test "frames unit: teardown" frames_unit_teardown

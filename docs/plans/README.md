@@ -31,6 +31,9 @@ messages and pull requests are for.
   and fetching bytes from whichever holder has them.
 - [receiving-end.md](receiving-end.md) — identity, names and selection on an
   archive that many senders ship into.
+- [frames-selection.md](frames-selection.md) — one frames connection for a SET
+  of stores, and the identity that travels with them: the destination found by
+  selection rather than named by a route.
 - [follower-selection.md](follower-selection.md) — one follower declaration
   for a SET of stores: the selection as its subject, and the poll loop that
   serves the whole set from one process.

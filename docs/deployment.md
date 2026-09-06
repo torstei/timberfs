@@ -873,50 +873,68 @@ systemctl edit timberfs-frames.socket
   ListenStream=0.0.0.0:4319
 
 # and its policy — which is ITS policy: settings never travel, only labels
+# and identity
 systemctl edit timberfs-frames.service
   [Service]
   ExecStart=
   ExecStart=/usr/bin/timberfs frames-intake --forest default \
-      --route service --replica --index --auto-create --exit-on-upgrade
+      --index --auto-create --exit-on-upgrade
 
 systemctl enable --now timberfs-frames.socket
 ```
 
-Like the other two this is **one listener for every stream**, and it routes by
-a label rather than a tag or a resource attribute: `--route service` puts each
-stream at `/var/log/timberfs/<service>/<service>.log`. `--auto-create` is
-absent from the shipped unit on purpose — an undeclared stream is refused and
-said so, as elsewhere.
+Like the other two this is **one listener for every stream** — but it routes by
+nothing. A stream lands in the store its **identity** names: the id travels, so
+a replica is the store in another place rather than a derivative of it, and the
+destination is whichever store here declares `origin_id=<that id>`. A store
+this archive has already received says so; so does one an operator declared up
+front (`timberfs create <store> --set origin_id=<id> --set retain_size=5G`),
+which is how a destination's retention is settled before any data arrives.
+Failing both, `--auto-create` mints one at
+`/var/log/timberfs/<id>/<id>` — an opaque path, because `timberfs list` is what
+answers where a store is.
 
-`--replica` is the one flag worth understanding. With it, the destination keeps
-the sender's chunk **numbering** and records its origin, so `(origin_id, seq)`
-names the same bytes at both ends; without it the destination renumbers and
-claims no origin, which is weaker but always possible. The two travel together
-or not at all — recording an origin while renumbering would produce an address
-that lies, so it is refused rather than configured. A replica is also refused
-if the numbering would not continue exactly, which is what a stream beginning
-mid-tape does.
+That is what closes the collision routing had: two hosts whose logs are both
+called `apache-error`, with the same `service` label and the same short
+hostname, are two identities and land in two stores. Nothing has to be
+relabelled to make it work.
+
+**A destination is a replica, and nothing else.** It keeps the sender's chunk
+**numbering** and records its origin, so `(origin_id, seq)` names the same
+bytes at both ends — and that is refused unless the numbering continues
+exactly, which is what a stream beginning mid-tape cannot do. Ingesting
+somebody else's chunks as a new, independent tape is `export`/`import`, not a
+mode here: a destination that numbered its own chunks would share no address
+with its source and could not answer where a sender got to.
 
 **One destination store, one origin.** A second origin arriving at a store that
-already holds one is refused, naming both — otherwise a host reinstall, or two
-hosts sharing a short hostname, silently appends a second tape to the first
-while the manifest describes only one of them.
+already holds one is refused, naming both — otherwise a host reinstall silently
+appends a second tape to the first while the manifest describes only one of
+them.
 
 On the sending host, `timberfs frames-send STORE --endpoint archive:4319` ships
-once; `--follow` keeps shipping as chunks seal, on the same connection, which is
-what a service unit should run:
+one store once; `--select` ships a set, and `--follow` keeps shipping as chunks
+seal — all on one connection, a stream per store, which is what a service unit
+should run:
 
 ```sh
 timberfs set apache-error retain_size=5G cursors=/var/lib/timberfs
-timberfs frames-send apache-error --endpoint archive:4319 --follow \
-    --cursor /var/lib/timberfs/apache-error.frames
+timberfs frames-send --select '[type=apache]' --endpoint archive:4319 --follow \
+    --positions /var/lib/timberfs/archive.positions
 ```
+
+The selection is the same `[]` predicate `timberfs list --select` and a
+follower take, re-resolved each pass — so a store that appears joins the
+connection and one that stops matching has its stream closed. A store refused
+by the far end leaves the rest shipping, the handshake being per stream.
 
 It takes no start position: it resumes from the **receiver's** position, which is
 authoritative, so re-running ships nothing rather than re-sending, and there is
-no local decision to get wrong. The `--cursor` is not that resume point — it
-records what the far end has acknowledged, so a store declaring `cursors=<dir>`
-can **report** it (`timberfs info`, `timberfs list`).
+no local decision to get wrong. The `--positions` file is not that resume point
+— it records what the far end has acknowledged, one entry per store keyed by
+identity, so a store declaring `cursors=<dir>` can **report** it (`timberfs
+info`, `timberfs list`). It was `--cursor` before it held a set, which still
+works.
 
 ⚠ **Reporting, and not a retention hold.** `retain_unconsumed` reads the
 follower **registry** and nothing else — a file lying in a directory
@@ -929,9 +947,9 @@ frames is bounded by `retain`/`retain_size` alone** until that lands; size it
 for the outage worth surviving, as you would with no consumer at all.
 
 There is no TLS: a private network, or a tunnel. And only *sealed* chunks
-ship, so a replica trails its source by one chunk flush — the live edge
-belongs to `query --follow` on the source itself. The verb names
-(`frames-intake`, `frames-send`) are provisional.
+ship, so a replica trails its source by one chunk flush however many stores
+share the connection — the live edge belongs to `query --follow` on the source
+itself. The verb names (`frames-intake`, `frames-send`) are provisional.
 
 ### Tapping incus consoles — `timberfs-incus.service`
 
