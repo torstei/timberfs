@@ -517,6 +517,14 @@ way — and a name added in a later release could break a deployment whose own
 document already used it. A one-sided promise, enforced by a test rather than
 remembered.
 
+⚠ **A READER has a third directory the provisioning does not:**
+`~/.config/timberfs/tally.extractors.d`, where the fleet's `targets.json`
+already lives, so a document can be written and tried without root. It is
+deliberately not on the provisioning's list — that runs as a service, creating
+stores and registering followers, so what it does must not depend on whose home
+it looked in, and on a shared machine one user must not be able to shadow a
+shipped extractor for a root-run provisioning.
+
 Provisioning is site-only, in `/etc/timberfs/tally.d/`, which keeps the plain
 `.d` name for the deployment file exactly as `file.d` has it. "Extractor" and not "rule" for the document,
 because RULE already means one metric inside one, and one word meaning two

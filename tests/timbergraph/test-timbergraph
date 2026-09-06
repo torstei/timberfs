@@ -203,6 +203,34 @@ def test_trouble_is_told_apart_from_metadata():
     check("meta not reported", False, "!meta" in said)
 
 
+def test_an_extractor_is_a_path_or_a_name():
+    """A name is what makes a per-user directory worth having rather
+    than another place to type a long path from."""
+    import tempfile
+    home = tempfile.mkdtemp(prefix="timbergraph-test-")
+    d = os.path.join(home, "timberfs", "tally.extractors.d")
+    os.makedirs(d)
+    doc = os.path.join(d, "mine.json")
+    with open(doc, "w", encoding="utf-8") as fh:
+        fh.write('{"v":"1.0-EXPERIMENTAL","name":"mine",'
+                 '"window":{"axis":"logline","width_ms":60000},'
+                 '"metrics":[{"name":"m","measure":[{"count":true,"unit":"x"}]}]}')
+    old = os.environ.get("XDG_CONFIG_HOME")
+    os.environ["XDG_CONFIG_HOME"] = home
+    try:
+        check("by name", doc, g.resolve_extractor("mine"))
+        check("by path", doc, g.resolve_extractor(doc))
+        check("the unit", "x", g.extractor_facts(["mine"])["m"]["unit"])
+        raises("neither", lambda: g.resolve_extractor("absent"), "no extractor")
+    finally:
+        if old is None:
+            del os.environ["XDG_CONFIG_HOME"]
+        else:
+            os.environ["XDG_CONFIG_HOME"] = old
+        import shutil as sh
+        sh.rmtree(home, ignore_errors=True)
+
+
 def test_the_time_axis_is_local_and_snaps_to_the_clock():
     """gnuplot renders a time axis as though every value were UTC, so
     the shift is in the number — and a tic lands on the hour a reader

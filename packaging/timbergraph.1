@@ -129,8 +129,15 @@ Of a histogram's cumulative ladder, interpolated inside the bucket it
 falls in \(em which is what additive data supports, and the reason a
 stored percentile was never allowed.
 .TP
-.BI \-\-using " PATH"
-An extractor document, for the unit and the title. ⚠ Named here and
+.BI \-\-using " PATH|NAME"
+An extractor document, for the unit and the title \(em a path, or a NAME
+looked up in
+.BR /usr/lib/timberfs/tally.extractors.d ,
+.BR /etc/timberfs/tally.extractors.d ,
+then
+.BR ~/.config/timberfs/tally.extractors.d ,
+later shadowing earlier. The last one is what lets a document be written
+and tried without root. ⚠ Named here and
 nowhere else: recording it in the tally store would have to be kept in
 step with the provisioning that applies it, and would travel to hosts
 where the name resolves to a different document or to none.

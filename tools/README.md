@@ -666,8 +666,23 @@ refused too.
 
 What a line cannot say is the **unit**, and which metrics exist but were
 silent in the window. A `!meta` marker supplies the unit where the window
-happens to hold one; otherwise name the extractor document with
-`--using`.
+happens to hold one; otherwise name the extractor document with `--using`,
+which takes a path **or a name**:
+
+```sh
+mkdir -p ~/.config/timberfs/tally.extractors.d
+$EDITOR ~/.config/timberfs/tally.extractors.d/my-app.json
+timberfs tally --try --extractor my-app < /var/log/my-app.log
+timberfs query my-app-tally | timbergraph -m requests --using my-app
+```
+
+A name is looked up in `/usr/lib/timberfs/tally.extractors.d`, then
+`/etc/…`, then `~/.config/…`, later shadowing earlier — so a document can be
+written and tried without root, and can shadow a shipped one while it is.
+
+⚠ That last directory is a **reader's**. `timberfs tally --provision` never
+looks in a home: it runs as a service, creating stores and registering
+followers, so what it does must not depend on whose home it looked in.
 
 **The markers are the graph's error bars.** `!drop` says the numbers in
 that bucket are *wrong*, `!cap` that they are understated, `!late` that

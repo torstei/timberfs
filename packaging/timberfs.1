@@ -1420,18 +1420,33 @@ observations through
 so it need not bucket them itself. Several tally stores may derive from
 one log; a reader selects across them.
 .TP
-.BI \-\-extractor " PATH"
-A document, or a directory of
+.BI \-\-extractor " PATH|NAME"
+A document, a directory of
 .B *.json
-read whole. Repeatable. A name claimed by two documents is refused,
-naming both \(em which definition a number came from must not depend on
-readdir order. A directory given LATER shadows an earlier one by FILE
-NAME, so
+read whole, or a NAME. Repeatable. An argument that exists as a file or
+a directory is taken as given; anything else is a name, looked up in
+.BR /usr/lib/timberfs/tally.extractors.d ,
+.BR /etc/timberfs/tally.extractors.d ,
+then
+.BR ~/.config/timberfs/tally.extractors.d ,
+later shadowing earlier \(em so a document can be tried without root, and
+shadow a shipped one while it is.
+.RS
+.PP
+⚠ That last one is a READER's. A
+.B \-\-provision
+never looks in a home directory: it runs as a service, creating stores
+and registering followers, so what it does must not depend on whose home
+it looked in \(em and on a shared machine one user must not be able to
+shadow a shipped extractor for a root-run provisioning.
+.PP
+A directory given LATER shadows an earlier one by FILE NAME, so
 .B "\-\-extractor /usr/lib/timberfs/tally.extractors.d \-\-extractor /etc/timberfs/tally.extractors.d"
 means the packaged set with the site's edits winning; forking a shipped
-document means keeping its filename.
+document means keeping its filename. A name claimed by two documents is
+refused, naming both \(em which definition a number came from must not
+depend on readdir order.
 .PP
-.RS
 ⚠ Every name this package ships begins with
 .BR timberfs\- ,
 and nothing else does. Names live in one flat namespace and a collision

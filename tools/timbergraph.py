@@ -483,6 +483,50 @@ def tape_units(markers):
     }
 
 
+#: Where a document is looked up by NAME, in order — later shadows
+#: earlier, which is the rule a same-named file already follows.
+#:
+#: ⚠ A reader's list. `timberfs tally --provision` has its own and never
+#: includes a home directory: it runs as a service, and what a service
+#: does must not depend on whose home it looked in.
+EXTRACTOR_DIRS = (
+    "/usr/lib/timberfs/tally.extractors.d",
+    "/etc/timberfs/tally.extractors.d",
+    "~/.config/timberfs/tally.extractors.d",
+)
+
+
+def extractor_dirs():
+    base = os.environ.get("XDG_CONFIG_HOME")
+    out = []
+    for d in EXTRACTOR_DIRS:
+        if d.startswith("~"):
+            d = (os.path.join(base, "timberfs", "tally.extractors.d") if base
+                 else os.path.expanduser(d))
+        out.append(d)
+    return [d for d in out if os.path.isdir(d)]
+
+
+def resolve_extractor(name_or_path):
+    """A path, or a NAME looked up in the reading directories.
+
+    An argument that exists is taken as given; anything else is a name,
+    which is what makes a per-user directory worth having rather than
+    another place to type a long path from.
+    """
+    if os.path.exists(name_or_path):
+        return name_or_path
+    for d in reversed(extractor_dirs()):
+        candidate = os.path.join(d, f"{name_or_path}.json")
+        if os.path.isfile(candidate):
+            return candidate
+    where = ", ".join(extractor_dirs()) or "no extractor directory that exists"
+    raise Bad(
+        f"no extractor {name_or_path!r} — neither a path that exists nor a "
+        f"document in {where}"
+    )
+
+
 def extractor_facts(paths):
     """What a plot cannot read off a line: the UNIT, and which metrics
     exist at all.
@@ -494,7 +538,7 @@ def extractor_facts(paths):
     Absent, everything but these two facts is still known.
     """
     facts = {}
-    for path in paths:
+    for path in (resolve_extractor(p) for p in paths):
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
         for m in doc.get("metrics", []):
@@ -759,7 +803,9 @@ def main(argv=None):
     ap.add_argument("--quantile", type=float, metavar="Q",
                     help="of a histogram's cumulative ladder, e.g. 0.95")
     ap.add_argument("--using", action="append", default=[], metavar="PATH",
-                    help="an extractor document, for the unit and the title")
+                    help="an extractor document — a path, or a NAME in "
+                         "~/.config/timberfs/tally.extractors.d (or the site "
+                         "or packaged ones)")
     ap.add_argument("--list", action="store_true",
                     help="say what is in the input and draw nothing")
     ap.add_argument("--png", metavar="FILE")
