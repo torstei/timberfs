@@ -43,6 +43,16 @@ run_test() {
     fi
 }
 
+# Make a pair look like one an older timberfs created: the store-id field
+# of the .rings header zeroed, which `header_store_id` reads as carrying
+# none. A pair is stamped when it is created, so this is the only way a
+# store without an identity still comes about -- and the only way to test
+# what the tools do with one.
+strip_carried_identity() {
+    python3 -c "
+f = open('$1','r+b'); f.seek(48); f.write(bytes(16)); f.close()"
+}
+
 BACKING=/var/log/timberfs-backing/test
 MNT=/var/log/testlogs
 
@@ -2363,6 +2373,9 @@ identity_reports_and_repairs_the_three_broken_states() {
     local d=/var/log/timberfs/vmident
     rm -rf "$d"
     printf 'no manifest here\n' | timberfs append --into "$d/vmident.log" --quiet 2>/dev/null || return 1
+    # A pair is stamped when it is created, so an identity-less store is
+    # one an older timberfs made -- which is exactly who --mint is for.
+    strip_carried_identity "$d/vmident.log.rings"
 
     # 1. Nothing on either side: not a store. Reporting exits non-zero, so
     #    this doubles as the check a script runs.
@@ -2482,35 +2495,39 @@ p = '$d/vmid.log.bark'
 m = json.load(open(p)); m['id'] = '$bark_id'
 json.dump(m, open(p,'w'), indent=1)"
 
-    # `create --if-not-exists` completes a pair that has no identity: it
-    # has not been created yet in the only sense that matters, so reporting
-    # "nothing created" at it would be reporting success at doing nothing.
+    # A BARE `append` declares nothing, so it writes no manifest -- and the
+    # pair is still a store, because identity is stamped when the pair is
+    # created rather than when something first declares a property. That is
+    # the commonest store there is, and every reader keyed on identity (a
+    # cursor, a follower, a query document, a replica's destination) was
+    # blind to it while this waited on a manifest.
     local bare=/var/log/timberfs/vmbareid
     rm -rf "$bare"
     printf 'no manifest here\n' | timberfs append --into "$bare/vmbareid.log" --quiet 2>/dev/null || return 1
     [ -e "$bare/vmbareid.log.bark" ] && { echo "bare append wrote a manifest?" >&2; return 1; }
-    timberfs create --if-not-exists "$bare/vmbareid.log" > /tmp/vmine.out 2>&1 || return 1
-    grep -q 'minted one' /tmp/vmine.out || { cat /tmp/vmine.out >&2; return 1; }
     local minted
-    minted=$(jq -r .id "$bare/vmbareid.log.bark") || return 1
-    # ...and the pair carries it, not just the manifest.
-    python3 - "$bare/vmbareid.log.rings" "$minted" <<'PYMINT'
-import sys
-b = open(sys.argv[1], 'rb').read()[48:64]
-h = b.hex()
-got = '-'.join([h[0:8], h[8:12], h[12:16], h[16:20], h[20:32]])
-sys.exit(0 if got == sys.argv[2] else 1)
-PYMINT
-    [ $? -eq 0 ] || { echo "header did not get the minted id" >&2; return 1; }
+    minted=$(timberfs info --json "$bare/vmbareid.log" | jq -r '.id // "NONE"')
+    [ "$minted" != NONE ] || { echo "a bare append left no identity" >&2; return 1; }
+
+    # `create --if-not-exists` then writes the manifest, which ADOPTS the
+    # pair's id rather than minting a second: two ids for one store is what
+    # the next open refuses outright.
+    timberfs create --if-not-exists "$bare/vmbareid.log" > /tmp/vmine.out 2>&1 || return 1
+    grep -q 'recovered its identity from the index' /tmp/vmine.out \
+        || { cat /tmp/vmine.out >&2; return 1; }
+    [ "$(jq -r .id "$bare/vmbareid.log.bark")" = "$minted" ] \
+        || { echo "the manifest minted a second id" >&2; return 1; }
     # Idempotent: a second run has nothing to do.
     timberfs create --if-not-exists "$bare/vmbareid.log" 2>&1 | grep -q 'nothing created' || return 1
-    # Manifest lost, pair intact: the identity is RECOVERED, not re-minted,
-    # because the pair is the store.
+    # Neither side carrying one -- a pair an older timberfs created. THAT
+    # is what has not been created yet in the only sense that matters, so
+    # reporting "nothing created" at it would be success at doing nothing.
     rm "$bare/vmbareid.log.bark"
+    strip_carried_identity "$bare/vmbareid.log.rings"
     timberfs create --if-not-exists "$bare/vmbareid.log" > /tmp/vmine2.out 2>&1 || return 1
-    grep -q 'recovered its identity from the index' /tmp/vmine2.out || { cat /tmp/vmine2.out >&2; return 1; }
-    [ "$(jq -r .id "$bare/vmbareid.log.bark")" = "$minted" ] \
-        || { echo "re-minted instead of recovering" >&2; return 1; }
+    grep -q 'minted one' /tmp/vmine2.out || { cat /tmp/vmine2.out >&2; return 1; }
+    [ "$(jq -r .id "$bare/vmbareid.log.bark")" != "$minted" ] \
+        || { echo "recovered an identity that was gone from both sides" >&2; return 1; }
     # And the data is still there.
     timberfs query "$bare/vmbareid.log" 2>/dev/null | grep -q 'no manifest here' || return 1
 
@@ -2656,6 +2673,9 @@ catalogue_fields_are_a_projection_of_list() {
     rm -f /var/log/timberfs/vmbare/vmbare.log.*
     mkdir -p /var/log/timberfs/vmbare
     printf 'no manifest here\n' | timberfs append --into /var/log/timberfs/vmbare/vmbare.log --quiet 2>/dev/null
+    # A pair made HERE carries an identity, so this is one an older build
+    # left behind -- the only store that still has none.
+    strip_carried_identity /var/log/timberfs/vmbare/vmbare.log.rings
     timberfs list --json /var/log/timberfs \
         | jq -e '.[] | select(.handle == "vmbare") | .id == null and (.labels | length == 0)' \
             > /dev/null || return 1
@@ -4140,15 +4160,17 @@ forest_list_command() {
     find /var/log/timberfs -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
     printf '2026-07-08T09:00:00 INFO web one\n2026-07-08T09:00:01 INFO web two\n' \
         | timberfs append --into /var/log/timberfs/web/web.log --quiet || return 1
+    strip_carried_identity /var/log/timberfs/web/web.log.rings
     printf '2026-07-08T09:05:00 INFO db one\n' \
         | timberfs append --into /var/log/timberfs/db/db.log --quiet || return 1
 
     local out names dir_names
     out=$(timberfs list) || return 1
     echo "$out" | head -1 | grep -qE '^ID[[:space:]]+NAME' || return 1
-    # Both stores here were made by a bare `append`, which declares
-    # nothing and so writes no manifest: the ID column is structural, so
-    # they show a dash rather than the column disappearing.
+    # `web` was made by a bare `append` and then stripped of the identity
+    # its pair is stamped with, so it stands for a store an older build
+    # left: the ID column is structural, so it shows a dash rather than
+    # the column disappearing.
     echo "$out" | grep -qE '^-[[:space:]]+web[[:space:]]' || return 1
     # a row for each, with a real (non-"empty") SPAN — both stores have data
     echo "$out" | grep -E '[[:space:]]web[[:space:]]+default[[:space:]]' | grep -q ' \.\. ' || return 1
