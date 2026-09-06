@@ -597,6 +597,29 @@ Several metrics go on one graph, comma-separated — which is how two stores
 answer at once, since `[class=tally]` covers both and the metric name is what
 tells them apart.
 
+### `extracting` — metrics from a store that has no tally
+
+```
+timberfs=# graph http_latency from [service=nginx]
+             extracting timberfs-nginx-combined
+             where logline since '13:00' quantile 0.95;
+```
+
+Fetches the log, runs the extractor **here**, and plots the result — so a
+document can be tried against real production data before anything is
+provisioned. The per-metric report (`claimed`, `skipped`, `dropped`) comes back
+with it, which is the same thing `timberfs tally --try` prints.
+
+⚠ **It moves the raw log.** Tens of megabytes an hour per host, against
+kilobytes for the same window from a tally store — so it is the one statement
+that refuses to be unbounded: give it a window, a session or a `limit`. That
+contrast is the argument for tally existing, and the tool says the byte count
+so it is not a surprise.
+
+⚠ It extracts **locally**, because a target takes one query document and has
+nowhere to put a pipeline — so it needs a local `timberfs`, and says so when
+there isn't one.
+
 ### `against` — are these two actually related?
 
 ```

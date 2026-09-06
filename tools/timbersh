@@ -80,7 +80,8 @@ something else again at the far end.
                  not the statement's `limit`, which is how much of the
                  answer you want
 """
-import argparse, json, os, queue, re, readline, sys, threading, time
+import argparse, json, os, queue, re, readline, shutil, subprocess, sys
+import threading, time
 
 # The viewer, and the pieces both front ends share. A checkout finds
 # them beside this script; the package installs them where both do.
@@ -198,6 +199,7 @@ HELP = """
   graph  <metric>[, <metric>...] from <source> [by LABEL] [where ...]
          [quantile Q] [rate] [png 'FILE'];
   graph  <metric> against <metric> from <source> [...];
+  graph  <metric> from <source> extracting <name> where ... ;
 
     `into view` puts the ANSWER on the pager's screen instead of on the
     terminal: multi-line entries stay whole, Tab and Enter search as
@@ -216,6 +218,12 @@ HELP = """
     across the fleet. Several, comma-separated, share one picture -- and
     the UNIT decides the axis, so two response times share one while a
     count and a byte total do not.
+
+    `extracting NAME` makes the numbers HERE, from a store that has no
+    tally at all -- for trying an extractor against real data before
+    provisioning anything. ⚠ It moves the RAW LOG (tens of megabytes an
+    hour per host, against kilobytes from a tally store), so it insists
+    on a window, a session or a limit, and needs a local timberfs.
 
     `graph Y against X` is a SCATTER -- one point per bucket -- and is
     the honest plot for "are these two related": two lines on a shared
@@ -768,7 +776,13 @@ def show_window(session):
     return " ".join(ends) or "unbounded"
 
 
-def parse_where(toks, i):
+#: What ends a `where` in a `graph`. A select's clauses are `limit` and
+#: `into`; a graph has its own, and without them here `quantile` after a
+#: `where` was read as a condition and refused.
+GRAPH_CLAUSES = ("by", "quantile", "rate", "png", "svg", "using", "extracting")
+
+
+def parse_where(toks, i, stop=()):
     """`entry has 'X'` / `chunk may have 'X'` / `logline since 'T'`. The
     SUBJECT carries what the document makes required — granularity and
     axis — so neither can be defaulted by accident."""
@@ -776,7 +790,8 @@ def parse_where(toks, i):
     # What ENDS a where clause. Lowercased, so a shouted LIMIT stops it
     # too — and `into`, which names where the answer goes rather than
     # what it contains.
-    while i < len(toks) and toks[i][1].lower() not in (";", "limit", "into"):
+    while i < len(toks) and toks[i][1].lower() not in (";", "limit", "into") \
+            and toks[i][1].lower() not in stop:
         w = toks[i][1].lower()
         if w == "and": i += 1; continue
         if w in ("entry", "chunk"):
@@ -934,7 +949,7 @@ class Complete:
         if slot == "<graphclauses...>":
             if prev == "by":
                 return []              # a label, which only the data knows
-            if prev in ("quantile", "png", "svg", "using"):
+            if prev in ("quantile", "png", "svg", "using", "extracting"):
                 return []
             if prev in ("where", "and"):
                 return SUBJECTS
@@ -949,8 +964,8 @@ class Complete:
             if prev in ("logline", "written", "write"):
                 return AFTER_TIME
             low = [t.lower() for t in rest]
-            once = [w for w in ("where", "quantile", "rate", "png", "svg", "using")
-                    if w not in low]
+            once = [w for w in ("where", "quantile", "rate", "png", "svg",
+                                "using", "extracting") if w not in low]
             return ["by"] + once + (["and"] if "where" in low else [])
         if slot == "<at...>":
             if prev in ("chunk", "offset"):
@@ -1690,9 +1705,10 @@ class Shell:
                 i += 1
                 continue
             if w == "where":
-                conds, i = parse_where(toks, i + 1)
+                conds, i = parse_where(toks, i + 1, GRAPH_CLAUSES)
                 continue
-            if i + 1 >= len(toks) and w in ("by", "quantile", "png", "svg", "using"):
+            if i + 1 >= len(toks) and w in ("by", "quantile", "png", "svg",
+                                            "using", "extracting"):
                 raise ValueError(f"`{w}` what?")
             if w == "by":
                 by.append(toks[i + 1][1]); i += 2
@@ -1700,19 +1716,35 @@ class Shell:
                 opts["rate"] = True; i += 1
             elif w == "quantile":
                 opts["quantile"] = float(toks[i + 1][1]); i += 2
-            elif w in ("png", "svg", "using"):
+            elif w in ("png", "svg", "using", "extracting"):
                 opts[w] = toks[i + 1][1]; i += 2
             else:
                 raise ValueError(
                     f"`{toks[i][1]}`? after the source come `by LABEL`, "
-                    f"`where ...`, `quantile Q`, `rate`, `using PATH` and "
-                    f"`png FILE`/`svg FILE`")
+                    f"`where ...`, `quantile Q`, `rate`, `using PATH`, "
+                    f"`extracting NAME` and `png FILE`/`svg FILE`")
 
+        extracting = opts.get("extracting")
+        if extracting:
+            # ⚠ A BOUND is required, and this is the one statement that
+            # insists. It transfers the RAW LOG — tens of megabytes an
+            # hour per host, against kilobytes for the same window from a
+            # tally store — so "the whole store, on every host" must be
+            # asked for rather than arrived at.
+            bounded = any(c.get("t") == "time" for c in conds) or self.session \
+                or any(t[1].lower() == "limit" for t in toks)
+            if not bounded:
+                raise ValueError(
+                    "`extracting` reads the RAW LOG to make the numbers, which "
+                    "is tens of megabytes an hour per host — bound it with "
+                    "`where logline since '...'`, a session, or `limit N`")
         notes = []
         doc = build("loglines", terms, conds, None, self.session, notes)
         for note in notes:
             print(note)
         answers = self.fan_out(doc)
+        if extracting:
+            answers = self.extract(extracting, answers)
 
         # ⚠ The host is made a LABEL, because a fleet answer that merged
         # two hosts into one line would be two series a reader takes for
@@ -1792,6 +1824,45 @@ class Shell:
             timbergraph.note_markers(markers, window, sys.stdout)
         if dest:
             print(f"wrote {dest}")
+
+    def extract(self, name, answers):
+        """Turn each host's LOG lines into tally lines, here.
+
+        ⚠ Locally, and it could not be otherwise: a target takes ONE
+        query document and streams an answer, so there is nowhere to put
+        a pipeline at the far end. Which is also why the raw log crosses
+        the network — the cost this statement makes you bound.
+        """
+        exe = shutil.which("timberfs")
+        if not exe:
+            raise ValueError(
+                "`extracting` runs the extractor HERE, over what the hosts "
+                "sent, and needs a local `timberfs` to do it — install it, or "
+                "graph a tally store instead")
+        doc = timbergraph.resolve_extractor(name)
+        out, bytes_in = {}, 0
+        for host, (text, err, rc) in answers.items():
+            if rc != 0:
+                out[host] = (text, err, rc)
+                continue
+            bytes_in += len(text)
+            run = subprocess.run(
+                [exe, "tally", "--try", "--extractor", doc],
+                input=text, text=True, capture_output=True, check=False)
+            if run.returncode != 0:
+                out[host] = ("", run.stderr.strip().splitlines()[-1]
+                             if run.stderr.strip() else "the extractor refused it",
+                             run.returncode)
+                continue
+            # ⚠ Its report goes to stderr and is worth seeing: `skipped`
+            # is ordinary on a store of several shapes, `dropped` says
+            # the numbers are wrong.
+            for line in run.stderr.strip().splitlines():
+                if line.strip():
+                    print(f"{host + ': ' if host else ''}{line}")
+            out[host] = (run.stdout, "", 0)
+        print(f"read {bytes_in} byte(s) of log to make them")
+        return out
 
     def view(self, toks):
         """A pager over the tape, IN PROCESS.

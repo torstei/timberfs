@@ -922,9 +922,10 @@ The first reads a tally store: kilobytes, and it needs **no timberfs change at
 all**, because a tally line is text and `select loglines` already returns it.
 The `samples` response kind would make it typed; it is not required to start.
 
-The second is the loop for WRITING an extractor: fetch raw loglines, pipe them
-through `timberfs tally --try`, plot the result — so a document can be tested
-against real production data before anything is provisioned. ⚠ It transfers the
+The second is BUILT as `timbersh`'s `extracting` clause: fetch raw loglines,
+run the extractor here, plot the result — so a document can be tested against
+real production data, from a store that has no tally at all, before anything is
+provisioned. It is the one statement that refuses to be unbounded. ⚠ It transfers the
 RAW LOG. Measured on a comparable access log elsewhere, that is tens of
 megabytes per hour per host against a few kilobytes for the same window from a
 tally store — so it states its cost and defaults to a short window. That
