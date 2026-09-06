@@ -585,6 +585,27 @@ so a search returning one, opening one, and handing a place back to the
 shell are the same operation. The store id is the name and the host is a
 hint: bake the host in and a pasted link breaks the day a store moves.
 
+## `graph` — a metric across the fleet
+
+```
+timberfs=# graph http_requests from [class=tally] by status;
+timberfs=# graph request_latency from [class=tally] by tenant quantile 0.95;
+```
+
+A tally line is text, so `graph` is a `loglines` read and a plot of what came
+back — no response kind of its own, and nothing the far end has to grow.
+
+⚠ **The host is a label like any other.** Nothing in a tally line says which
+host it came from — a line's labels are the *metric's* — so a fleet answer
+would silently add two hosts into one series. `by host` keeps them apart;
+leaving it out sums them, which is a legitimate fleet total and now an explicit
+one. Measured on two hosts holding the same store: 90 with `by status by host`,
+180 with `by status` alone.
+
+It refuses the two a plot cannot draw honestly — a gauge summed across series,
+and a cumulative `le` ladder — and the refusals name what to do instead.
+`timbergraph` below is the same drawing outside the shell.
+
 ## `timbergraph` — a graph of a tally store
 
 ⚠ **Experimental.** Draws what a metric did over time, from

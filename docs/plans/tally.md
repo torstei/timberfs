@@ -839,12 +839,17 @@ In `timbersh` it lands in the shape that is already there:
 
 ## Graphing it
 
-**Status: `timbergraph` is BUILT** — the module, the entry point, its tests and
-its man page (`timbergraph(1)`). It reads tally lines from stdin or a file, so
-it needed nothing of timberfs. ⚠ **Not built: the `graph` statement in
-`timbersh`**, which is where the value is — a graph across the fleet rather
-than of one store — and which needs the shell's fan-out rather than another
-renderer.
+**Status: BUILT** — `timbergraph(1)` reads tally lines from stdin or a file,
+and `timbersh`'s `graph` statement draws the same thing across the fleet. Both
+needed nothing of timberfs: a tally line is text, so it is a `loglines` read and
+a plot of what came back.
+
+⚠ **The host had to become a LABEL, which this note did not anticipate.**
+Nothing in a tally line says which host produced it — a line's labels are the
+METRIC's — so a fleet answer merged two hosts into one series, silently.
+Measured on two hosts holding one store: 90 with `by status by host`, 180
+without. Merging is legitimate as a fleet TOTAL; doing it without being asked
+was not.
 
 ### The extractor document is a plot spec
 

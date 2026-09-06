@@ -88,6 +88,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [p for p in (_HERE, "/usr/share/timberfs-sh")
                 if os.path.exists(os.path.join(p, "timberview.py"))]
 import timberfs_client
+import timbergraph
 import timberview
 from timberfs_client import HOST_TOKEN, when, when_ms
 
@@ -194,6 +195,7 @@ HELP = """
 
   select <kind> from <source> [where ...] [limit N [chunks]] [into view];
   tail   <kind> from <source> [where ...];
+  graph  <metric> from <source> [by LABEL] [where ...] [quantile Q] [rate];
 
     `into view` puts the ANSWER on the pager's screen instead of on the
     terminal: multi-line entries stay whole, Tab and Enter search as
@@ -207,6 +209,16 @@ HELP = """
     A time bound is refused -- for a window, `select` it. On a store with
     a `wal` the newest entries arrive within a poll; without one, a flush
     behind the writer.
+
+    `graph` draws a metric from a TALLY store (see `man timberfs`, tally)
+    across the fleet. A tally line is text, so it is a `loglines` read
+    and a plot of what came back. ⚠ The HOST is a label like any other:
+    a fleet answer that merged two of them would be two series a reader
+    takes for one, so `by host` keeps them apart and leaving it out sums
+    them on purpose. `quantile 0.95` of a cumulative `le` ladder --
+    summing one multiplies the count, so it is refused; `rate` divides by
+    the bucket width; `png 'f'`/`svg 'f'` draw somewhere other than the
+    terminal. Needs gnuplot.
 
     <kind>    records | loglines | stores | chunks
     <source>  a view name, or a predicate literal like [type=console].
@@ -817,6 +829,7 @@ SUBJECTS = ["entry", "chunk", "logline", "written"]
 # yet. It is the index of what exists, which is the half that was drifting.
 FORMS = """
     select <kind> from <source> <clauses...>
+    graph  <metric> from <source> <graphclauses...>
     tail   <kind> from <source> <tailclauses...>
     view   <source> <at...>
     declare <name> cursor for <statement...>
@@ -908,6 +921,27 @@ class Complete:
                 else ("where", "limit", "into")
             return [w for w in clauses if w not in low] \
                 + (["and"] if "where" in low else [])
+        if slot == "<graphclauses...>":
+            if prev == "by":
+                return []              # a label, which only the data knows
+            if prev in ("quantile", "png", "svg", "using"):
+                return []
+            if prev in ("where", "and"):
+                return SUBJECTS
+            if prev == "entry":
+                return AFTER_ENTRY
+            if prev == "chunk":
+                return ["may"]
+            if prev == "may":
+                return ["have"]
+            if prev == "not":
+                return ["has", "substring", "regex"]
+            if prev in ("logline", "written", "write"):
+                return AFTER_TIME
+            low = [t.lower() for t in rest]
+            once = [w for w in ("where", "quantile", "rate", "png", "svg", "using")
+                    if w not in low]
+            return ["by"] + once + (["and"] if "where" in low else [])
         if slot == "<at...>":
             if prev in ("chunk", "offset"):
                 return []
@@ -1502,6 +1536,8 @@ class Shell:
             cur = self.cursors.get(toks[3][1])
             if cur is None: raise ValueError(f"no cursor `{toks[3][1]}`")
             return self.fetch(cur, n)
+        if head == "graph":
+            return self.graph(toks)
         if head == "view":
             if len(toks) < 2:
                 raise ValueError(
@@ -1599,6 +1635,122 @@ class Shell:
         end = timberview.watch_source(backend, answer)
         report_errors({**refused, **backend.unreachable})
         print(f"  {end}" if end else "  -- left the answer")
+
+    def graph(self, toks):
+        """`graph <metric> from <source> [by <label>] [where ...]`.
+
+        A tally line is TEXT, so this is a `loglines` read and a plot of
+        what came back — no response kind of its own, and nothing the far
+        end has to grow.
+        """
+        if len(toks) < 4 or toks[2][1].lower() != "from":
+            raise ValueError(
+                "graph <metric> from <source> [by <label>] [where logline since 'T'] "
+                "[quantile 0.95] [rate] [png 'FILE']")
+        metric = toks[1][1]
+        terms = self.source(toks[3])
+        conds, by, opts, i = [], [], {}, 4
+        while i < len(toks):
+            w = toks[i][1].lower()
+            if w == ";":
+                i += 1
+                continue
+            if w == "where":
+                conds, i = parse_where(toks, i + 1)
+                continue
+            if i + 1 >= len(toks) and w in ("by", "quantile", "png", "svg", "using"):
+                raise ValueError(f"`{w}` what?")
+            if w == "by":
+                by.append(toks[i + 1][1]); i += 2
+            elif w == "rate":
+                opts["rate"] = True; i += 1
+            elif w == "quantile":
+                opts["quantile"] = float(toks[i + 1][1]); i += 2
+            elif w in ("png", "svg", "using"):
+                opts[w] = toks[i + 1][1]; i += 2
+            else:
+                raise ValueError(
+                    f"`{toks[i][1]}`? after the source come `by LABEL`, "
+                    f"`where ...`, `quantile Q`, `rate`, `using PATH` and "
+                    f"`png FILE`/`svg FILE`")
+
+        notes = []
+        doc = build("loglines", terms, conds, None, self.session, notes)
+        for note in notes:
+            print(note)
+        answers = self.fan_out(doc)
+
+        # ⚠ The host is made a LABEL, because a fleet answer that merged
+        # two hosts into one line would be two series a reader takes for
+        # one — and nothing in a tally line says which host it came from,
+        # the line's labels being the METRIC's.
+        samples, markers, bad = [], [], {}
+        for host in TARGETS:
+            out, err, rc = answers.get(host, ("", "no answer", 1))
+            if rc != 0:
+                bad[host] = err or f"exit {rc}"
+                continue
+            try:
+                got, marks = timbergraph.read(out)
+            except timbergraph.Bad as e:
+                bad[host] = str(e)
+                continue
+            for sample in got:
+                if "host" in sample.labels:
+                    raise ValueError(
+                        f"these samples already carry a `host` label, so the "
+                        f"fleet cannot be one too — read one host at a time "
+                        f"(`graph {metric} from [host=...]`)")
+                if host:
+                    sample.labels["host"] = host
+            samples += got
+            markers += marks
+        report_errors(bad)
+        if not samples:
+            raise ValueError(
+                f"no tally lines came back. `graph` reads a TALLY store — "
+                f"try `select stores from [class=tally]` to see which there are")
+
+        chosen = timbergraph.matching(samples, metric, None)
+        if opts.get("quantile") is not None:
+            if not timbergraph.is_histogram(chosen):
+                raise ValueError(f"{metric} is not a histogram — it has no `le` ladder")
+            lines = timbergraph.quantile(chosen, opts["quantile"], tuple(by))
+            what = f"p{opts['quantile'] * 100:g}"
+        elif timbergraph.is_histogram(chosen) and not by:
+            raise ValueError(
+                f"{metric} is a cumulative `le` ladder, and summing one "
+                f"multiplies the count — ask for `quantile 0.95`, or `by le`")
+        else:
+            what, lines = timbergraph.series(
+                chosen, metric, tuple(by), None, None, opts.get("rate", False))
+
+        facts = timbergraph.extractor_facts([opts["using"]]) if "using" in opts else {}
+        fact = dict(facts.get(metric, {}))
+        fact.setdefault("unit", timbergraph.tape_units(markers).get(metric))
+        unit = fact.get("unit") or ""
+        if opts.get("rate"):
+            unit = f"{unit}/s" if unit else "per second"
+        title = fact.get("description") or metric
+        ylabel = f"{what} ({unit})" if unit else what
+
+        every = sorted({ts for at in lines.values() for ts in at})
+        window = (every[0], every[-1]) if every else (0, 0)
+        marks = [(m.ts, m.metric) for m in markers
+                 if m.metric in timbergraph.TROUBLE
+                 and window[0] <= m.ts <= window[1]
+                 and m.labels.get("metric") == metric]
+
+        dest = opts.get("png") or opts.get("svg")
+        terminal = "pngcairo" if "png" in opts else "svg" if "svg" in opts else "dumb"
+        size = ((1000, 500) if dest else timbergraph.terminal_size())
+        text = timbergraph.script(lines, title, ylabel, terminal, size, marks, dest)
+        drawn = timbergraph.draw(text, terminal)
+        if drawn:
+            sys.stdout.write(drawn)
+        timbergraph.note_markers(markers, window, sys.stdout)
+        if dest:
+            print(f"wrote {dest}")
 
     def view(self, toks):
         """A pager over the tape, IN PROCESS.

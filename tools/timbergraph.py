@@ -419,7 +419,10 @@ def script(lines, title, ylabel, terminal, size, marks=(), output=None):
         "set datafile separator '\\t'",
         f"set title {gp_quote(title)}",
         f"set ylabel {gp_quote(ylabel)}",
-        "set key outside below",
+        # ⚠ `width 2` because gnuplot's dumb terminal packs the key
+        # entries against each other — `200 *******404 #######` reads as
+        # one legend entry with a strange name.
+        "set key outside below width 2",
         "set grid",
     ]
     # ⚠ Only where the terminal can draw one. On `dumb` an arrow is

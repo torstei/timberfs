@@ -18,7 +18,7 @@ FAKE = os.path.join(HERE, "fake-timberfs")
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
 from timberview import when                                  # noqa: E402
 
-VERBS_THE_PARSER_TAKES = ["select", "tail", "view", "declare", "fetch",
+VERBS_THE_PARSER_TAKES = ["select", "tail", "graph", "view", "declare", "fetch",
                           "close", "create", "drop", "refresh", "add", "show",
                           "save", "load", "help", "quit", "exit"]
 
@@ -439,6 +439,45 @@ def a_logline_window_on_chunks_is_refused_before_the_axis_is_rewritten():
         "select chunks from [svc=web] where logline since '00:00';")
     assert "logline window has nothing to apply to" in s.out, s.out
     assert s.docs("chunks") == [], s.requests
+    s.cleanup()
+
+
+@test
+def a_graph_makes_the_fleet_a_dimension_rather_than_merging_it():
+    """Nothing in a tally line says which host it came from — a line's
+    labels are the METRIC's — so a fleet answer would silently add two
+    hosts into one series. The refusal names `host` because the shell put
+    it there."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    s = Session({h: {"stores": [store("t", ID_A)], "loglines": gauge}
+                 for h in ("a", "b")}, hosts=["a", "b"]).run(
+        "graph heap from [class=tally];")
+    assert "gauge" in s.out, s.out
+    assert "host" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_graph_refuses_a_cumulative_ladder_rather_than_multiplying_it():
+    """`le` series are cumulative, so stacking them multiplies the count
+    — the one a grapher gets WRONG rather than ugly."""
+    ladder = ("2026-09-06T13:37:00.000Z 60s lat le=10 count=24\n"
+              "2026-09-06T13:37:00.000Z 60s lat le=+Inf count=150 sum=900\n")
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": ladder}}).run(
+        "graph lat from [class=tally];")
+    assert "cumulative" in s.out, s.out
+    assert "quantile" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_graph_says_when_it_read_no_tally_lines_at_all():
+    """"Nothing matched" and "that store holds a log, not numbers" are
+    different answers, and the second is the one somebody new makes."""
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": ""}}).run(
+        "graph m from [class=tally];")
+    assert "no tally lines" in s.out, s.out
+    assert "class=tally" in s.out, s.out
     s.cleanup()
 
 
