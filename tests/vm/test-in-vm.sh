@@ -5295,13 +5295,6 @@ binary_upgrade_restarts_mount() {
     return $rc
 }
 
-run_test "upgrade: appender self-exits, systemd restarts it on the new binary" binary_upgrade_restarts_appender
-run_test "upgrade: mount self-exits, remounts on the new binary" binary_upgrade_restarts_mount
-run_test "apt-get purge removes package" purge_package
-run_test "purge keeps user conf and data, drops package files" purge_correct
-
-# Health checks run LAST: a test that leaks disk turns a clear failure into
-# confusing cascades (a full /tmp made query fail silently, empty-stderr),
 # ---------------------------------------------------------------- tally
 
 tally_example_installed() {
@@ -5362,7 +5355,11 @@ CONF
     }
     # …and the bucket is findable by the minute it DESCRIBES, which is the
     # half the declared lag buys.
-    timberfs query "$d/vmtally.log" --from '2026-09-06 10:02' --to '2026-09-06 10:03' 2>/dev/null \
+    # RFC3339 with the zone spelled out: a NAIVE stamp is parsed in the
+    # READER's timezone, so this would pass in a UTC VM and fail anywhere
+    # else — the store's stamps are UTC whatever the host is set to.
+    timberfs query "$d/vmtally.log" \
+        --from '2026-09-06T10:02:00Z' --to '2026-09-06T10:03:00Z' 2>/dev/null \
         | grep -q 'count=1' || {
         echo "a logline window over the buckets found nothing" >&2
         return 1
@@ -5374,6 +5371,14 @@ CONF
 run_test "tally: example conf and man section installed by the package" tally_example_installed
 run_test "tally: metrics derived into an ordinary store" \
     tally_derives_metrics_that_are_a_store_like_any_other
+
+run_test "upgrade: appender self-exits, systemd restarts it on the new binary" binary_upgrade_restarts_appender
+run_test "upgrade: mount self-exits, remounts on the new binary" binary_upgrade_restarts_mount
+run_test "apt-get purge removes package" purge_package
+run_test "purge keeps user conf and data, drops package files" purge_correct
+
+# Health checks run LAST: a test that leaks disk turns a clear failure into
+# confusing cascades (a full /tmp made query fail silently, empty-stderr),
 
 # so assert the filesystems aren't near-full and surface it as its own test.
 health_filesystems_not_full() {
