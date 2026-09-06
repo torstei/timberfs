@@ -520,10 +520,18 @@ def resolve_extractor(name_or_path):
         candidate = os.path.join(d, f"{name_or_path}.json")
         if os.path.isfile(candidate):
             return candidate
-    where = ", ".join(extractor_dirs()) or "no extractor directory that exists"
+    # ⚠ A directory is listed only if it EXISTS, so where none does the
+    # list is empty — and a failure naming nowhere says nothing about
+    # where the file should go.
+    found = extractor_dirs()
+    if not found:
+        raise Bad(
+            f"no extractor {name_or_path!r} — it is not a path that exists, and "
+            f"there is no extractor directory to search: none of "
+            f"{', '.join(EXTRACTOR_DIRS)} exists")
     raise Bad(
         f"no extractor {name_or_path!r} — neither a path that exists nor a "
-        f"document in {where}"
+        f"document in {', '.join(found)}"
     )
 
 

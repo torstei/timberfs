@@ -222,6 +222,8 @@ def test_an_extractor_is_a_path_or_a_name():
         check("by path", doc, g.resolve_extractor(doc))
         check("the unit", "x", g.extractor_facts(["mine"])["m"]["unit"])
         raises("neither", lambda: g.resolve_extractor("absent"), "no extractor")
+        raises("names where it looked", lambda: g.resolve_extractor("absent"),
+               d)
     finally:
         if old is None:
             del os.environ["XDG_CONFIG_HOME"]
@@ -229,6 +231,23 @@ def test_an_extractor_is_a_path_or_a_name():
             os.environ["XDG_CONFIG_HOME"] = old
         import shutil as sh
         sh.rmtree(home, ignore_errors=True)
+
+
+def test_a_name_that_resolves_nowhere_says_where_it_looked():
+    """A directory is listed only if it exists, so where none does the
+    list is empty — and the failure then named nowhere at all, which says
+    nothing about where the file should go. The directories are replaced
+    rather than the run being skipped where a real one exists: a test
+    that runs on some machines and not others has told you nothing."""
+    was = g.EXTRACTOR_DIRS
+    g.EXTRACTOR_DIRS = ("/nonexistent/packaged", "/nonexistent/site",
+                        "~/nonexistent/mine")
+    try:
+        check("none exist", [], g.extractor_dirs())
+        raises("names the packaged one", lambda: g.resolve_extractor("absent"),
+               "/nonexistent/packaged")
+    finally:
+        g.EXTRACTOR_DIRS = was
 
 
 def test_the_time_axis_is_local_and_snaps_to_the_clock():
