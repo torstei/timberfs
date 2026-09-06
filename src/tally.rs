@@ -1444,6 +1444,30 @@ struct Run {
 
 impl Run {
     fn new(docs: &[(PathBuf, Extractor)], opts: &TallyOpts) -> anyhow::Result<Run> {
+        // ⚠ A metric is named once across the APPLIED set, not merely
+        // within a document. Two documents may share a name — apache's
+        // and nginx's `http_requests` are the same measurement — and
+        // they are only wrong TOGETHER, where the two would fold into
+        // one series and the numbers would be a sum of two different
+        // things. Refused here, where the applied set is known, rather
+        // than in the directory sweep, where holding both is right.
+        let mut named: BTreeMap<&str, &Extractor> = BTreeMap::new();
+        for (_, doc) in docs {
+            for m in &doc.metrics {
+                if let Some(other) = named.insert(&m.name, doc) {
+                    if other.name != doc.name {
+                        bail!(
+                            "{} and {} both define the metric {:?} — applied together \
+                             their samples fold into one series, and the numbers become \
+                             a sum of two different measurements. Apply one",
+                            other.name,
+                            doc.name,
+                            m.name
+                        );
+                    }
+                }
+            }
+        }
         let mut live = Vec::new();
         for (path, doc) in docs {
             let mut window = doc.window;

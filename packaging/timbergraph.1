@@ -75,7 +75,17 @@ lying about being exact.
 .SH OPTIONS
 .TP
 .BI \-m " METRIC" ", " \-\-metric " METRIC"
-Which metric to draw. Omitted, the input is summarised instead.
+Which metric to draw. Repeatable, or comma-separated, to put several on
+one graph. Omitted, the input is summarised instead.
+.PP
+.RS
+⚠ The UNIT decides the y axis, and it alone \(em it is what makes two
+numbers comparable. Two response times share one; a request count and a
+byte total do not, so the second goes on the right and the legend says
+so. Drawing them as though they shared a scale is how a plot makes any
+two things look related, which matters most in the case somebody plots
+two metrics FOR. A third unit is refused: nobody can read three y axes.
+.RE
 .TP
 .BI \-\-by " LABEL"
 One line per value of this label, summed over the rest. Repeatable.

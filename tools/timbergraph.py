@@ -316,6 +316,72 @@ def quantile(samples, q, by=(), where=None):
     return lines
 
 
+def terms(samples, metrics, by=(), where=None, field=None, rate=False,
+          want_quantile=None, facts=None):
+    """Every metric asked for, as one set of lines ready to draw.
+
+    Shared by both front ends so the judgement — what may be aggregated,
+    what a histogram needs, which axis a unit belongs on — is made once
+    rather than twice and differently.
+
+    ⚠ Two metrics with DIFFERENT units do not share a y axis. Drawing
+    them as though they did is how a plot makes any two things look
+    related, which matters most in the case this exists for: somebody
+    checking whether they are.
+    """
+    facts = facts or {}
+    lines, units, several = {}, {}, len(metrics) > 1
+    for metric in metrics:
+        chosen = matching(samples, metric, where)
+        if want_quantile is not None and is_histogram(chosen):
+            got = quantile(chosen, want_quantile, tuple(by), where)
+            what = f"p{want_quantile * 100:g}"
+        elif is_histogram(chosen) and "le" not in by:
+            raise Bad(
+                f"{metric} is a cumulative `le` ladder, and summing one "
+                f"multiplies the count. Ask for a quantile, or draw the "
+                f"ladder itself (by le)"
+            )
+        else:
+            what, got = series(chosen, metric, tuple(by), where, field, rate)
+        unit = facts.get(metric, {}).get("unit") or ""
+        if rate:
+            unit = f"{unit}/s" if unit else "per second"
+        units[metric] = (unit, what)
+        for key, at in got.items():
+            lines[(metric,) + tuple(key) if several else tuple(key)] = at
+
+    # ⚠ One axis per distinct UNIT, and the unit alone: it is what makes
+    # two numbers comparable. Keying on the measure as well put a count
+    # and a sum of the same thing on two axes, which says they are
+    # incomparable when they are not.
+    distinct = []
+    for metric in metrics:
+        if units[metric][0] not in distinct:
+            distinct.append(units[metric][0])
+    if len(distinct) > 2:
+        raise Bad(
+            "these metrics are measured in "
+            + ", ".join(u or "no unit" for u in distinct)
+            + " — a plot with three y axes is one nobody can read, so draw "
+              "them separately"
+        )
+
+    def axis_label(unit):
+        measures = sorted({w for u, w in units.values() if u == unit})
+        what = measures[0] if len(measures) == 1 else "/".join(measures)
+        return f"{what} ({unit})" if unit else what
+
+    ylabel = axis_label(distinct[0])
+    y2label = axis_label(distinct[1]) if len(distinct) > 1 else None
+    on_y2 = set()
+    if y2label:
+        for metric in metrics:
+            if units[metric][0] == distinct[1]:
+                on_y2.update(k for k in lines if k and k[0] == metric)
+    return lines, ylabel, y2label, on_y2
+
+
 # --------------------------------------------------------- the drawing
 
 def tape_units(markers):
@@ -388,7 +454,8 @@ def x_format(span_ms):
     return "%m-%d"
 
 
-def script(lines, title, ylabel, terminal, size, marks=(), output=None):
+def script(lines, title, ylabel, terminal, size, marks=(), output=None,
+           y2label=None, on_y2=()):
     """The gnuplot script, with its data inline so it re-runs on its own.
 
     One script for every output: `dumb` is ASCII in a terminal over ssh,
@@ -425,6 +492,10 @@ def script(lines, title, ylabel, terminal, size, marks=(), output=None):
         "set key outside below width 2",
         "set grid",
     ]
+    if y2label:
+        # ⚠ Said on the axis, because two scales on one picture is how a
+        # plot makes unrelated things look related.
+        out += [f"set y2label {gp_quote(y2label)}", "set y2tics", "set ytics nomirror"]
     # ⚠ Only where the terminal can draw one. On `dumb` an arrow is
     # invisible, so the markers are said in words instead — never
     # dropped, because a bucket whose numbers are wrong must not look
@@ -437,7 +508,9 @@ def script(lines, title, ylabel, terminal, size, marks=(), output=None):
                 f"{gp_quote('#cc0000' if what == '!drop' else '#cc8800')} lw 1"
             )
     plots = ", ".join(
-        f"'-' using 1:2 with lines title {gp_quote(name(k))}"
+        "'-' using 1:2 with lines"
+        + (" axes x1y2" if k in on_y2 else "")
+        + f" title {gp_quote(name(k) + (' (right)' if k in on_y2 else ''))}"
         for k in sorted(lines)
     )
     out.append("plot " + plots)
@@ -547,7 +620,8 @@ def main(argv=None):
         epilog="timberfs query app-tally --from 13:00 | timbergraph -m http_requests --by status",
     )
     ap.add_argument("file", nargs="*", help="tally lines; default stdin")
-    ap.add_argument("-m", "--metric", help="which metric to draw")
+    ap.add_argument("-m", "--metric", action="append", default=[],
+                    help="which metric to draw; repeatable, or comma-separated")
     ap.add_argument("--by", action="append", default=[], metavar="LABEL",
                     help="one line per value of this label; repeatable")
     ap.add_argument("--where", action="append", default=[], metavar="K=V",
@@ -585,7 +659,8 @@ def main(argv=None):
     samples, markers = read(text)
     if not samples and not markers:
         raise Bad("no tally lines on the input")
-    if args.list or not args.metric:
+    metrics = [m for spec in args.metric for m in spec.split(",") if m]
+    if args.list or not metrics:
         summarise(samples, markers, sys.stdout)
         if not args.metric:
             print("\nname a metric with -m to draw one", file=sys.stderr)
@@ -597,33 +672,17 @@ def main(argv=None):
         where[k] = v
 
     facts = extractor_facts(args.using)
-    fact = dict(facts.get(args.metric, {}))
-    # The document has the last word — it is the one a reader chose,
-    # where the marker is whatever the window happened to catch.
-    fact.setdefault("unit", tape_units(markers).get(args.metric))
-    chosen = matching(samples, args.metric, where)
+    for m in metrics:
+        facts.setdefault(m, {})
+        facts[m].setdefault("unit", tape_units(markers).get(m))
 
-    if args.quantile is not None:
-        if not is_histogram(chosen):
-            raise Bad(f"{args.metric} is not a histogram — it has no `le` ladder")
-        lines = quantile(chosen, args.quantile, tuple(args.by), where)
-        what = f"p{args.quantile * 100:g}"
-        unit = fact.get("unit") or ""
-    elif is_histogram(chosen) and not args.by:
-        raise Bad(
-            f"{args.metric} is a cumulative `le` ladder, and summing one "
-            f"multiplies the count. Ask for a quantile (--quantile 0.95), or "
-            f"draw the ladder itself (--by le)"
-        )
-    else:
-        what, lines = series(chosen, args.metric, tuple(args.by), where,
-                             args.field, args.rate)
-        unit = fact.get("unit") or ""
-        if args.rate:
-            unit = f"{unit}/s" if unit else "per second"
-
-    title = fact.get("description") or args.metric
-    ylabel = f"{what} ({unit})" if unit else what
+    lines, ylabel, y2label, on_y2 = terms(
+        samples, metrics, tuple(args.by), where, args.field, args.rate,
+        args.quantile, facts,
+    )
+    first = facts.get(metrics[0], {})
+    title = (first.get("description") if len(metrics) == 1 else None) \
+        or ", ".join(metrics)
     every = sorted({ts for at in lines.values() for ts in at})
     window = (every[0], every[-1]) if every else (0, 0)
 
@@ -637,19 +696,22 @@ def main(argv=None):
     marks = [(s.ts, s.metric) for s in markers
              if s.metric in TROUBLE
              and window[0] <= s.ts <= window[1]
-             and s.labels.get("metric") == args.metric]
+             and s.labels.get("metric") in metrics]
 
     if args.png or args.svg:
         dest = args.png or args.svg
         size = (args.width or 1000, args.height or 500)
         text_out = script(lines, title, ylabel,
-                          "pngcairo" if args.png else "svg", size, marks, dest)
+                          "pngcairo" if args.png else "svg", size, marks, dest,
+                          y2label, on_y2)
     elif args.window:
         size = (args.width or 900, args.height or 500)
-        text_out = script(lines, title, ylabel, "qt", size, marks)
+        text_out = script(lines, title, ylabel, "qt", size, marks, None,
+                          y2label, on_y2)
     else:
         size = (args.width or terminal_size()[0], args.height or terminal_size()[1])
-        text_out = script(lines, title, ylabel, "dumb", size, marks)
+        text_out = script(lines, title, ylabel, "dumb", size, marks, None,
+                          y2label, on_y2)
 
     if args.gnuplot:
         with open(args.gnuplot, "w", encoding="utf-8") as fh:

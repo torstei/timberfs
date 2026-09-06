@@ -1,0 +1,6 @@
+2026-09-06T13:37:00Z level=info tenant=acme ms=12 msg="handled"
+2026-09-06T13:37:05Z level=warn tenant=acme ms=430 msg="slow"
+2026-09-06T13:37:40Z level=error tenant=globex ms=2100 msg="upstream refused"
+	at com.example.Upstream.call(Upstream.java:88)
+2026-09-06T13:38:00Z level=info tenant=globex ms=9 msg="handled"
+10.0.0.1 - - [06/Sep/2026:13:38:01 +0200] "GET / HTTP/1.1" 200 10

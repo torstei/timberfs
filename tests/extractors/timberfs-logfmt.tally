@@ -1,0 +1,27 @@
+# app_events: claimed 4 skipped 1 dropped 0
+# app_duration: claimed 4 skipped 1 dropped 0
+2026-09-06T13:37:00.000Z 0s !meta metric=app_events unit=events
+2026-09-06T13:37:00.000Z 0s !meta metric=app_duration unit=ms
+2026-09-06T13:37:00.000Z 60s app_duration le=+Inf count=3 sum=2542 @0+252
+2026-09-06T13:37:00.000Z 60s app_duration le=100 count=1 @0+64
+2026-09-06T13:37:00.000Z 60s app_duration le=1000 count=2 @0+126
+2026-09-06T13:37:00.000Z 60s app_duration le=25 count=1 @0+64
+2026-09-06T13:37:00.000Z 60s app_duration le=250 count=1 @0+64
+2026-09-06T13:37:00.000Z 60s app_duration le=2500 count=3 @0+252
+2026-09-06T13:37:00.000Z 60s app_duration le=50 count=1 @0+64
+2026-09-06T13:37:00.000Z 60s app_duration le=500 count=2 @0+126
+2026-09-06T13:37:00.000Z 60s app_duration le=5000 count=3 @0+252
+2026-09-06T13:37:00.000Z 60s app_events level=error count=1 @126+126
+2026-09-06T13:37:00.000Z 60s app_events level=info count=1 @0+64
+2026-09-06T13:37:00.000Z 60s app_events level=warn count=1 @64+62
+2026-09-06T13:38:00.000Z 60s app_duration le=+Inf count=1 sum=9 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=10 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=100 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=1000 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=25 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=250 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=2500 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=50 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=500 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_duration le=5000 count=1 @252+65
+2026-09-06T13:38:00.000Z 60s app_events level=info count=1 @252+65

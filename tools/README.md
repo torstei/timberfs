@@ -589,8 +589,20 @@ hint: bake the host in and a pasted link breaks the day a store moves.
 
 ```
 timberfs=# graph http_requests from [class=tally] by status;
-timberfs=# graph request_latency from [class=tally] by tenant quantile 0.95;
+timberfs=# graph http_latency from [class=tally] quantile 0.95;
+timberfs=# graph http_latency, app_duration from [class=tally] quantile 0.95;
 ```
+
+Several metrics go on one graph, comma-separated — which is how two stores
+answer at once, since `[class=tally]` covers both and the metric name is what
+tells them apart.
+
+⚠ **The UNIT decides the axis, and it alone** — it is what makes two numbers
+comparable. Two response times share one; a request count and a byte total do
+not, so the second goes on the right and the legend says so. Drawing them as
+though they shared a scale is how a plot makes any two things look related,
+which matters most in the case somebody plots two metrics *for*: checking
+whether they are.
 
 A tally line is text, so `graph` is a `loglines` read and a plot of what came
 back — no response kind of its own, and nothing the far end has to grow.

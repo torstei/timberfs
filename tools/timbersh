@@ -195,7 +195,8 @@ HELP = """
 
   select <kind> from <source> [where ...] [limit N [chunks]] [into view];
   tail   <kind> from <source> [where ...];
-  graph  <metric> from <source> [by LABEL] [where ...] [quantile Q] [rate];
+  graph  <metric>[, <metric>...] from <source> [by LABEL] [where ...]
+         [quantile Q] [rate] [png 'FILE'];
 
     `into view` puts the ANSWER on the pager's screen instead of on the
     terminal: multi-line entries stay whole, Tab and Enter search as
@@ -210,8 +211,10 @@ HELP = """
     a `wal` the newest entries arrive within a poll; without one, a flush
     behind the writer.
 
-    `graph` draws a metric from a TALLY store (see `man timberfs`, tally)
-    across the fleet. A tally line is text, so it is a `loglines` read
+    `graph` draws metrics from a TALLY store (see `man timberfs`, tally)
+    across the fleet. Several, comma-separated, share one picture -- and
+    the UNIT decides the axis, so two response times share one while a
+    count and a byte total do not. A tally line is text, so it is a `loglines` read
     and a plot of what came back. ⚠ The HOST is a label like any other:
     a fleet answer that merged two of them would be two series a reader
     takes for one, so `by host` keeps them apart and leaving it out sums
@@ -1643,13 +1646,20 @@ class Shell:
         what came back — no response kind of its own, and nothing the far
         end has to grow.
         """
-        if len(toks) < 4 or toks[2][1].lower() != "from":
+        # The metrics run up to `from`, comma-separated — a comma binds
+        # to the word the lexer hands over, so it is split rather than
+        # relied on to be its own token.
+        at = next((n for n, t in enumerate(toks)
+                   if t[1].lower() == "from"), None)
+        if at is None or at < 2 or at + 1 >= len(toks):
             raise ValueError(
-                "graph <metric> from <source> [by <label>] [where logline since 'T'] "
-                "[quantile 0.95] [rate] [png 'FILE']")
-        metric = toks[1][1]
-        terms = self.source(toks[3])
-        conds, by, opts, i = [], [], {}, 4
+                "graph <metric>[, <metric>...] from <source> [by <label>] "
+                "[where logline since 'T'] [quantile 0.95] [rate] [png 'FILE']")
+        metrics = [m for t in toks[1:at] for m in t[1].split(",") if m]
+        if not metrics:
+            raise ValueError("graph what? name a metric before `from`")
+        terms = self.source(toks[at + 1])
+        conds, by, opts, i = [], [], {}, at + 2
         while i < len(toks):
             w = toks[i][1].lower()
             if w == ";":
@@ -1708,43 +1718,33 @@ class Shell:
         report_errors(bad)
         if not samples:
             raise ValueError(
-                f"no tally lines came back. `graph` reads a TALLY store — "
+                "no tally lines came back. `graph` reads a TALLY store — "
                 f"try `select stores from [class=tally]` to see which there are")
 
-        chosen = timbergraph.matching(samples, metric, None)
-        if opts.get("quantile") is not None:
-            if not timbergraph.is_histogram(chosen):
-                raise ValueError(f"{metric} is not a histogram — it has no `le` ladder")
-            lines = timbergraph.quantile(chosen, opts["quantile"], tuple(by))
-            what = f"p{opts['quantile'] * 100:g}"
-        elif timbergraph.is_histogram(chosen) and not by:
-            raise ValueError(
-                f"{metric} is a cumulative `le` ladder, and summing one "
-                f"multiplies the count — ask for `quantile 0.95`, or `by le`")
-        else:
-            what, lines = timbergraph.series(
-                chosen, metric, tuple(by), None, None, opts.get("rate", False))
-
         facts = timbergraph.extractor_facts([opts["using"]]) if "using" in opts else {}
-        fact = dict(facts.get(metric, {}))
-        fact.setdefault("unit", timbergraph.tape_units(markers).get(metric))
-        unit = fact.get("unit") or ""
-        if opts.get("rate"):
-            unit = f"{unit}/s" if unit else "per second"
-        title = fact.get("description") or metric
-        ylabel = f"{what} ({unit})" if unit else what
+        units = timbergraph.tape_units(markers)
+        for m in metrics:
+            facts.setdefault(m, {})
+            facts[m].setdefault("unit", units.get(m))
 
-        every = sorted({ts for at in lines.values() for ts in at})
+        lines, ylabel, y2label, on_y2 = timbergraph.terms(
+            samples, metrics, tuple(by), None, None, opts.get("rate", False),
+            opts.get("quantile"), facts)
+
+        title = (facts[metrics[0]].get("description") if len(metrics) == 1
+                 else None) or ", ".join(metrics)
+        every = sorted({ts for a in lines.values() for ts in a})
         window = (every[0], every[-1]) if every else (0, 0)
         marks = [(m.ts, m.metric) for m in markers
                  if m.metric in timbergraph.TROUBLE
                  and window[0] <= m.ts <= window[1]
-                 and m.labels.get("metric") == metric]
+                 and m.labels.get("metric") in metrics]
 
         dest = opts.get("png") or opts.get("svg")
         terminal = "pngcairo" if "png" in opts else "svg" if "svg" in opts else "dumb"
         size = ((1000, 500) if dest else timbergraph.terminal_size())
-        text = timbergraph.script(lines, title, ylabel, terminal, size, marks, dest)
+        text = timbergraph.script(lines, title, ylabel, terminal, size, marks,
+                                  dest, y2label, on_y2)
         drawn = timbergraph.draw(text, terminal)
         if drawn:
             sys.stdout.write(drawn)

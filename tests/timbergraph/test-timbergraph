@@ -118,6 +118,31 @@ def test_a_cumulative_ladder_is_never_summed():
     check("p99", 100.0, g.quantile(samples, 0.99)[()][g.parse_stamp("2026-09-06T13:37:00.000Z")])
 
 
+def test_two_metrics_share_a_graph_and_a_unit_decides_the_axis():
+    """Two response times share an axis honestly. A count and a byte
+    total do not — and drawing them as though they did is how a plot
+    makes any two things look related, which matters most in the case
+    somebody plots two metrics FOR: checking whether they are."""
+    both = TALLY + "2026-09-06T13:37:00.000Z 60s http_bytes count=10 sum=4096\n"
+    samples, markers = g.read(both)
+    facts = {"http_requests": {"unit": "requests"}, "http_bytes": {"unit": "B"}}
+    lines, ylabel, y2label, on_y2 = g.terms(
+        samples, ["http_requests", "http_bytes"], facts=facts)
+    check("both drawn", True, len(lines) >= 2)
+    check("first axis", "count (requests)", ylabel)
+    check("second axis", "sum (B)", y2label)
+    check("only the second is on it", {("http_bytes",)}, on_y2)
+    # The metric is in the series name once there is more than one, or
+    # two lines would answer to one legend entry.
+    check("named", True, all(k[0].startswith("http_") for k in lines))
+
+    # One unit, one axis.
+    same = {"http_requests": {"unit": "requests"},
+            "http_bytes": {"unit": "requests"}}
+    _, _, y2, _ = g.terms(samples, ["http_requests", "http_bytes"], facts=same)
+    check("one axis", None, y2)
+
+
 def test_the_unit_comes_from_the_tape_or_the_document():
     _, markers = g.read(TALLY)
     check("from the tape", {"http_requests": "requests"}, g.tape_units(markers))

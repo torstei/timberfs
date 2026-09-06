@@ -141,6 +141,8 @@ assets = [
     ["packaging/timberfs-follower.conf.example", "usr/share/doc/timberfs/examples/timberfs-follower.conf.example", "644"],
     ["packaging/extractors/timberfs-volume.json", "usr/lib/timberfs/tally.extractors.d/timberfs-volume.json", "644"],
     ["packaging/extractors/timberfs-apache-combined.json", "usr/lib/timberfs/tally.extractors.d/timberfs-apache-combined.json", "644"],
+    ["packaging/extractors/timberfs-nginx-combined.json", "usr/lib/timberfs/tally.extractors.d/timberfs-nginx-combined.json", "644"],
+    ["packaging/extractors/timberfs-logfmt.json", "usr/lib/timberfs/tally.extractors.d/timberfs-logfmt.json", "644"],
     ["packaging/limits.conf.example", "usr/share/doc/timberfs/examples/limits.conf.example", "644"],
     ["packaging/etc-README", "etc/timberfs/README", "644"],
     ["packaging/forests-default.conf", "etc/timberfs/forests.d/default.conf", "644"],

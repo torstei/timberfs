@@ -1,0 +1,27 @@
+{
+  "v": "1.0-EXPERIMENTAL",
+  "name": "timberfs-logfmt",
+  "description": "An application writing logfmt with the conventional keys. The field names are the PRODUCER's, so this measures the ones most logfmt libraries emit by default and an application using others needs an extractor of its own.",
+  "window": { "axis": "logline", "width_ms": 60000, "grace_ms": 120000 },
+  "metrics": [
+    {
+      "name": "app_events",
+      "description": "events a minute by level",
+      "claim": { "all": [{ "substring": "level=" }] },
+      "fields": { "decode": "logfmt" },
+      "labels": ["level"],
+      "measure": [{ "count": true, "unit": "events" }]
+    },
+    {
+      "name": "app_duration",
+      "description": "how long an operation took, from a `ms` field",
+      "claim": { "all": [{ "substring": "ms=" }] },
+      "fields": { "decode": "logfmt" },
+      "histogram": {
+        "field": "ms",
+        "unit": "ms",
+        "buckets": [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+      }
+    }
+  ]
+}

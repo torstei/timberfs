@@ -1,0 +1,39 @@
+# http_requests: claimed 4 skipped 1 dropped 0
+# http_bytes: claimed 4 skipped 1 dropped 0
+# http_latency: claimed 4 skipped 1 dropped 0
+2026-09-06T11:37:00.000Z 0s !meta metric=http_requests unit=requests
+2026-09-06T11:37:00.000Z 0s !meta metric=http_bytes unit=B
+2026-09-06T11:37:00.000Z 0s !meta metric=http_latency unit=s
+2026-09-06T11:37:00.000Z 60s http_bytes status=200 count=2 sum=3138 @0+203
+2026-09-06T11:37:00.000Z 60s http_bytes status=500 count=1 sum=90 @203+103
+2026-09-06T11:37:00.000Z 60s http_latency le=+Inf status=200 count=2 sum=0.184 @0+203
+2026-09-06T11:37:00.000Z 60s http_latency le=+Inf status=500 count=1 sum=2.4 @203+103
+2026-09-06T11:37:00.000Z 60s http_latency le=0.005 status=200 count=1 @0+101
+2026-09-06T11:37:00.000Z 60s http_latency le=0.01 status=200 count=1 @0+101
+2026-09-06T11:37:00.000Z 60s http_latency le=0.025 status=200 count=1 @0+101
+2026-09-06T11:37:00.000Z 60s http_latency le=0.05 status=200 count=1 @0+101
+2026-09-06T11:37:00.000Z 60s http_latency le=0.1 status=200 count=1 @0+101
+2026-09-06T11:37:00.000Z 60s http_latency le=0.25 status=200 count=2 @0+203
+2026-09-06T11:37:00.000Z 60s http_latency le=0.5 status=200 count=2 @0+203
+2026-09-06T11:37:00.000Z 60s http_latency le=1 status=200 count=2 @0+203
+2026-09-06T11:37:00.000Z 60s http_latency le=10 status=200 count=2 @0+203
+2026-09-06T11:37:00.000Z 60s http_latency le=10 status=500 count=1 @203+103
+2026-09-06T11:37:00.000Z 60s http_latency le=2.5 status=200 count=2 @0+203
+2026-09-06T11:37:00.000Z 60s http_latency le=2.5 status=500 count=1 @203+103
+2026-09-06T11:37:00.000Z 60s http_latency le=5 status=200 count=2 @0+203
+2026-09-06T11:37:00.000Z 60s http_latency le=5 status=500 count=1 @203+103
+2026-09-06T11:37:00.000Z 60s http_requests method=GET status=200 count=2 @0+203
+2026-09-06T11:37:00.000Z 60s http_requests method=POST status=500 count=1 @203+103
+2026-09-06T11:38:00.000Z 60s http_bytes status=200 count=1 sum=2326 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=+Inf status=200 count=1 sum=0.006 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=0.01 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=0.025 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=0.05 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=0.1 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=0.25 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=0.5 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=1 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=10 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=2.5 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_latency le=5 status=200 count=1 @306+101
+2026-09-06T11:38:00.000Z 60s http_requests method=GET status=200 count=1 @306+101
