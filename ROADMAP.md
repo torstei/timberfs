@@ -5,6 +5,14 @@ works is in [docs/design.md](docs/design.md); entries too large to state in a
 paragraph get a design note under [docs/plans/](docs/plans/) and a pointer from
 here.
 
+- **A frame nothing witnesses (a real defect)**: a chunk is the frame then its
+  record, data first, and a crash between them leaves a `.trunk` frame no
+  `.rings` record describes. A wal store recovers its own from the `.sap.seal`;
+  a non-wal flush and a crashed `stage()` leave one with no durable witness of
+  what it is, and on disk those two are indistinguishable though they want
+  opposite treatment. Left alone it also breaks stock-`zstd -dc` recovery of
+  the trunk once a shorter frame is written over part of it. Design note:
+  [docs/plans/frame-witness.md](docs/plans/frame-witness.md).
 - **More `.bark`**: an `annotate` command for existing logs, attribution
   labels from manifest fields in multi-file output (`--label '{host}'`),
   auto-seeded provenance on import, bark-aware routing in the future

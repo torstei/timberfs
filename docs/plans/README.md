@@ -49,6 +49,11 @@ messages and pull requests are for.
 - [logline-order.md](logline-order.md) — ordering a multi-store answer by the
   clock an entry CARRIES: the frontier merge that makes it streamable, and the
   per-chunk logline range it needs.
+- [frame-witness.md](frame-witness.md) — a `.trunk` frame whose `.rings`
+  record never landed: which of the four crash paths can leave one, why the
+  wal's seal already recovers its own, the on-disk stage marker that makes the
+  rest decidable, and the source witness that would let `file-intake` adopt one
+  (and serve a live edge) without writing every byte twice.
 - [tally.md](tally.md) — metrics derived from the log as a tape of their own:
   the extractor as a consumer (and therefore backfillable), the one invariant
   that decides the line format, and how a site declares extractors of its own.
