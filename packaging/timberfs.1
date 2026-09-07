@@ -1649,10 +1649,24 @@ and no more.
 ⚠ On the logline axis event time only advances when events ARRIVE, which
 is what makes a backfill deterministic and what would leave a quiet log's
 last buckets unsealed forever. So a run that has heard nothing for a few
-seconds lets wall clock stand in for event time, and one that has heard
-nothing for ten seconds seals everything it holds: the producer has
-stopped. An entry arriving after that is displaced, which is the rule
-every late entry already follows.
+seconds lets wall clock stand in for event time \(em but only as far as
+the newest entry's stamp plus
+.BR grace ,
+so it seals the buckets in-order data has already left and never the one
+that data is still in. Nothing may seal that bucket, because sealing it
+would need event time pushed past where the data has reached, and every
+entry arriving afterwards would then be displaced out of its own bucket.
+.PP
+⚠ Instead that bucket is STATED, provisionally, and kept open \(em which
+is how a quiet store's newest minute appears at all. A later line for the
+same bucket SUPERSEDES it, carrying the complete total, so a tally tape
+must be read newest-line-wins per bucket. Every reader here does
+.RB ( timbergraph ,
+.BR timberview );
+a reader that SUMMED every line would double-count, and one that took the
+first would report a minute that had barely begun. A run re-reading a
+still-open bucket after a restart states it again for the same reason,
+and that revision is likewise the newer line.
 .RE
 .PP
 .B LATENESS

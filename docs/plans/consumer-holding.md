@@ -1,10 +1,18 @@
 # A consumer that is HOLDING entries: `taken` beside the position
 
-**Status: not built.** A measured defect in the shipped feed→tally pair, and
-the protocol amendment that fixes it. What it rests on is built: the consumer
-protocol's `progress` report, the per-store positions, and `Roller`'s sealing
-rule. See [consumer-protocol.md](consumer-protocol.md) for the first and
-[tally.md](tally.md) for the last — this note amends a claim in each.
+**Status: BUILT.** `taken` on the progress report, the park and the read
+gating on it, the provisional bucket, `advance_to`'s clamp, and `feed` saying
+`stream-end`. Measured after: **51 → 51,949 entries/s** at the unchanged
+default batch size, and the tape a batched pipeline writes is now
+byte-identical to one in-memory pass over the same store. What is NOT built
+is the hot-loop work in its own section below, and the open questions at the
+end.
+
+It amends a claim in [consumer-protocol.md](consumer-protocol.md) (a consumer
+took it or dropped it) and one in [tally.md](tally.md) (`safe_offset` is
+already the answer). ⚠ And it amends ITSELF: the fix this note first proposed
+for the quiet tail was wrong, and the section below says how — that is the
+one part worth reading if you read nothing else.
 
 ## The defect
 
@@ -41,9 +49,21 @@ visible as an error:
   batch. At the shipped 60 s/120 s window the crossover arrives after ~5.5
   minutes of backfill.
 
-⚠ **`!late count=512` on a tally store, with 512 the follower's batch size,
-is this defect's signature.** It is the one thing an operator can grep for
-before the fix lands.
+⚠ **The two phases leave different traces, and only one leaves a marker.**
+`!late count=<batch size>` is the displacement phase's signature, and it
+needs an arrival rate high enough (~64/s at the shipped window) for the
+injected wall clock to outrun the data — so a store slower than that is
+under-reporting with *nothing* to grep for. What finds the fragment phase is
+duplicate bucket-and-series lines, which no correct tape has:
+
+```sh
+timberfs query <tally-store> | grep -v ' !' \
+  | sed -E 's/ (count|sum|min|max|last)=[^ ]*//g; s/ @[0-9]+\+[0-9]+$//' \
+  | sort | uniq -d
+```
+
+⚠ Since the fix a tape carries deliberate revisions, so that check no longer
+means what it meant: it is for reading a tape written by an older build.
 
 ## Two rules, each right alone
 
@@ -142,30 +162,77 @@ fragments.
 
 ### What it also fixes
 
-With the pipeline flowing there is no stall, so the 10-second force-seal
-never fires mid-stream — and both wrong answers go with it. One change, three
-symptoms.
+With the pipeline flowing there is no stall, so the force-seal never fires
+mid-stream during a backfill — which removed the displacement outright.
 
-## Independently wrong, and worth fixing either way
+## ⚠ Where this note was WRONG: the quiet tail
 
-* **`finish()` is not a mid-stream flush.** It force-drains regardless of
-  sealing, and a bucket that later receives more entries simply re-opens at
-  the same start and is emitted again — no displacement, no marker, because
-  the watermark never crossed `start + width + grace`. That is the unmarked
-  undercount above. `finish()` is sound only at true end of stream (stdin
-  closed). The tail of a genuinely quiet log should come out via `advance()`,
-  which seals through the watermark and therefore marks a later arrival
-  `!late` honestly. The cost is that a quiet store's last bucket appears after
-  `grace` of quiet — which is what `grace` means, and what a smaller `grace`
-  is for.
-* **`idle()`'s wall-clock advance must be gated on the live edge.** It is
-  documented "For a LIVE reader only" (`Roller::advance`), but it fires on
-  any 2-second gap in the record stream — including a backfill stalled by the
-  park. That injects 8 s of fabricated event time per 10 s cycle against 2.56
-  s of real log time per batch, the watermark outruns the data, and every
-  entry after that is displaced. Fixing the park removes the stall that
-  triggers it, but the gate is still missing and should be explicit rather
-  than left to depend on the park being fast.
+The first version of this note said `finish()` should be reserved for true
+end of stream and that "the tail of a genuinely quiet log should come out via
+`advance()`, which seals through the watermark". **That does not work, and
+implementing it is how the hole showed up.**
+
+`advance()` can never seal the bucket the newest entry is IN. Sealing it
+needs the watermark past `start + width + grace`, i.e. past event time the
+data has not reached — and every entry arriving afterwards is then late and
+displaced out of its own bucket, which is the second wrong answer above,
+caused deliberately this time. So under that proposal a store's newest bucket
+never appears while it is live: a store getting one request a minute would
+have shown nothing until the following minute, and the shipped 3-entry VM
+test could never have produced a line at all.
+
+**The real defect was narrower than the note claimed.** Force-draining a
+bucket is not wrong; force-draining and then EVICTING it is. Each tick then
+emitted only what had arrived since the last one, and a reader resolving a
+bucket to its newest line took the last fragment for the whole. So:
+
+* a quiet tick states every changed OPEN bucket and **keeps it open**
+  (`Drain::Provisional`), so the next line for that bucket carries the
+  complete total and supersedes the provisional one — which is what `resolve`
+  and `timbergraph.read` already do with two lines for one bucket;
+* `Drain::Final` — emit and evict — is for a stream that has genuinely ended;
+* an unchanged bucket is not restated, so a quiet store does not write the
+  same numbers every two seconds;
+* and a provisional line does **not** move the position, because the bucket
+  is still open. That falls out of keeping it: `safe_offset` still names its
+  oldest byte.
+
+⚠ **A tally tape therefore carries revisions in normal operation**, where
+before it only did in principle ("nothing emits a revision", `timbergraph`).
+Reading one newest-line-wins per bucket is now load-bearing rather than a
+guard against re-running an extractor. Summing every line double-counts.
+
+⚠ **Known cost**: a follower restarted before a bucket seals re-reads it and
+states it again, so the tape grows by one line per series per restart until
+that bucket closes. Bounded by restarts rather than by time, and every such
+line carries the same value, so the resolved answer does not move — verified
+across three passes over a one-bucket store.
+
+`advance` did still need fixing, and separately:
+
+* **`advance_to` is clamped to `last_event + grace`.** It was
+  `advance(by_ms)`, unclamped, so a stalled backfill's 2-second ticks
+  injected 8 s of fabricated event time per 10 s against 2.56 s of real log
+  time, the watermark outran the data, and every batch after that was
+  displaced whole. The clamp makes it seal exactly the buckets in-order data
+  has already left and never the one it is in — which is the same invariant
+  the provisional bucket rests on, so there is one rule rather than two. It
+  also tracks `last_event` apart from `watermark`, since the latter is no
+  longer only event time.
+
+## Found while building: `feed` never said `stream-end`
+
+A one-shot `feed` closed the consumer's stdin and wrote no `stream-end`, and
+a records stream without one is TRUNCATED by definition (`records.rs` treats
+it as an error, never a short result). So `tally --run` bailed with "record
+stream truncated — no stream-end (producer died or pipe broke)", abandoned
+the buckets it was holding and exited 1 — **on every clean stop of a tally
+follower, and at the end of every one-shot**, losing the tail each time.
+Measured before the fix on a 500k-entry store: 468,000 delivered, exit 1.
+`feed` now says `stream-end status=exhausted` before closing, but only where
+its own loop succeeded: on our own failure the stream really is truncated,
+and claiming otherwise would have the consumer seal partial buckets as whole
+ones.
 * **The `--max` note leaks the follower's internals.** `timberfs: stopped at
   --max 512; more entries matched than were shown` (`query.rs`, reached
   through `ship.rs`) is `query`'s message about a bound the operator never
@@ -223,14 +290,17 @@ several batch boundaries, resolve the resulting tape the way
 fed. Per the test-placement rule this is an integration test of the feed→tally
 pair rather than a VM test — nothing here needs a VM.
 
-## The numbers already collected
+## The numbers collected before the fix
 
 Not salvageable, and not partially salvageable: an undercount of an unknown
-factor in the early minutes and displaced buckets after that, with markers on
-only the second. The source stores still hold the lines, so the remedy is to
-drop the tally stores and re-derive from a reset position once the fix is in —
-which is the backfill property tally was designed for and is the thing worth
-checking the fix against.
+factor, and displaced buckets too on a store fast enough to reach that phase,
+with markers on only the second. The source stores still hold the lines, so
+the remedy is to drop the tally stores and re-derive from a reset position —
+which is the backfill property tally was designed for, and is the check the
+fix was verified against: the tape a batched pipeline writes over a
+500k-entry store is now **byte-identical** to one in-memory `--try` pass over
+the same lines, and its resolved `http_requests` total is exactly the 500,000
+entries fed.
 
 ## Open
 

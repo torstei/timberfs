@@ -5399,6 +5399,20 @@ tally_fold_buckets_anybodys_observations() {
         | grep -qx '2026-09-06T10:00:00.000Z 60s gc_pause count=2 sum=2' || return 1
 }
 
+# One line per bucket and series, keeping the NEWEST — what `resolve`
+# and `timbergraph.read` do with a tally tape, in awk, because that
+# resolution is the contract a re-run has to preserve.
+resolved_tally() {
+    timberfs query "$1" 2>/dev/null | grep -v ' !' | awk '{
+        key = ""; val = ""
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^(count|sum|min|max|last)=/ || $i ~ /^@/) { val = val " " $i }
+            else { key = key " " $i }
+        }
+        last[key] = val
+    } END { for (k in last) print k, last[k] }' | sort
+}
+
 tally_provisioning_end_to_end() {
     # The whole loop from a config file: a provisioning declares which
     # stores get a tally store, the follower it registers writes them,
@@ -5439,9 +5453,11 @@ CONF
         return 1
     }
 
-    # The producer is quiet, so the run seals what it holds and exits on
-    # the timeout; 25s is comfortably past the ten it waits.
-    timeout 25 timberfs follower run tally-vmprov >/dev/null 2>&1
+    # The producer is quiet, so the run states the bucket it is holding
+    # PROVISIONALLY on its first idle tick and keeps it open — nothing
+    # seals a bucket the newest entry is still in, since that would need
+    # event time pushed past it. 10s is several ticks.
+    timeout 10 timberfs follower run tally-vmprov >/dev/null 2>&1
     timberfs query "$d/vmprov-tally.log" 2>/dev/null > /tmp/vmprov.tally
     grep -q 'http_requests method=GET status=200 count=2' /tmp/vmprov.tally || {
         cat /tmp/vmprov.tally >&2
@@ -5470,13 +5486,27 @@ CONF
         return 1
     }
 
-    # ⚠ A second pass must not recount: the position is the follower's.
+    # ⚠ A second pass must not recount — and what that means is that the
+    # bucket's VALUE is unchanged, not that the tape is. A bucket still
+    # open is re-stated by every run that re-reads it (its position stays
+    # behind it on purpose, so a restart re-derives it), and the newest
+    # line for a bucket is the one that counts. Asserting the line count
+    # instead would forbid the revision that makes this correct.
     local before after
-    before=$(wc -l < /tmp/vmprov.tally)
-    timeout 20 timberfs follower run tally-vmprov >/dev/null 2>&1
-    after=$(timberfs query "$d/vmprov-tally.log" 2>/dev/null | wc -l)
+    before=$(resolved_tally "$d/vmprov-tally.log")
+    timeout 10 timberfs follower run tally-vmprov >/dev/null 2>&1
+    after=$(resolved_tally "$d/vmprov-tally.log")
     [ "$before" = "$after" ] || {
-        echo "recounted: $before then $after" >&2
+        echo "recounted:" >&2
+        printf 'before:\n%s\nafter:\n%s\n' "$before" "$after" >&2
+        return 1
+    }
+    # And the revision really is what is being relied on: a second pass
+    # DID write the bucket again, so a reader that summed every line
+    # would now double it.
+    [ "$(timberfs query "$d/vmprov-tally.log" 2>/dev/null \
+            | grep -c 'http_requests method=GET status=200 count=2')" -gt 1 ] || {
+        echo "the second pass wrote no revision, so this proves nothing" >&2
         return 1
     }
 

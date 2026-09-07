@@ -603,6 +603,16 @@ pub struct Imposed {
     pub max: bool,
     pub max_chunks: bool,
     pub deadline: bool,
+    /// This read's bounds are a CALLER's internal batching, not anything
+    /// an operator typed or a limits file imposed — so the notes that
+    /// explain a short answer to a person are suppressed. `stream-end`
+    /// still says `status=limited`, which is how the program driving it
+    /// finds out.
+    ///
+    /// ⚠ `feed`'s batch size reached the operator as "stopped at --max
+    /// 512; more entries matched than were shown", once per batch, for
+    /// as long as a follower was behind — a `--max` nobody had typed.
+    pub internal: bool,
 }
 
 impl Imposed {
@@ -978,7 +988,10 @@ pub fn read_forward<W: Write>(
         false,
         true,
         Some(max),
-        Default::default(),
+        Imposed {
+            internal: true,
+            ..Default::default()
+        },
         &Budget::Unbounded,
     )
 }
@@ -1486,7 +1499,7 @@ fn query_entries<W: Write>(
     out.flush()?;
     // The same thing `status=limited` tells a program, told to a person:
     // a count alone reads as the whole answer, and this one is not.
-    if limited {
+    if limited && !imposed.internal {
         if let Some(m) = max {
             if imposed.max {
                 crate::note!(

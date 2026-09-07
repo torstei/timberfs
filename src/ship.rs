@@ -268,19 +268,28 @@ impl Shipper {
     /// so nothing drifts between what timberfs wrote and what the
     /// consumer reads.
     pub fn poll_raw(&mut self) -> anyhow::Result<(Vec<u8>, Vec<Store>, usize)> {
-        self.poll_excluding(&|_| false)
+        self.poll_excluding(&|_| false, &|_| None)
     }
 
-    /// The same read, skipping the stores `parked` names.
+    /// The same read, skipping the stores `parked` names and resuming
+    /// each from `read_from` where that is further on than its position.
     ///
     /// PER-STORE FLOW CONTROL, which the caller owns because only it
     /// knows what its consumer has taken. Without it one store that
     /// never advances is re-read from the same place on every poll, its
     /// entries fill the shared cap, and the loop never rests — the
     /// head-of-line block the frames wire reserved a window for.
+    ///
+    /// ⚠ `read_from` is why the two are separate questions. A consumer
+    /// HOLDING entries keeps its position behind them deliberately, so
+    /// reading from the position would hand it the same entries for
+    /// ever; it reports how far it has READ, and that is where the next
+    /// read starts. In memory and never persisted — see
+    /// `consumer::Report::Progress`.
     pub fn poll_excluding(
         &mut self,
         parked: &dyn Fn(&str) -> bool,
+        read_from: &dyn Fn(&str) -> Option<u64>,
     ) -> anyhow::Result<(Vec<u8>, Vec<Store>, usize)> {
         let matches = crate::select::resolve(&self.dirs, &self.selector);
         let matched = matches.len();
@@ -319,13 +328,17 @@ impl Shipper {
             return Ok((Vec::new(), stores, matched));
         }
         let files: Vec<PathBuf> = stores.iter().map(|(_, p, _)| p.clone()).collect();
+        let mut cursor = self.positions.cursor();
+        for (id, _, _) in &stores {
+            // Never backwards: the recorded position is the floor, so a
+            // consumer cannot ask to be re-sent what it acknowledged.
+            if let Some(at) = read_from(id).filter(|at| *at > cursor.get(id).copied().unwrap_or(0))
+            {
+                cursor.insert(id.clone(), at);
+            }
+        }
         let mut buf = Vec::new();
-        crate::query::read_forward(
-            &mut buf,
-            &files,
-            &self.positions.cursor(),
-            self.batch_entries,
-        )?;
+        crate::query::read_forward(&mut buf, &files, &cursor, self.batch_entries)?;
         Ok((buf, stores, matched))
     }
 

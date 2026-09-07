@@ -66,6 +66,9 @@ itself.
     hello      v=1  reads=records          (once, before anything else)
                [ id=<store> offset=<n> ]*  what it ALREADY holds — a HINT
     progress   id=<store>  offset=<n>      (whenever it likes)
+               [ taken=<n> ]               how far it has READ, if that is
+                                           past the offset — flow control
+                                           only, never persisted
     note       [ id=<store> ] [ offset=<n> ]  text=<json string>
 
 **No hello, no run.** timberfs refuses rather than silently falling back to
@@ -305,16 +308,20 @@ not a matter of raising a number: it needs a SENT offset per store, kept
 beside the acknowledged one and read from instead of it. Otherwise "further
 ahead" means "the same entries again", which is what the park exists to stop.
 
-⚠⚠ **And a consumer that HOLDS entries cannot be served at that depth at
-all.** The park reads the position as flow control, so a consumer whose
+⚠⚠ **And a consumer that HOLDS entries could not be served at that depth at
+all**, which is why `progress` now carries an optional `taken` beside its
+`offset`. The park read the position as flow control, so a consumer whose
 position is deliberately conservative — tally's, which may not pass a byte an
-open bucket still depends on — is parked on its own correctness and never fed
-the entries that would let it advance. Measured: a tally follower capped at
-**51 entries/s** against the 310,000/s its extractor can do, with numbers
-silently wrong on both sides of the stall.
-[consumer-holding.md](consumer-holding.md) has the measurements and the
-`taken` field that separates the two meanings; the "took it or dropped it"
-dichotomy above is what it amends.
+open bucket still depends on — was parked on its own correctness and never
+fed the entries that would let it advance: measured at **51 entries/s**
+against the 310,000/s its extractor can do, with numbers silently wrong
+besides. `taken` says how far it has READ, for pacing only, and the park and
+the read now gate on that. So the depth above is the depth for a consumer
+that reports no `taken`, which is every consumer that does not hold.
+[consumer-holding.md](consumer-holding.md) has the measurements; the "took it
+or dropped it" dichotomy above is what it amends, and `MAX_HELD_ENTRIES` is
+the backstop that replaces the batch size as the bound on what one store may
+have outstanding.
 
 What the stalled store then costs is retention, not throughput: its position
 stops moving, so a `retaining` follower holds everything from there — which

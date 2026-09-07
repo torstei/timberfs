@@ -105,9 +105,57 @@ struct Tracked {
     /// bytes; what the position file records beside it — the chunk for
     /// the retention floor, the write time for a person reading it —
     /// was stated by the answer when those bytes went out, and this is
-    /// where it is kept until the consumer says it took them. Bounded by
-    /// the batch size.
+    /// where it is kept until the consumer says it took them.
+    ///
+    /// ⚠ Bounded by the batch size only for a consumer that does not
+    /// report `taken`; for one that does it is bounded by what that
+    /// consumer HOLDS, and ultimately by `MAX_HELD_ENTRIES`.
     pending: Vec<Pending>,
+    /// How far the consumer says it has READ, where that is past the
+    /// position it can be resumed from — a consumer HOLDING entries.
+    ///
+    /// ⚠ Flow control only, and deliberately not persisted: a consumer
+    /// that was holding entries lost them when it died, so a restart
+    /// must re-send from the recorded position. `None` means it has
+    /// never said, which is every consumer that does not hold.
+    taken: Option<u64>,
+    /// Whether `MAX_HELD_ENTRIES` has been reported for this store. Said
+    /// once: a stall an operator cannot see is the defect this whole
+    /// change exists to remove, and repeating it per poll would bury it.
+    said_held: bool,
+}
+
+/// Entries sent and neither taken nor acknowledged, which is what the
+/// park bounds. Once a consumer says it has TAKEN them they no longer
+/// hold the store back, however far behind its position stays.
+fn in_flight(t: &Tracked) -> usize {
+    match t.taken {
+        None => t.pending.len(),
+        Some(taken) => t.pending.iter().filter(|p| p.end > taken).count(),
+    }
+}
+
+/// How many entries a consumer may hold — taken, so no longer parking
+/// the store, but not yet acknowledged — before it is parked anyway.
+///
+/// ⚠ A BACKSTOP, not a tuning knob, and the reason one is needed at all:
+/// `pending` remembers each such entry's chunk and write time until the
+/// position passes it, so what used to be bounded by the batch size is
+/// now bounded by whatever the consumer holds. A tally consumer holds
+/// `width + grace` of entries, which is a few hundred KB on a busy store
+/// and fine; a consumer that reports `taken` and then never acknowledges
+/// is a leak with nothing to stop it. Generous enough that no correct
+/// consumer reaches it (~64 MB of bookkeeping), and reaching it parks
+/// the store — the old behaviour — rather than failing.
+const MAX_HELD_ENTRIES: usize = 2_000_000;
+
+/// Entries the consumer has TAKEN and not acknowledged, i.e. what it is
+/// holding and `pending` therefore still has to remember.
+fn held(t: &Tracked) -> usize {
+    match t.taken {
+        None => 0,
+        Some(taken) => t.pending.iter().filter(|p| p.end <= taken).count(),
+    }
 }
 
 struct Pending {
@@ -184,7 +232,22 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
         holds,
         &mut tracked,
     );
-    // Closing its stdin is how a consumer learns the stream ended, so
+    // ⚠ Said, not merely implied by the close. A records stream with no
+    // `stream-end` is TRUNCATED — `records.rs` treats it as an error,
+    // never a short result — so closing stdin on a consumer that reads
+    // the stream properly reported a clean end as a producer that died:
+    // `tally --run` bailed with "record stream truncated", abandoned the
+    // buckets it was holding, and exited 1. Every stop of a tally
+    // follower did that, and a one-shot lost its tail every time.
+    //
+    // Only where the loop itself is ok: on our own failure the stream
+    // really is truncated, and saying otherwise would have the consumer
+    // seal partial buckets as though they were whole.
+    if result.is_ok() {
+        let _ = sink.write_all(b"\x1estream-end\x1fstatus=exhausted\0");
+        let _ = sink.flush();
+    }
+    // Closing its stdin is how a consumer learns to stop reading, so
     // that comes first and a kill only after it has had a chance to
     // leave on its own — killing at once would report every clean
     // one-shot as a signal death.
@@ -340,28 +403,49 @@ fn feed(
     let mut skipped;
     loop {
         let (buf, stores, matched) = {
-            // A store with anything UNACKNOWLEDGED is parked: it has
-            // nothing new to offer, and asking would cost the stores
-            // beside it. Its recorded position only moves when the
-            // consumer acknowledges, so a read starting there hands back
-            // the entries already in flight — duplicates, filling the
-            // shared entry cap, on every poll, for as long as the
-            // trouble lasts. Measured: a consumer taking entries and
+            // A store with anything NEITHER TAKEN NOR ACKNOWLEDGED is
+            // parked: it has nothing new to offer, and asking would cost
+            // the stores beside it. Without the park a store that never
+            // advances is re-read from the same place on every poll —
+            // duplicates, filling the shared entry cap, for as long as
+            // the trouble lasts. Measured: a consumer taking entries and
             // acknowledging none held this at 99% of a core without the
             // park and 0% with it, and the test for it does not fail
             // without it, it never finishes.
             //
-            // ⚠ So the depth is one outstanding batch per store, and
-            // pipelining deeper is not a matter of raising a number: it
-            // needs a SENT offset per store, kept beside the
-            // acknowledged one and read from instead of it. Otherwise
-            // "further ahead" means "the same entries again", which is
-            // what this stops.
-            let parked = |id: &str| tracked.get(id).is_some_and(|t| !t.pending.is_empty());
+            // ⚠ It bounds what the consumer has not READ, not what it
+            // has not acknowledged, and those differ for a consumer
+            // HOLDING entries — one whose position stays behind them on
+            // purpose because it re-derives them after a restart. Gating
+            // on the position deadlocked such a consumer against its own
+            // correctness: tally reported the oldest byte an open bucket
+            // depended on, was parked there, and could not be sent the
+            // entries that would have sealed the bucket. Measured at 51
+            // entries/s against the 310,000/s its extractor does, with
+            // numbers silently wrong besides. See `in_flight`,
+            // `consumer::Report::Progress` and
+            // docs/plans/consumer-holding.md.
+            // Said before the read, where a `&mut` is still available:
+            // the park closure below cannot speak.
+            for (id, t) in tracked.iter_mut() {
+                if held(t) >= MAX_HELD_ENTRIES && !t.said_held {
+                    t.said_held = true;
+                    crate::note!(
+                        "timberfs: {id}: the consumer has taken {} entries without                          acknowledging any of them, which is as many as this will track for                          one store — pausing that store until it reports a position. Its                          other stores are unaffected",
+                        held(t)
+                    );
+                }
+            }
+            let parked = |id: &str| {
+                tracked
+                    .get(id)
+                    .is_some_and(|t| in_flight(t) > 0 || held(t) >= MAX_HELD_ENTRIES)
+            };
+            let read_from = |id: &str| tracked.get(id).and_then(|t| t.taken);
             // Whether ANY store was held out of this read, because that
             // decides what its emptiness means (see below).
-            skipped = tracked.values().any(|t| !t.pending.is_empty());
-            shipper.poll_excluding(&parked)?
+            skipped = tracked.values().any(|t| in_flight(t) > 0);
+            shipper.poll_excluding(&parked, &read_from)?
         };
         if said != Some(matched) {
             crate::note!("timberfs: following {matched} store(s)");
@@ -381,7 +465,7 @@ fn feed(
         }
         // Nothing to send. Either the stores are quiet, or every store
         // that has anything left is parked waiting to be acknowledged.
-        if !tracked.values().any(|t| !t.pending.is_empty()) {
+        if !tracked.values().any(|t| in_flight(t) > 0) {
             // ⚠ And only where the read was not narrowed. A store parked
             // AT POLL TIME is excluded from the read, and its report can
             // arrive in the drain a few lines above — so "nothing to
@@ -432,7 +516,7 @@ fn feed(
                     if !pacing.follow {
                         let stalled: Vec<&str> = tracked
                             .iter()
-                            .filter(|(_, t)| !t.pending.is_empty())
+                            .filter(|(_, t)| in_flight(t) > 0)
                             .map(|(id, _)| id.as_str())
                             .collect();
                         // Not an error: the positions are honest about
@@ -485,6 +569,8 @@ fn announce(
             path: path_text.clone(),
             announced: None,
             pending: Vec::new(),
+            taken: None,
+            said_held: false,
         });
         if entry.announced.as_ref() == Some(labels) {
             continue;
@@ -556,7 +642,7 @@ fn take(
     rep: Report,
 ) -> anyhow::Result<bool> {
     match rep {
-        Report::Progress { id, offset } => {
+        Report::Progress { id, offset, taken } => {
             let Some(t) = tracked.get_mut(&id) else {
                 crate::note!(
                     "timberfs: the consumer acknowledged store {id}, which it was never sent \
@@ -564,6 +650,13 @@ fn take(
                 );
                 return Ok(false);
             };
+            // ⚠ Monotonic, and never derived from `offset`: a consumer
+            // that reported `taken` once and omits it later has not
+            // withdrawn it — it is saying nothing about its reading,
+            // which is not the same as having unread what it read.
+            if let Some(at) = taken {
+                t.taken = Some(t.taken.unwrap_or(0).max(at));
+            }
             // What the position file records beside the offset — the
             // chunk for the retention floor, the write time for a person
             // — as the answer stated it when those entries went out.
@@ -806,6 +899,77 @@ done"#,
     /// shared cap so the read always reports `limited`, and the loop
     /// never rests: measured before the window, one store in trouble
     /// pushed the same rejected entries at a full core indefinitely.
+    /// A consumer HOLDING entries — one whose position stays behind them
+    /// on purpose — must still be fed, and this is the test the whole
+    /// `taken` field exists for.
+    ///
+    /// ⚠ Without it the park gates on the position, so such a consumer
+    /// is parked at the first entry it holds and never sent the ones
+    /// that would let it advance. That is not a slowdown, it is a
+    /// standstill: measured on the release binary, a tally follower
+    /// moved one batch per ten seconds — 51 entries/s against the
+    /// 310,000/s its extractor does — because only a ten-second idle
+    /// timer broke the deadlock. Here there is no such timer, so
+    /// without `taken` this test does not merely fail, it delivers one
+    /// batch and stops.
+    #[test]
+    fn a_consumer_that_holds_entries_is_still_fed() {
+        let _forking = crate::store::fork_guard();
+        let root = forest("holding", &[("aaa", 20)]);
+        let out = root.join("got.txt");
+        let pos = root.join("positions.json");
+        // Holds everything: its position never leaves 0, and it says so
+        // — while reporting how far it has actually read.
+        let script = format!(
+            r#"printf '\036hello\037v=1\037reads=records\000'
+while IFS= read -r -d '' hdr; do
+  kind=${{hdr%%$'\037'*}}; kind=${{kind#$'\036'}}
+  [ "$kind" = entry ] || continue
+  f() {{ printf '%s' "$hdr" | tr '\037' '
+' | sed -n "s/^$1=//p"; }}
+  len=$(f len); off=$(f offset); id=$(f id)
+  payload=$(head -c "$len"; head -c 1 >/dev/null)
+  printf '%s
+' "$payload" >> {out}
+  printf '\036progress\037id=%s\037offset=0\037taken=%s\000' "$id" "$((off + len))"
+done"#,
+            out = out.display()
+        );
+        let mut o = opts(&root, Some(&pos), vec!["bash".into(), "-c".into(), script]);
+        // Several batches, so a park would show as a truncated drain.
+        o.batch_entries = 4;
+        run(o).unwrap();
+
+        assert_eq!(
+            lines(&out).len(),
+            20,
+            "a holding consumer was starved: it got {} of 20 entries",
+            lines(&out).len()
+        );
+        // And its POSITION did not move, because it said it had not.
+        let held = crate::cursor::Positions::load(&pos).unwrap().unwrap();
+        assert!(
+            held.at.values().all(|a| a.offset == 0),
+            "a position moved on a consumer that only reported `taken`"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `taken` is flow control and NOT a licence to skip: a consumer
+    /// cannot be resumed from bytes it has not read, so a report whose
+    /// `taken` is behind its own position is refused rather than acted
+    /// on.
+    #[test]
+    fn taken_behind_the_position_is_refused() {
+        let mut r = crate::consumer::Reader::new(std::io::Cursor::new(
+            b"\x1ehello\x1fv=1\x1freads=records\0\x1eprogress\x1fid=a\x1foffset=90\x1ftaken=10\0"
+                .to_vec(),
+        ));
+        r.next_report().unwrap().expect("the hello");
+        let err = r.next_report().unwrap_err().to_string();
+        assert!(err.contains("taken"), "unhelpful refusal: {err}");
+    }
+
     #[test]
     fn a_store_that_is_never_acknowledged_parks_and_the_others_run() {
         let _forking = crate::store::fork_guard();

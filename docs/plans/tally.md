@@ -12,13 +12,15 @@ derived from the file, and `--run` is the consumer that follower execs. Not
 built: the `samples` response kind, rollups, the session, and the `!gap`
 marker.
 
-⚠ **The provisioned path is built and DEFECTIVE, and should not be enabled on
-a store busier than ~51 entries/s until it is fixed**: it deadlocks against
-the follower's park, runs at that rate whatever the hardware, and writes
-numbers that are silently short and then silently in the wrong buckets. The
-pipe below, `--try` and `--fold` are unaffected — the defect is in the
-consumer protocol's flow control, not in the extractor or the fold. Measured,
-diagnosed and fixed in [consumer-holding.md](consumer-holding.md).
+⚠ **The provisioned path was defective until the `taken` report** and a tally
+store written before it holds numbers that are silently short: it deadlocked
+against the follower's park and ran at 51 entries/s whatever the hardware.
+Fixed — measured at 51,949 entries/s after, with the tape byte-identical to
+one in-memory pass — but a store carried over from before wants dropping and
+re-deriving. `--try`, `--fold` and the pipe below were never affected; the
+defect was in the consumer protocol's flow control, not the extractor or the
+fold. [consumer-holding.md](consumer-holding.md) has the measurements, and
+the revision rule a tally tape now relies on.
 
 It rests on the follower registry and its position per store
 ([follower-selection.md](follower-selection.md)), the consumer protocol
@@ -1028,13 +1030,13 @@ loss, recorded exactly — the same rule retention already follows.
   the tally store with its labels and lineage, and writing the `!gap` marker
   from the registry's GAP.
 
-  ⚠ `safe_offset` is the right watermark and the WRONG thing to report as the
-  consumer protocol's `progress`, which the follower also reads as flow
-  control: a store is parked until its position moves, so the two rules
-  deadlock and a tally follower runs at **51 entries/s** with numbers that are
-  silently short and then silently displaced. Measured, with the fix, in
-  [consumer-holding.md](consumer-holding.md) — which is the follower half's
-  real remaining work.
+  ⚠ `safe_offset` is the right watermark and was the WRONG thing to report
+  alone as the consumer protocol's `progress`, which the follower also reads
+  as flow control: a store was parked until its position moved, so the two
+  rules deadlocked at **51 entries/s** with numbers silently short. It is now
+  reported beside `taken` — see [consumer-holding.md](consumer-holding.md),
+  which also covers the `!gap` marker's absence being the last piece of this
+  bullet still open.
 * **The `!gap` marker** — the registry reports a GAP when retention dropped
   chunks a follower had not read, and nothing writes it into the tally store
   yet. Until it does, a hole in the numbers and a quiet period look alike.
