@@ -79,8 +79,9 @@ anything.
 ## Where the write window lives
 
 **Without a wal** it exists only in memory until step 6 writes it into the
-record. An orphan frame's window is therefore unrecoverable: the only copy died
-with the process.
+record. An orphan frame's window is therefore unrecoverable from the store
+alone: the only copy died with the process. For `file-intake` it need not be —
+see the source witness below.
 
 **With a wal** every entry's `wf`/`wl` is on disk from step 3, CRC-covered,
 before the frame is written. `apply_entries` folds them back on recovery with
@@ -106,7 +107,7 @@ level), so the state converges exactly, window included.
 |                   | killed flush                       | crashed stage        |
 |-------------------|------------------------------------|----------------------|
 | **wal store**     | recovered, window and all          | orphan, no witness   |
-| **non-wal store** | orphan, window unrecoverable       | orphan, no witness   |
+| **non-wal store** | orphan, window gone unless a source witness | orphan, no witness |
 
 Three are broken, and **on disk they are indistinguishable** — which is the
 actual defect. It is not that the index disagrees with the trunk; it is that
@@ -144,9 +145,9 @@ interrupted collapse, and for the same reason.
 **2. A killed flush on a wal store: keep adopting.** Already the case, via the
 seal. No change beyond letting the marker take precedence.
 
-**3. A killed flush on a non-wal store: discard, and say so.** The frame is
-real data and this is the uncomfortable half, so the reason has to be better
-than tidiness:
+**3. A killed flush on a non-wal store: discard unless a source witness says
+otherwise, and say so either way.** The frame is real data and this is the
+uncomfortable half, so the reason has to be better than tidiness:
 
 * A chunk needs a write window. `comp_start`, `comp_len`, `uncomp_start`,
   `uncomp_len` and `seq` are all recoverable from the frame and its neighbour;
@@ -169,6 +170,47 @@ MORE than the trunk holds and never the reverse; `trunk.set_len(comp_size)`
 belongs beside that loop, gated on the decision above rather than
 unconditional, which is what the first draft of this got wrong.
 
+**5. A source witness for `file-intake` — one sidecar, two jobs.** Where the
+wal writes the bytes again, this records WHERE THEY ARE: `{inode,
+source_offset, buffer_start}`, some two dozen bytes per batch instead of the
+payload. `file-intake` is the intake that can, because it holds a path.
+
+*Recovery.* `follow.rs` extracts each line's timestamp from the line, and does
+so deterministically — so re-reading `source[buffer_start..source_offset]` and
+re-extracting yields the identical window. A killed non-wal flush on such a
+store can therefore ADOPT its frame with a true window rather than discard it,
+which is the whole of decision 3 reversed for the one intake that can afford
+it. ⚠ Recovery runs as the intake's own user, who was tailing the source by
+definition, so permissions never arise here.
+
+*Live tail.* The same witness lets a reader serve the unflushed edge from the
+source file, which is the visibility the wal is otherwise declared for. Serve
+from the source only when ALL of these hold, and fall back to store-only
+otherwise:
+
+* the witness exists and its inode matches the path's — else rotation or
+  copytruncate has moved the bytes, and reading the offset anyway would serve
+  a DIFFERENT log's content;
+* the intake is not mid re-sync — `follow.rs` arms `dedup` at startup when the
+  source overlaps what the store holds and drops lines one by one, so in that
+  window the source carries lines the store deliberately skipped;
+* the READER can open the source as itself. No helper, no setuid, no ambient
+  authority: the kernel decides, so this grants nothing that `cat` would not.
+
+⚠ **Which mode answered must be VISIBLE.** Two operators on one incident, one
+root and one not, otherwise see different edges and read the difference as data
+loss. The fallback is exactly today's no-wal behaviour, so nothing regresses —
+but `--follow` has to say "live edge from the source" or "store only, N seconds
+behind" rather than leave it to be inferred.
+
+⚠ And it is ADVISORY. A store cannot promise a live edge it reads from
+somewhere else, so nothing may depend on one: monitoring and incident work are
+the use, not a contract.
+
+Not available to `append` from a pipe, `forward` or `otlp` — those have no
+source to point at, which is exactly why they are the intakes that call
+`sap_sync()`.
+
 ## Why the non-wal path stays
 
 Not for compatibility. The wal writes every entry twice — raw into the sap,
@@ -188,6 +230,24 @@ becomes queryable as it lands rather than at the next flush. Durability is the
 source file's job. The shipped `file.d` example does exactly this on a panic
 log (`FLUSH_AGE=2s`, `wal=true`).
 
+⚠ **And the wal's cost and its benefit move together, which is why option 5 is
+not urgent.** Live-edge staleness with no wal is whichever of the two flush
+triggers fires first, and both scale with the source:
+
+| source rate                  | 256 KiB fills in | the wal costs |
+|------------------------------|------------------|---------------|
+| 10 MB/min                    | ~1.5 s           | 14 GB/day     |
+| 1.1 MB/min (a real access log) | ~14 s          | 1.6 GB/day    |
+| ~200 B/min (a quiet panic log) | never; `FLUSH_AGE` governs | 288 KB/day |
+
+So a busy log's edge is already near-current without one, and a quiet log's wal
+is free. What the table leaves open is a HIGH-VOLUME log wanting a sub-second
+edge, which is the case option 5 answers and the only one that needs it.
+
+⚠ Lowering `FLUSH_AGE` is NOT the cheap substitute on the quiet end. At one
+chunk per line it costs 56 bytes of `.rings` plus a ~58-byte frame for a
+48-byte line — an index larger than the log, and compression gone.
+
 ## Tests
 
 One deterministic test per cell of the table, since the fuzz proves a cell is
@@ -199,6 +259,11 @@ reachable and not which one it was:
 * crashed stage — the marker is honoured and the staged frames go, whether or
   not a wal is declared.
 * torn tail — an incomplete frame is truncated rather than adopted.
+* killed flush, non-wal, WITH a source witness — the frame is adopted and its
+  window matches what the live path would have recorded, byte for byte. The
+  three fallbacks each get one too: a rotated source (inode mismatch), a
+  re-syncing intake, and a reader that cannot open the source all fall back to
+  store-only and SAY so.
 
 The `zstd -dc` failure above is its own test: an orphan followed by a shorter
 append must not be able to break stock recovery.
