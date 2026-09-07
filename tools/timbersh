@@ -901,6 +901,13 @@ class Complete:
             "<cursor>": sorted(self.sh.cursors),
             "<host>": [label(h) for h in TARGETS if h],
             "<pred>": ["["],
+            # ⚠ From the extractor documents installed HERE, which is a
+            # candidate set and not the truth: a tally store holds
+            # whatever metrics the host that wrote it applied. The metric
+            # is typed before `from`, so there is no store to ask yet —
+            # and a hint from the documents beats the nothing this
+            # offered before.
+            "<metric>": timbergraph.known_metrics(),
         }.get(slot, [])
 
     def after(self, form, toks):
@@ -949,7 +956,9 @@ class Complete:
         if slot == "<graphclauses...>":
             if prev == "by":
                 return []              # a label, which only the data knows
-            if prev in ("quantile", "png", "svg", "using", "extracting"):
+            if prev in ("using", "extracting"):
+                return timbergraph.known_extractors()
+            if prev in ("quantile", "png", "svg"):
                 return []
             if prev in ("where", "and"):
                 return SUBJECTS
