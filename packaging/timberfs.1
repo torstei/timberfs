@@ -1659,14 +1659,16 @@ entry arriving afterwards would then be displaced out of its own bucket.
 .PP
 ⚠ Instead that bucket is STATED, provisionally, and kept open \(em which
 is how a quiet store's newest minute appears at all. A later line for the
-same bucket SUPERSEDES it, carrying the complete total, so a tally tape
-must be read newest-line-wins per bucket. Every reader here does
-.RB ( timbergraph ,
-.BR timberview );
-a reader that SUMMED every line would double-count, and one that took the
-first would report a minute that had barely begun. A run re-reading a
-still-open bucket after a restart states it again for the same reason,
-and that revision is likewise the newer line.
+same bucket SUPERSEDES it, carrying the complete total, so anything that
+AGGREGATES a tally tape must read it newest-line-wins per bucket.
+.B timbergraph
+does; a reader that SUMMED every line would double-count, and one that
+took the first would report a minute that had barely begun.
+.B timberview
+shows the tape as written, both lines included, which is what a tape
+viewer should do. A run re-reading a still-open bucket after a restart
+states it again for the same reason, and that revision is likewise the
+newer line.
 .RE
 .PP
 .B LATENESS
