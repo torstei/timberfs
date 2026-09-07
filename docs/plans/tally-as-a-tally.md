@@ -236,6 +236,71 @@ an LSM in miniature, and it is what every time-series store ends up with for
 this exact reason — worth saying plainly rather than arriving at it by
 accident three revisions later.
 
+## Six consecutive days, and the block knee holds
+
+The block sizing above was synthetic. Six contiguous days of the same real
+log — spanning three app versions, one extractor unchanged throughout —
+measured with the same encoding:
+
+| block spans | series | buckets | cells | B/cell |
+|---|---|---|---|---|
+| 1 day | 1,003 | 1,236 | 696,926 | **0.79** |
+| 3 days | 1,162 | 3,896 | 2,181,500 | 0.77 |
+| 6 days | 1,211 | 8,036 | 3,670,084 | 0.73 |
+
+**Six one-day blocks cost 2,760,563 bytes against 2,665,558 for one six-day
+block — the day-sized choice costs +4%**, and buys day-granular head-drop and
+regeneration. The synthetic knee was real.
+
+⚠ And 0.73–0.79 B/cell against the 1.31 modelled: real counts and millisecond
+sums delta-encode better than synthetic gaussians, so **the earlier estimate
+was pessimistic**. One day is 537 KB, and 730 of them 383 MB, against the
+shipped store's 3.6 GB.
+
+### ⚠ Which refutes this note's reason for a per-block dictionary
+
+The vhost section argued per-block dictionaries because "cardinality is local
+in time", imagining a store that has seen 50,000 series of which ~500 are
+active each day. **The real working set saturates instead:**
+
+| day | series | new vs previous | gone | union so far |
+|---|---|---|---|---|
+| 1 | 1,003 | — | — | 1,003 |
+| 2 | 940 | 71 | 134 | 1,074 |
+| 3 | 997 | 154 | 97 | 1,162 |
+| 4 | 597 | 9 | 409 | 1,162 |
+| 5 | 677 | 121 | 41 | 1,165 |
+| 6 | 992 | 373 | 58 | 1,211 |
+
+479 series are present on all six days and the union grows 1,003 → 1,211 —
+a saturating curve, not a drift. So a per-store dictionary would be ~9 KB
+against a per-day one's 8 KB, and **the whole question is worth about 1% of
+the store**: per-block dictionaries cost 5.7 MB over a 730-day retention
+against a 422 MB store, or 1.35%.
+
+**The conclusion stands and the reasoning does not.** Per-block wins because
+it makes a block **self-contained** — readable and replicable alone, which is
+what makes the manifest diff a complete protocol — and that is worth 1.35%.
+It does not win on cardinality, and citing an invented 50,000-series drift to
+argue it was reaching for evidence rather than looking for it.
+
+### What the churn actually shows
+
+⚠ **Two things are conflated in that "gone" column, and only one is churn.**
+Day 4 shows 409 series gone with 9 new — but day 4 carried 258k log lines
+against day 3's 2.7M. A series absent on a quiet day has not gone anywhere;
+that is **day-level sparsity**, the same effect as the 21% within-day density,
+one zoom level out.
+
+The genuine signal is the **version boundary**: the change to the third
+version brought **373 new series** against a 70–150/day baseline, because new
+code has new methods and the extractor labels by `class.method`. Which is
+worth noting for [tally-series-identity.md](tally-series-identity.md): a
+deploy changes which series exist **without changing the definition at all**,
+so it needs none of the generation machinery — the dictionary simply has more
+entries the next day. The two kinds of change are genuinely different, and
+only one of them is about definitions.
+
 ## A high-cardinality metric: bytes per vhost
 
 ⚠ Modelled rather than measured, unlike the real day above — the shapes are
@@ -266,13 +331,12 @@ flattering number.
   is 180 bytes raw and **37 bytes** after zstd, because the runs are exactly
   what an entropy coder is for. Sparse series do not pay for the buckets they
   are missing.
-* ⚠ **The dictionary must be PER BLOCK**, which the Open list below had left
-  undecided. Vhosts churn: a store that has seen 50,000 of them over two years
-  should have blocks listing only the ~500 active in each day. A store-level
-  dictionary grows monotonically and every block ends up referencing ids from
-  a table dominated by series that died a year ago. Per block makes
-  **cardinality local in time**, and it is the same choice that makes a block
-  self-contained enough to replicate on its own.
+* **The dictionary is PER BLOCK** — but for self-containedness, not for
+  cardinality. ⚠ This section originally argued it from a store that has seen
+  50,000 series of which ~500 are active daily; the six-day measurement above
+  shows a real working set SATURATING instead, which makes the whole question
+  worth about 1% of the store. A block carries its own dictionary because that
+  is what makes it readable and replicable alone.
 
 ⚠ **What does NOT work is exceeding the cap**, and that is by design:
 `max_series` is 1000 per bucket, so 500 vhosts fits and 5,000 does not — the
@@ -383,7 +447,9 @@ of a first cut.
 
 ## Open
 
-* **Segment length**, which is the one number this design actually turns on:
+* **Segment length**, which is now the ONLY sizing question left open — the
+  block range is settled at a day by two independent measurements, synthetic
+  and then six real days at +4% against a six-day block. Segment length is:
   how many sealed buckets accumulate before a segment is appended. Short
   segments cost compression (2.07 B/cell at 15 minutes against 1.31 at a day)
   and long ones cost a bigger open region to rewrite. The block range is
@@ -392,8 +458,9 @@ of a first cut.
   input and writes a new generation, so it need not be, and a `trim`-shaped
   cron-able verb would fit the tree — which also answers who trims a retired
   generation ([tally-series-identity.md](tally-series-identity.md)).
-* ~~Where the dictionary lives.~~ **Settled by the vhost case above: per
-  block**, so cardinality is local in time and a block is self-contained.
+* ~~Where the dictionary lives.~~ **Per block, for self-containedness** — and
+  the six-day measurement shows it is worth ~1% of the store either way, so
+  it is an architectural choice rather than an economic one.
 * **What `!cap`, `!late` and `!drop` become.** They are per-bucket statements
   about quality, so probably their own columns or bits beside the presence
   bitmap — which would make them selectable rather than markers a reader has
