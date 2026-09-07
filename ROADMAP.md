@@ -916,6 +916,17 @@ here.
   `Roller::add`'s per-new-series scan being a 4.16 s → 61.7 s cliff — and the
   in-flight bound question. Note:
   [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
+- **Designing a tally as a tally**: compression, head-drop and being queryable
+  through timberfs's own query are why a tally lives here at all; the tape it
+  inherited is not. A tally is a KEYED store with two regions wanting opposite
+  disciplines — an immutable sealed body, which a tape is right for, and an
+  accumulating OPEN EDGE, which it is not. Putting the open edge in a readable
+  sidecar (the shape `.sap` already has for logs, rewritten rather than
+  appended) removes the revisions 0.33.0 had to put on the tape; a sealed body
+  of range-addressed blocks carrying a generation would make regeneration safe
+  where a monotone chunk number cannot, and replication then follows from the
+  addressing rather than the frames wire. Design note:
+  [docs/plans/tally-as-a-tally.md](docs/plans/tally-as-a-tally.md).
 - **A metric is a series, and combining it is the reader's decision** (a real
   defect): `tally --fold` sums two definitions' measurements into one number,
   because `Roller` keys a bucket on `(start, metric, labels)` and nothing on
