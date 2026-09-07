@@ -67,9 +67,11 @@ messages and pull requests are for.
   travel with the tally store and their names are the namespace, so a metric
   name is unique within one tally. The ordinary edit — a regex fixed, a metric
   added or removed — is an in-place update that breaks no series; a changed
-  MEANING is the exception the generation machinery serves. And why an
+  MEANING is the exception the generation machinery serves. Why an
   offset-scoped definition fails as a reader's contract and works as
-  provenance.
+  provenance; and why the tape model was inherited rather than chosen — a log
+  entry is a fact, a tally bucket is a conclusion, and only the prefix older
+  than the source's retention horizon is irreplaceable.
 - [tally.md](tally.md) — metrics derived from the log as a tape of their own:
   the extractor as a consumer (and therefore backfillable), the one invariant
   that decides the line format, and how a site declares extractors of its own.

@@ -12,6 +12,11 @@ note is arranged so that case stays cheap. A changed MEANING is the exception;
 everything about generations, supersession and closed state serves only that,
 and can wait.
 
+⚠ And one assumption underneath all of it is itself in question: that a tally
+store is a tape like a log's. A log entry is a fact and a tally bucket is a
+conclusion, and since 0.33.0 a tally tape already supersedes its own lines,
+which no log tape does. See *A tally is not a log*.
+
 ## The defect, demonstrated
 
 Two observations from two different definitions that happen to share a metric
@@ -313,6 +318,64 @@ missing is not a primitive; it is that nothing puts those three steps behind
 one verb, and doing them by hand in the wrong order loses the numbers that
 cannot be re-derived. Retention on a retired generation is the one genuine
 gap.
+
+## A tally is not a log, and the tape model was inherited rather than chosen
+
+Everything above works around one assumption: that a tally store is a tape
+like any other. It is worth asking why a log tape is immutable, because the
+answer does not transfer.
+
+**A log entry is a historical FACT.** A producer wrote it; no later knowledge
+revises it. That is why a sealed chunk can be immutable, and
+[chunks-by-address.md](chunks-by-address.md) rests on exactly that — "a
+head-drop changes a chunk's OFFSET inside the trunk, never its bytes … so a
+cached copy cannot go stale". The property is inherited from the domain, not
+imposed by the format.
+
+**A tally bucket is a CONCLUSION.** It is derived, recomputable, and — since
+0.33.0 — routinely revised: one bucket appears many times and the newest line
+SUPERSEDES the earlier one. ⚠ **No log tape has any such rule.** So a tally
+tape is already only BYTE-immutable and not semantically immutable: the
+earlier line's bytes sit there while its meaning is annulled. The divergence
+has already happened, in shipped code; what is left is a format insisting on a
+discipline its content does not have.
+
+### What is actually irreplaceable
+
+Follows directly, and it is the useful part: a tally is regenerable wherever
+its source still exists, so **the only irreplaceable stretch of a tally store
+is the prefix older than the source's retention horizon.** Everything newer is
+a cache — expensive to recompute, never impossible.
+
+Which makes "export the prefix, drop the rest, re-derive" not a workaround but
+the natural decomposition: it separates the part that is data from the part
+that is a cache. And it says what a tally's retention is really for — the
+`retain 730d` that outlives a 30-day log is protecting one stretch, and
+re-deriving the other 30 days costs a read of a source that is still there.
+
+### WAL timelines, and whether they are overkill
+
+The postgres analogy is the right shape and it dissolves all three costs of
+regenerating in place, which is worth recording even if nobody builds it.
+Address a chunk by **(timeline, number)** and bump the timeline when history
+diverges: a regenerated chunk 500 on timeline 2 does not collide with 500 on
+timeline 1, so a cache keyed on the address cannot go stale, a replica sees a
+new timeline rather than silently disagreeing about what 500 is, and a
+follower's position is on a timeline it can be TOLD has ended instead of
+pointing past a new end.
+
+⚠ **Probably overkill, and the reason is surface rather than complexity.**
+Every reader and consumer would have to learn about timelines — `query`,
+`view`, the frames wire, follower positions, the chunk cache — for an
+operation performed rarely, since the ordinary definition change is an
+in-place update that regenerates nothing. `export` plus a drop buys the same
+outcome today with no format change and no new concept, at the cost of
+copying the kept prefix once.
+
+So: recorded as the correct model for a store whose content is derived, and
+the thing to reach for **if regeneration becomes routine** rather than
+exceptional. The signal to watch for is operators doing the three-step
+retirement often enough to want it behind one verb.
 
 ## Offset-scoped definitions: a dead end as SEMANTICS, kept as PROVENANCE
 
