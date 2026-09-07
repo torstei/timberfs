@@ -233,6 +233,80 @@ def test_an_extractor_is_a_path_or_a_name():
         sh.rmtree(home, ignore_errors=True)
 
 
+def test_the_documents_installed_here_identify_the_metric():
+    """A tally line cannot carry its unit and the store's manifest
+    deliberately records no extractor names, so the unit came from a
+    `!meta` in the window or from a document the reader NAMED. But the
+    answer's own metric names identify the document, so `using` can be
+    the override rather than the normal path — and where two documents
+    disagree, the answer is no unit rather than a guess, because the unit
+    decides which axis a series lands on."""
+    import tempfile, shutil, json as j
+    d = tempfile.mkdtemp(prefix="timbergraph-test-")
+
+    def doc(path, name, metrics):
+        with open(os.path.join(d, path), "w", encoding="utf-8") as fh:
+            j.dump({"v": "1.0-EXPERIMENTAL", "name": name,
+                    "window": {"axis": "logline", "width_ms": 60000},
+                    "metrics": metrics}, fh)
+
+    doc("one.json", "one", [
+        {"name": "only_mine", "measure": [{"count": True, "unit": "widgets"}]},
+        {"name": "shared_agree", "measure": [{"count": True, "unit": "B"}]},
+        {"name": "shared_differ", "measure": [{"sum": "t", "unit": "ms"}]}])
+    doc("two.json", "two", [
+        {"name": "shared_agree", "measure": [{"count": True, "unit": "B"}]},
+        {"name": "shared_differ", "measure": [{"sum": "t", "unit": "s"}]}])
+
+    was = g.EXTRACTOR_DIRS
+    g.EXTRACTOR_DIRS = (d,)
+    try:
+        # One document declares it: nothing has to be typed.
+        f, notes = g.facts_for(["only_mine"], [])
+        check("inferred", "widgets", f["only_mine"]["unit"])
+        check("and said which", "one", f["only_mine"]["extractor"])
+        check("silently", [], notes)
+
+        # Several agree, so which one it was does not matter.
+        f, notes = g.facts_for(["shared_agree"], [])
+        check("agreeing", "B", f["shared_agree"]["unit"])
+        check("also silently", [], notes)
+
+        # ⚠ They disagree: no unit, and BOTH named. Guessing between ms
+        # and s would not mislabel the plot, it would regroup it.
+        f, notes = g.facts_for(["shared_differ"], [])
+        check("no guess", None, f["shared_differ"].get("unit"))
+        check("one note", 1, len(notes))
+        for want in ("one=ms", "two=s", "using"):
+            if want not in notes[0]:
+                FAILED.append(f"the ambiguity note omits {want!r}: {notes[0]!r}")
+
+        # A `!meta` is the producer's own word about these numbers and
+        # outranks the inference.
+        _, markers = g.read("2026-09-06T10:00:00.000Z 0s !meta "
+                            "metric=only_mine unit=furlongs\n")
+        f, _ = g.facts_for(["only_mine"], markers)
+        check("the tape wins over a guess", "furlongs", f["only_mine"]["unit"])
+
+        # An explicit `using` is an instruction and outranks both — but a
+        # disagreement with the tape is reported rather than silent.
+        f, notes = g.facts_for(["only_mine"], markers, ["one"])
+        check("using wins", "widgets", f["only_mine"]["unit"])
+        check("and says so", 1, len(notes))
+        if "furlongs" not in notes[0]:
+            FAILED.append(f"the conflict note omits the tape's unit: {notes[0]!r}")
+
+        # Naming a document that declares none of them is worth saying:
+        # it is silently accepted otherwise.
+        f, notes = g.facts_for(["only_mine"], [], ["two"])
+        check("still inferred", "widgets", f["only_mine"]["unit"])
+        if not notes or "declares none" not in notes[0]:
+            FAILED.append(f"a `using` that matches nothing went unreported: {notes!r}")
+    finally:
+        g.EXTRACTOR_DIRS = was
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_a_name_that_resolves_nowhere_says_where_it_looked():
     """A directory is listed only if it exists, so where none does the
     list is empty — and the failure then named nowhere at all, which says
@@ -267,7 +341,14 @@ def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and only in n]
     for name, fn in tests:
-        fn()
+        # ⚠ Caught per test, as the timbersh suite does. Unguarded, one
+        # test raising aborted the whole run and every test after it
+        # silently never ran — which is the failure mode a suite exists
+        # to prevent.
+        try:
+            fn()
+        except Exception as e:                              # noqa: BLE001
+            FAILED.append(f"{name}: {type(e).__name__}: {e}")
     if FAILED:
         for f in FAILED:
             print(f"FAIL {f}", file=sys.stderr)
