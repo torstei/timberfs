@@ -197,7 +197,8 @@ HELP = """
   select <kind> from <source> [where ...] [limit N [chunks]] [into view];
   tail   <kind> from <source> [where ...];
   graph  <metric>[, <metric>...] from <source> [by LABEL] [where ...]
-         [quantile Q] [rate] [using <name>] [png 'FILE'|svg 'FILE'];
+         [quantile Q] [rate] [using <name>]
+         [window|ascii|png 'FILE'|svg 'FILE'];
   graph  <metric> against <metric> from <source> [...];
   graph  <metric> from <source> extracting <name> where ... ;
 
@@ -234,8 +235,18 @@ HELP = """
     takes for one, so `by host` keeps them apart and leaving it out sums
     them on purpose. `quantile 0.95` of a cumulative `le` ladder --
     summing one multiplies the count, so it is refused; `rate` divides by
-    the bucket width; `png 'f'`/`svg 'f'` draw somewhere other than the
-    terminal. Needs gnuplot.
+    the bucket width. Needs gnuplot.
+
+    WHERE IT DRAWS, and by default that is a WINDOW where one can be
+    drawn and ASCII where it cannot -- so the same statement gives a
+    picture at a desk and still answers over ssh. A window needs a
+    display and a gnuplot built with an interactive terminal, which
+    `gnuplot-nox` is not -- and, for the DEFAULT only, a terminal to be
+    watching it, so a redirected run keeps its answer as text instead of
+    losing it to a window. `window` and `ascii` say which outright, and a
+    `window` that cannot be drawn is refused rather than downgraded;
+    `png 'f'`/`svg 'f'` write a file instead -- timbersh does not open
+    it. One of the four at a time.
 
     <kind>    records | loglines | stores | chunks
     <source>  a view name, or a predicate literal like [type=console].
@@ -779,7 +790,8 @@ def show_window(session):
 #: What ends a `where` in a `graph`. A select's clauses are `limit` and
 #: `into`; a graph has its own, and without them here `quantile` after a
 #: `where` was read as a condition and refused.
-GRAPH_CLAUSES = ("by", "quantile", "rate", "png", "svg", "using", "extracting")
+GRAPH_CLAUSES = ("by", "quantile", "rate", "png", "svg", "using", "extracting",
+                 "window", "ascii")
 
 
 def parse_where(toks, i, stop=()):
@@ -974,7 +986,8 @@ class Complete:
                 return AFTER_TIME
             low = [t.lower() for t in rest]
             once = [w for w in ("where", "quantile", "rate", "png", "svg",
-                                "using", "extracting") if w not in low]
+                                "using", "extracting", "window", "ascii")
+                    if w not in low]
             return ["by"] + once + (["and"] if "where" in low else [])
         if slot == "<at...>":
             if prev in ("chunk", "offset"):
@@ -1722,8 +1735,8 @@ class Shell:
                 raise ValueError(f"`{w}` what?")
             if w == "by":
                 by.append(toks[i + 1][1]); i += 2
-            elif w == "rate":
-                opts["rate"] = True; i += 1
+            elif w in ("rate", "window", "ascii"):
+                opts[w] = True; i += 1
             elif w == "quantile":
                 opts["quantile"] = float(toks[i + 1][1]); i += 2
             elif w in ("png", "svg", "using", "extracting"):
@@ -1732,7 +1745,26 @@ class Shell:
                 raise ValueError(
                     f"`{toks[i][1]}`? after the source come `by LABEL`, "
                     f"`where ...`, `quantile Q`, `rate`, `using PATH`, "
-                    f"`extracting NAME` and `png FILE`/`svg FILE`")
+                    f"`extracting NAME`, `png FILE`/`svg FILE`, and "
+                    f"`window`/`ascii`")
+
+        # ⚠ WHERE to draw, decided BEFORE the read and by timbergraph's
+        # own rule rather than a second copy of it — the same words must
+        # mean the same picture whichever of the two you typed them in.
+        # Before the read, because a statement naming two places is
+        # refused and there is no reason to spend a fleet query on it
+        # first.
+        #
+        # ⚠ `Bad` is not a ValueError, and only ValueError reaches the
+        # loop's handler — so a refusal left untranslated arrives as a
+        # traceback out of the shell rather than as a message.
+        try:
+            terminal = timbergraph.choose_terminal(
+                png=opts.get("png"), svg=opts.get("svg"),
+                window=opts.get("window", False),
+                want_ascii=opts.get("ascii", False))
+        except timbergraph.Bad as e:
+            raise ValueError(str(e)) from None
 
         extracting = opts.get("extracting")
         if extracting:
@@ -1817,8 +1849,9 @@ class Shell:
                      and m.labels.get("metric") in metrics]
 
         dest = opts.get("png") or opts.get("svg")
-        terminal = "pngcairo" if "png" in opts else "svg" if "svg" in opts else "dumb"
-        size = ((1000, 500) if dest else timbergraph.terminal_size())
+        size = ((1000, 500) if dest
+                else (900, 500) if terminal in timbergraph.WINDOW_TERMINALS
+                else timbergraph.terminal_size())
         if scatter_x:
             text = timbergraph.scatter(lines, title, xlabel, ylabel, terminal,
                                        size, dest)

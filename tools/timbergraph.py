@@ -813,6 +813,107 @@ def gp_quote(text):
     return "'" + str(text).replace("'", "''") + "'"
 
 
+#: Interactive gnuplot terminals, best first. `aqua` is macOS's.
+WINDOW_TERMINALS = ("qt", "wxt", "x11", "aqua")
+
+_window_term = "unprobed"
+
+
+def window_terminal():
+    """The interactive gnuplot terminal available here, or None.
+
+    Two facts are needed and neither implies the other: a DISPLAY to put
+    a window on, and a gnuplot built with an interactive terminal —
+    `gnuplot-nox` has none, so it draws files and ASCII and warns on
+    `set terminal qt`.
+
+    ⚠ Read from the TERMINAL LIST, not from gnuplot's exit code: `set
+    terminal nosuchterm` exits 0 and only warns on stderr, so a probe
+    that trusted the status would call every terminal available. The
+    list costs one gnuplot at ~10 ms and is cached, this being a fact
+    about the machine rather than about a plot.
+    """
+    global _window_term
+    if _window_term != "unprobed":
+        return _window_term
+    _window_term = None
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        exe = shutil.which("gnuplot")
+        if exe:
+            try:
+                # ⚠ stdin=DEVNULL, and it is the whole of this working.
+                # `gnuplot -e CMD` runs CMD and then goes on READING
+                # STDIN, and `capture_output` does not touch stdin — so
+                # inside an interactive shell the probe inherited the
+                # user's terminal, sat there until the timeout, and the
+                # fallback below reported "no interactive terminal" on a
+                # machine with gnuplot-qt installed and a display. It
+                # also ate the keystrokes typed at it meanwhile. Every
+                # test piped stdin, so none of them could see it.
+                out = subprocess.run([exe, "-e", "set term"], text=True,
+                                     capture_output=True, check=False,
+                                     stdin=subprocess.DEVNULL, timeout=10)
+                have = {ln.split()[0] for ln in
+                        (out.stderr + out.stdout).splitlines() if ln.split()}
+                _window_term = next(
+                    (w for w in WINDOW_TERMINALS if w in have), None)
+            except (OSError, subprocess.SubprocessError):
+                # Fall back to ASCII, which is the safe direction — but
+                # narrowly, so a bug here is a traceback rather than a
+                # silent "this machine cannot draw".
+                _window_term = None
+    return _window_term
+
+
+def choose_terminal(png=None, svg=None, window=False, want_ascii=False,
+                    tty=None, term="probe", spell=""):
+    """WHERE to draw, from what was asked and what is possible.
+
+    One rule, called by the CLI and by timbersh's `graph`, because two
+    copies of it would drift and the drift would be silent: the same
+    words would mean different pictures depending which you typed it in.
+
+    The default is a WINDOW, because ASCII cannot carry the detail —
+    five series an order of magnitude apart collapse into two rows of
+    characters, and one of them vanishes. It needs three things, none of
+    which implies another: a display, a gnuplot built with an
+    interactive terminal, and a TTY to be watching it. That last one
+    bounds the DEFAULT only: a redirected run keeps its answer as text
+    rather than losing it to a window nobody sees, while a NAMED window
+    is what was asked for and a window is not stdout.
+
+    A named window that cannot be drawn is refused rather than
+    downgraded — the point of saying it is to get one.
+    """
+    named = [n for n, on in (("window", window), ("ascii", want_ascii),
+                             ("png", bool(png)), ("svg", bool(svg))) if on]
+    if len(named) > 1:
+        raise Bad(
+            "`" + "` and `".join(spell + n for n in named) + "` name "
+            "different places to draw — give one. Omit them all for a "
+            "window where one can be drawn and ASCII where it cannot")
+    if png:
+        return "pngcairo"
+    if svg:
+        return "svg"
+    if want_ascii:
+        return "dumb"
+    if term == "probe":
+        term = window_terminal()
+    if window:
+        if not term:
+            raise Bad(
+                "no interactive gnuplot terminal here — a window needs a "
+                "display (DISPLAY or WAYLAND_DISPLAY) and a gnuplot built "
+                "with one (`apt install gnuplot-qt`; gnuplot-nox has none). "
+                f"Drop `{spell}window` for ASCII, or "
+                f"`{spell}png`/`{spell}svg` for a file")
+        return term
+    if tty is None:
+        tty = sys.stdout.isatty()
+    return term if (term and tty) else "dumb"
+
+
 def draw(text, terminal):
     """Run gnuplot, or say what to install. ⚠ A SOFT dependency: the
     tools carry no third-party imports and nothing here should be the
@@ -825,7 +926,7 @@ def draw(text, terminal):
             "window needs gnuplot-qt or gnuplot-x11)"
         )
     proc = subprocess.run(
-        [exe, "-p" if terminal in ("qt", "x11", "wxt") else "-"],
+        [exe, "-p" if terminal in WINDOW_TERMINALS else "-"],
         input=text, text=True, capture_output=True, check=False,
     )
     if proc.returncode != 0:
@@ -927,7 +1028,11 @@ def main(argv=None):
     ap.add_argument("--png", metavar="FILE")
     ap.add_argument("--svg", metavar="FILE")
     ap.add_argument("--window", action="store_true",
-                    help="an interactive window; needs a display and gnuplot-qt")
+                    help="force an interactive window; needs a display and "
+                         "gnuplot-qt (the default already draws one where it "
+                         "can)")
+    ap.add_argument("--ascii", action="store_true",
+                    help="force characters on the terminal instead of a window")
     ap.add_argument("--width", type=int,
                     help="characters on the terminal, pixels in an image")
     ap.add_argument("--height", type=int)
@@ -1010,13 +1115,13 @@ def main(argv=None):
              and s.labels.get("metric") in metrics]
 
     dest = args.png or args.svg
-    terminal = ("pngcairo" if args.png else "svg" if args.svg
-                else "qt" if args.window else "dumb")
+    terminal = choose_terminal(png=args.png, svg=args.svg, window=args.window,
+                               want_ascii=args.ascii, spell="--")
     if terminal == "dumb":
         size = (args.width or terminal_size()[0],
                 args.height or terminal_size()[1])
     else:
-        size = (args.width or (900 if args.window else 1000),
+        size = (args.width or (900 if terminal in WINDOW_TERMINALS else 1000),
                 args.height or 500)
     if args.against:
         text_out = scatter(lines, title, xlabel, ylabel, terminal, size, dest)
