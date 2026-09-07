@@ -841,14 +841,26 @@ def window_terminal():
         exe = shutil.which("gnuplot")
         if exe:
             try:
+                # ⚠ stdin=DEVNULL, and it is the whole of this working.
+                # `gnuplot -e CMD` runs CMD and then goes on READING
+                # STDIN, and `capture_output` does not touch stdin — so
+                # inside an interactive shell the probe inherited the
+                # user's terminal, sat there until the timeout, and the
+                # fallback below reported "no interactive terminal" on a
+                # machine with gnuplot-qt installed and a display. It
+                # also ate the keystrokes typed at it meanwhile. Every
+                # test piped stdin, so none of them could see it.
                 out = subprocess.run([exe, "-e", "set term"], text=True,
                                      capture_output=True, check=False,
-                                     timeout=10)
+                                     stdin=subprocess.DEVNULL, timeout=10)
                 have = {ln.split()[0] for ln in
                         (out.stderr + out.stdout).splitlines() if ln.split()}
                 _window_term = next(
                     (w for w in WINDOW_TERMINALS if w in have), None)
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
+                # Fall back to ASCII, which is the safe direction — but
+                # narrowly, so a bug here is a traceback rather than a
+                # silent "this machine cannot draw".
                 _window_term = None
     return _window_term
 
