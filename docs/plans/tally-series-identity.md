@@ -198,18 +198,23 @@ re-derived anyway — the state 0.33.0 left the production tally stores in.
 
 ### What the two tallies must say about each other
 
-⚠ **Needed only for the exception above, so none of it blocks a first cut.**
-Most of the mechanism already exists; the conventions do not, and without them
-a fleet that has been through a meaning change accumulates tally stores nobody
-can order.
+⚠ **Mostly needed only for the exception above** — but the supersedes
+relation is also what "regenerate what the source still covers" rests on, so
+it is not purely exceptional; see that section. Most of the mechanism already
+exists; the conventions do not, and without them a fleet accumulates tally
+stores nobody can order.
 
-* **A supersedes relation.** `.bark` carries `derived_from` and `derived_op`,
-  which point at the SOURCE. Nothing points from one tally to the tally it
-  replaces, so a reader assembling a long window cannot know that the two are
-  the same measurement under two definitions, and a person cannot tell which
-  is current. ⚠ This is most needed in exactly the case where it is least
-  visible: if the definition kept its name and only its content changed, the
-  metric names in both stores are IDENTICAL and nothing distinguishes them.
+* **A supersedes relation, and an ORDER over the overlap.** `.bark` carries
+  `derived_from` and `derived_op`, which point at the SOURCE. Nothing points
+  from one tally to the tally it replaces, so a reader assembling a long
+  window cannot know the two are the same measurement under two definitions,
+  and a person cannot tell which is current. ⚠ Most needed where it is least
+  visible: a definition that kept its name and changed its content leaves both
+  stores carrying IDENTICAL metric names. ⚠ And newest-line-wins is defined
+  WITHIN a tape — tape order is arrival order, and two tapes have none — so
+  the relation must also say which store wins where they overlap. That is the
+  one thing a reader cannot infer, and without it summing both double-counts
+  precisely the period that was re-derived in order to be trusted.
 * **A declared closed state.** "Nothing follows it" is visible in `list`'s
   `FOLLOWERS` column but means several things — never started, deliberately
   retired, or broken. A store that will not be written again should say so, so
@@ -222,6 +227,53 @@ can order.
   same source and want the same `retain`; only one is current. The split
   between "inherited from the provisioning" and "true of this generation only"
   has to be decided once rather than per site.
+
+## Regenerating what the source still covers
+
+The case worth having, and the one the retention budget above creates: the log
+is kept 30 days, the tally two years, and today the regex got better. You want
+the last 30 days re-derived with it and the previous 23 months left alone —
+those numbers being the best that will ever exist for that period.
+
+**Resetting the tally's TAIL and re-deriving it** is the direct way, and it
+costs more than the wording it amends. "Chunks are immutable" is not a slogan;
+three things rely on it, and none of them checks whether a store is derived:
+
+* **The chunk number is an address that travels.** `docs/design.md` has it as
+  "a position in one store, not a fact about its contents", and replication
+  *preserves* numbering so that `dropped + uncomp_start` is "the same absolute
+  number at both ends" — which is what lets a receiver state its coverage.
+  Regenerating chunk 500 with different bytes makes two stores disagree about
+  what 500 is, and `frames-send` sends what the receiver says it LACKS, so it
+  would never notice.
+* **Anything caching chunks by `(store id, number)`** serves the old bytes for
+  ever. That cache exists.
+* **Follower positions past the cut** point beyond the new end. A consumer
+  shipping tally lines onward has a durable offset that no longer means
+  anything.
+
+⚠ A derived store *is* genuinely a different case — regenerable by
+construction, which is what `derived_from` and `derived_op` say — so the
+exception is not arbitrary. The trouble is that the machinery relying on
+immutability does not ask.
+
+**The same outcome is available without mutating anything**, and it is the
+generation mechanism deferred above, earning its keep for the ordinary case
+rather than only the exceptional one: keep the old tally and stop writing it,
+and derive a NEW one from the source with `FOLLOW_FROM=begin` — which is
+exactly "everything the source still holds", i.e. the 30 days. The seam then
+sits at the source's retention horizon instead of inside a tape, and a long
+window reads both stores.
+
+Which is not a new capability. `graph … from [class=tally]` already spans many
+stores; spanning two generations of one source's tally is that same operation.
+
+⚠ **What it does need is an ORDER over the overlap.** The two stores both
+cover the last 30 days, and newest-line-wins is defined WITHIN a tape — tape
+order is arrival order, and two tapes have none. So the supersedes relation has
+to say which store wins where they overlap, and that is the one piece a reader
+cannot infer. Without it a reader summing both double-counts exactly the
+period that was re-derived to be trusted.
 
 ## Offset-scoped definitions: a dead end as SEMANTICS, kept as PROVENANCE
 
