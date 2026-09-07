@@ -10,7 +10,17 @@ two shipped extractors tested by their own `--try` output (`timberfs.1`,
 tally stores and registers a follower whose selection and command are both
 derived from the file, and `--run` is the consumer that follower execs. Not
 built: the `samples` response kind, rollups, the session, and the `!gap`
-marker. It rests on the follower registry and its position per store
+marker.
+
+⚠ **The provisioned path is built and DEFECTIVE, and should not be enabled on
+a store busier than ~51 entries/s until it is fixed**: it deadlocks against
+the follower's park, runs at that rate whatever the hardware, and writes
+numbers that are silently short and then silently in the wrong buckets. The
+pipe below, `--try` and `--fold` are unaffected — the defect is in the
+consumer protocol's flow control, not in the extractor or the fold. Measured,
+diagnosed and fixed in [consumer-holding.md](consumer-holding.md).
+
+It rests on the follower registry and its position per store
 ([follower-selection.md](follower-selection.md)), the consumer protocol
 ([consumer-protocol.md](consumer-protocol.md)), store selection (`select.rs`),
 derived-store lineage (`.bark`), and head-drop retention.
@@ -1017,6 +1027,14 @@ loss, recorded exactly — the same rule retention already follows.
   bucket still depends on, so a restart re-derives identical lines), creating
   the tally store with its labels and lineage, and writing the `!gap` marker
   from the registry's GAP.
+
+  ⚠ `safe_offset` is the right watermark and the WRONG thing to report as the
+  consumer protocol's `progress`, which the follower also reads as flow
+  control: a store is parked until its position moves, so the two rules
+  deadlock and a tally follower runs at **51 entries/s** with numbers that are
+  silently short and then silently displaced. Measured, with the fix, in
+  [consumer-holding.md](consumer-holding.md) — which is the follower half's
+  real remaining work.
 * **The `!gap` marker** — the registry reports a GAP when retention dropped
   chunks a follower had not read, and nothing writes it into the tally store
   yet. Until it does, a hole in the numbers and a quiet period look alike.

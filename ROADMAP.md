@@ -903,6 +903,16 @@ here.
   head-drop takes a cumulative base), `sum`+`count` over averages, and
   histogram buckets over quantiles. Design note:
   [docs/plans/tally.md](docs/plans/tally.md).
+- **A consumer that is HOLDING entries** (`taken` beside the position): the
+  consumer protocol has "took it" and "dropped it" and no way to say "I have
+  these and will need them again if I restart", which is what a tally
+  consumer's open bucket is. Reporting the conservative position instead
+  deadlocks against the follower's park — measured at **51 entries/s** for a
+  tally follower whose extractor does 310,000/s, with numbers silently short
+  and then silently displaced. One optional `taken` field on the existing
+  `progress` report separates flow control from the durable position and
+  fixes all three symptoms. Design note:
+  [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
 - **Declarations scoped to a range of the tape**: everything a store
   declares about itself is true of the WHOLE store, and some of it is only
   ever true of a stretch. A producer that changed its line format mid-life
