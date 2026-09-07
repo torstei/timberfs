@@ -455,6 +455,36 @@ and
 .BR timbergraph (1)
 is the same drawing outside the shell.
 .PP
+WHERE IT DRAWS: a WINDOW where one can be drawn, and characters on the
+terminal where it cannot \(em so the same statement gives a picture at a
+desk and still answers over ssh. A window wants two things, and neither
+implies the other: a display
+.RB ( $DISPLAY
+or
+.BR $WAYLAND_DISPLAY )
+and a
+.BR gnuplot (1)
+built with an interactive terminal, which
+.B gnuplot\-nox
+is not \(em and, for the DEFAULT only, a terminal to be watching it: a
+redirected run keeps its answer as text rather than losing it to a
+window nobody asked for. Naming
+.B window
+overrides that, a window not being stdout.
+.B window
+and
+.B ascii
+say which outright, and a
+.B window
+that cannot be drawn is REFUSED rather than quietly downgraded \(em the
+point of naming it is to get one.
+.BI "png " \(fmFILE\(fm
+and
+.BI "svg " \(fmFILE\(fm
+write a file instead, which timbersh does not open for you. One of the
+four at a time: two name different places to draw, and a statement whose
+destination is picked for it means something other than what it says.
+.PP
 .B view
 opens a store as a tape rather than as an answer, IN PROCESS: the loop it
 exists for is search, jump, search again, and a separate program would

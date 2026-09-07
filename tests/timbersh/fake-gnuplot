@@ -1,0 +1,19 @@
+#!/bin/sh
+# A gnuplot that exists but draws nothing, so a test can decide what
+# this machine can do rather than inherit it.
+#
+# $FAKE_TERMS is the terminal list `set term` reports (space separated).
+# It prints which of the two it was asked for: -p — which timbergraph
+# passes only for an interactive terminal — is a WINDOW, anything else is
+# text on stdout. So a test asserts what WAS chosen rather than the
+# absence of the other, which would also pass if nothing ran at all.
+case "$1" in
+  -e) [ "$2" = "set term" ] && {
+        echo "" >&2
+        echo "Available terminal types:" >&2
+        for t in ${FAKE_TERMS:-dumb}; do echo "      $t  a fake" >&2; done
+      }
+      exit 0 ;;
+  -p) cat >/dev/null; echo "FAKE-GNUPLOT-WINDOW"; exit 0 ;;
+  *)  cat >/dev/null; echo "FAKE-GNUPLOT-TEXT";   exit 0 ;;
+esac
