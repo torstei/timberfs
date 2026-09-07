@@ -6,6 +6,12 @@ irreversibly — and the remedy, which is small: the definitions travel with the
 tally store, and their names are the namespace. Amends [tally.md](tally.md),
 whose `Run::new` guard is right for a reason it does not give.
 
+⚠ The ordinary change to a definition — a regex fixed, a metric added, a
+metric removed — is an in-place UPDATE that does not break a series, and this
+note is arranged so that case stays cheap. A changed MEANING is the exception;
+everything about generations, supersession and closed state serves only that,
+and can wait.
+
 ## The defect, demonstrated
 
 Two observations from two different definitions that happen to share a metric
@@ -117,8 +123,45 @@ edited in `/etc/timberfs/tally.extractors.d` does **not** change any tally.
 The store holds the definitions it was created with, and goes on producing
 those numbers until somebody decides otherwise.
 
-Applying new definitions is therefore a deliberate operation with two
-decisions in it, neither of which has a default that is right for everyone.
+### Usually, applying just means UPDATING — and that is fine
+
+⚠ **The common changes do not break a series, and the design must not make
+them expensive.** What an operator actually does, most of the time:
+
+* **fixes a regex** — a `claim` that was too narrow, or a producer whose
+  format shifted. The instrument got better; the measurement is the same one.
+* **adds a metric** — strictly additive.
+* **removes a metric** — the series stops, exactly as a producer going quiet
+  stops one.
+
+For all three, replacing the store's recorded definitions in place is correct,
+and the tape stays ONE series. "I am changing what this metric MEANS" is the
+exception, not the rule, and a design that treated every edit as a
+supersession would make the ordinary case ceremonial and get worked around.
+
+So the recorded definitions are a **record, not a lock**: drift is REPORTED —
+here is what changed — and the ordinary answer is "update them, I know what I
+am doing". Only a changed meaning needs anything more.
+
+⚠ **Record the change, do not make a reader reconcile it.** When the
+definitions are updated, write down that they were, when, and at what offset.
+That is the offset-scoped idea in its workable form: **provenance for a person
+looking at a step in a graph, never a contract a reader has to honour.** The
+version below that failed was the one that asked a reader to reconcile two
+definitions inside one window; nobody has to reconcile a regex that got
+better, they only have to be able to find out that it did.
+
+⚠ **One subtlety the additive case raises**: [tally.md](tally.md)'s second
+invariant is that **zero and unknown are different**. A metric added today did
+not exist last week, so last week's buckets are UNKNOWN for it and not zero —
+and today nothing says so. `!gap` is the marker for "a window the extractor
+could not see" and is not written yet; a metric that did not exist is the same
+shape of fact and wants the same treatment.
+
+### The exception: a changed MEANING
+
+Only here is a new tally warranted, and only here do the conventions below
+matter. Two decisions, neither with a default right for everyone.
 
 **What becomes of the old tally** — three answers, all legitimate:
 
@@ -155,8 +198,10 @@ re-derived anyway — the state 0.33.0 left the production tally stores in.
 
 ### What the two tallies must say about each other
 
-Most of the mechanism above already exists; the conventions do not, and
-without them a fleet accumulates tally stores nobody can order.
+⚠ **Needed only for the exception above, so none of it blocks a first cut.**
+Most of the mechanism already exists; the conventions do not, and without them
+a fleet that has been through a meaning change accumulates tally stores nobody
+can order.
 
 * **A supersedes relation.** `.bark` carries `derived_from` and `derived_op`,
   which point at the SOURCE. Nothing points from one tally to the tally it
@@ -178,13 +223,16 @@ without them a fleet accumulates tally stores nobody can order.
   between "inherited from the provisioning" and "true of this generation only"
   has to be decided once rather than per site.
 
-## Recorded dead end: offset-scoped definitions
+## Offset-scoped definitions: a dead end as SEMANTICS, kept as PROVENANCE
 
 The most *correct* answer is that the tape knows which definition was in force
 from which byte offset, superseded by the next — the general form
 [tally.md](tally.md) already reaches for under "Declarations scoped to a range
-of the tape". It is a good idea and it is **not a workable solution to this
-problem**, which is worth writing down so it is not re-proposed:
+of the tape". ⚠ The distinction that makes it usable is **who has to obey it**.
+As a CONTRACT A READER HONOURS it does not work, and that is worth writing
+down so it is not re-proposed; as a NOTE FOR A PERSON it is exactly right, and
+is what the update path above records. The same fact, and only one of the two
+uses is affordable:
 
 if `some_metric` changes definition at offset `0x42424242`, a reader asking for
 a window that spans it has no honest answer. Summing is wrong — they measure
@@ -194,21 +242,34 @@ exist for. **More correct and less usable**, which is the signature of the
 wrong granularity; and the store-scoped version above gets the same property —
 the definition follows the tape — at a granularity somebody can act on.
 
+⚠ **But nobody has to reconcile a regex that got better** — they only have to
+be able to find out that it did. So the offset goes on the record as
+provenance: a step in a graph becomes explicable instead of mysterious, and no
+reader is obliged to do anything about it. That is the whole of the idea that
+survives here, and it is cheap.
+
 Worth keeping as an idea for elsewhere: a producer that changed its line format
 mid-life has one `timestamp_regex` today, and that IS a range-scoped
 declaration problem where regeneration is not an option.
 
 ## What changes
 
+A first cut, in order, and none of it needs the generation conventions:
+
 1. **Copy the resolved definitions into the tally store at creation**, keyed by
    short name.
 2. **Prefix metric names with that short name.** No format change; `:` is
    already legal.
-3. **Fix the guard's message and its four leaks** — `--check`, `--provision`,
+3. **Report drift and let the operator apply it** — the ordinary path. Record
+   that the definitions changed, when, and at what offset, as provenance.
+4. **Fix the guard's message and its four leaks** — `--check`, `--provision`,
    the first-entry laziness, and `{extractor}` in `OUTPUT` so the refusal is
    actionable.
-4. **Read the unit from the stored definitions**, so nothing is inferred from
+5. **Read the unit from the stored definitions**, so nothing is inferred from
    the local install.
+
+Deferred, and only for a changed MEANING: the supersedes relation, the closed
+state, the generation naming, and the shared-property split.
 
 ## Open
 

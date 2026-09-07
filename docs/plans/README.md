@@ -65,8 +65,11 @@ messages and pull requests are for.
   and whether two series combine is the READER's decision: the shipped fold
   makes it at storage time and irreversibly. The remedy is that the definitions
   travel with the tally store and their names are the namespace, so a metric
-  name is unique within one tally and a changed definition means a new one —
-  and why the more correct offset-scoped answer is not a workable one here.
+  name is unique within one tally. The ordinary edit — a regex fixed, a metric
+  added or removed — is an in-place update that breaks no series; a changed
+  MEANING is the exception the generation machinery serves. And why an
+  offset-scoped definition fails as a reader's contract and works as
+  provenance.
 - [tally.md](tally.md) — metrics derived from the log as a tape of their own:
   the extractor as a consumer (and therefore backfillable), the one invariant
   that decides the line format, and how a site declares extractors of its own.

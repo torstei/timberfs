@@ -927,10 +927,12 @@ here.
   remedy is small: the resolved definitions are copied into the tally store at
   creation and their short names prefix the metrics, so a name is unique within
   one tally by construction, "which definition produced this" is answerable
-  from the store rather than from whatever is installed locally, and a changed
-  definition means re-deriving into a NEW tally — which makes the source
-  store's retention the budget for changing your mind. `:` is already legal in
-  a metric name, so none of it is a format change. Design note:
+  from the store rather than from whatever is installed locally, and drift is
+  reported so the operator can apply it. ⚠ The ordinary edit — a regex fixed,
+  a metric added or removed — is an in-place update that breaks no series;
+  only a changed MEANING wants a new tally, which makes the source store's
+  retention the budget for changing your mind. `:` is already legal in a
+  metric name, so none of it is a format change. Design note:
   [docs/plans/tally-series-identity.md](docs/plans/tally-series-identity.md).
 - **Declarations scoped to a range of the tape**: everything a store
   declares about itself is true of the WHOLE store, and some of it is only
