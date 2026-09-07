@@ -197,6 +197,76 @@ an LSM in miniature, and it is what every time-series store ends up with for
 this exact reason — worth saying plainly rather than arriving at it by
 accident three revisions later.
 
+## A high-cardinality metric: bytes per vhost
+
+The grid argument assumes density, so the honest test is a label whose values
+come and go. `http_bytes` by `vhost` on a shared-hosting box: a few busy
+vhosts all day, a long tail with an hour here and there.
+
+| vhosts | present cells/day | columns | bitmap | per day | two years |
+|---|---|---|---|---|---|
+| 50 | 19,380 | 76 KB | 4.9 KB | 81 KB | 0.06 GB |
+| 500 | 190,504 | 757 KB | 45.5 KB | 802 KB | 0.60 GB |
+| 1000 (the cap) | 374,931 | 1458 KB | 90.4 KB | 1.5 MB | 1.16 GB |
+
+Against the shipped text format for the identical 500-vhost day: 183,664
+lines, 17.9 MB raw, **1812 KB** compressed — so columnar is **2.26×** better
+here rather than the 3× of the dense case, because a sparse series offers less
+positional redundancy to exploit. Worth stating rather than quoting the
+flattering number.
+
+**Three things make sparsity work, and one of them settles an open question:**
+
+* **A column holds only the values that are PRESENT**; the bitmap says which
+  buckets they belong to. A vhost with one hour of traffic costs 60 values and
+  not 1440, so an absent cell costs a bit rather than a number.
+* **The bitmap is cheap even when it is mostly empty** — 1440 bits with 1% set
+  is 180 bytes raw and **37 bytes** after zstd, because the runs are exactly
+  what an entropy coder is for. Sparse series do not pay for the buckets they
+  are missing.
+* ⚠ **The dictionary must be PER BLOCK**, which the Open list below had left
+  undecided. Vhosts churn: a store that has seen 50,000 of them over two years
+  should have blocks listing only the ~500 active in each day. A store-level
+  dictionary grows monotonically and every block ends up referencing ids from
+  a table dominated by series that died a year ago. Per block makes
+  **cardinality local in time**, and it is the same choice that makes a block
+  self-contained enough to replicate on its own.
+
+⚠ **What does NOT work is exceeding the cap**, and that is by design:
+`max_series` is 1000 per bucket, so 500 vhosts fits and 5,000 does not — the
+`!cap` marker fires and the excess is dropped, recorded. An operator wanting
+the latter raises the cap or stops labelling by vhost, which is the decision
+being forced into the open.
+
+⚠ And this is the metric that meets the performance cliff already recorded in
+[tally-series-identity.md](tally-series-identity.md): `Roller::add` scans the
+bucket's existing series for every NEW one, measured at 4.16 s capped against
+**61.7 s uncapped** over 500k entries. High cardinality is exactly where that
+bites, so "bytes per vhost" is the metric that would find it. Fixing it is on
+that note's list and is independent of any of this.
+
+## Retention granularity is one day
+
+Yes — head-drop unlinks leading blocks, so retention moves in whole days.
+`retain 30d` keeps between 30 and 31 days.
+
+That is coarser than a log's, where retention drops chunks of a few hundred
+KB, but the absolute step is small because the whole store is: a day is 74 KB
+at 20 series, 802 KB for 500 vhosts, 1.5 MB at the cap. Trading a day of
+granularity for one unlink and no offset rebasing is a good trade at those
+sizes; it would not be on a store measured in GB per day, which is why a log
+keeps the finer mechanism.
+
+⚠ **The consequence that matters is not the granularity, it is the POSITION.**
+A consumer of a tally store — something shipping the numbers onward — holds a
+byte offset today, because the store is a tape. With blocks there is no tape
+to hold an offset on, so a position becomes a bucket time or a
+`(range, generation)`. Which touches `retain_unconsumed` and `cursors`, both
+of which a tally store can declare, and the consumer protocol's "ONE unit:
+the absolute offset on the store's tape". A tally would need its own answer
+there — the same "a tally is not a log" that this note turns on, arriving one
+more time.
+
 ## How the files are named
 
     web-access-tally/
@@ -272,10 +342,8 @@ of a first cut.
   input and writes a new generation, so it need not be, and a `trim`-shaped
   cron-able verb would fit the tree — which also answers who trims a retired
   generation ([tally-series-identity.md](tally-series-identity.md)).
-* **Where the dictionary lives.** Per block makes a block self-contained and
-  therefore replicable and readable alone; per store is smaller and dedupes
-  across the store's whole life. Self-contained probably wins, since it is
-  what makes the manifest diff a complete protocol.
+* ~~Where the dictionary lives.~~ **Settled by the vhost case above: per
+  block**, so cardinality is local in time and a block is self-contained.
 * **What `!cap`, `!late` and `!drop` become.** They are per-bucket statements
   about quality, so probably their own columns or bits beside the presence
   bitmap — which would make them selectable rather than markers a reader has
