@@ -1432,60 +1432,64 @@ pub fn resolve_extractors(args: &[PathBuf], etc: &Path) -> anyhow::Result<Vec<Pa
             .find(|p| p.is_file())
         {
             Some(p) => out.push(p),
-            None => {
-                // ⚠ A directory is listed only if it EXISTS, so on a host
-                // where none does the list is empty — and a resolution
-                // failure naming nowhere tells the reader nothing about
-                // where to put the file.
-                if dirs.is_empty() {
-                    bail!(
-                        "no extractor {name:?} — it is not a path that exists, and there \
-                         is no extractor directory to search: none of \
-                         {PACKAGED_EXTRACTORS} (the timberfs package), {} or \
-                         ~/.config/timberfs/{EXTRACTOR_DIR} exists",
-                        etc.join(EXTRACTOR_DIR).display(),
-                    );
-                }
-                // ⚠ What is listed is the FILE STEM, because that is
-                // what this lookup takes — a provisioning's APPLY names
-                // the DOCUMENT instead, and the two can differ on a
-                // site's own file. Naming the document here would print
-                // a word that does not resolve.
-                let known = load_extractors(&dirs)
-                    .map(|docs| {
-                        docs.iter()
-                            .map(|(p, d)| {
-                                let stem = p
-                                    .file_stem()
-                                    .map(|s| s.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                if stem == d.name {
-                                    stem
-                                } else {
-                                    format!("{stem} (the document {:?})", d.name)
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                bail!(
-                    "no extractor {name:?} — neither a path that exists nor a document \
-                     in {}{}",
-                    dirs.iter()
-                        .map(|d| d.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if known.is_empty() {
-                        ", which hold none".to_string()
-                    } else {
-                        format!(", which hold {known}")
-                    }
-                );
-            }
+            None => return Err(no_such_extractor(&name, &dirs, etc)),
         }
     }
     Ok(out)
+}
+
+/// Why a name resolved to nothing, in terms of where it was looked for.
+///
+/// Takes the directories rather than deriving them so it can be tested
+/// against a list this host does not have: `PACKAGED_EXTRACTORS` exists
+/// wherever the package is installed, which is most machines that run
+/// the suite and none of the ones that used to.
+fn no_such_extractor(name: &str, dirs: &[PathBuf], etc: &Path) -> anyhow::Error {
+    // ⚠ A directory is listed only if it EXISTS, so where none does the
+    // list is empty — and a resolution failure naming nowhere tells the
+    // reader nothing about where to put the file.
+    if dirs.is_empty() {
+        return anyhow::anyhow!(
+            "no extractor {name:?} — it is not a path that exists, and there is no \
+             extractor directory to search: none of {PACKAGED_EXTRACTORS} (the timberfs \
+             package), {} or ~/.config/timberfs/{EXTRACTOR_DIR} exists",
+            etc.join(EXTRACTOR_DIR).display(),
+        );
+    }
+    // ⚠ What is listed is the FILE STEM, because that is what this
+    // lookup takes — a provisioning's APPLY names the DOCUMENT instead,
+    // and the two can differ on a site's own file. Naming the document
+    // here would print a word that does not resolve.
+    let known = load_extractors(dirs)
+        .map(|docs| {
+            docs.iter()
+                .map(|(p, d)| {
+                    let stem = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if stem == d.name {
+                        stem
+                    } else {
+                        format!("{stem} (the document {:?})", d.name)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "no extractor {name:?} — neither a path that exists nor a document in {}{}",
+        dirs.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        if known.is_empty() {
+            ", which hold none".to_string()
+        } else {
+            format!(", which hold {known}")
+        }
+    )
 }
 
 /// Every extractor named, with duplicate names refused across files.
@@ -3383,33 +3387,41 @@ mod tests {
 
     #[test]
     fn a_name_that_resolves_nowhere_says_where_it_looked() {
-        // A directory is listed only if it EXISTS, so on a host with
-        // none the list is empty — and the failure then named nowhere at
-        // all, which tells a reader nothing about where to put the file.
-        let empty = tempdir();
-        let err = resolve_extractors(&[PathBuf::from("nope")], &empty)
-            .unwrap_err()
-            .to_string();
+        // A directory is listed only if it EXISTS, so where none does the
+        // list is empty — and the failure then named nowhere at all, which
+        // says nothing about where the file should go.
+        //
+        // ⚠ The directories are PASSED, not derived. Deriving them makes
+        // the test depend on whether this host has the timberfs package
+        // installed — it passed everywhere until 0.32.0 landed on the
+        // machine it was written on, which is a test that has told you
+        // nothing.
+        let etc = PathBuf::from("/etc/timberfs");
+        let err = no_such_extractor("nope", &[], &etc).to_string();
         assert!(err.contains(PACKAGED_EXTRACTORS), "{err}");
-        assert!(err.contains(EXTRACTOR_DIR), "{err}");
+        assert!(err.contains("/etc/timberfs/tally.extractors.d"), "{err}");
 
-        let site = empty.join(EXTRACTOR_DIR);
-        std::fs::create_dir_all(&site).unwrap();
+        let site = tempdir();
         std::fs::write(
             site.join("x.json"),
             doc(r#"{"name":"m","measure":[{"count":true}]}"#),
         )
         .unwrap();
-        let err = resolve_extractors(&[PathBuf::from("nope")], &empty)
-            .unwrap_err()
-            .to_string();
+        let err = no_such_extractor("nope", std::slice::from_ref(&site), &etc).to_string();
         assert!(err.contains(&site.display().to_string()), "{err}");
         // The FILE STEM, because that is what this lookup takes. The
-        // document is named `t`, and printing that would print a word
-        // that does not resolve.
+        // document is named `t`, and printing that alone would print a
+        // word that does not resolve.
         assert!(err.contains("which hold x "), "{err}");
         assert!(err.contains(r#"the document "t""#), "{err}");
-        std::fs::remove_dir_all(&empty).ok();
+
+        // An empty directory says so rather than trailing off.
+        let bare = tempdir();
+        let err = no_such_extractor("nope", std::slice::from_ref(&bare), &etc).to_string();
+        assert!(err.contains("which hold none"), "{err}");
+
+        std::fs::remove_dir_all(&site).ok();
+        std::fs::remove_dir_all(&bare).ok();
     }
 
     /// Every extractor this repository SHIPS, run against a fixture and
