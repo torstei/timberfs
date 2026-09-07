@@ -53,11 +53,21 @@ or
 is refused too.
 .PP
 ⚠ What a line cannot say is the UNIT, and which metrics exist but were
-silent in this window. A
+silent in this window. Three things can supply the unit, in order of
+authority: the document
+.B \-\-using
+NAMED, then a
 .B !meta
-marker supplies the unit where the window happens to hold one; otherwise
-name the extractor document with
-.BR \-\-using .
+marker if the window holds one (the producer's own word about these
+numbers), then the documents installed HERE \(em the answer's metric
+names identify the document, so a metric only one of them declares needs
+nothing typed. ⚠ Where two of them declare it in DIFFERENT units, both
+are named and the unit is left blank: the unit decides which axis a
+series lands on, so guessing between
+.B ms
+and
+.B s
+would not mislabel the plot, it would regroup it.
 .PP
 .B THE MARKERS ARE THE ERROR BARS
 .PP
@@ -130,8 +140,9 @@ falls in \(em which is what additive data supports, and the reason a
 stored percentile was never allowed.
 .TP
 .BI \-\-using " PATH|NAME"
-An extractor document, for the unit and the title \(em a path, or a NAME
-looked up in
+An extractor document, for the unit and the title \(em the OVERRIDE, since
+the metric names in the answer already identify the document where that
+is unambiguous. A path, or a NAME looked up in
 .BR /usr/lib/timberfs/tally.extractors.d ,
 .BR /etc/timberfs/tally.extractors.d ,
 then

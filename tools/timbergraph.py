@@ -601,6 +601,71 @@ def extractor_facts(paths):
     return facts
 
 
+def declaring(metric, dirs=None):
+    """Which local documents declare `metric`, as `[(name, unit)]`.
+
+    The answer's own metric names identify the document, which is why
+    `using` can be an override rather than the normal path: `http_latency`
+    is declared by one shipped document, so nothing has to be typed for a
+    plot of it to know its unit.
+    """
+    out = []
+    for doc in declared(dirs).values():
+        for m in doc.get("metrics", []):
+            if m.get("name") != metric:
+                continue
+            unit = (m.get("histogram") or {}).get("unit")
+            for measure in m.get("measure", []):
+                unit = measure.get("unit", unit)
+            out.append((doc.get("name"), unit))
+    return out
+
+
+def facts_for(metrics, markers, using=(), dirs=None):
+    """The unit and description per metric, from the three sources that
+    can supply them, plus what a reader should be told.
+
+    In order of authority: the documents `using` NAMED (an instruction),
+    then a `!meta` in the window (the producer's own word about these
+    numbers), then inference from the documents installed here (a guess,
+    and taken only where every document that declares the metric agrees).
+
+    ⚠ Inference degrades to NO unit, never to a wrong one. Two documents
+    declaring one metric in different units is reported and left blank —
+    the unit decides which axis a series lands on, so guessing between
+    `ms` and `s` would not mislabel a plot, it would regroup it.
+    """
+    facts, notes = extractor_facts(using), []
+    tape = tape_units(markers)
+    named = {m for m in facts}
+    if using and not (named & set(metrics)):
+        notes.append(
+            f"⚠ {', '.join(using)} declares none of {', '.join(sorted(metrics))} "
+            f"— units come from elsewhere or nowhere")
+    for m in metrics:
+        f = facts.setdefault(m, {})
+        if f.get("unit") and tape.get(m) and f["unit"] != tape[m]:
+            notes.append(
+                f"⚠ {m}: the document you named says {f['unit']}, the tape says "
+                f"{tape[m]} — using the document")
+        if f.get("unit"):
+            continue
+        if tape.get(m):
+            f["unit"] = tape[m]
+            continue
+        owners = declaring(m, dirs)
+        units = {u for _, u in owners if u}
+        if len(units) == 1:
+            f["unit"] = units.pop()
+            f.setdefault("extractor", owners[0][0])
+        elif len(units) > 1:
+            notes.append(
+                f"⚠ {m}: declared here by "
+                + ", ".join(f"{n}={u}" for n, u in sorted(owners) if u)
+                + " — name one with `using` for an axis label")
+    return facts, notes
+
+
 #: Tic intervals worth landing on, in seconds. A reader looks for
 #: :00, :15, :30 — never :07.
 TICS = (60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200,
@@ -893,12 +958,11 @@ def main(argv=None):
         k, _, v = kv.partition("=")
         where[k] = v
 
-    facts = extractor_facts(args.using)
     if args.against:
         metrics = metrics + [args.against]
-    for m in metrics:
-        facts.setdefault(m, {})
-        facts[m].setdefault("unit", tape_units(markers).get(m))
+    facts, notes = facts_for(metrics, markers, args.using)
+    for note in notes:
+        print(note, file=sys.stderr)
 
     if args.against:
         if len(metrics) != 2:

@@ -1787,16 +1787,14 @@ class Shell:
                 "no tally lines came back. `graph` reads a TALLY store — "
                 f"try `select stores from [class=tally]` to see which there are")
 
-        facts = timbergraph.extractor_facts([opts["using"]]) if "using" in opts else {}
-        units = timbergraph.tape_units(markers)
-        for m in metrics:
-            facts.setdefault(m, {})
-            facts[m].setdefault("unit", units.get(m))
-
         scatter_x = opts.get("against")
+        facts, notes = timbergraph.facts_for(
+            metrics + ([scatter_x] if scatter_x else []),
+            markers,
+            [opts["using"]] if "using" in opts else [])
+        for note in notes:
+            print(f"  {note}")
         if scatter_x:
-            facts.setdefault(scatter_x, {})
-            facts[scatter_x].setdefault("unit", units.get(scatter_x))
             lines, xlabel, ylabel, dropped = timbergraph.against(
                 samples, metrics[0], scatter_x, tuple(by), None, None,
                 opts.get("rate", False), opts.get("quantile"), facts)

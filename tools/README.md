@@ -692,9 +692,18 @@ multiplies the count, so drawing one without `--quantile` or `--by le` is
 refused too.
 
 What a line cannot say is the **unit**, and which metrics exist but were
-silent in the window. A `!meta` marker supplies the unit where the window
-happens to hold one; otherwise name the extractor document with `--using`,
-which takes a path **or a name**:
+silent in the window. Three things can supply the unit, in order of authority:
+the document `--using` **named**, then a `!meta` marker if the window holds one
+(the producer's own word about these numbers), then the documents installed
+**here** — the answer's own metric names identify the document, so a metric
+only one of them declares needs nothing typed.
+
+⚠ Where two documents declare one metric in **different** units, both are named
+and the unit is left blank rather than guessed. The unit decides which axis a
+series lands on, so picking between `ms` and `s` would not mislabel the plot, it
+would regroup it.
+
+So `--using` is the **override**, and it takes a path **or a name**:
 
 ```sh
 mkdir -p ~/.config/timberfs/tally.extractors.d
