@@ -109,21 +109,74 @@ Then:
   `wal` — and nothing about its definitions. Given them, a changed definition
   becomes visible drift through code that is already written.
 
-## Changing a definition means a NEW tally
+## Editing a definition changes nothing. APPLYING one is an act
 
-Not a rewrite of the old one, and not a second definition appended to the same
-tape:
+That is the property the stored copy buys, and it is worth stating plainly
+because it is the opposite of how a config file usually behaves: a document
+edited in `/etc/timberfs/tally.extractors.d` does **not** change any tally.
+The store holds the definitions it was created with, and goes on producing
+those numbers until somebody decides otherwise.
 
-* **Re-derive into a new store**, from the source tape. Then keep the old tally
-  or drop it — both are valid and it depends what the old numbers are worth to
-  you. Mutating in place makes neither answer available.
-* ⚠ **The SOURCE store's retention is therefore the budget for changing your
-  mind.** `retain 30d` on the log means definitions are revisable over thirty
-  days of history and no further; throw the log away and the tally you have is
-  the tally you keep. That is a real operational consequence and it is
-  documented nowhere.
-* The cheapest moment to adopt any of this is while stores are being dropped
-  and re-derived anyway — the state 0.33.0 left the production tally stores in.
+Applying new definitions is therefore a deliberate operation with two
+decisions in it, neither of which has a default that is right for everyone.
+
+**What becomes of the old tally** — three answers, all legitimate:
+
+| | expressible today |
+|---|---|
+| drop it | delete the store and its follower |
+| keep it, stop writing | stop the follower; ⚠ nothing declares it closed |
+| keep it, keep writing | leave its provisioning; add a second `.conf` with its own `OUTPUT` ✅ |
+
+**Where the new tally starts** — three answers again:
+
+| | expressible today |
+|---|---|
+| from now | `FOLLOW_FROM=end` ✅ |
+| regenerate everything available | `FOLLOW_FROM=begin` ✅ |
+| regenerate from a fixed time | ⚠ not expressible: `FollowFrom` has no clock |
+
+⚠ On that last one, `FollowFrom::End` carries a warning worth reading before
+adding a timestamp: "a POSITION rather than a clock, because a clock is what
+broke a tail once already". **It does not settle this case, and the difference
+matters.** A clock is treacherous as "start now" — it races the writer and the
+host's own time. As "start at this point in a tape that already exists" it is
+what `query --from` does routinely and safely. A backfill start and a tail
+start are not the same question, and only the second is what that comment is
+about.
+
+⚠ **The SOURCE store's retention is the budget for changing your mind.**
+`retain 30d` on the log means definitions are revisable over thirty days of
+history and no further; throw the log away and the tally you have is the tally
+you keep. A real operational consequence, documented nowhere.
+
+The cheapest moment to adopt any of this is while stores are being dropped and
+re-derived anyway — the state 0.33.0 left the production tally stores in.
+
+### What the two tallies must say about each other
+
+Most of the mechanism above already exists; the conventions do not, and
+without them a fleet accumulates tally stores nobody can order.
+
+* **A supersedes relation.** `.bark` carries `derived_from` and `derived_op`,
+  which point at the SOURCE. Nothing points from one tally to the tally it
+  replaces, so a reader assembling a long window cannot know that the two are
+  the same measurement under two definitions, and a person cannot tell which
+  is current. ⚠ This is most needed in exactly the case where it is least
+  visible: if the definition kept its name and only its content changed, the
+  metric names in both stores are IDENTICAL and nothing distinguishes them.
+* **A declared closed state.** "Nothing follows it" is visible in `list`'s
+  `FOLLOWERS` column but means several things — never started, deliberately
+  retired, or broken. A store that will not be written again should say so, so
+  that a stalled follower and a finished one are not read alike.
+* **A naming convention.** `OUTPUT` must vary per source store, so two tallies
+  from one source need two templates and the operator invents the
+  discriminator. A generation in the name (or a label carrying it) makes the
+  ordering readable without parsing names.
+* **Which properties are shared and which are not.** Both tallies describe the
+  same source and want the same `retain`; only one is current. The split
+  between "inherited from the provisioning" and "true of this generation only"
+  has to be decided once rather than per site.
 
 ## Recorded dead end: offset-scoped definitions
 
