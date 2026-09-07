@@ -275,6 +275,45 @@ to say which store wins where they overlap, and that is the one piece a reader
 cannot infer. Without it a reader summing both double-counts exactly the
 period that was re-derived to be trusted.
 
+### Keeping the old store whole is not the answer either
+
+Two objections to "keep it and stop writing", and both are right:
+
+* ⚠ **Retention is enforced by WRITERS.** `trim`'s own reason for existing:
+  retention "runs inside a live writer … so a store whose producer went quiet
+  keeps its data indefinitely". A retired generation is precisely that store,
+  so the thing whose whole point is a two-year retention would sit there
+  unbounded. `timberfs trim --select '[class=tally]'` is the cron-able answer
+  and sweeps every generation at once, but somebody has to arrange it, and a
+  design that needs a cron job to stop accumulating has got its defaults
+  backwards.
+* ⚠ **The proportions are usually wrong.** 1 GB of tally where the first
+  100 MB is worth keeping and the trailing 900 MB is to be re-derived means
+  holding a 1 GB store to serve a tenth of itself, plus the new one — 1.9 GB
+  for 1 GB of numbers, with 90% of the old store dead weight that the overlap
+  rule tells every reader to ignore.
+
+**`export` already does the right thing**, and it is the piece that makes the
+seam affordable: it copies a WINDOW into a NEW store, chunks verbatim and no
+recompression, with "fresh identity, lineage to the source". So:
+
+```sh
+timberfs export tally --into tally-gen1 --to '<the source's horizon>'
+# drop the old store; derive tally-gen2 from the source with the new definition
+```
+
+100 MB plus 900 MB, nothing duplicated, no tape mutated, and the immutability
+the chunk number rests on is untouched. The price is copying the kept prefix
+once rather than truncating in place — cheap, because it is verbatim frames
+and it is the small end.
+
+⚠ **So a tail truncation is the operation an operator WANTS, and `export` plus
+a drop is how to give it to them without the three costs above.** What is
+missing is not a primitive; it is that nothing puts those three steps behind
+one verb, and doing them by hand in the wrong order loses the numbers that
+cannot be re-derived. Retention on a retired generation is the one genuine
+gap.
+
 ## Offset-scoped definitions: a dead end as SEMANTICS, kept as PROVENANCE
 
 The most *correct* answer is that the tape knows which definition was in force
@@ -341,6 +380,14 @@ state, the generation naming, and the shared-property split.
   declare a shared measurement id**, so drawing them as one line is a stated
   fact rather than a name coincidence — the smallest test of whether the
   reader-side correspondence mechanism is any good.
+* **Who trims a retired generation.** The provisioning knows its generations
+  and could sweep them on its own tick; a cron'd `trim --select
+  '[class=tally]'` needs no code and needs arranging. The first makes the
+  common case correct by default, which is the argument for it.
+* **Whether the three-step retirement should be ONE verb.** `export` the kept
+  prefix, drop the old store, derive the new one — done by hand in the wrong
+  order it loses exactly the numbers that cannot be re-derived, which is the
+  case for not leaving it as three commands in a runbook.
 
 ## Separable, and worth fixing whatever is decided
 
