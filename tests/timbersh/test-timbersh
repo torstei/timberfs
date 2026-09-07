@@ -1012,6 +1012,38 @@ def every_verb_the_parser_takes_is_in_the_grammar_table():
 
 
 @test
+def a_metric_and_an_extractor_complete_from_the_documents_installed_here():
+    """The metric is typed BEFORE `from`, so there is no store to ask —
+    the candidates are the extractor documents on this machine, and the
+    slot used to offer nothing at all. The directories are passed rather
+    than derived: deriving them makes the test measure whether the
+    timberfs package happens to be installed."""
+    import tempfile, shutil
+    d = tempfile.mkdtemp(prefix="timbersh-test-")
+    with open(os.path.join(d, "mine.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"v":"1.0-EXPERIMENTAL","name":"mine",'
+                 '"window":{"axis":"logline","width_ms":60000},'
+                 '"metrics":[{"name":"queue_depth","measure":[{"last":"n"}]},'
+                 '{"name":"queue_waits","measure":[{"count":true}]}]}')
+    mod = timbersh_module()
+    was = mod.timbergraph.EXTRACTOR_DIRS
+    mod.timbergraph.EXTRACTOR_DIRS = (d,)
+    try:
+        c = completer()
+        assert c.options("graph ", "") == ["queue_depth", "queue_waits"]
+        # Both sides of a scatter are the same slot.
+        assert c.options("graph queue_depth against ", "") \
+            == ["queue_depth", "queue_waits"]
+        # `using` and `extracting` take the FILE stem, which is what the
+        # lookup joins `.json` onto — not the document's own name.
+        assert c.options("graph queue_depth from [] using ", "") == ["mine"]
+        assert c.options("graph queue_depth from [] extracting ", "") == ["mine"]
+    finally:
+        mod.timbergraph.EXTRACTOR_DIRS = was
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test
 def the_completer_still_knows_the_rest_of_the_grammar():
     """The half a change to it could quietly break. Every point where
     exactly one kind of thing can come next, checked once."""

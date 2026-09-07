@@ -535,6 +535,46 @@ def resolve_extractor(name_or_path):
     )
 
 
+def declared(dirs=None):
+    """Every extractor document the reading directories hold, as
+    `{file stem: parsed document}` with a later directory shadowing an
+    earlier one by FILE NAME — the rule `resolve_extractor` follows.
+
+    ⚠ A CANDIDATE set, not the truth. A tally store holds whatever
+    metrics the host that wrote it applied, which need not be what is
+    installed here. Good enough to complete a name and never a substitute
+    for reading the tape.
+    """
+    out = {}
+    for d in (extractor_dirs() if dirs is None else dirs):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for f in names:
+            if not f.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    out[f[:-len(".json")]] = json.load(fh)
+            except (OSError, ValueError):
+                continue        # a half-written document is not an error here
+    return out
+
+
+def known_metrics(dirs=None):
+    """Metric names declared by any document in the reading directories."""
+    return sorted({m["name"] for doc in declared(dirs).values()
+                   for m in doc.get("metrics", []) if m.get("name")})
+
+
+def known_extractors(dirs=None):
+    """The names `--using` and `extracting` take: the FILE stems, which is
+    what the lookup joins `.json` onto — not the documents' own names,
+    which can differ and would not resolve."""
+    return sorted(declared(dirs))
+
+
 def extractor_facts(paths):
     """What a plot cannot read off a line: the UNIT, and which metrics
     exist at all.
