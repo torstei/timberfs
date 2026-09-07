@@ -350,6 +350,10 @@ struct Bucket {
     /// The oldest source byte folded in here — what a consumer's
     /// watermark may not pass while this bucket is still open.
     off_lo: Option<u64>,
+    /// Changed since it was last written as a PROVISIONAL line, so a
+    /// quiet store does not re-state the same numbers every tick.
+    /// Meaningless for a sealed bucket, which is written exactly once.
+    dirty: bool,
 }
 
 /// What a bucket LOST or was HANDED, per metric rather than per series:
@@ -361,6 +365,31 @@ struct Marks {
     /// The largest `grace` that would have kept a displaced entry in its
     /// own bucket, which is exactly the number to act on.
     late_max: u64,
+}
+
+/// How much of a roller to write out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Drain {
+    /// Buckets the watermark has left behind: written once and evicted.
+    /// Seal-once, which is the rule everything else here follows.
+    Sealed,
+    /// Those, plus every OPEN bucket that has changed — written as a
+    /// REVISION and kept open.
+    ///
+    /// ⚠ The revision is the whole point. A bucket the producer has not
+    /// finished filling has a number worth showing — a quiet store's
+    /// newest minute, which nothing else will surface until data arrives
+    /// in a later one — but showing it must not consume it. Written and
+    /// EVICTED, each tick emitted only what had arrived since the last,
+    /// and a reader resolving a bucket to its newest line (`resolve`,
+    /// and `timbergraph.read`) then reported the last fragment as the
+    /// whole: measured at 512 of 1536 entries. Kept open, the next line
+    /// for that bucket carries the complete total and supersedes this
+    /// one, which is what those readers already do with it.
+    Provisional,
+    /// Everything, evicted: the stream has ended and no bucket can
+    /// receive another entry.
+    Final,
 }
 
 /// Observations in, buckets out. Also the coarsener: feeding it buckets
@@ -377,6 +406,10 @@ pub struct Roller {
     buckets: BTreeMap<Key, Bucket>,
     marks: BTreeMap<(u64, String), Marks>,
     watermark: u64,
+    /// The greatest stamp an actual ENTRY carried, which `watermark` is
+    /// not once wall clock has stood in for it. `advance_to` clamps
+    /// against this so it can never seal a bucket the data is still in.
+    last_event: u64,
 }
 
 impl Roller {
@@ -388,6 +421,7 @@ impl Roller {
             buckets: BTreeMap::new(),
             marks: BTreeMap::new(),
             watermark: 0,
+            last_event: 0,
         }
     }
 
@@ -402,24 +436,34 @@ impl Roller {
         for s in samples {
             r.add(s);
         }
-        r.drain(true)
+        r.drain(Drain::Final)
     }
 
     pub fn watermark(&self) -> u64 {
         self.watermark
     }
 
-    /// Move the watermark without adding anything.
+    /// Let WALL CLOCK stand in for event time, as far as it may.
     ///
-    /// ⚠ For a LIVE reader only. Event time advances when events arrive,
-    /// which is what makes a backfill deterministic — and what leaves a
-    /// quiet log's last buckets unsealed forever, since nothing is
-    /// coming to push them out. So a follower that has heard nothing for
-    /// a while lets WALL CLOCK stand in for event time; a backfill never
-    /// goes quiet before its end, so it never calls this and behaves as
-    /// it always did.
-    pub fn advance(&mut self, by_ms: u64) {
-        self.watermark = self.watermark.saturating_add(by_ms);
+    /// Event time advances when events arrive, which is what makes a
+    /// backfill deterministic — and what leaves a quiet log's last
+    /// buckets unsealed for ever, since nothing is coming to push them
+    /// out. So a reader that has heard nothing for a while calls this.
+    ///
+    /// ⚠ Clamped to `last_event + grace`, and that clamp is the whole
+    /// safety of it. It seals exactly the buckets in-order data has
+    /// already passed — the ones whose grace has genuinely expired —
+    /// and never the bucket the newest entry is in, which is the only
+    /// one an in-order arrival can still land in. Unclamped, it ran the
+    /// watermark ahead of the data instead: `advance(2000)` per tick
+    /// during a stalled backfill injected 8 s of fabricated event time
+    /// per 10 s against 2.56 s of real log time, after which every
+    /// entry was late and every batch was displaced whole
+    /// (`!late count=<batch>`, measured). Also never past `now`, so a
+    /// clock that jumps back cannot rewind it.
+    pub fn advance_to(&mut self, now_ms: u64) {
+        let reach = self.last_event.saturating_add(self.grace_ms);
+        self.watermark = self.watermark.max(now_ms.min(reach));
     }
 
     /// The oldest source byte any OPEN bucket still depends on. A
@@ -459,6 +503,7 @@ impl Roller {
 
     pub fn add(&mut self, s: &Sample) {
         self.watermark = self.watermark.max(s.ts);
+        self.last_event = self.last_event.max(s.ts);
         let (start, late) = self.place(s.ts);
         // A marker about a bucket is not itself displaceable data.
         if let Some(by) = late.filter(|_| !s.is_marker()) {
@@ -484,6 +529,7 @@ impl Roller {
             }
         }
         let b = self.buckets.entry(key).or_default();
+        b.dirty = true;
         for (f, v) in &s.fields {
             let next = (*v, s.ts);
             let merged = match b.fields.get(f) {
@@ -499,14 +545,24 @@ impl Roller {
         }
     }
 
-    /// Every bucket the watermark has left behind, written once and
-    /// evicted, with whatever markers that bucket owes.
-    pub fn drain(&mut self, force: bool) -> Vec<Sample> {
+    /// The buckets `how` asks for, with whatever markers they owe.
+    ///
+    /// A sealed bucket is written once and evicted; an open one, under
+    /// `Drain::Provisional`, is written as a revision and KEPT — see
+    /// `Drain`.
+    pub fn drain(&mut self, how: Drain) -> Vec<Sample> {
         let mut out = Vec::new();
         let mut evict: Vec<Key> = Vec::new();
+        let mut clean: Vec<Key> = Vec::new();
         for (key, b) in self.buckets.iter() {
-            if !force && !self.sealed(key.0) {
-                continue;
+            let sealed = how == Drain::Final || self.sealed(key.0);
+            if !sealed {
+                // Unchanged since its last provisional line, so that
+                // line still says what this one would.
+                if how != Drain::Provisional || !b.dirty {
+                    continue;
+                }
+                clean.push(key.clone());
             }
             let mut s = Sample::new(key.0, self.width_ms, &key.1);
             s.labels = key.2.clone();
@@ -515,15 +571,26 @@ impl Roller {
                 s.cite = Some((lo, hi - lo));
             }
             out.push(s);
-            evict.push(key.clone());
+            if sealed {
+                evict.push(key.clone());
+            }
         }
         for k in evict {
             self.buckets.remove(&k);
         }
+        for k in clean {
+            if let Some(b) = self.buckets.get_mut(&k) {
+                b.dirty = false;
+            }
+        }
+        // ⚠ Markers are drained on SEALING only, provisional or not: a
+        // `!cap` or `!late` count for an open bucket is still rising, and
+        // a marker is not keyed by label set, so re-stating one would not
+        // supersede its predecessor the way a bucket's own line does.
         let due: Vec<(u64, String)> = self
             .marks
             .keys()
-            .filter(|(start, _)| force || self.sealed(*start))
+            .filter(|(start, _)| how == Drain::Final || self.sealed(*start))
             .cloned()
             .collect();
         for k in due {
@@ -1369,9 +1436,9 @@ pub fn fold_stream(
             );
         }
         roller.add(&s);
-        let _ = emit(out, roller.drain(false))?;
+        let _ = emit(out, roller.drain(Drain::Sealed))?;
     }
-    let _ = emit(out, roller.drain(true))?;
+    let _ = emit(out, roller.drain(Drain::Final))?;
     Ok(())
 }
 
@@ -1663,15 +1730,23 @@ impl Run {
                 }
             }
             if !observations {
-                batch.extend(l.roller.drain(false));
+                batch.extend(l.roller.drain(Drain::Sealed));
             }
         }
         Ok(span(meta, emit(out, batch)?))
     }
 
-    /// Let wall clock stand in for event time on a quiet stream, and
-    /// write whatever that seals.
-    fn idle(&mut self, by_ms: u64, out: &mut impl Write) -> anyhow::Result<Option<(u64, u64)>> {
+    /// A quiet stream: let wall clock stand in for event time, write
+    /// whatever that seals, and state the still-open buckets
+    /// provisionally.
+    ///
+    /// ⚠ The provisional half is what surfaces a quiet store's NEWEST
+    /// bucket, and nothing else can. Sealing it would need the watermark
+    /// pushed past its end plus grace — i.e. past event time the data
+    /// has not reached — and every entry arriving after that is then
+    /// displaced out of its own bucket. So the newest bucket is shown
+    /// rather than sealed, and superseded when it is complete.
+    fn idle(&mut self, now_ms: u64, out: &mut impl Write) -> anyhow::Result<Option<(u64, u64)>> {
         let mut batch: Vec<Sample> = Vec::new();
         for l in self.live.iter_mut() {
             if l.roller.watermark() == 0 {
@@ -1679,8 +1754,8 @@ impl Run {
                 // advance from and nothing could be sealed anyway.
                 continue;
             }
-            l.roller.advance(by_ms);
-            batch.extend(l.roller.drain(false));
+            l.roller.advance_to(now_ms);
+            batch.extend(l.roller.drain(Drain::Provisional));
         }
         emit(out, batch)
     }
@@ -1695,7 +1770,7 @@ impl Run {
         }
         let mut batch: Vec<Sample> = Vec::new();
         for l in self.live.iter_mut() {
-            batch.extend(l.roller.drain(true));
+            batch.extend(l.roller.drain(Drain::Final));
         }
         emit(out, batch)
     }
@@ -2470,9 +2545,11 @@ struct Sink {
     store: crate::store::Store,
     run: Run,
     /// The end of the last entry delivered, which is where a position
-    /// goes when nothing is open.
+    /// goes when nothing is open — and what is reported as `taken`
+    /// meanwhile, so the follower keeps feeding while a bucket is held.
     delivered_to: Option<u64>,
     reported: Option<u64>,
+    reported_taken: Option<u64>,
 }
 
 impl Sink {
@@ -2543,16 +2620,6 @@ impl TallyOpts {
 /// clock that ticks rather than the thing that decides.
 const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How many of those in a row mean the producer has STOPPED, at which
-/// point everything held is sealed.
-///
-/// ⚠ Without it the tail of a quiet log waits for `grace` of TICKS —
-/// six minutes of ticking to cross a two-minute grace — and a log that
-/// never speaks again never gets its last minutes at all. An entry
-/// arriving after this is displaced, which is the same rule as any other
-/// late entry, so nothing new is being decided here.
-const QUIET_TICKS: u32 = 5;
-
 pub struct RunOpts {
     pub etc: PathBuf,
     /// Where a tally store is created if the provisioning has not run —
@@ -2609,7 +2676,6 @@ pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
     let mut sinks: BTreeMap<String, Sink> = BTreeMap::new();
     let mut known: BTreeMap<String, (String, Map<String, Value>)> = BTreeMap::new();
     let mut ended = false;
-    let mut quiet: u32 = 0;
 
     loop {
         let rec = match rx.recv_timeout(IDLE_TICK) {
@@ -2618,23 +2684,16 @@ pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
             Ok(Err(e)) => return Err(e),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                quiet += 1;
+                let now = crate::store::now_ms();
                 for (id, sink) in sinks.iter_mut() {
                     let mut lines: Vec<u8> = Vec::new();
-                    let window = if quiet == QUIET_TICKS {
-                        sink.run.finish(&mut lines, false)?
-                    } else if quiet < QUIET_TICKS {
-                        sink.run.idle(IDLE_TICK.as_millis() as u64, &mut lines)?
-                    } else {
-                        None
-                    };
+                    let window = sink.run.idle(now, &mut lines)?;
                     sink.write(&lines, window)?;
                     report(&mut reports, id, sink)?;
                 }
                 continue;
             }
         };
-        quiet = 0;
         match rec {
             crate::records::Rec::Source(fields) => {
                 let get = |k: &str| fields.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
@@ -2711,11 +2770,25 @@ fn report(out: &mut impl Write, id: &str, sink: &mut Sink) -> anyhow::Result<()>
     let Some(at) = sink.watermark() else {
         return Ok(());
     };
-    if sink.reported == Some(at) {
+    // ⚠ Both numbers, and the second is what keeps this fed. `offset` is
+    // where a restart may resume — behind every open bucket, because
+    // those are re-derived from the source bytes rather than persisted —
+    // and a follower reads a position as flow control too, so reporting
+    // only that one parked the store on the oldest byte the oldest open
+    // bucket depended on and then waited for the entries that would have
+    // sealed it. `taken` says how far this has actually READ. See
+    // consumer.rs and docs/plans/consumer-holding.md.
+    let took = sink.delivered_to;
+    if sink.reported == Some(at) && sink.reported_taken == took {
         return Ok(());
     }
     sink.reported = Some(at);
-    write!(out, "\x1eprogress\x1fid={id}\x1foffset={at}\0")?;
+    sink.reported_taken = took;
+    write!(out, "\x1eprogress\x1fid={id}\x1foffset={at}")?;
+    if let Some(took) = took.filter(|t| *t > at) {
+        write!(out, "\x1ftaken={took}")?;
+    }
+    out.write_all(b"\0")?;
     out.flush()?;
     Ok(())
 }
@@ -2775,6 +2848,7 @@ fn open_sink(
         run: Run::new(docs, &TallyOpts::for_run(p.width_ms))?,
         delivered_to: None,
         reported: None,
+        reported_taken: None,
     })
 }
 
@@ -2808,6 +2882,10 @@ mod tests {
 
     fn s(line: &str) -> Sample {
         Sample::parse(line).expect(line)
+    }
+
+    fn stamp(t: &str) -> u64 {
+        parse_stamp(t).expect(t)
     }
 
     #[test]
@@ -2910,12 +2988,12 @@ mod tests {
         let mut r = Roller::new(60_000, 30_000, 1000);
         r.add(&s("2026-09-06T13:37:10.000Z 0s m count=1"));
         assert!(
-            r.drain(false).is_empty(),
+            r.drain(Drain::Sealed).is_empty(),
             "not sealed while the grace stands"
         );
 
         r.add(&s("2026-09-06T13:39:00.000Z 0s m count=1"));
-        let sealed = r.drain(false);
+        let sealed = r.drain(Drain::Sealed);
         assert_eq!(
             sealed.iter().map(|s| s.render()).collect::<Vec<_>>(),
             vec!["2026-09-06T13:37:00.000Z 60s m count=1"]
@@ -2924,7 +3002,7 @@ mod tests {
         // Its own bucket is gone, so it joins the one the watermark is
         // in — and nothing re-opens what was already written.
         r.add(&s("2026-09-06T13:37:30.000Z 0s m count=1"));
-        let out = r.drain(true);
+        let out = r.drain(Drain::Final);
         let rendered: Vec<String> = out.iter().map(|s| s.render()).collect();
         assert!(
             rendered.contains(&"2026-09-06T13:39:00.000Z 60s m count=2".to_string()),
@@ -2975,7 +3053,7 @@ mod tests {
         r.add(&b);
         assert_eq!(r.safe_offset(), Some(512));
         assert_eq!(
-            r.drain(true)[0].render(),
+            r.drain(Drain::Final)[0].render(),
             "2026-09-06T13:37:00.000Z 60s m count=2 @512+3684"
         );
         assert_eq!(r.safe_offset(), None, "nothing held, nothing to hold back");
@@ -2991,7 +3069,7 @@ mod tests {
                     .field(Field::Count, 1.0),
             );
         }
-        let out = r.drain(true);
+        let out = r.drain(Drain::Final);
         let cap: Vec<&Sample> = out.iter().filter(|s| s.metric == "!cap").collect();
         assert_eq!(cap.len(), 1);
         assert_eq!(cap[0].fields, vec![(Field::Count, 3.0)]);
@@ -3224,7 +3302,7 @@ mod tests {
         // of them at the epoch, which is exactly the one worth reading.
         let mut r = Roller::new(60_000, u64::MAX, 1000);
         note_drop(&mut r, "m", "unreadable", Some(1_788_700_000_000));
-        let out = r.drain(true);
+        let out = r.drain(Drain::Final);
         assert_eq!(out.len(), 1);
         assert!(
             out[0].render().starts_with("2026-09-06T"),
@@ -3639,21 +3717,96 @@ mod tests {
         );
     }
 
+    /// Wall clock may seal the buckets in-order data has already left,
+    /// and never the one it is still in — which is the only bucket an
+    /// in-order arrival can land in. Advancing past it displaced every
+    /// later entry out of its own bucket, marked `!late`.
     #[test]
-    fn wall_clock_stands_in_for_event_time_only_when_asked() {
-        // A backfill never goes quiet before its end, so it never
-        // advances and behaves as it always did. A follower on a log that
-        // has stopped would otherwise hold its last minutes forever.
+    fn wall_clock_seals_what_event_time_has_left_and_no_more() {
         let mut r = Roller::new(60_000, 30_000, 1000);
+        r.add(&s("2026-09-06T13:35:10.000Z 0s m count=1"));
         r.add(&s("2026-09-06T13:37:10.000Z 0s m count=1"));
-        assert!(r.drain(false).is_empty());
-        r.advance(120_000);
+        // Hours later by the clock, and it still may not seal 13:37.
+        r.advance_to(stamp("2026-09-06T19:00:00.000Z"));
         assert_eq!(
-            r.drain(false)
+            r.drain(Drain::Sealed)
                 .iter()
                 .map(|s| s.render())
                 .collect::<Vec<_>>(),
-            vec!["2026-09-06T13:37:00.000Z 60s m count=1"]
+            vec!["2026-09-06T13:35:00.000Z 60s m count=1"],
+            "13:37 holds the newest entry, so nothing may seal it"
+        );
+        // And a later entry for it is therefore NOT late.
+        r.add(&s("2026-09-06T13:37:50.000Z 0s m count=1"));
+        let out = r.drain(Drain::Final);
+        assert!(
+            !out.iter().any(|s| s.metric == "!late"),
+            "an in-order arrival was displaced: {:?}",
+            out.iter().map(|s| s.render()).collect::<Vec<_>>()
+        );
+        assert!(out
+            .iter()
+            .any(|s| s.render() == "2026-09-06T13:37:00.000Z 60s m count=2"));
+    }
+
+    /// The defect that made a tally store under-report: a bucket shown
+    /// before it was complete used to be EVICTED, so each showing
+    /// carried only what had arrived since the last one — and a reader
+    /// resolving a bucket to its newest line then read the last fragment
+    /// as the whole. Measured at 512 of 1536 entries.
+    #[test]
+    fn a_provisional_bucket_is_superseded_by_its_complete_total() {
+        let mut r = Roller::new(60_000, 120_000, 1000);
+        let mut tape: Vec<Sample> = Vec::new();
+        for i in 0..9 {
+            r.add(&s(&format!(
+                "2026-09-06T13:37:{:02}.000Z 0s m count=1",
+                i * 5
+            )));
+            // A quiet tick between every entry, as a stalled feed
+            // produced: each one shows the bucket without consuming it.
+            tape.extend(r.drain(Drain::Provisional));
+        }
+        tape.extend(r.drain(Drain::Final));
+        assert!(tape.len() > 1, "the bucket was never shown provisionally");
+        let resolved = resolve(tape);
+        assert_eq!(
+            resolved.iter().map(|s| s.render()).collect::<Vec<_>>(),
+            vec!["2026-09-06T13:37:00.000Z 60s m count=9"],
+            "the newest line for a bucket must carry its whole total"
+        );
+    }
+
+    /// A quiet store must not restate the same numbers every tick: the
+    /// tape is what retention keeps, and a bucket nothing has added to
+    /// says what its last line already said.
+    #[test]
+    fn an_unchanged_bucket_is_not_restated() {
+        let mut r = Roller::new(60_000, 120_000, 1000);
+        r.add(&s("2026-09-06T13:37:10.000Z 0s m count=1"));
+        assert_eq!(r.drain(Drain::Provisional).len(), 1);
+        assert!(
+            r.drain(Drain::Provisional).is_empty(),
+            "nothing arrived, so there is nothing to say again"
+        );
+        r.add(&s("2026-09-06T13:37:20.000Z 0s m count=1"));
+        assert_eq!(r.drain(Drain::Provisional).len(), 1, "it changed again");
+    }
+
+    /// A provisional line must not move the position: the bucket is
+    /// still open, so a restart has to re-read the entries behind it.
+    #[test]
+    fn showing_a_bucket_does_not_release_its_source_bytes() {
+        let mut r = Roller::new(60_000, 120_000, 1000);
+        let mut sample = s("2026-09-06T13:37:10.000Z 0s m count=1");
+        sample.cite = Some((4096, 100));
+        r.add(&sample);
+        assert_eq!(r.safe_offset(), Some(4096));
+        let _ = r.drain(Drain::Provisional);
+        assert_eq!(
+            r.safe_offset(),
+            Some(4096),
+            "the bucket is still open, so its oldest byte is still needed"
         );
     }
 

@@ -1084,6 +1084,13 @@ entries again, an entry refused for being too old is reported past and never
 re-sent, and a `note` records why nothing is moving. **No hello, no run** —
 timberfs refuses rather than guessing that a silent program is keeping up.
 
+A consumer that is **holding** entries — a `tally` run's open bucket, which it
+re-derives from the source bytes after a restart rather than persisting — keeps
+its watermark behind them deliberately, and reports `taken` beside it: how far
+it has read, which is what timberfs paces on. Nothing to configure; it matters
+only if you write a consumer of your own that holds state, in which case
+reporting the conservative watermark alone will stall it.
+
 Being a **reader**, it cannot hurt the store or the appender: an unreachable
 receiver stalls its own follower and nothing else, and the store is the send
 buffer — retention is the disconnection budget (`retain 30d` means the receiver

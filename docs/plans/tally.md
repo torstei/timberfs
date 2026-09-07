@@ -10,7 +10,19 @@ two shipped extractors tested by their own `--try` output (`timberfs.1`,
 tally stores and registers a follower whose selection and command are both
 derived from the file, and `--run` is the consumer that follower execs. Not
 built: the `samples` response kind, rollups, the session, and the `!gap`
-marker. It rests on the follower registry and its position per store
+marker.
+
+⚠ **The provisioned path was defective until the `taken` report** and a tally
+store written before it holds numbers that are silently short: it deadlocked
+against the follower's park and ran at 51 entries/s whatever the hardware.
+Fixed — measured at 51,949 entries/s after, with the tape byte-identical to
+one in-memory pass — but a store carried over from before wants dropping and
+re-deriving. `--try`, `--fold` and the pipe below were never affected; the
+defect was in the consumer protocol's flow control, not the extractor or the
+fold. [consumer-holding.md](consumer-holding.md) has the measurements, and
+the revision rule a tally tape now relies on.
+
+It rests on the follower registry and its position per store
 ([follower-selection.md](follower-selection.md)), the consumer protocol
 ([consumer-protocol.md](consumer-protocol.md)), store selection (`select.rs`),
 derived-store lineage (`.bark`), and head-drop retention.
@@ -238,16 +250,24 @@ once. Named here rather than guarded against, because a robust watermark is its
 own design and choosing a percentile over the max should be forced by a real
 log rather than imagined.
 
-⚠ **Newest-wins survives, as a READ rule, for a different reason.** Re-running
-an extractor over a window emits the same buckets again, and
+⚠ **Newest-wins survives, and is now LOAD-BEARING rather than a safety net.**
 
 > **the newest line for `(metric, labels, start, width)` wins**
 
-is what makes a recompute idempotent rather than doubling. It is a property of
-reading a tape, not of writing one: nothing emits a revision, but a reader must
-still resolve a window before answering it. Bounded by series × buckets, not by
-entries. A **`--follow` of a tally store delivers unresolved lines and must say
-so**, exactly as a live-edge entry carries no chunk number.
+It was written for recompute idempotence: re-running an extractor over a window
+emits the same buckets again, and this is what keeps that from doubling. On
+that reasoning it was "a property of reading a tape, not of writing one:
+nothing emits a revision" — which **stopped being true** when a quiet tick
+began stating an open bucket provisionally and keeping it (see
+[consumer-holding.md](consumer-holding.md)). A running tally follower now emits
+revisions as a matter of course: the newest line for a bucket carries its
+complete total, and every earlier line for it is superseded.
+
+So a reader that SUMS the lines for one bucket double-counts, and one that
+takes the FIRST reports a minute that had barely begun. Resolution is not
+optional. Bounded by series × buckets, not by entries. A **`--follow` of a
+tally store delivers unresolved lines and must say so**, exactly as a live-edge
+entry carries no chunk number.
 
 ## A tally store's chunks are stamped with the buckets
 
@@ -1017,6 +1037,14 @@ loss, recorded exactly — the same rule retention already follows.
   bucket still depends on, so a restart re-derives identical lines), creating
   the tally store with its labels and lineage, and writing the `!gap` marker
   from the registry's GAP.
+
+  ⚠ `safe_offset` is the right watermark and was the WRONG thing to report
+  alone as the consumer protocol's `progress`, which the follower also reads
+  as flow control: a store was parked until its position moved, so the two
+  rules deadlocked at **51 entries/s** with numbers silently short. It is now
+  reported beside `taken` — see [consumer-holding.md](consumer-holding.md),
+  which also covers the `!gap` marker's absence being the last piece of this
+  bullet still open.
 * **The `!gap` marker** — the registry reports a GAP when retention dropped
   chunks a follower had not read, and nothing writes it into the tally store
   yet. Until it does, a hole in the numbers and a quiet period look alike.

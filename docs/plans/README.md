@@ -44,6 +44,13 @@ messages and pull requests are for.
   position and a consumer says how far to move it: three messages, why the
   watermark means "do not send me these again", and what that makes possible
   (any language, and a destination on another machine).
+- [consumer-holding.md](consumer-holding.md) — the third thing a consumer can
+  be doing with an entry, beside taking it and dropping it: HOLDING it. The
+  measured deadlock between the park and tally's watermark that capped a tally
+  follower at 51 entries/s and silently corrupted its numbers, the `taken`
+  report that separates flow control from the position, and the provisional
+  bucket that replaced the force-seal — including the fix this note first
+  proposed and got wrong.
 - [paging.md](paging.md) — walking a bounded result set: a cursor beside the
   search rather than inside it, covering every store examined.
 - [logline-order.md](logline-order.md) — ordering a multi-store answer by the

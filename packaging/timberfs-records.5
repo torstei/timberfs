@@ -403,7 +403,7 @@ itself.
 .RS
 .nf
 hello     v=1  reads=records  [ holds=<json object> ]
-progress  id=<store>  offset=<n>
+progress  id=<store>  offset=<n>  [ taken=<n> ]
 note      [ id=<store> ]  [ offset=<n> ]  text=<json string>
 .fi
 .RE
@@ -438,6 +438,28 @@ and the runs chain, so a watermark is the last accepted entry's
 .BR "offset + len" ,
 per
 .BR id .
+.IP
+.B taken
+is how far the consumer has READ, and it is FLOW CONTROL rather than a
+position: timberfs sends from it, records
+.B offset
+and never persists it. It exists for a consumer that is HOLDING entries
+\(em neither taking them nor dropping them. A
+.B tally
+consumer's open bucket is re-derived from its source bytes rather than
+persisted, so it has the entries, does not want them again now, and needs
+them again if it restarts; its
+.B offset
+must therefore stay behind them. Since timberfs also reads a position as
+flow control \(em a store with anything outstanding is not read again \(em
+one number for both stalls such a consumer on its own correctness, and a
+tally follower ran at 51 entries a second for that reason. ABSENT means
+equal to
+.BR offset ,
+which is every consumer that does not hold and all this protocol could
+once say. It may never be BEHIND
+.BR offset :
+that would ask to be resumed from bytes it has not read, and is refused.
 .B ONE unit whatever it reads:
 the absolute offset on the store's tape \(em what has ever left the store
 plus where the bytes sit in what remains. Retention cannot move it, and a

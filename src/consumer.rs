@@ -18,6 +18,15 @@
 //! own log say why. What it did with the data is its business, which is
 //! why no error taxonomy crosses this boundary.
 //!
+//! **A consumer may also be HOLDING them, which is neither.** tally's
+//! open bucket is derived from its source bytes rather than persisted,
+//! so it has the entries, does not want them again now, and needs them
+//! again if it restarts — and its position must therefore stay behind
+//! them. A follower reads that position as flow control too, so saying
+//! one number for both stalls such a consumer on its own correctness.
+//! Hence `taken` beside `offset` on a progress report: how far it has
+//! read, for pacing only, never persisted, absent meaning equal.
+//!
 //! **One unit: the absolute offset on the store's tape.** An entry
 //! record states `offset` and `len` and the runs chain, so a watermark
 //! is the last accepted entry's `offset + len` — a number the consumer
@@ -92,7 +101,17 @@ pub enum Report {
         holds: Vec<(String, u64)>,
     },
     /// Move this store's position here.
-    Progress { id: String, offset: u64 },
+    ///
+    /// `taken` is FLOW CONTROL and not a position: how far the consumer
+    /// has read, which for one HOLDING entries runs ahead of the offset
+    /// it is willing to be resumed from. Absent means equal to `offset`
+    /// — every consumer that does not hold, and the only thing this
+    /// protocol used to be able to say.
+    Progress {
+        id: String,
+        offset: u64,
+        taken: Option<u64>,
+    },
     /// Why nothing is moving, for an operator. Opaque to timberfs and
     /// rendered verbatim. `id` absent means "about me, not a store".
     Note {
@@ -174,7 +193,25 @@ impl<R: BufRead> Reader<R> {
                         .context("a progress report carries no offset")?
                         .parse()
                         .context("a progress report's offset is not a number")?;
-                    return Ok(Some(Report::Progress { id, offset }));
+                    let taken: Option<u64> = match get("taken") {
+                        None => None,
+                        Some(v) => Some(
+                            v.parse::<u64>()
+                                .context("a progress report's taken is not a number")?,
+                        ),
+                    };
+                    // Behind the offset it would mean "resume me from
+                    // bytes I have not read", which is not a thing a
+                    // consumer can want and would silently skip entries.
+                    if taken.is_some_and(|t| t < offset) {
+                        bail!(
+                            "a progress report says it has taken {} but its position is {offset} \
+                             — taken is how far it has READ, so it cannot be behind the offset \
+                             it can be resumed from",
+                            taken.expect("just tested")
+                        );
+                    }
+                    return Ok(Some(Report::Progress { id, offset, taken }));
                 }
                 b"note" => {
                     self.require_hello("note")?;
@@ -300,8 +337,9 @@ mod tests {
             _ => panic!("expected a hello"),
         }
         match &reports[1] {
-            Report::Progress { id, offset } => {
+            Report::Progress { id, offset, taken } => {
                 assert_eq!((id.as_str(), *offset), ("aaa", 33724753900));
+                assert_eq!(*taken, None, "a consumer that does not hold says nothing");
             }
             _ => panic!("expected progress"),
         }
@@ -376,7 +414,9 @@ mod tests {
             "the unknown kind is gone, the rest is not"
         );
         match &reports[1] {
-            Report::Progress { id, offset } => assert_eq!((id.as_str(), *offset), ("aaa", 7)),
+            Report::Progress { id, offset, .. } => {
+                assert_eq!((id.as_str(), *offset), ("aaa", 7))
+            }
             _ => panic!("expected progress"),
         }
     }

@@ -903,6 +903,19 @@ here.
   head-drop takes a cumulative base), `sum`+`count` over averages, and
   histogram buckets over quantiles. Design note:
   [docs/plans/tally.md](docs/plans/tally.md).
+- **A consumer that is HOLDING entries** (`taken` beside the position) —
+  SHIPPED. The consumer protocol had "took it" and "dropped it" and no way to
+  say "I have these and will need them again if I restart", which is what a
+  tally consumer's open bucket is; reporting the conservative position instead
+  deadlocked against the follower's park at **51 entries/s** for a tally
+  follower whose extractor does 310,000/s, with numbers silently short and
+  then silently displaced. An optional `taken` field on `progress` now
+  separates flow control from the durable position (**51,949 entries/s**
+  after), and a quiet tick states an open bucket as a revision rather than
+  force-sealing it. What is left is the hot-loop work the same note lists —
+  `Roller::add`'s per-new-series scan being a 4.16 s → 61.7 s cliff — and the
+  in-flight bound question. Note:
+  [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
 - **Declarations scoped to a range of the tape**: everything a store
   declares about itself is true of the WHOLE store, and some of it is only
   ever true of a stretch. A producer that changed its line format mid-life
