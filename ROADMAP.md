@@ -924,9 +924,13 @@ here.
   `Run::new`'s refusal is the symptom rather than the rule, and contradicts
   itself in one function: its comment says apache's and nginx's
   `http_requests` are the same measurement, its error says they are two. The
-  fix is the identity discipline this tree already applies to stores — minted
-  and declared, never a name — with combination stated where the question is
-  asked. Design note:
+  remedy is small: the resolved definitions are copied into the tally store at
+  creation and their short names prefix the metrics, so a name is unique within
+  one tally by construction, "which definition produced this" is answerable
+  from the store rather than from whatever is installed locally, and a changed
+  definition means re-deriving into a NEW tally — which makes the source
+  store's retention the budget for changing your mind. `:` is already legal in
+  a metric name, so none of it is a format change. Design note:
   [docs/plans/tally-series-identity.md](docs/plans/tally-series-identity.md).
 - **Declarations scoped to a range of the tape**: everything a store
   declares about itself is true of the WHOLE store, and some of it is only
