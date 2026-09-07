@@ -239,11 +239,11 @@ the latter raises the cap or stops labelling by vhost, which is the decision
 being forced into the open.
 
 ⚠ And this is the metric that meets the performance cliff already recorded in
-[tally-series-identity.md](tally-series-identity.md): `Roller::add` scans the
-bucket's existing series for every NEW one, measured at 4.16 s capped against
-**61.7 s uncapped** over 500k entries. High cardinality is exactly where that
-bites, so "bytes per vhost" is the metric that would find it. Fixing it is on
-that note's list and is independent of any of this.
+[consumer-holding.md](consumer-holding.md): `Roller::add` scans the bucket's
+existing series for every NEW one, measured at 4.16 s capped against **61.7 s
+uncapped** over 500k entries. High cardinality is exactly where that bites, so
+"bytes per vhost" is the metric that would find it. Fixing it is on that
+note's list and is independent of any of this.
 
 ## Retention granularity is one day
 
