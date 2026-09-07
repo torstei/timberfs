@@ -3217,6 +3217,21 @@ the same entries again, the second reports past them. No error taxonomy
 crosses the boundary, because the consumer is the only party that knows
 what its destination meant.
 .PP
+A consumer may also be HOLDING entries \(em neither taking nor dropping
+them. A
+.B tally
+consumer's open bucket is re-derived from its source bytes rather than
+persisted, so its watermark must stay behind them, and since timberfs
+reads a watermark as flow control too, one number for both would stall it
+on its own correctness. Such a consumer reports
+.B taken
+beside its
+.B offset
+\(em how far it has READ, for pacing only, never persisted \(em and
+timberfs sends from that. Absent, as it is for every consumer that does
+not hold, the two are the same number. See THE CONSUMER PROTOCOL in
+.BR timberfs\-records (5).
+.PP
 The consumer is not verified at registration. A path that does not exist,
 a binary deleted afterwards and
 .B /bin/false
