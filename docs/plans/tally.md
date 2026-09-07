@@ -405,7 +405,11 @@ across both documents, which is worth more than the format change on its own.
 
 **The name is declared INSIDE**, never taken from the filename: renaming a file
 must not change what a document IS, the same rule a metric name and a store
-identity already follow. Two documents claiming one name is refused, naming
+identity already follow. ⚠ That sentence is wrong about the metric name, and
+the error is load-bearing: a store identity is a MINTED id and not a name,
+which is the whole of why a store is found by what it declares. A metric name
+is a string two unrelated definitions can both write, and the fold merges them.
+See [tally-series-identity.md](tally-series-identity.md). Two documents claiming one name is refused, naming
 both files.
 
 ⚠ **What JSON costs, honestly**: regexes double-escape (`\\S`, `\\d{3}`),

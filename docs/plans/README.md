@@ -61,6 +61,11 @@ messages and pull requests are for.
   wal's seal already recovers its own, the on-disk stage marker that makes the
   rest decidable, and the source witness that would let `file-intake` adopt one
   (and serve a live edge) without writing every byte twice.
+- [tally-series-identity.md](tally-series-identity.md) — a metric is a series,
+  and whether two series combine is the READER's decision: the shipped fold
+  makes it at storage time and irreversibly, `Run::new`'s guard is the symptom
+  and contradicts itself, and a name is the wrong place for an identity this
+  tree already decided must be minted and declared.
 - [tally.md](tally.md) — metrics derived from the log as a tape of their own:
   the extractor as a consumer (and therefore backfillable), the one invariant
   that decides the line format, and how a site declares extractors of its own.

@@ -916,6 +916,18 @@ here.
   `Roller::add`'s per-new-series scan being a 4.16 s → 61.7 s cliff — and the
   in-flight bound question. Note:
   [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
+- **A metric is a series, and combining it is the reader's decision** (a real
+  defect): `tally --fold` sums two definitions' measurements into one number,
+  because `Roller` keys a bucket on `(start, metric, labels)` and nothing on
+  the line says which definition produced it — so the question "are these one
+  series" is answered by the STORAGE layer, at write time, irreversibly.
+  `Run::new`'s refusal is the symptom rather than the rule, and contradicts
+  itself in one function: its comment says apache's and nginx's
+  `http_requests` are the same measurement, its error says they are two. The
+  fix is the identity discipline this tree already applies to stores — minted
+  and declared, never a name — with combination stated where the question is
+  asked. Design note:
+  [docs/plans/tally-series-identity.md](docs/plans/tally-series-identity.md).
 - **Declarations scoped to a range of the tape**: everything a store
   declares about itself is true of the WHOLE store, and some of it is only
   ever true of a stretch. A producer that changed its line format mid-life
