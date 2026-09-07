@@ -916,11 +916,13 @@ here.
   `Roller::add`'s per-new-series scan being a 4.16 s → 61.7 s cliff — and the
   in-flight bound question. Note:
   [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
-- **A tally store designed from the data**: measured on a real tally, 86% of a
-  line is not the number — series identity 35%, bucket stamps 31%, citations
-  19% — because a tally is a dense GRID of series × buckets whose row key is
-  written into every cell, and `zstd -19` does not recover it (a columnar
-  block is 3× smaller than the best-compressed text, before any delta coding).
+- **A tally store designed from the data**: measured on one real day of a
+  site's own performance tally (2.7M log lines in, 268,140 tally lines out,
+  992 series over 1,260 buckets), 83% of a line is not the number — series
+  identity 44%, bucket stamps 24%, citations 14% — because the row key is
+  written into every occupied cell of a grid that is only 21% dense, and
+  compression cannot recover it: **a columnar block is 8.5× smaller than the
+  shipped store on disk**, 0.44 GB against 3.77 GB over a two-year retention.
   So: a series is an object with an id, a definition and a unit, written once;
   a bucket start is a POSITION in a block and costs no bytes; measures are
   columns, which is what makes coarsening a column operation under the rule

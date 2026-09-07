@@ -6,36 +6,75 @@ times over, so this one starts from the data instead. Follows
 [tally-series-identity.md](tally-series-identity.md), which established that
 the tape model was inherited rather than chosen.
 
-## What a tally actually is, measured
+## What a tally actually is, measured on a real one
 
-A 42-minute tally of a 500k-entry apache store, 20 series, the shipped format:
+One day of a real site's performance log — 2.7M lines, 780 MB — through that
+site's own extractor: four metrics over one line shape, three label-set views
+plus a latency histogram, `max_series` raised to 4000.
 
-| | bytes | share |
-|---|---|---|
-| series identity, each repeated 42× | 27,720 | 35% |
-| bucket stamp + width, on every line | 24,360 | 31% |
-| citations | 14,957 | 19% |
-| **the numbers** | **11,140** | **14%** |
+The tally it produces: **268,140 lines, 32.3 MB of text, 992 series over 1,260
+buckets.** Where the bytes go:
 
-20 series × 42 buckets = 840 lines, exactly. **A tally is a dense, regular
-GRID of series × buckets, and the shipped format writes the row key into every
-cell.** 86% of a line is not the number.
-
-⚠ **And compression does not recover it**, which is the measurement that
-decides this:
-
-| | bytes |
+| | share |
 |---|---|
-| text, raw | 78,177 |
-| text, `zstd -19` | 8,375 |
-| columnar, raw | 9,235 |
-| columnar, `zstd -19` | **2,756** |
+| series identity, repeated once per bucket | **44%** |
+| bucket stamp + width, on every line | 24% |
+| citations | 14% |
+| **the numbers** | **17%** |
 
-**3× better than the best-compressed text**, with fixed-width 8-byte integers
-and no delta coding at all — so that is a floor rather than a ceiling. The
-*uncompressed* columnar form is already about the size of the
-*best-compressed* text. Structure beats an entropy coder here because the
-redundancy is positional, not textual.
+**83% of a tally line is not the number**, and on real data it is worse than
+on synthetic, because real series identities are long — Java `class.method`
+names, tenant names — where a synthetic `status=200` is short.
+
+⚠ **And compression does not recover it.** Against what actually ships, at the
+level a tally store actually writes (zstd 3, not 19):
+
+| one real day | |
+|---|---|
+| tally as text | 32.3 MB |
+| **the shipped store, on disk** | **5,040 KB** (6.3×) |
+| **columnar** | **592 KB** — 542 columns + 29 bitmap + ~20 dictionary |
+| **ratio** | **8.5×** |
+| over a two-year retention | **3.77 GB against 0.44 GB** |
+
+Structure beats an entropy coder here because the redundancy is *positional*,
+not textual: zstd can shorten a repeated identity but cannot stop it being
+there once per bucket.
+
+### ⚠ And the grid is SPARSE, which corrects this note's first claim
+
+An earlier version of this note called a tally "a dense, regular grid". Real
+data says **21% density** — 268,136 present cells against 992 × 1,260
+possible. One metric was 17%: most `class.method` pairs do not appear in most
+minutes.
+
+**The design does not depend on density, and it is worth being clear about
+why the win survives.** It comes from writing each identity once instead of
+once per bucket, which is 44% of the bytes and is *independent* of how full
+the grid is. Density only decides how much the value columns cost. Sparsity
+is then handled without a penalty:
+
+* a column holds only the values that are PRESENT — a series appearing in a
+  tenth of the buckets writes a tenth of the numbers;
+* the bitmap locates them, and stays cheap when nearly empty: 992 × 1,260
+  bits is 156 KB raw and **29 KB** compressed, the runs being exactly what an
+  entropy coder is for.
+
+So the honest framing is a **grid that is usually sparse**, whose row key the
+shipped format writes into every occupied cell.
+
+### Two things the same run measured, in passing
+
+* **56,600 entries/s** for four metrics over 2.7M real entries (48 s), against
+  310,000/s for the two-metric apache document on synthetic lines. Four
+  `extract` regexes and a 20-rung histogram cost what one would expect, and
+  ⚠ all four metrics share ONE `claim`, which is run four times — the
+  duplicated-work finding in [consumer-holding.md](consumer-holding.md),
+  visible on a real document.
+* **The histogram emitted 54.5M observations from 2.7M entries** — a
+  cumulative `le` ladder writes one sample per rung at or above the value, so
+  ~20 per entry. Which is why `service_duration`'s 23 series are the densest
+  thing in the store and the cheapest to encode as columns.
 
 ## Three things follow from the grid
 
@@ -199,9 +238,12 @@ accident three revisions later.
 
 ## A high-cardinality metric: bytes per vhost
 
-The grid argument assumes density, so the honest test is a label whose values
-come and go. `http_bytes` by `vhost` on a shared-hosting box: a few busy
-vhosts all day, a long tail with an hour here and there.
+⚠ Modelled rather than measured, unlike the real day above — the shapes are
+synthetic. Kept because it varies cardinality deliberately, which one real
+log cannot.
+
+`http_bytes` by `vhost` on a shared-hosting box: a few busy vhosts all day, a
+long tail with an hour here and there.
 
 | vhosts | present cells/day | columns | bitmap | per day | two years |
 |---|---|---|---|---|---|
@@ -330,6 +372,14 @@ does not care which it is** — it reads the segments it needs. Compaction is
 then a pure optimisation that can be skipped, deferred, or run by something
 other than the writer, which is the property that makes it safe to leave out
 of a first cut.
+
+## Separable, found while measuring
+
+* ⚠ **`tally --try` held 3 GB of RSS** for the 780 MB input, because
+  `entries_of_text` collects every entry into a `Vec` before folding any of
+  them. The follower path streams and does not do this, so it is `--try`'s own
+  defect — and `--try` is exactly what an operator points at a day of log to
+  develop a document, which is the case that makes it matter.
 
 ## Open
 

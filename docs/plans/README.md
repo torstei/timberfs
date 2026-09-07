@@ -62,12 +62,13 @@ messages and pull requests are for.
   rest decidable, and the source witness that would let `file-intake` adopt one
   (and serve a live edge) without writing every byte twice.
 - [tally-as-a-tally.md](tally-as-a-tally.md) — a tally store designed from the
-  data rather than from the tape it inherited. Measured: 86% of a tally line
-  is not the number, the shape is a dense grid of series × buckets, and a
-  columnar block beats the best-compressed text 3×. A series becomes an object
-  and a bucket start a position, which makes the presence bitmap enforce "zero
-  and unknown are different", makes provisional values a mutable cell rather
-  than a revision, and makes regeneration and replication a manifest diff.
+  data rather than from the tape it inherited. Measured on a real day: 83% of
+  a tally line is not the number, the grid is 21% dense, and a columnar block
+  is **8.5× smaller than the shipped store on disk** — 0.44 GB against
+  3.77 GB over a two-year retention. A series becomes an object and a bucket
+  start a position, which makes the presence bitmap enforce "zero and unknown
+  are different", makes provisional values a mutable cell rather than a
+  revision, and makes regeneration and replication a manifest diff.
 - [tally-series-identity.md](tally-series-identity.md) — a metric is a series,
   and whether two series combine is the READER's decision: the shipped fold
   makes it at storage time and irreversibly. The remedy is that the definitions
