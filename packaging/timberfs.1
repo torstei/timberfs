@@ -1314,6 +1314,24 @@ counted. It is a range to read and not the set of entries \(em a metric
 matching one line in a hundred cites the ninety\-nine between them \(em
 so the spike in a graph opens the log around it.
 .PP
+⚠ ONE BUCKET MAY APPEAR MORE THAN ONCE, AND THE NEWEST LINE WINS. A
+bucket still being filled is stated provisionally and kept open, so a
+later line for the same
+.BI ( metric , labels , stamp , width )
+SUPERSEDES the earlier one, carrying the complete total rather than the
+difference; re-deriving a window emits its buckets again for the same
+reason. So anything that AGGREGATES a tally tape must resolve on that
+key first:
+.B summing
+the lines for one bucket double\-counts, and taking the FIRST reports a
+minute that had barely begun.
+.B timbergraph
+does this;
+.B timberview
+shows the tape as written, both lines included, which is what a tape
+viewer should do. See LATENESS below for when a provisional line is
+written.
+.PP
 .B THE EXTRACTOR DOCUMENT
 .PP
 .RS

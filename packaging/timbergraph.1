@@ -69,6 +69,16 @@ and
 .B s
 would not mislabel the plot, it would regroup it.
 .PP
+⚠ It also RESOLVES the tape before drawing it: one bucket may appear more
+than once and the newest line for a
+.BI ( metric , labels , stamp , width )
+wins. That is not a courtesy \(em a tally follower states a bucket it is
+still filling provisionally and keeps it open, so a running store emits
+revisions as a matter of course, and re-deriving a window emits its
+buckets again. Summing the lines for one bucket would double\-count and
+taking the first would draw a minute that had barely begun, so a plot
+made by any other tool over the same tape has to do this too.
+.PP
 .B THE MARKERS ARE THE ERROR BARS
 .PP
 .B !drop

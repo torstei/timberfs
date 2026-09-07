@@ -139,10 +139,13 @@ def read(text):
     """Every line, split into samples and markers, with the NEWEST line
     for a bucket winning.
 
-    ⚠ That last rule is not about lateness — nothing emits a revision.
-    It is what makes a RECOMPUTE idempotent: re-running an extractor over
-    a window writes its buckets again, and a reader that summed both
-    would double every count.
+    ⚠ Not optional, and not only about recompute. A tally follower states
+    a bucket it is still filling PROVISIONALLY and keeps it open, so a
+    running store emits revisions as a matter of course; the newest line
+    for a bucket carries its complete total. Summing the lines for one
+    bucket double-counts, and taking the first reports a minute that had
+    barely begun. It also makes a RECOMPUTE idempotent, which is what it
+    was first written for.
     """
     seen, order = {}, []
     markers = []

@@ -250,16 +250,24 @@ once. Named here rather than guarded against, because a robust watermark is its
 own design and choosing a percentile over the max should be forced by a real
 log rather than imagined.
 
-⚠ **Newest-wins survives, as a READ rule, for a different reason.** Re-running
-an extractor over a window emits the same buckets again, and
+⚠ **Newest-wins survives, and is now LOAD-BEARING rather than a safety net.**
 
 > **the newest line for `(metric, labels, start, width)` wins**
 
-is what makes a recompute idempotent rather than doubling. It is a property of
-reading a tape, not of writing one: nothing emits a revision, but a reader must
-still resolve a window before answering it. Bounded by series × buckets, not by
-entries. A **`--follow` of a tally store delivers unresolved lines and must say
-so**, exactly as a live-edge entry carries no chunk number.
+It was written for recompute idempotence: re-running an extractor over a window
+emits the same buckets again, and this is what keeps that from doubling. On
+that reasoning it was "a property of reading a tape, not of writing one:
+nothing emits a revision" — which **stopped being true** when a quiet tick
+began stating an open bucket provisionally and keeping it (see
+[consumer-holding.md](consumer-holding.md)). A running tally follower now emits
+revisions as a matter of course: the newest line for a bucket carries its
+complete total, and every earlier line for it is superseded.
+
+So a reader that SUMS the lines for one bucket double-counts, and one that
+takes the FIRST reports a minute that had barely begun. Resolution is not
+optional. Bounded by series × buckets, not by entries. A **`--follow` of a
+tally store delivers unresolved lines and must say so**, exactly as a live-edge
+entry carries no chunk number.
 
 ## A tally store's chunks are stamped with the buckets
 
