@@ -916,16 +916,20 @@ here.
   `Roller::add`'s per-new-series scan being a 4.16 s → 61.7 s cliff — and the
   in-flight bound question. Note:
   [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
-- **Designing a tally as a tally**: compression, head-drop and being queryable
-  through timberfs's own query are why a tally lives here at all; the tape it
-  inherited is not. A tally is a KEYED store with two regions wanting opposite
-  disciplines — an immutable sealed body, which a tape is right for, and an
-  accumulating OPEN EDGE, which it is not. Putting the open edge in a readable
-  sidecar (the shape `.sap` already has for logs, rewritten rather than
-  appended) removes the revisions 0.33.0 had to put on the tape; a sealed body
-  of range-addressed blocks carrying a generation would make regeneration safe
-  where a monotone chunk number cannot, and replication then follows from the
-  addressing rather than the frames wire. Design note:
+- **A tally store designed from the data**: measured on a real tally, 86% of a
+  line is not the number — series identity 35%, bucket stamps 31%, citations
+  19% — because a tally is a dense GRID of series × buckets whose row key is
+  written into every cell, and `zstd -19` does not recover it (a columnar
+  block is 3× smaller than the best-compressed text, before any delta coding).
+  So: a series is an object with an id, a definition and a unit, written once;
+  a bucket start is a POSITION in a block and costs no bytes; measures are
+  columns, which is what makes coarsening a column operation under the rule
+  the field name already names. Three things fall out — a presence bitmap
+  enforces "zero and unknown are different" structurally, a provisional value
+  is a mutable cell so the 0.33.0 supersede rule disappears, and a block
+  addressed `(range, generation)` makes regeneration and replication a
+  manifest diff. The text line format survives as the INTERCHANGE form, so
+  `query`, `timbergraph` and `--fold` keep working. Design note:
   [docs/plans/tally-as-a-tally.md](docs/plans/tally-as-a-tally.md).
 - **A metric is a series, and combining it is the reader's decision** (a real
   defect): `tally --fold` sums two definitions' measurements into one number,

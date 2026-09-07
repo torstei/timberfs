@@ -1,169 +1,178 @@
-# Designing a tally as a tally
+# A tally store, designed from the data
 
-**Status: design, nothing built.** What a tally store must share with a log,
-what it need not, and a shape for the parts that differ. Follows
+**Status: design, nothing built.** An earlier version of this note asked how a
+tally could be made to fit a timberfs tape. That was the wrong question three
+times over, so this one starts from the data instead. Follows
 [tally-series-identity.md](tally-series-identity.md), which established that
-the tape model was inherited rather than chosen — a log entry is a fact and a
-tally bucket is a conclusion — and left the format question open. This note is
-that question.
+the tape model was inherited rather than chosen.
 
-## What is fixed, and why
+## What a tally actually is, measured
 
-Three properties are the reason a tally lives in timberfs at all, and none is
-negotiable:
+A 42-minute tally of a 500k-entry apache store, 20 series, the shipped format:
 
-* **Compression.** 50 MB for two years of numbers against 300 GB of the log
-  they came from; the canonical line rendering exists so that repeated series
-  compress.
-* **Head-drop.** The retention asymmetry IS the feature — the log's head goes
-  and the numbers do not.
-* **Queryable through timberfs's own query.** A tally store answers
-  `--from`/`--to`, `--has`, `--follow` and the fleet resolver today because it
-  IS a store, and that is most of what makes it usable.
+| | bytes | share |
+|---|---|---|
+| series identity, each repeated 42× | 27,720 | 35% |
+| bucket stamp + width, on every line | 24,360 | 31% |
+| citations | 14,957 | 19% |
+| **the numbers** | **11,140** | **14%** |
 
-Everything else is ours to choose.
+20 series × 42 buckets = 840 lines, exactly. **A tally is a dense, regular
+GRID of series × buckets, and the shipped format writes the row key into every
+cell.** 86% of a line is not the number.
 
-## What a tally IS, structurally
+⚠ **And compression does not recover it**, which is the measurement that
+decides this:
 
-**Not a stream of lines: a KEYED store.**
-`(bucket start, width, metric, labels) → fields`, time-ordered, tiny, with
-bounded cardinality per bucket (`max_series`, 1000 by default). Writes land in
-a window that stays open for `width + grace` and then never change — unless
-the whole range is regenerated.
+| | bytes |
+|---|---|
+| text, raw | 78,177 |
+| text, `zstd -19` | 8,375 |
+| columnar, raw | 9,235 |
+| columnar, `zstd -19` | **2,756** |
 
-Two regions follow, and they want opposite disciplines:
+**3× better than the best-compressed text**, with fixed-width 8-byte integers
+and no delta coding at all — so that is a floor rather than a ceiling. The
+*uncompressed* columnar form is already about the size of the
+*best-compressed* text. Structure beats an entropy coder here because the
+redundancy is positional, not textual.
 
-* a **SEALED BODY** — immutable once sealed, compressed, time-indexed. This is
-  exactly what a tape is good at, and there is no argument for replacing it.
-* an **OPEN EDGE** — a handful of buckets still accumulating, whose values
-  change with every entry. A tape is the wrong thing for this, and every
-  awkwardness in the shipped design is downstream of pretending otherwise.
+## Three things follow from the grid
 
-## Requirement: "I had not finished that bucket after all"
+### A series is an object, not a repeated string
 
-Take this first, because it is the cheap one and it is independent of
-everything else.
+    series_id → (metric, labels, unit, definition)
 
-**Today** (0.33.0) an open bucket is emitted as a line and superseded by a
-later line carrying the complete total. Pragmatic — it shipped, it is correct,
-and it surfaced a quiet store's newest minute, which nothing else did. But it
-puts revisions on a tape that every aggregating reader must now resolve, and
-it made newest-line-wins load-bearing where it had been a guard against
-re-running an extractor.
+Assigned at first sight, a small integer, written **once**. Bounded by the
+store's cardinality over its life rather than by time.
 
-**The elegant answer is that the open edge is not on the tape at all.** Hold
-the accumulating buckets in a readable sidecar, rewritten as they change, and
-promote them into the sealed body when they seal. Then:
+⚠ This is where [tally-series-identity.md](tally-series-identity.md) lands,
+and it dissolves the question that note spent its length on: **a series
+carries its definition, so no name prefix is needed** — the name was never the
+identity, and once identity is an object there is nothing to qualify.
 
-* no revisions on the tape, and newest-wins goes back to being a guard;
-* a reader sees the current minute by reading the sidecar, and knows it is
-  provisional from WHERE IT CAME FROM rather than from a marker;
-* the sealed body is genuinely immutable, which is the property everything
-  else wants.
+### A bucket start is a POSITION, not a value
 
-⚠ **This is not a new decomposition — it is what a log already does.** `.sap`
-is a readable live edge: `query` reads it when the store declares a wal, so
-"the newest data is in a sidecar, not yet in a chunk" is shipped machinery.
-The only difference is that a log's edge is APPENDED and a tally's is
-REWRITTEN, because a bucket accumulates rather than arriving finished.
+A block covers `[t0, t0 + n·width)`. Sample *i* of a series is bucket
+`t0 + i·width`. **Zero bytes of timestamp**, and no parsing to group by time.
 
-**And it is cheap, because the open edge is reconstructible.** The open
-buckets are already re-derived from the source after a restart — that is what
-`Roller::safe_offset` holds the consumer's position back for — so the sidecar
-needs no write-ahead discipline of its own. Temp-plus-rename on each flush is
-enough, which is what `.bark` already does. Its size is bounded by
-construction: `max_series` per open bucket start, over a `width + grace` of
-starts.
+⚠ Which requires a **presence bitmap**, and that is a feature rather than a
+cost: "zero and unknown are different" is tally's second invariant and is
+today a convention nothing can enforce. One bit per `(series, bucket)` makes
+it structural — and answers the open question the identity note left, where a
+metric added today leaves last week UNKNOWN for it rather than zero.
 
-⚠ **One consequence worth seeing, even though it is not a reason.** If the
-open edge were DURABLE rather than merely reconstructible, a tally's watermark
-could be `delivered_to` and its position would not lag by `grace` at all —
-which is the interaction that produced the 51-entries/s deadlock
-([consumer-holding.md](consumer-holding.md)). The same knot, seen from the
-storage end. Making it durable costs the double write `wal=true` costs; worth
-knowing the option exists.
+### Measures are columns, not fields on a row
 
-## Requirement: regeneration
+`count`/`sum`/`min`/`max`/`last` coarsen differently and compress
+differently. As columns they are runs of like numbers; as fields on a text row
+they interleave with labels and stamps. And **coarsening becomes a column
+operation** — 60s to 5m is combining five adjacent cells per column, under the
+rule the field name already names, which is the invariant tally was built on
+expressed directly instead of re-derived from text.
 
-**(a) Today, with no format change:** export the kept prefix into a new store,
-drop the old one, re-derive the remainder from the source
-([tally-series-identity.md](tally-series-identity.md) has the reasoning).
-Correct, costs a copy of the small end and three operator steps in an order
-that matters.
+## The open edge stops being a special case
 
-**(b) If the sealed body were designed for a tally:** RANGE-ADDRESSED blocks,
-each carrying a **generation**. Replacing a range means writing new blocks and
-switching atomically; the superseded ones are dropped. Head-drop stays
-dropping leading blocks; a query still selects blocks by time.
+A block whose range has not closed is **open**: mutable, checkpointed,
+rewritten as its cells fill. When the range passes `grace` it is **finalised**
+and compressed.
 
-⚠ The point of (b) is the ADDRESS. A block is `(range, generation)` rather
-than a monotone number, so nothing that caches or replicates can confuse two
-generations of the same stretch — which is precisely the failure that makes
-in-place regeneration unsafe on a tape today, where the chunk number is "a
-position in one store" and travels to replicas as a shared address. It is the
-WAL-timeline idea localised to the one store class whose content is derived,
-which is what makes it affordable here and overkill globally.
+⚠ **There is no revision concept, because there is nothing to revise.** A
+provisional value is a cell in an open block; its final value is the same cell
+later. The supersede rule shipped in 0.33.0 exists only because a tape cannot
+express "this value is not final yet" — the tape's only verb is *append*, so
+correcting a number meant writing another one. Given a mutable cell the whole
+mechanism, and the newest-line-wins rule it forced on every reader,
+disappears.
 
-## Requirement: replication
+And a reader knows a value is provisional **structurally** — it came from an
+open block — rather than by comparing it with a later line.
 
-Falls out of the two above rather than needing a protocol of its own:
+## Regeneration is replacing blocks
 
-* **sealed blocks** — immutable within a generation, shipped verbatim, the
-  receiver keyed by `(range, generation)`;
-* **the open edge** — a snapshot, idempotent overwrite, cheap because it is
-  small and reconstructible;
-* **a regenerated range** — a new generation the receiver REPLACES rather than
-  appends.
+A block is addressed `(range, generation)`. Regenerating means writing
+generation+1 for the ranges covered, swapping those manifest entries
+atomically, and dropping the old blocks. Nothing else in the store moves, and
+there is no numbering to collide because **a block was never a position in a
+sequence** — which is the whole difficulty on a tape, where a chunk number is
+"a position in one store" and travels to replicas as a shared address.
 
-⚠ **And that is a different contract from the frames wire**, which is the
-answer to "might it be different?": frames ships what the receiver says it
-LACKS, keyed on chunk number, because a log only ever grows. A tally would
-ship what the receiver holds a STALE GENERATION of. The difference is not
-incidental — it is the same "a log is append-only and a tally is not" that
-this whole thread turns on.
+Head-drop is dropping leading blocks and raising the manifest's floor. No
+`FALLOC_FL_COLLAPSE_RANGE`, no offset rebasing, no seqlock: a block is a file
+and forgetting it is unlinking it.
 
-## What going bespoke costs
+## Replication is a manifest diff
 
-Honest list, because it is the argument for doing as little as possible:
-`query` with both time axes, `--has` and the `.grain`, `--follow`, retention
-and head-drop, `frames-send`/`frames-intake`, `view`, `list`, `info`, the
-fleet resolver and `timbergraph` — all of it works on a tally today for one
-reason, which is that a tally store IS a store. Every part of the format that
-stops being a tape is a part of that list which needs a reader written for it.
+The manifest IS the state: `(range, generation, digest)` per block.
 
-## Recommendation, in order
+* the receiver states what it holds;
+* the sender ships blocks it lacks **or holds a stale generation of**.
 
-1. **The open-edge sidecar.** Independent of everything else, answers the
-   bucket-completion problem properly, removes the revision rule from the
-   tape, and reuses a decomposition that already ships. Do this first even if
-   nothing else here is ever built.
-2. **Keep the sealed body a tape** until regeneration is routine rather than
-   exceptional. (a) covers it meanwhile.
-3. **Range-addressed blocks with generations** when it is, and replication
-   then follows from the addressing rather than needing its own design.
+Idempotent, diff-based, and needing no offsets. ⚠ Which is why this cannot be
+the frames wire: frames ships what the receiver LACKS, keyed on chunk number,
+on the assumption that a log only ever grows. A derived store needs to say
+"replace that", and a diff over a manifest says it in one round trip.
+
+## "Queryable through timberfs query" does not force a tape
+
+⚠ **The text line format survives as the INTERCHANGE form rather than as the
+storage.** `query` renders lines out of blocks; `timbergraph`, `--fold`,
+`--try`, a pipe into `grep` and a human reading the terminal all keep working
+unchanged.
+
+That is the resolution of the requirement that looked like it forced a tape:
+the line format was doing two jobs — storage and interchange — and only one of
+them needed a tape. Keeping it as the rendering keeps every reader and every
+test, and gives up nothing, because a projection of a grid into lines is
+cheaper than parsing lines into a grid.
+
+## What is genuinely given up
+
+* **The `.grain` token index.** Meaningless here — you select a tally by label,
+  not by substring, and the identity is in a dictionary rather than in the
+  bytes.
+* **Two clocks.** A tally has ONE, the bucket start. ⚠ A simplification rather
+  than a loss: the 0.33.0 fix had to stamp chunks with bucket windows so that
+  the write and logline axes would agree, and a store with one clock cannot
+  have that bug.
+* **`view` as a tape to scroll.** A grid is not a tape; the answer screen over
+  a rendered query is the equivalent.
+* **The head-drop machinery**, replaced by unlinking a file.
+
+## A block, concretely enough to argue with
+
+    header    magic, version, width_ms, t0, n_buckets, generation
+    series    [ series_id, metric, labels, unit, definition_id ]   (or a ref
+              to a store-level dictionary — see Open)
+    presence  bitmap, n_series × n_buckets bits
+    columns   per (series, measure): n_buckets values
+              delta + zigzag + varint, then zstd over the whole column region
+    footer    digest, column offsets
+
+Everything a reader needs to answer "metric M matching P over this range" is
+in the header and the series table; the columns are fetched only for the
+series that matched, which is the query-planning property
+[chunks-by-address.md](chunks-by-address.md) wants and gets here for free.
 
 ## Open
 
-* **Whether the open edge should be durable.** Reconstructible is enough for
-  correctness; durable would remove the position lag. It is the `wal=true`
-  trade — a second write — on a store that takes a handful of lines a minute.
-* **Whether a block is a chunk with a generation in `.bark`, or a new
-  layout.** The first keeps every reader; the second is free to key on
-  `(range, generation)` properly. Probably the first for as long as possible.
-* **How `query` reads a tally that is no longer a tape**, if it comes to that.
-  A reader per store class, or a view that presents one — and the answer
-  decides how much of the list above survives.
-* **What a coarsened read does across a generation boundary**, where two
-  generations of one stretch may both be present mid-switch.
-* **Whether the `!cap`, `!late` and `!drop` markers belong on the sealed body
-  or beside the open edge.** They are statements about a bucket's quality and
-  are currently drained with it.
-
-## Separable, and found while writing this
-
-* ⚠ **`docs/design.md` says of the `.sap` that "Readers (`query`/`info`/`grep`)
-  never touch it".** That stopped being true when the live tail shipped —
-  `query` reads the sap's live edge when the store declares a wal. It is the
-  document that describes how timberfs actually works, so the sentence is
-  actively misleading, and it is the sentence somebody would rely on when
-  designing exactly what this note designs.
+* **Block range: fixed or adaptive?** A day at 60s is 1440 cells per column —
+  a natural unit, and it makes head-drop and regeneration granular in a way an
+  operator can reason about.
+* **Where the dictionary lives.** Per block makes a block self-contained and
+  therefore replicable and readable alone; per store is smaller and dedupes
+  across the store's whole life. Self-contained probably wins, since it is
+  what makes the manifest diff a complete protocol.
+* **What `!cap`, `!late` and `!drop` become.** They are per-bucket statements
+  about quality, so probably their own columns or bits beside the presence
+  bitmap — which would make them selectable rather than markers a reader has
+  to notice.
+* **The open block's checkpoint interval**, and whether it is durable at all:
+  the cells are re-derivable from the source, which is what
+  `Roller::safe_offset` currently holds a consumer's position back for. ⚠ A
+  durable open block would let that position advance freely, which is the
+  same knot that produced the 51-entries/s deadlock
+  ([consumer-holding.md](consumer-holding.md)) seen from the storage end.
+* **Whether a tally store is still a timberfs "store"** for `list`, `info`,
+  selection and the follower registry. It should be — those read `.bark`, and
+  a manifest can sit beside one.
