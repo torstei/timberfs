@@ -139,26 +139,139 @@ cheaper than parsing lines into a grid.
   a rendered query is the equivalent.
 * **The head-drop machinery**, replaced by unlinking a file.
 
+## How big is a block, and how many
+
+Measured with delta+zigzag+varint columns then `zstd -19`, 50 series, two
+measures each:
+
+| block | B/cell | one day | files / 2y | rewrite while open |
+|---|---|---|---|---|
+| 15 min | 2.07 | 291 KB | 70,080 | 3 KB |
+| 1 hour | 1.88 | 264 KB | 17,520 | 11 KB |
+| 6 hours | 1.59 | 223 KB | 2,920 | 56 KB |
+| **1 day** | **1.31** | **184 KB** | **730** | 184 KB |
+| 7 days | 1.29 | 182 KB | 104 | 1,274 KB |
+
+⚠ **Compression has a knee at about a day and then flattens** — 1.31 to 1.29
+B/cell for seven times the range buys nothing, while 15-minute blocks cost 58%
+more bytes for 96× the files. So a day is the block, and the file count is 730
+for a two-year retention, which is nothing.
+
+Whole-store sizes, at 60s buckets and two years:
+
+| series | per day | two years |
+|---|---|---|
+| 20 | 74 KB | **54 MB** |
+| 50 | 184 KB | 134 MB |
+| 1000 (the `max_series` cap) | 3.7 MB | 2.7 GB |
+
+The 20-series row is worth noting: [tally.md](tally.md) estimated "50 MB of
+tally for two years" from first principles, and this lands on 54 MB. At the
+cardinality cap it is 2.7 GB, which is the cap doing its job of making
+cardinality an explicit decision rather than a surprise.
+
+### ⚠ The last column is the catch, and it is the `.sap` tension again
+
+A day's block is 184 KB at 50 series and 3.7 MB at 1000, and an open block
+rewritten on every checkpoint means rewriting that much every couple of
+seconds. Which is exactly the bind
+[docs/design.md](../design.md) names for logs — "chunking has two masters that
+want opposite things: compression wants chunks big and infrequent; durability
+wants every byte on disk the instant it arrives" — arriving here as
+*compression wants a day and checkpointing wants a handful of buckets*.
+
+**The resolution is the same shape: decouple them.**
+
+* the **open region** holds only the buckets that have not sealed — `width +
+  grace`, so three of them at the defaults. 3 buckets × 1000 series × 2
+  measures is ~12 KB, cheap to rewrite at any cardinality;
+* a **sealed bucket is appended to the current day's block as a SEGMENT** — a
+  short column region covering the buckets that sealed since the last append;
+* when the day closes the segments are **compacted** into one column region,
+  which is where the compression knee is actually collected. Compaction reads
+  immutable input and writes a new generation of the same block, so it is the
+  regeneration path doing double duty.
+
+⚠ So a block has internal structure and a reader reads its segments. That is
+an LSM in miniature, and it is what every time-series store ends up with for
+this exact reason — worth saying plainly rather than arriving at it by
+accident three revisions later.
+
+## How the files are named
+
+    web-access-tally/
+      web-access-tally.bark          declared properties, as any store
+      web-access-tally.tally        the MANIFEST — authoritative
+      b/20260906T000000Z.g1         a sealed day, generation 1
+      b/20260907T000000Z.g1
+      b/20260908T000000Z.g2         this day was regenerated
+      open                          the unsealed buckets, temp+rename
+
+Four properties, each the reason for a part of it:
+
+* **Lexicographically sortable**, so a retention sweep and a range scan are
+  both directory order and neither needs the manifest to find candidates.
+* **The generation is in the NAME**, so `ls` says what you have and a replaced
+  generation is visibly a different file. ⚠ Deliberately not content-addressed:
+  a digest as the filename makes replication idempotent and dedupes, but makes
+  a directory an operator inspects completely opaque. The digest goes in the
+  manifest, where the replication protocol wants it anyway.
+* **Derivable from `(range, generation)`**, so a receiver can place a shipped
+  block without asking anything.
+* **A subdirectory**, so 730 block files do not sit beside the manifest and
+  the `.bark`, and a forest scan — which looks for a store's marker files —
+  does not see them at all.
+
+### The manifest is the commit point
+
+Which is what makes every crash window benign:
+
+1. write the new block file and fsync it;
+2. rewrite the manifest, temp-plus-rename — **this is the commit**;
+3. unlink the superseded block.
+
+A crash between 1 and 2 leaves a block the manifest does not reference; a
+crash between 2 and 3 leaves a superseded one nothing reads. Both are
+unreferenced files a sweep can collect, and neither is a store that lies. ⚠
+The alternative — the directory as truth — makes step 2 unnecessary and every
+partial write a corrupt store, which is the trade `.bark`'s temp-plus-rename
+already makes in this tree.
+
 ## A block, concretely enough to argue with
 
     header    magic, version, width_ms, t0, n_buckets, generation
     series    [ series_id, metric, labels, unit, definition_id ]   (or a ref
               to a store-level dictionary — see Open)
-    presence  bitmap, n_series × n_buckets bits
-    columns   per (series, measure): n_buckets values
-              delta + zigzag + varint, then zstd over the whole column region
-    footer    digest, column offsets
+    segments  one or more, appended as buckets seal; a compacted block has
+              exactly one:
+                bucket range covered
+                presence  bitmap, n_series × n_buckets_in_segment bits
+                columns   per (series, measure): the segment's values,
+                          delta + zigzag + varint, then zstd per column region
+    footer    digest, segment offsets
 
 Everything a reader needs to answer "metric M matching P over this range" is
 in the header and the series table; the columns are fetched only for the
 series that matched, which is the query-planning property
 [chunks-by-address.md](chunks-by-address.md) wants and gets here for free.
 
+⚠ A compacted block has one segment and an open one has many, so **a reader
+does not care which it is** — it reads the segments it needs. Compaction is
+then a pure optimisation that can be skipped, deferred, or run by something
+other than the writer, which is the property that makes it safe to leave out
+of a first cut.
+
 ## Open
 
-* **Block range: fixed or adaptive?** A day at 60s is 1440 cells per column —
-  a natural unit, and it makes head-drop and regeneration granular in a way an
-  operator can reason about.
+* **Segment length**, which is the one number this design actually turns on:
+  how many sealed buckets accumulate before a segment is appended. Short
+  segments cost compression (2.07 B/cell at 15 minutes against 1.31 at a day)
+  and long ones cost a bigger open region to rewrite. The block range is
+  settled at a day by the measurements; the segment inside it is not.
+* **Whether compaction is the writer's job or a sweep's.** It reads immutable
+  input and writes a new generation, so it need not be, and a `trim`-shaped
+  cron-able verb would fit the tree — which also answers who trims a retired
+  generation ([tally-series-identity.md](tally-series-identity.md)).
 * **Where the dictionary lives.** Per block makes a block self-contained and
   therefore replicable and readable alone; per store is smaller and dedupes
   across the store's whole life. Self-contained probably wins, since it is
