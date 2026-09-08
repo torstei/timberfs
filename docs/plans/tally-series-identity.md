@@ -485,6 +485,29 @@ The rest follows from the name being a boundary rather than a label:
   Definitions outlive the numbers they describe, or the numbers stop being
   readable — which is the whole reason for storing them.
 
+**Two reads, in opposite directions, and neither is on a hot path.** The
+writer reads its DOCUMENTS once at startup — `load_extractors` and `Run::new`
+are each called once, and the record loop never re-reads — so a document
+edited under a running writer takes effect at its next RESTART, which is
+"applying is an act" in mechanical form. It reads the store's newest
+definitions file at that same startup, and only to answer two questions: does
+the record differ from what I am about to compute, and what is the id
+high-water mark. The store is somewhere the writer files a record, never
+somewhere it learns anything.
+
+That also fixes the boundary: the offset in a filename is the follower's
+resume position at that restart — a real event at a known position rather than
+an arbitrary point.
+
+⚠ **Which leaves drift with nobody to report it.** A document edited and never
+applied keeps the store producing the old numbers, correctly, and silently: a
+writer that read its documents once cannot notice a later edit even in
+principle, and `--check` validates documents while reading no store. So the
+"drift is REPORTED" promise above needs a comparison that does not exist —
+recorded definitions against the documents on disk. Its home is the
+provisioning's converge run, which already executes on a timer and at every
+deploy and is where an operator already looks.
+
 **Finding the ACTIVE set is a readdir and a sort, and that is deliberately not
 optimised.** The cost is a rounding error against what the same directory
 already holds — one block per day, so ~730 entries at a two-year retention,
@@ -499,6 +522,16 @@ reached for. The manifest is loaded anyway, is committed by temp-and-rename,
 and is the store's commit point — so a pointer there costs no I/O and becomes
 atomic with the blocks written under that set. The files stay the record;
 the manifest would carry only the newest offset.
+
+**The write order is `definitions -> blocks -> manifest`**, each step
+referenced only by the next, so every crash window leaves unreferenced debris
+rather than a dangling reference — a block must never cite an id nothing
+defines. ⚠ A definitions file is found by readdir rather than named by the
+manifest, so an orphan from a crash IS taken as the active set. Benign both
+ways: the restarting writer either finds its definitions identical and files
+nothing, or files a newer set and leaves the premature one standing as a
+record of definitions nothing was produced under. Misleading provenance at
+worst, never a wrong number.
 
 ⚠ **A lone block is deliberately not self-describing.** It names its
 definition by id; the store holds the text. That is the split the assigned id
