@@ -951,14 +951,16 @@ here.
   instead, and cardinality costs I/O and disk — the resource `retain_size`
   and head-drop already govern. `max_series`, `!cap`, `grace_ms` as a
   correctness boundary, displacement/`!late`, and the 0.33.0 revision rule all
-  go with it. ⚠ Additive partials are NOT idempotent, and crash recovery is the
-  same problem — it is free today only because the tape REPLACES, so a restart
-  that re-reads folded bytes merely restates them. What identifies a partial is
-  the source offset range it consumed (`cursor::At::offset`, exact and
-  retention-stable), never its citation (a widened, optional "range to READ"),
-  and consecutive ranges must TILE so two partials of a bucket are either
-  identical or disjoint. That also frees `generation` of a second job: a
-  generation replaces, a consumed range adds. Design note:
+  go with it. ⚠ Additive partials are NOT idempotent, but recovery is not the
+  place that bites: unlike a follower, which shipped bytes it cannot un-ship, a
+  tally is a function of source entries still on disk, so it RE-DERIVES what it
+  is unsure of and a position is efficiency rather than correctness — and the
+  citation, useless as a dedup key, is exactly the right rewind point.
+  ⚠ Re-derivation is exact only once DISPLACEMENT is gone, so purity is a
+  property this design gains rather than assumes. What remains is
+  representation and identity: keep partials as blocks in a set and merge at
+  read, never fold on receipt, and `Manifest::put` retains one block per `t0`
+  — right for a generation, fatal for a partial. Design note:
   [docs/plans/tally-partials.md](docs/plans/tally-partials.md).
 - **A metric is a series, and combining it is the reader's decision** (a real
   defect): `tally --fold` sums two definitions' measurements into one number,

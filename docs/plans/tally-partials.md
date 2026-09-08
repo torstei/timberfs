@@ -1,8 +1,10 @@
 # Partial aggregates: never holding a bucket to completion
 
-**Status: design, nothing built.** It removes a knob rather than adding one,
-and its second half is a design for CRASH RECOVERY, which turns out to be the
-same problem — see "Provenance is not coverage". It amends three notes: [tally.md](tally.md) (grace and displacement as the
+**Status: design, nothing built.** It removes a knob rather than adding one.
+Its second half is about recovery, and the load-bearing claim there is that a
+tally can always go back to the source while the chunks are there — so a
+position is efficiency and a re-derivation is the answer to a crash. It amends
+three notes: [tally.md](tally.md) (grace and displacement as the
 lateness mechanism), [consumer-holding.md](consumer-holding.md) (the
 provisional bucket and the revision rule it introduced), and
 [tally-as-a-tally.md](tally-as-a-tally.md) (the block's cell merge, which is
@@ -125,11 +127,14 @@ additive partial twice double-counts (`Min`/`Max` survive it, `Count`/`Sum` do
 not). So everything that can re-deliver one needs an identity for what it
 accounts for — a re-fed range, a retried ship, a replayed replication stream.
 
-⚠ **Crash recovery is that same problem, not a separate one.** Today it is free
-*because* the tape replaces: a position is only advanced on a progress report,
-so a restart re-reads bytes already folded, and restating those buckets is
-harmless. Additive partials remove exactly that safety net. So a design for
-partials is a design for recovery, and the note below is both.
+⚠ **Crash recovery looks like that same problem and is not**, which took two
+passes to see. Today it is free *because* the tape replaces: a position is only
+advanced on a progress report, so a restart re-reads bytes already folded, and
+restating those buckets is harmless. Additive partials remove that safety net —
+but a tally can re-derive what it is unsure of, so recovery is answered by
+recomputation rather than by reconciling partials. What genuinely needs solving
+is narrower: the representation (a set of blocks, never a running total) and
+identity for replication. The two sections below.
 
 The block manifest addresses a block by **`(t0, generation)`** — `Manifest::put`
 supersedes on `had.t0 == e.t0` alone, and `Entry`'s own comment says "the
@@ -167,42 +172,80 @@ distinction in its own comment — "TWO positions, because they answer different
 questions and neither can answer the other's: the offset is where to RESUME,
 exact and valid inside the write-ahead segment; this is the RETENTION FLOOR,
 chunks strictly below it being fully consumed". The `offset` is absolute on the
-store's tape so retention cannot move it. **So a partial's identity is the
-offset range it consumed**, and nothing new needs inventing — it is the number
-the consumer protocol already persists.
+store's tape so retention cannot move it. **So what a partial accounts for is
+the offset range it consumed**, and the quantity needs no inventing — it is the
+number the consumer protocol already persists. What that range is FOR is the
+subject of the two sections below, and it is not what I first took it for.
 
-⚠ **An interval is not enough; the ranges must TILE.** Dedup by overlap does
-not survive the crash it exists for: a partial covering `[0,1000)` is applied,
-the process dies before its position is durable, the fold resumes at 500 and
-produces `[500,1500)` for the same bucket. It can neither be added (500–1000
-counted twice) nor dropped (1000–1500 lost). The rule that works is that a
-partial always begins where the previous one ended, so two partials of a bucket
-are **either identical — drop it — or disjoint — add it**, and dedup is an
-equality test rather than an interval calculus.
+## Recovery is re-derivation, not reconciliation
 
-That in turn requires **the position to be committed with the partial, in one
-write**, not beside it: if the two can diverge the tiling breaks, and a
-diverged pair is exactly what a crash produces. The manifest's temp-and-rename
-is already that commit point, which is the second argument for the grid.
+A generic follower must never re-read: it shipped bytes somewhere and cannot
+un-ship them, so its position is precious. **A tally is not that**, and this is
+where being special rather than being a follower pays: its output is a function
+of source entries that are still on disk, so it can always go back. The
+position is an EFFICIENCY device — do not re-read 700 GB at every restart — and
+not a correctness one.
 
-**And `generation` stops doing two jobs.** A generation is a RE-DERIVATION — a
-definition changed, a range recomputed — and it *replaces*, which is what
-`Manifest::put` implements. A consumed range says which slice of the source a
-partial accounts for, and it *adds*. Two axes, neither overloaded: a partial
-cannot be expressed as a generation without making `put` mean both replace and
-accumulate depending on which field moved.
+So the crash case needs no dedup. Discard the buckets that may be incomplete,
+re-derive them from the source, and replace: `How::Regenerate` is already that
+operation and is already idempotent, because a replace applied twice is a
+replace. Reconciling what was half-applied is work that never has to be done.
 
-## Three things that block it today
+**And this is the job the cite is for.** As a rewind point it is exactly right
+where it was useless as a dedup key: "a range to READ" is literally what a
+rewind point is, its widening is conservative in the safe direction — rewinding
+too far costs work, never correctness — and being switchable off costs a
+coarser rewind (the retention floor, say) rather than a wrong answer. Both
+properties that disqualified it above qualify it here.
+
+⚠ **Re-derivation is exact only if the fold is a pure function of the source,
+and TODAY IT IS NOT.** Displacement puts a late entry in the *current* bucket,
+and which bucket is current depends on the watermark, which depends on where
+the read started; sealing depends on it too. So the shipped fold is
+reproducible only from the same start offset — which is why the 0.33.0
+verification compared a batched pipeline against one in-memory pass over the
+same store, and not against a re-derivation from elsewhere. Removing
+displacement, which partials do, is what makes re-derivation exact. **Purity is
+a property this design gains, not one it assumes**, and it is a further
+argument for it rather than a precondition.
+
+## What that leaves for the consumed range
+
+⚠ **A partial must never be folded on receipt.** Keep partials as blocks in a
+set and merge at read or compaction time: re-applying one is then re-inserting
+the same member of a set, which is idempotent, and the arithmetic
+non-idempotence above only ever bites a receiver that accumulates. That leaves
+replication needing IDENTITY and no arithmetic guard — and a byte-identical
+retry is already recognisable from `(t0, generation)` with `bytes` and `crc32`.
+
+So the consumed range's real job is not dedup. It is **block identity**, so
+that several partials of one range can coexist at all: `Manifest::put` retains
+only `had.t0 != e.t0`, one block per `t0`, which is right for a generation and
+makes a second partial of a range impossible. Identity needs a third component,
+and "which slice of the source this accounts for" is the honest one.
+
+**Which also frees `generation` of a second job.** A generation is a
+RE-DERIVATION — a definition changed, a range recomputed — and it *replaces*. A
+consumed range says which slice of the source a partial accounts for, and it
+*accumulates*. Two axes, neither overloaded: a partial expressed as a
+generation would make `put` mean replace or accumulate depending on which field
+moved.
+
+## Four things that block it today
 
 Facts about the code, found while building the prototype rather than while
 implementing this:
 
-1. **`Block::merge` is replace, not add.** It writes `mine[b] = *v` for every
+1. **`Manifest::put` allows one block per `t0`.** It retains only
+   `had.t0 != e.t0`, so putting a second partial of a range evicts the first
+   and returns it as superseded — correct for a generation, and fatal for a
+   partial. The narrowest and most concrete of the four.
+2. **`Block::merge` is replace, not add.** It writes `mine[b] = *v` for every
    present cell, so it accepts a restatement and would silently take the last
    partial as the answer. Additive merge, per `Field`, is new code.
-2. **`Sample::render` drops the timestamp on `last=`** (above), so `Last` is
+3. **`Sample::render` drops the timestamp on `last=`** (above), so `Last` is
    unmergeable as the tape stands.
-3. **Add-versus-replace is not expressible.** `Block::pack` already carries
+4. **Add-versus-replace is not expressible.** `Block::pack` already carries
    `How::Merge` and `How::Regenerate` because inferring a regeneration from
    "I already hold this range" silently superseded three of six days of real
    data. The same distinction has to be explicit wherever a partial travels,
@@ -250,6 +293,11 @@ remains to place cannot corrupt the grid by being lost.
   (`At::offset` is valid inside the write-ahead segment) but the retention
   floor is chunk-granular. Whether a spill may end anywhere or must reach a
   chunk boundary is a choice between write amplification and a simpler floor.
+- **What "may be incomplete" means on restart**, since that is the set a
+  recovery re-derives. The conservative answer is every bucket the newest
+  partial touches; a cheaper one needs a durable statement that a bucket is
+  closed, which is a claim about the future and therefore a `grace` in
+  disguise.
 - **Gauges.** If `Last` keeps its timestamp on the wire, nothing is held to
   completion. If not, gauge series need their own bound, and the argument
   against a cap applies to them unchanged.

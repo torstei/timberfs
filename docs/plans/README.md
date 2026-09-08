@@ -89,10 +89,12 @@ messages and pull requests are for.
   is accumulated in memory until complete, then written once — and the input
   is replayable while `Field::combine` is already the associative merge, so
   spilling partials is legal. Four other mechanisms dissolve with the cap; the
-  bill is mandatory compaction. Its second half is a design for crash recovery,
-  which is the same problem: additive partials are not idempotent, and what
-  identifies one is the source offset range it consumed — not its citation,
-  which is provenance and cannot serve.
+  bill is mandatory compaction. Its second half is about recovery, where being
+  a tally rather than a follower pays: the output is a function of source
+  entries still on disk, so a crash is answered by re-deriving rather than by
+  reconciling partials — and the citation, useless as a dedup key, is the right
+  rewind point. Provenance and coverage are two byte ranges that must stop
+  being one word.
 - [tally.md](tally.md) — metrics derived from the log as a tape of their own:
   the extractor as a consumer (and therefore backfillable), the one invariant
   that decides the line format, and how a site declares extractors of its own.
