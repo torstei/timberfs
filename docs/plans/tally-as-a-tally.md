@@ -338,6 +338,10 @@ flattering number.
   worth about 1% of the store. A block carries its own dictionary because that
   is what makes it readable and replicable alone.
 
+⚠ **Amended by [tally-partials.md](tally-partials.md):** the decision this
+forces into the open is one nobody can make in advance, and the cap should not
+exist. Read the rest of this paragraph as what ships, not as what should.
+
 ⚠ **What does NOT work is exceeding the cap**, and that is by design:
 `max_series` is 1000 per bucket, so 500 vhosts fits and 5,000 does not — the
 `!cap` marker fires and the excess is dropped, recorded. An operator wanting

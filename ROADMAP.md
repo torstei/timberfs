@@ -933,6 +933,28 @@ here.
   manifest diff. The text line format survives as the INTERCHANGE form, so
   `query`, `timbergraph` and `--fold` keep working. Design note:
   [docs/plans/tally-as-a-tally.md](docs/plans/tally-as-a-tally.md).
+- **A tally that never holds a bucket to completion** (removes a knob):
+  `window.max_series` asks a document's author how many distinct series a
+  bucket will hold, which is a prediction about traffic that has not happened
+  — so moving it to a site file changes who guesses, not whether it is one.
+  Measured over six real days, the count the cap sees (367 per bucket at
+  worst) is 2.3× smaller than the day's union somebody would size it on, the
+  document that produced it sets 4,000, and per-metric enforcement over three
+  open bucket-starts permits ~48,000 live series that no file states — while
+  no unit sets `MemoryMax`, so this unsettable count is the only bound on
+  memory. It comes from one decision, not a hazard: a bucket is accumulated
+  in memory until complete, then written once. A database would have spilled
+  and merged instead (PostgreSQL 13 added exactly that to `HashAgg`, removing
+  the need to estimate cardinality in advance). It is not forced here either:
+  the input is a store with a recorded position, so the accumulator is
+  replayable, and `Field::combine` is already the associative merge. Spill
+  instead, and cardinality costs I/O and disk — the resource `retain_size`
+  and head-drop already govern. `max_series`, `!cap`, `grace_ms` as a
+  correctness boundary, displacement/`!late`, and the 0.33.0 revision rule all
+  go with it. ⚠ Additive partials are NOT idempotent, so anything that can
+  re-deliver one needs a dedup identity: the block manifest's
+  `(range, generation)` has one and a tape line does not. Design note:
+  [docs/plans/tally-partials.md](docs/plans/tally-partials.md).
 - **A metric is a series, and combining it is the reader's decision** (a real
   defect): `tally --fold` sums two definitions' measurements into one number,
   because `Roller` keys a bucket on `(start, metric, labels)` and nothing on

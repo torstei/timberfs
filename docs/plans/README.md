@@ -82,6 +82,15 @@ messages and pull requests are for.
   provenance; and why the tape model was inherited rather than chosen — a log
   entry is a fact, a tally bucket is a conclusion, and only the prefix older
   than the source's retention horizon is irreplaceable.
+- [tally-partials.md](tally-partials.md) — a tally that never holds a bucket
+  to completion, and therefore needs no cardinality cap. `window.max_series`
+  asks its author to predict traffic that has not happened, and it does not
+  bound the memory it exists to bound. It comes from one decision — a bucket
+  is accumulated in memory until complete, then written once — and the input
+  is replayable while `Field::combine` is already the associative merge, so
+  spilling partials is legal. Four other mechanisms dissolve with the cap; the
+  bill is mandatory compaction, and the sharp edge is that additive partials
+  are not idempotent.
 - [tally.md](tally.md) — metrics derived from the log as a tape of their own:
   the extractor as a consumer (and therefore backfillable), the one invariant
   that decides the line format, and how a site declares extractors of its own.
