@@ -48,13 +48,10 @@ const VERSION: u8 = 1;
 
 /// One series' identity, written once per block.
 ///
-/// ⚠ Which DEFINITION produced it is not carried yet, and belongs on a
-/// metric table rather than here: a metric maps to one definition, so a
-/// field here would repeat it once per series. An assigned id into the
-/// definitions stored with the tally is the settled shape
-/// (docs/plans/tally-series-identity.md); until it exists, "which
-/// definition" is answerable only from whatever documents the reader's
-/// own host happens to have.
+/// ⚠ Which DEFINITION produced it is deliberately NOT here: a metric
+/// maps to one definition, so it belongs on the block's metric table
+/// where there is one of it (`Block::definitions`), not on each series
+/// of that metric.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Series {
     pub metric: String,
@@ -108,6 +105,20 @@ pub struct Block {
     /// is what makes regeneration safe where a chunk number is not.
     pub generation: u32,
     pub series: Vec<Series>,
+    /// Which definition produced each metric, by the id assigned in the
+    /// tally's own definitions (docs/plans/tally-series-identity.md).
+    ///
+    /// ⚠ Keyed by metric and not by series because a metric maps to one
+    /// definition, so a field on `Series` would have many homes for one
+    /// fact. The wire form is a metric table the series index into,
+    /// DERIVED at encode time rather than stored beside them, so the two
+    /// cannot disagree.
+    ///
+    /// ⚠ A metric may legitimately be ABSENT from this, permanently: a
+    /// block packed from tally lines has no definition to record, the
+    /// interchange form carrying none. So absence is not definition 0 —
+    /// zero and unknown are different, as they are for a cell.
+    pub definitions: BTreeMap<String, u32>,
     /// `cells[s][f]` is series `s`'s column for field `f`, as
     /// `Option<f64>` per bucket — `None` being ABSENT and not zero.
     cells: Vec<BTreeMap<Field, Vec<Option<f64>>>>,
@@ -225,6 +236,7 @@ impl Block {
                 n_buckets: range_buckets,
                 generation: 0,
                 series,
+                definitions: BTreeMap::new(),
                 cells,
                 cites,
             }
@@ -357,9 +369,27 @@ impl Block {
         put_uvarint(&mut head, self.series.len() as u64);
 
         let mut body = Vec::new();
-        // The series table: identities, once.
+        // The metric table, then the series that index into it. Derived
+        // here rather than held beside the series so the two cannot
+        // disagree; first-appearance order, the series being sorted.
+        let mut order: Vec<&str> = Vec::new();
+        let mut index: BTreeMap<&str, usize> = BTreeMap::new();
         for s in &self.series {
-            put_str(&mut body, &s.metric);
+            index.entry(&s.metric).or_insert_with(|| {
+                order.push(&s.metric);
+                order.len() - 1
+            });
+        }
+        put_uvarint(&mut body, order.len() as u64);
+        for m in &order {
+            put_str(&mut body, m);
+            // Biased by one, so 0 can mean "not recorded" and stay
+            // distinguishable from definition 0.
+            let d = self.definitions.get(*m).map_or(0, |d| *d as u64 + 1);
+            put_uvarint(&mut body, d);
+        }
+        for s in &self.series {
+            put_uvarint(&mut body, index[s.metric.as_str()] as u64);
             put_uvarint(&mut body, s.labels.len() as u64);
             for (k, v) in &s.labels {
                 put_str(&mut body, k);
@@ -518,9 +548,27 @@ impl Block {
         let body = zstd::stream::decode_all(frame).context("decompressing a tally block")?;
 
         let mut p = 0usize;
+        let n_metrics = get_uvarint(&body, &mut p)? as usize;
+        let mut names: Vec<String> = Vec::with_capacity(n_metrics);
+        let mut definitions: BTreeMap<String, u32> = BTreeMap::new();
+        for _ in 0..n_metrics {
+            let name = get_str(&body, &mut p)?;
+            let d = get_uvarint(&body, &mut p)?;
+            if let Some(d) = d.checked_sub(1) {
+                definitions.insert(
+                    name.clone(),
+                    u32::try_from(d).context("a definition id does not fit")?,
+                );
+            }
+            names.push(name);
+        }
         let mut series = Vec::with_capacity(n_series);
         for _ in 0..n_series {
-            let metric = get_str(&body, &mut p)?;
+            let mi = get_uvarint(&body, &mut p)? as usize;
+            let metric = names
+                .get(mi)
+                .context("a series names a metric outside the block's own table")?
+                .clone();
             let n_labels = get_uvarint(&body, &mut p)? as usize;
             let mut labels = Vec::with_capacity(n_labels);
             for _ in 0..n_labels {
@@ -607,6 +655,7 @@ impl Block {
                 n_buckets,
                 generation,
                 series,
+                definitions,
                 cells,
                 cites,
             },
@@ -824,6 +873,22 @@ impl Block {
             );
         }
         let mut out = self.clone();
+        for (m, d) in &other.definitions {
+            // Within one tally a metric has one definition, and both
+            // blocks are of one tally — `commit` finds the other
+            // through this store's own manifest. So a disagreement is a
+            // bug in whatever built them, not a case to pick a winner
+            // for. ⚠ It is NOT a guard against merging two tallies: an
+            // id is local to a store, so two of them can agree on the
+            // number and mean different definitions.
+            match out.definitions.get(m) {
+                Some(had) if had != d => bail!(
+                    "{m} is definition {had} in one block and {d} in the other, which cannot \
+                     both be true of one tally"
+                ),
+                _ => out.definitions.insert(m.clone(), *d),
+            };
+        }
         for (i, s) in other.series.iter().enumerate() {
             let at = match out.series.iter().position(|had| had == s) {
                 Some(at) => at,
@@ -1350,6 +1415,69 @@ mod tests {
         let mut blocks = Block::pack(&samples, range).unwrap();
         assert_eq!(blocks.len(), 1, "expected one block");
         blocks.remove(0)
+    }
+
+    /// A metric's identity is written once for the block, not once per
+    /// series, and the definition that produced it rides on that table.
+    /// The table is derived at encode time, so this is also the test
+    /// that a series can still name its metric after a round trip.
+    #[test]
+    fn a_metric_is_named_once_and_carries_its_definition() {
+        let mut block = pack1(
+            &[
+                "2026-09-06T13:37:00.000Z 60s m a=1 count=1",
+                "2026-09-06T13:37:00.000Z 60s m a=2 count=2",
+                "2026-09-06T13:37:00.000Z 60s other a=1 count=3",
+            ],
+            60,
+        );
+        block.definitions.insert("m".to_string(), 0);
+        block.definitions.insert("other".to_string(), 7);
+        let back = Block::decode(&block.encode(3).unwrap()).unwrap();
+        assert_eq!(back, block);
+        assert_eq!(back.definitions.get("m"), Some(&0));
+        assert_eq!(back.definitions.get("other"), Some(&7));
+        assert_eq!(
+            back.series
+                .iter()
+                .map(|x| x.metric.as_str())
+                .collect::<Vec<_>>(),
+            ["m", "m", "other"],
+        );
+    }
+
+    /// A metric with no recorded definition is a permanent state of the
+    /// format rather than a stage of it — a block packed from tally
+    /// lines has none to record — so absence must survive the round trip
+    /// and stay distinguishable from definition 0. Tally's "zero and
+    /// unknown are different", one level up from the presence bitmap.
+    #[test]
+    fn an_unrecorded_definition_is_absent_and_not_zero() {
+        let block = pack1(&["2026-09-06T13:37:00.000Z 60s m a=1 count=1"], 60);
+        assert!(block.definitions.is_empty());
+        let back = Block::decode(&block.encode(3).unwrap()).unwrap();
+        assert!(
+            back.definitions.is_empty(),
+            "an absent definition came back as {:?}",
+            back.definitions
+        );
+    }
+
+    /// Both blocks of a merge are of one tally, so a metric cannot have
+    /// two definitions between them: refused rather than resolved by
+    /// picking a side. ⚠ Not a cross-tally check — an id is local, so
+    /// two tallies can agree on the number and mean different things.
+    #[test]
+    fn merging_blocks_that_disagree_about_a_definition_is_refused() {
+        let mut a = pack1(&["2026-09-06T13:37:00.000Z 60s m a=1 count=1"], 60);
+        let mut b = pack1(&["2026-09-06T13:38:00.000Z 60s m a=2 count=2"], 60);
+        a.definitions.insert("m".to_string(), 1);
+        b.definitions.insert("m".to_string(), 2);
+        let err = a.merge(&b).unwrap_err().to_string();
+        assert!(err.contains("cannot both be true of one tally"), "{err}");
+        b.definitions.insert("m".to_string(), 1);
+        let merged = a.merge(&b).unwrap();
+        assert_eq!(merged.definitions.get("m"), Some(&1));
     }
 
     /// The whole claim: the grid renders back to the lines it was built
@@ -2136,7 +2264,12 @@ mod tests {
         assert!(a < b, "directory order must be time order");
     }
 
-    /// Garbage in must not panic: a block arrives over a wire.
+    /// Garbage in must not panic, and the OPEN REGION is where it can
+    /// arrive: every sealed block has a crc32 in the manifest that
+    /// `read_block` checks before decoding, while `open` is read by name
+    /// with nothing vouching for its bytes. `read_open` also walks
+    /// concatenated blocks by `size_of`, so a disagreement there hands
+    /// decode a suffix from inside the file.
     #[test]
     fn a_truncated_or_foreign_block_is_an_error_not_a_panic() {
         assert!(Block::decode(b"").is_err());
