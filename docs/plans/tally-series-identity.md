@@ -485,29 +485,6 @@ The rest follows from the name being a boundary rather than a label:
   Definitions outlive the numbers they describe, or the numbers stop being
   readable — which is the whole reason for storing them.
 
-**Two reads, in opposite directions, and neither is on a hot path.** The
-writer reads its DOCUMENTS once at startup — `load_extractors` and `Run::new`
-are each called once, and the record loop never re-reads — so a document
-edited under a running writer takes effect at its next RESTART, which is
-"applying is an act" in mechanical form. It reads the store's newest
-definitions file at that same startup, and only to answer two questions: does
-the record differ from what I am about to compute, and what is the id
-high-water mark. The store is somewhere the writer files a record, never
-somewhere it learns anything.
-
-That also fixes the boundary: the offset in a filename is the follower's
-resume position at that restart — a real event at a known position rather than
-an arbitrary point.
-
-⚠ **Which leaves drift with nobody to report it.** A document edited and never
-applied keeps the store producing the old numbers, correctly, and silently: a
-writer that read its documents once cannot notice a later edit even in
-principle, and `--check` validates documents while reading no store. So the
-"drift is REPORTED" promise above needs a comparison that does not exist —
-recorded definitions against the documents on disk. Its home is the
-provisioning's converge run, which already executes on a timer and at every
-deploy and is where an operator already looks.
-
 ### Applying makes them current, in one act
 
 ⚠ **What this must never become is "apply, and then remember to restart
@@ -532,11 +509,20 @@ was still producing numbers. Each step is idempotent, so a re-run converges;
 and if the start fails the filed definitions are not merely harmless but
 correct, the position not having moved.
 
-⚠ **So there is no drift to report, and that is the point** — an unapplied
-edit is a no-op by design, and the state where a store's record disagrees with
-what is running is unreachable rather than monitored. What remains useful is
-"what would applying change", which is `--dry-run` on the same command rather
-than a mechanism of its own.
+**Two reads, in opposite directions, and neither is on a hot path.** The
+writer reads its DOCUMENTS once at startup, and reads the store's newest
+definitions file at that same startup only to ask whether the record differs
+and what the id high-water mark is. The store is somewhere it files a record,
+never somewhere it learns anything.
+
+⚠ **Two DIFFERENT differences, and only one of them is reportable.** A store's
+record against what is actually running is unreachable — apply is one act, so
+they cannot disagree — and needs no monitoring. The documents on disk against
+the store's record is perfectly reachable, being exactly what an unapplied
+edit leaves behind, and reporting it is the "drift is REPORTED" promise
+earlier in this note: it is how an operator learns there is something to
+apply. Neither is a new mechanism. Both are `--dry-run` on the apply command,
+which already has to compute the comparison in order to do the work.
 
 **Finding the ACTIVE set is a readdir and a sort, and that is deliberately not
 optimised.** The cost is a rounding error against what the same directory
