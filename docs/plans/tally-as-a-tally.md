@@ -445,6 +445,83 @@ of a first cut.
   defect — and `--try` is exactly what an operator points at a day of log to
   develop a document, which is the case that makes it matter.
 
+## Why zstd, and why the lack of seek does not decide it
+
+Asked before replication, on the reasoning that a wire format is
+expensive to change. Measured on one real day:
+
+**zstd earns its place.** The block body is already delta+zigzag+varint
+coded and zstd still finds **2.42×** on top of it — 2,276,648 bytes of
+coded columns down to 939,537. Dropping it for a directly-indexable
+encoding would take six days from 4.2 MB to about 10 MB, giving up more
+than half the win over the tape.
+
+**And seek is not the bottleneck.** A selective read of one metric out of
+one day is 12 ms, of which decompressing 939 KB is about 1 ms — zstd runs
+at GB/s, so the cost is the parsing and the materialising, which
+selection already skips. Buying seek could save that ~8%.
+
+The alternatives, and why none of them wins here:
+
+* **Frame-of-reference bit packing** (what Parquet and Arrow use) is
+  directly indexable and needs no general compressor — but the 2.42×
+  above is exactly the redundancy ACROSS series and columns that
+  per-column packing cannot see, so it would pay the full ratio.
+* **Gorilla/XOR** (Prometheus's) is for float series with stable
+  exponents. These values are integers and delta+varint already suits
+  them.
+* **LZ4 with independent blocks** is seekable and ~2× worse than zstd,
+  trading ratio for decompression speed — which is backwards when
+  decompression is already 8% of a read.
+* **zstd's own seekable format** is not a different codec but the framing
+  option below, standardised.
+
+### ⚠ The framing option is FREE, and worth knowing before it is needed
+
+| framing | bytes | cost |
+|---|---|---|
+| raw columns, no zstd | 876,235 | — |
+| **one frame** (what the prototype writes) | 561,814 | baseline |
+| one frame per **metric** (4 of them) | 560,873 | **1.00× — free** |
+| one frame per **series** (992) | 631,980 | 1.12× worse |
+
+Per-metric framing costs nothing measurable and would let a read
+decompress only the metric it asked for — which is the granularity real
+queries use. Per-series costs 12% for a finer cut than anyone asks for.
+
+Not done yet, because 8% of a 12 ms read does not justify a frame table
+today. It becomes worth doing when a block is big enough that
+decompressing it whole to read one series is the cost — a much higher
+cardinality than the 992 measured, or the 4000 a real document already
+permits.
+
+### And deferring it is cheap, which was the thing to check
+
+⚠ **Replication does not lock the internal framing.** A manifest entry
+holds `(t0, n_buckets, generation, bytes, crc32)` and nothing about a
+block's insides: the diff is over those, and a block travels as opaque
+bytes. So changing the framing later changes the bytes of blocks that get
+re-derived, which is a REGENERATION — an operation the manifest already
+has, with a generation to bump and a supersede to record.
+
+⚠ And a block carries a **version byte** that `decode` refuses rather
+than guesses at, so a v2 framing is a lazy migration with both readers
+present — the discipline `.rings` v1→v2 already follows in this tree
+("both migrations are lazy, so no store needs an operator step").
+
+So the premise "changing it later would be more expensive" turns out not
+to hold for the framing, and to hold for the CODEC only in the sense that
+every block would want re-deriving. Keeping zstd is the decision; the
+framing stays open on purpose.
+
+⚠ One option worth recording rather than measuring now: **a trained zstd
+dictionary**. The quiet days are 309 KB blocks where the compressor has
+little history to work with, and a dictionary trained on tally columns is
+exactly the case zstd dictionaries exist for. It is also invisible to
+replication for the same reason the framing is — except that the
+dictionary itself would then be state a replica needs, which is the part
+that would want designing.
+
 ## Open
 
 * **Segment length**, which is now the ONLY sizing question left open — the
