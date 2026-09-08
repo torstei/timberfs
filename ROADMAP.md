@@ -921,8 +921,12 @@ here.
   992 series over 1,260 buckets), 83% of a line is not the number — series
   identity 44%, bucket stamps 24%, citations 14% — because the row key is
   written into every occupied cell of a grid that is only 21% dense, and
-  compression cannot recover it: **a columnar block is 8.5× smaller than the
-  shipped store on disk**, 0.44 GB against 3.77 GB over a two-year retention.
+  compression cannot recover it: **a columnar block is 5.5× smaller than the
+  shipped store's `.trunk`** (measured, not estimated: 917.5 KiB against
+  5,034 KiB for one real day), 0.69 GB against 3.76 GB over a two-year
+  retention. ⚠ 6.2× against the whole store on disk, but that compares a
+  searchable store with a block carrying no token index, so 5.5× is the figure
+  to quote.
   So: a series is an object with an id, a definition and a unit, written once;
   a bucket start is a POSITION in a block and costs no bytes; measures are
   columns, which is what makes coarsening a column operation under the rule

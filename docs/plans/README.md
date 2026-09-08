@@ -64,8 +64,8 @@ messages and pull requests are for.
 - [tally-as-a-tally.md](tally-as-a-tally.md) — a tally store designed from the
   data rather than from the tape it inherited. Measured on a real day: 83% of
   a tally line is not the number, the grid is 21% dense, and a columnar block
-  is **8.5× smaller than the shipped store on disk** — 0.44 GB against
-  3.77 GB over a two-year retention. A series becomes an object and a bucket
+  is **5.5× smaller than the shipped store's `.trunk`** — 0.69 GB against
+  3.76 GB over a two-year retention, measured rather than estimated. A series becomes an object and a bucket
   start a position, which makes the presence bitmap enforce "zero and unknown
   are different", makes provisional values a mutable cell rather than a
   revision, and makes regeneration a manifest diff — and a replication

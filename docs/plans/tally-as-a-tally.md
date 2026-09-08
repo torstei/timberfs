@@ -31,11 +31,27 @@ level a tally store actually writes (zstd 3, not 19):
 
 | one real day | |
 |---|---|
-| tally as text | 32.3 MB |
-| **the shipped store, on disk** | **5,040 KB** (6.3×) |
-| **columnar** | **592 KB** — 542 columns + 29 bitmap + ~20 dictionary |
-| **ratio** | **8.5×** |
-| over a two-year retention | **3.77 GB against 0.44 GB** |
+| tally as text | 32.3 MB (32,259,142 B) |
+| the shipped store's `.trunk` | 5,034 KiB (6.3×) |
+| its `.grain` + `.rings` | 682 KiB — **5,715 KiB on disk** |
+| **the block** | **917.5 KiB** (939,559 B, + a 228 B manifest) |
+| **ratio against `.trunk`** | **5.5×** |
+| against the whole store on disk | 6.2× |
+| over a two-year retention | **3.76 GB against 0.69 GB** |
+
+⚠ **Corrected: this table said 592 KB and 8.5×**, from an estimate that
+omitted citations. The 917.5 KiB above is a block the packer wrote, measured
+with `stat`. Two things move with it: the two-year figures, and the claim that
+the win is mostly structural — 5.5× still is, but it is not 8.5×.
+
+⚠ **And the two ratios are not interchangeable.** A block carries no token
+index at all, so 6.2× compares a store that `query --has` can search against
+one that nothing can; **5.5× against `.trunk` is the fair headline** and the
+one to quote.
+
+Citations, in the per-bucket form this format settled on, cost **7,542 bytes of
+that block — 0.8%** (measured by packing the same day with the `@off+len`
+tokens stripped: 932,017 B). Per cell they were 60%.
 
 Structure beats an entropy coder here because the redundancy is *positional*,
 not textual: zstd can shorten a repeated identity but cannot stop it being
