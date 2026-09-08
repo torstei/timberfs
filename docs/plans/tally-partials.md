@@ -329,6 +329,17 @@ belong when this is wanted. Doing it by hand needs two rules:
 - **Do not copy `open`.** It is rewritten in place, so a copy can be torn.
   Sealed history copies; the live edge is queried.
 
+⚠ **Better still, do not sync a directory at all — send a bundle.** `export`
+already writes one for a store: "a plain uncompressed tar (the payload is
+already zstd)", and the same shape fits a block set. It is not merely tidier.
+A single file takes its **atomicity from the container**, so a torn
+intermediate state is unobservable and the ordering rule above stops being
+load-bearing — the bundle's own members are ordered to suit the READER
+(`export` puts the tiny `.rings` before the `.trunk` "so readers see the index
+before the data"), which a directory sync cannot afford to do. So the rule
+above is what a hand copy needs, and the bundle is what the command should
+provide: a hazard made structurally impossible beats a hazard documented.
+
 ## Open
 
 - **The spill trigger.** Bytes held is the honest measure, and sizing a bucket
