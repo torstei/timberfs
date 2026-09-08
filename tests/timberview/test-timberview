@@ -928,6 +928,110 @@ def joining_keeps_the_entry_you_are_on():
 
 
 @test
+def one_entry_can_be_opened_back_out_of_the_join():
+    """`z` is the whole answer at once, which is what makes ten traces
+    comparable — and then one of them is the one you read. Opening it is
+    an exception to the join and not a second mode: everything else stays
+    a row, and the entry is still one entry to the motions and the copy."""
+    frames = "\n".join(f"  at frame.{i}(F.java:1)" for i in range(5))
+    r = tv.Records(answer(("one", {"offset": 0}),
+                          (f"boom\n{frames}", {"offset": 100}),
+                          ("three", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    # Through the KEYS: a binding nothing exercises is one a refactor can
+    # lose, and `Z` is only reachable through one.
+    screen = Screen_for_test()
+    screen.view = v
+    screen.step(Screenish(), ord("z"))
+    assert len(v.source.lines) == 3, [ln.text for ln in v.source.lines]
+
+    v.cur = 1
+    screen.step(Screenish(), ord("Z"))
+    assert len(v.source.lines) == 8, [ln.text for ln in v.source.lines]
+    # The other two are untouched, and the cursor is on what it was on.
+    assert [v.source.lines[i].text for i in (0, 7)] == ["one", "three"]
+    assert v.cur == 1 and v.source.lines[1].text == "boom", v.cur
+    assert "↵" not in "".join(ln.text for ln in v.source.lines)
+    # Still ONE entry: the whole trace is what a bare `c` takes, and the
+    # entry motion steps over it.
+    assert v.entry_span() == (1, 6), v.entry_span()
+    assert v.selection()[1] == "this entry, 6 lines", v.selection()[1]
+    v.move_entry(1)
+    assert v.source.lines[v.cur].text == "three", v.source.lines[v.cur].text
+
+    # From ANY of its lines, because what you point at is the entry.
+    v.cur = 4
+    v.open_entry()
+    assert len(v.source.lines) == 3, [ln.text for ln in v.source.lines]
+    assert v.source.lines[v.cur].text.startswith("boom ↵ at frame.0")
+
+    # A one-line entry has nothing folded into it, and says so.
+    v.cur = 0
+    v.open_entry()
+    assert len(v.source.lines) == 3 and "one line" in v.message, v.message
+
+
+@test
+def opening_one_entry_is_a_property_of_the_join():
+    """It is an exception to a rendering, so it lives and dies with one:
+    `z` sets the whole screen, and a screen that is not joined has
+    nothing to open out of."""
+    r = tv.Records(answer(("boom\n  at A\n  at B", {"offset": 0}),
+                          ("next", {"offset": 100})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.open_entry()
+    assert len(v.source.lines) == 4 and "nothing is joined" in v.message, \
+        v.message
+
+    v.join_entries()
+    v.cur = 0
+    v.open_entry()
+    assert len(v.source.lines) == 4, [ln.text for ln in v.source.lines]
+    v.join_entries()                            # everything as written
+    v.join_entries()                            # ...and joined again
+    assert len(v.source.lines) == 2, [ln.text for ln in v.source.lines]
+
+
+@test
+def entries_at_a_live_edge_open_one_at_a_time():
+    """An entry that has not been placed yet has no offset, and every one
+    of them reports 0 — so an open entry is remembered by its ORDINAL. By
+    offset, opening one of them would open all the others with it."""
+    r = tv.Records(answer(("first\n  at A", {}), ("second\n  at B", {})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    assert r.unplaced == 2, r.unplaced
+    v.join_entries()
+    v.cur = 1
+    v.open_entry()
+    assert [ln.text for ln in v.source.lines] == \
+        ["first ↵ at A", "second", "  at B"], \
+        [ln.text for ln in v.source.lines]
+
+
+@test
+def opening_an_entry_keeps_what_was_selected():
+    """The rows renumber under it exactly as they do under `z`, so both
+    ends of a region travel as offsets — a region that quietly became a
+    different set of lines is the copy that takes the wrong thing."""
+    r = tv.Records(answer(("one", {"offset": 0}),
+                          ("boom\n  at A\n  at B", {"offset": 100}),
+                          ("three", {"offset": 900})))
+    v = tv.View(Fake(["x\n"]), source=r)
+    v.join_entries()
+    v.cur = 0
+    v.set_mark()
+    v.move(1)                                   # "one", then the trace
+    whole = "one\nboom\n  at A\n  at B\n"
+    assert v.selection()[0] == whole, v.selection()
+
+    v.open_entry()
+    assert v.region() == (0, 3), v.region()
+    assert v.selection()[0] == whole, v.selection()
+    v.open_entry()
+    assert v.region() == (0, 1) and v.selection()[0] == whole, v.selection()
+
+
+@test
 def the_join_survives_the_view_changing_store():
     """A hit in another store replaces the source outright. A display
     option nobody re-applies there is one that turns itself off when you

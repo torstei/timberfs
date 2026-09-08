@@ -150,6 +150,23 @@ all keep working, because every line on the screen is a real line with a
 real address.
 .RE
 .TP
+.B Z
+Open THIS entry back out of the join, as its own lines \(em the one of
+the ten you picked out to read, while the other nine stay rows to come
+back to. Pressing it again joins it, from ANY of its lines: what you are
+pointing at is the entry, not the row.
+.RS
+.PP
+Several can be open at once, because comparing two traces is the next
+thing after picking them out of the ten. It is an exception to a
+rendering and not a second mode \(em the entry is still one entry to the
+entry motion and to a bare
+.BR c ,
+and
+.BR z ,
+which sets the whole screen, builds the join afresh and so clears them.
+.RE
+.TP
 .BR space " " b
 A page.
 .BR h " " l " " \(<- " " \(->
@@ -240,7 +257,9 @@ in \(em that rendering is for reading. So
 .B z
 and then a mark is how a run of whole entries is selected. Toggling
 .B z
-with a region live keeps what was selected rather than the row numbers:
+\(em or opening one entry with
+.B Z
+\(em with a region live keeps what was selected rather than the row numbers:
 both ends travel as offsets, and the upper one is taken to the END of the
 entry it lands in, since a row unjoins into several lines and an offset
 resolves to the first of them.
