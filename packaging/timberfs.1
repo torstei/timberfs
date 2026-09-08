@@ -1363,6 +1363,36 @@ bound the entries it counted: a displaced entry (see LATENESS) came from
 outside the bucket's window, so a time-range lookup would miss exactly
 the entries that made a number surprising.
 .IP
+.BI \-\-query " DIR"
+reads lines back out, selecting series with
+.BI \-\-series " EXPR"
+(the predicate
+.B "list \-\-select"
+takes, with the metric as the key
+.BR metric ,
+so
+.BR "[metric=http_requests,status=500]" )
+and bounding them with
+.BI \-\-since " T"
+and
+.BI \-\-until " T".
+.IP
+⚠ It reports what it did NOT touch, which is the number worth having and
+the one most log stores cannot give without doing the work: TWO prunings,
+neither reading a number it does not need. The manifest says which blocks
+hold a bucket in the window, so the rest are never opened at all; and the
+series table at the front of each opened block says which series it holds,
+so the columns of those the predicate did not pick are STEPPED OVER
+instead of decoded. Measured on six real days: the whole store is
+1,351,587 lines in 624 ms reading 4.2 MiB, and one metric of one day is
+357 lines in 12 ms reading 924 KiB with 990 of 997 series stepped over
+\(em 53x, on the same data.
+.IP
+⚠ Decompression is the FLOOR: a block is one zstd frame and zstd has no
+seek, so an opened block is decompressed whole and what selection saves
+is the parsing. Framing per series to save the decompression too would
+cost compression on every block to speed up a minority of reads.
+.PP
 ⚠ A
 .B manifest.json
 beside the blocks is the store's STATE and its COMMIT POINT: which ranges

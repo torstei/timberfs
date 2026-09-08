@@ -71,6 +71,30 @@ impl Series {
     }
 }
 
+impl Series {
+    /// The series as a LABEL MAP, so the selector that picks stores
+    /// picks series too.
+    ///
+    /// ⚠ The metric goes in under the key `metric`, which is what
+    /// [tally.md](../docs/plans/tally.md) already said the read side
+    /// would do: the name is POSITIONAL in a line and a selectable KEY
+    /// in a parsed one, the same relation a store's `name` and `id`
+    /// already have. So `[metric=http_requests,status=500]` works with
+    /// the operators `--select` already has — regex, negation, substring
+    /// — rather than a second predicate language for series.
+    pub fn as_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "metric".to_string(),
+            serde_json::Value::String(self.metric.clone()),
+        );
+        for (k, v) in &self.labels {
+            m.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
+        m
+    }
+}
+
 /// A block: one time range of one tally, every series in it, columnar.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Block {
@@ -433,7 +457,49 @@ impl Block {
         at.checked_add(frame).context("a frame length overflows")
     }
 
+    /// Decode only the series a selector picks, and only the buckets in
+    /// `[from, to]`.
+    ///
+    /// ⚠ **The point is what is NOT done.** The series table is at the
+    /// front, so the identities are read, matched, and then every
+    /// non-matching series' columns are STEPPED OVER rather than
+    /// materialised — one selective read of a 992-series day touches the
+    /// columns of the series asked for and no others. The frame is still
+    /// decompressed whole, which is the floor: zstd has no seek, and
+    /// framing per series to get one would cost compression on every
+    /// block to speed up a minority of reads. Measured either way before
+    /// choosing (see docs/plans/tally-as-a-tally.md).
+    pub fn select(
+        b: &[u8],
+        sel: &crate::select::Selector,
+        from: u64,
+        to: u64,
+    ) -> anyhow::Result<Vec<Sample>> {
+        let (block, _, _) = Block::decode_matching(b, sel)?;
+        Ok(block
+            .samples()
+            .into_iter()
+            .filter(|s| s.ts >= from && s.ts <= to)
+            .collect())
+    }
+
+    /// The block with only the matching series' cells populated, and
+    /// how many series were matched and stepped over.
+    fn decode_matching(
+        b: &[u8],
+        sel: &crate::select::Selector,
+    ) -> anyhow::Result<(Block, usize, usize)> {
+        Block::decode_inner(b, Some(sel))
+    }
+
     pub fn decode(b: &[u8]) -> anyhow::Result<Block> {
+        Ok(Block::decode_inner(b, None)?.0)
+    }
+
+    fn decode_inner(
+        b: &[u8],
+        sel: Option<&crate::select::Selector>,
+    ) -> anyhow::Result<(Block, usize, usize)> {
         let (t0, width_ms, n_buckets, generation) = Block::peek(b)?;
         let mut at = 5;
         let _ = get_uvarint(b, &mut at)?; // width
@@ -463,9 +529,18 @@ impl Block {
             }
             series.push(Series { metric, labels });
         }
+        // ⚠ Matched BEFORE the columns are read, which is the whole
+        // saving: a series the selector did not pick has its columns
+        // stepped over — the varints are counted off the presence bits
+        // and discarded — rather than decoded into a vector nobody
+        // asked for.
+        let wanted: Vec<bool> = match sel {
+            None => vec![true; n_series],
+            Some(sel) => series.iter().map(|s| sel.matches(&s.as_fields())).collect(),
+        };
         let mut cells = Vec::with_capacity(n_series);
         let bitmap_len = n_buckets.div_ceil(8);
-        for _ in 0..n_series {
+        for want in wanted.iter().copied() {
             let n_cols = get_uvarint(&body, &mut p)? as usize;
             let mut cols = BTreeMap::new();
             for _ in 0..n_cols {
@@ -477,9 +552,18 @@ impl Block {
                     .with_context(|| format!("a block names field {tag}, which is not one"))?;
                 let bits = body
                     .get(p..p + bitmap_len)
-                    .context("a block ended inside a presence bitmap")?
-                    .to_vec();
+                    .context("a block ended inside a presence bitmap")?;
+                let present = bits.iter().map(|b| b.count_ones() as usize).sum::<usize>();
+                let bits = bits.to_vec();
                 p += bitmap_len;
+                if !want {
+                    // Step over: the column holds one varint per present
+                    // bit, and a varint's end is its own high bit.
+                    for _ in 0..present {
+                        get_uvarint(&body, &mut p)?;
+                    }
+                    continue;
+                }
                 let mut col = vec![None; n_buckets];
                 let mut prev = 0i64;
                 for i in 0..n_buckets {
@@ -514,15 +598,20 @@ impl Block {
             }
             col
         };
-        Ok(Block {
-            width_ms,
-            t0,
-            n_buckets,
-            generation,
-            series,
-            cells,
-            cites,
-        })
+        let matched = wanted.iter().filter(|w| **w).count();
+        Ok((
+            Block {
+                width_ms,
+                t0,
+                n_buckets,
+                generation,
+                series,
+                cells,
+                cites,
+            },
+            matched,
+            wanted.len() - matched,
+        ))
     }
 }
 
@@ -945,6 +1034,86 @@ pub fn read_open(dir: &std::path::Path) -> anyhow::Result<Vec<Sample>> {
     Ok(out)
 }
 
+// ------------------------------------------------------------------ reading
+
+/// What a read touched, so a caller can say what it did NOT do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Touched {
+    pub blocks_in_manifest: usize,
+    pub blocks_opened: usize,
+    pub bytes_read: u64,
+    pub series_matched: usize,
+    pub series_skipped: usize,
+}
+
+/// Answer a window and a series selector out of a tally store.
+///
+/// Two prunings, and neither reads a number it does not need:
+///
+/// 1. **the manifest** says which blocks hold a bucket in the window, so
+///    the rest are never opened — no bytes, no decompression;
+/// 2. **the series table** at the front of each opened block says which
+///    series it holds, so the columns of those the selector did not pick
+///    are stepped over.
+///
+/// ⚠ The OPEN region is read last and always, because its buckets are
+/// still filling and are in no block yet. A window that ends before them
+/// filters them out on time; one that reaches now sees them.
+pub fn query(
+    dir: &std::path::Path,
+    sel: &crate::select::Selector,
+    from: u64,
+    to: u64,
+) -> anyhow::Result<(Vec<Sample>, Touched)> {
+    let m =
+        Manifest::load(dir)?.with_context(|| format!("{} holds no {MANIFEST}", dir.display()))?;
+    let mut out = Vec::new();
+    let mut t = Touched {
+        blocks_in_manifest: m.blocks.len(),
+        ..Default::default()
+    };
+    for e in m.covering(from, to) {
+        let path = dir.join(e.file_name());
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if crate::sap::crc32(&bytes) != e.crc32 {
+            bail!(
+                "{}: the manifest records crc32 {:#010x} and the file is {:#010x}",
+                path.display(),
+                e.crc32,
+                crate::sap::crc32(&bytes)
+            );
+        }
+        t.blocks_opened += 1;
+        t.bytes_read += bytes.len() as u64;
+        // ⚠ ONE pass. A first version decoded the block whole to count
+        // its series and then decoded it again selectively, which did
+        // exactly the work the selection exists to avoid — so the pass
+        // reports what it matched and stepped over.
+        let (block, matched, skipped) = Block::decode_matching(&bytes, sel)?;
+        t.series_matched += matched;
+        t.series_skipped += skipped;
+        out.extend(
+            block
+                .samples()
+                .into_iter()
+                .filter(|s| s.ts >= from && s.ts <= to),
+        );
+    }
+    for s in read_open(dir)? {
+        if s.ts >= from && s.ts <= to {
+            let series = Series {
+                metric: s.metric.clone(),
+                labels: s.labels.clone(),
+            };
+            if sel.matches(&series.as_fields()) {
+                out.push(s);
+            }
+        }
+    }
+    out.sort_by(|a, b| (a.ts, &a.metric, &a.labels).cmp(&(b.ts, &b.metric, &b.labels)));
+    Ok((out, t))
+}
+
 // ------------------------------------------------------------- the verbs
 
 /// A block's file name: sortable by time, generation visible, derivable
@@ -1067,6 +1236,51 @@ pub fn cmd_pack(dir: &std::path::Path, range_buckets: usize) -> anyhow::Result<(
             debris.len()
         );
     }
+    Ok(())
+}
+
+/// `tally --query DIR --series '[...]'`: the two prunings, with an
+/// account of what was NOT touched.
+///
+/// ⚠ The account is the interesting half. Block selection precedes
+/// reading, so this can state what it kept shut — which most log stores
+/// cannot answer without doing the work first.
+pub fn cmd_query(
+    dir: &std::path::Path,
+    expr: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let sel = crate::select::Selector::parse(expr)?;
+    let from_ms = match from {
+        Some(t) => crate::tally::parse_stamp(t)?,
+        None => 0,
+    };
+    let to_ms = match to {
+        Some(t) => crate::tally::parse_stamp(t)?,
+        None => u64::MAX,
+    };
+    let began = std::time::Instant::now();
+    let (rows, touched) = query(dir, &sel, from_ms, to_ms)?;
+    let took = began.elapsed();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for s in &rows {
+        writeln!(out, "{}", s.render())?;
+    }
+    out.flush()?;
+    crate::note!(
+        "timberfs: {} line(s) in {:?} — opened {} of {} block(s), {} read; {} series matched, \
+         {} stepped over",
+        rows.len(),
+        took,
+        touched.blocks_opened,
+        touched.blocks_in_manifest,
+        human(touched.bytes_read as usize),
+        touched.series_matched,
+        touched.series_skipped
+    );
     Ok(())
 }
 
@@ -1313,6 +1527,121 @@ mod tests {
         // here either.
         let at40 = got.iter().find(|x| x.ts == s(lines[3]).ts).unwrap();
         assert_eq!(at40.cite, None);
+    }
+
+    fn sel(expr: &str) -> crate::select::Selector {
+        crate::select::Selector::parse(expr).expect(expr)
+    }
+
+    /// ⚠ THE TWO PRUNINGS, and the point is what is NOT touched: the
+    /// manifest keeps blocks outside the window shut, and the series
+    /// table keeps the columns of series the selector did not pick from
+    /// being decoded.
+    #[test]
+    fn a_query_opens_only_the_blocks_and_series_it_needs() {
+        let dir = tmpdir("q1");
+        let mut m = Manifest::new(60_000, 60);
+        // Three hours, three series each.
+        for h in 0..3u64 {
+            let mut rows = Vec::new();
+            for which in ["a", "b", "c"] {
+                let mut x = Sample::new(
+                    crate::tally::parse_stamp("2026-09-06T00:00:00.000Z").unwrap() + h * 3_600_000,
+                    60_000,
+                    "m",
+                );
+                x = x.label("who", which).field(Field::Count, 1.0);
+                rows.push(x);
+            }
+            for b in Block::pack(&rows, 60).unwrap() {
+                commit(&dir, &mut m, &b, 3, How::Merge).unwrap();
+            }
+        }
+        let t0 = crate::tally::parse_stamp("2026-09-06T00:00:00.000Z").unwrap();
+
+        // The middle hour, one series of the three.
+        let (got, touched) = query(&dir, &sel("[who=b]"), t0 + 3_600_000, t0 + 3_600_000).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].labels, vec![("who".to_string(), "b".to_string())]);
+        assert_eq!(touched.blocks_in_manifest, 3);
+        assert_eq!(touched.blocks_opened, 1, "the other two were never read");
+        assert_eq!(touched.series_matched, 1);
+        assert_eq!(touched.series_skipped, 2, "their columns were stepped over");
+    }
+
+    /// A selective read must produce EXACTLY what a full read would,
+    /// filtered — or the pruning is not pruning, it is losing.
+    #[test]
+    fn a_selective_read_agrees_with_a_full_one() {
+        let dir = tmpdir("q2");
+        let mut m = Manifest::new(60_000, 60);
+        let mut rows = Vec::new();
+        for i in 0..20u64 {
+            let mut x = Sample::new(
+                crate::tally::parse_stamp("2026-09-06T00:00:00.000Z").unwrap() + (i % 5) * 60_000,
+                60_000,
+                if i % 2 == 0 { "even" } else { "odd" },
+            );
+            x = x
+                .label("n", &format!("{}", i))
+                .field(Field::Count, i as f64)
+                .field(Field::Sum, (i * 3) as f64);
+            rows.push(x);
+        }
+        for b in Block::pack(&rows, 60).unwrap() {
+            commit(&dir, &mut m, &b, 3, How::Merge).unwrap();
+        }
+        let (all, _) = query(&dir, &sel("[]"), 0, u64::MAX).unwrap();
+        let (some, t) = query(&dir, &sel("[metric=even]"), 0, u64::MAX).unwrap();
+        let want: Vec<String> = all
+            .iter()
+            .filter(|s| s.metric == "even")
+            .map(|s| s.render())
+            .collect();
+        assert_eq!(some.iter().map(|s| s.render()).collect::<Vec<_>>(), want);
+        assert_eq!(t.series_matched, 10);
+        assert_eq!(t.series_skipped, 10);
+    }
+
+    /// The metric is a selectable KEY on a parsed line even though it is
+    /// POSITIONAL in a rendered one — so the predicate that picks stores
+    /// picks series, with the operators it already has.
+    #[test]
+    fn the_metric_is_a_selectable_key_with_the_usual_operators() {
+        let s1 = Series {
+            metric: "http_requests".to_string(),
+            labels: vec![("status".to_string(), "500".to_string())],
+        };
+        assert!(sel("[metric=http_requests]").matches(&s1.as_fields()));
+        assert!(sel("[metric=~http_.*]").matches(&s1.as_fields()));
+        assert!(sel("[status=500]").matches(&s1.as_fields()));
+        assert!(sel("[metric=http_requests,status!=200]").matches(&s1.as_fields()));
+        assert!(!sel("[metric=http_bytes]").matches(&s1.as_fields()));
+        assert!(
+            sel("[]").matches(&s1.as_fields()),
+            "the empty predicate is everything"
+        );
+    }
+
+    /// ⚠ The OPEN region is part of the answer, because its buckets are
+    /// in no block yet — and a window that ends before them must not
+    /// take them.
+    #[test]
+    fn a_query_includes_the_open_region_and_respects_the_window() {
+        let dir = tmpdir("q3");
+        let mut m = Manifest::new(60_000, 60);
+        let t0 = crate::tally::parse_stamp("2026-09-06T00:00:00.000Z").unwrap();
+        let sealed = pack1(&["2026-09-06T00:00:00.000Z 60s m count=1"], 60);
+        commit(&dir, &mut m, &sealed, 3, How::Merge).unwrap();
+        checkpoint(&dir, &[s("2026-09-06T00:30:00.000Z 60s m count=99")], 3).unwrap();
+
+        let (whole, _) = query(&dir, &sel("[]"), 0, u64::MAX).unwrap();
+        assert_eq!(whole.len(), 2, "the sealed bucket and the open one");
+        assert_eq!(whole[1].render(), "2026-09-06T00:30:00.000Z 60s m count=99");
+
+        let (early, _) = query(&dir, &sel("[]"), t0, t0 + 60_000).unwrap();
+        assert_eq!(early.len(), 1, "the open bucket is outside this window");
+        assert_eq!(early[0].render(), "2026-09-06T00:00:00.000Z 60s m count=1");
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
