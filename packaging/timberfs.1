@@ -1343,10 +1343,10 @@ lines: the blocks render back to exactly what the line path wrote.
 ⚠ A HARNESS rather than an interface. Nothing in a provisioned deployment
 runs this: it is how the writer is exercised against a real store until
 .B \-\-run
-can write blocks itself. And it names a DIRECTORY, which every other
-timberfs argument deliberately does not \(em a store is found by what it
-declares \(em because a block store has no identity yet. When its
-manifest carries one, this takes a store.
+can write blocks itself. And it names a DIRECTORY where every other
+timberfs argument names a store: the manifest carries an id, but nothing
+searches for block stores by it yet, so a path is the only address there
+is.
 .IP
 .BI \-\-block\-flush " N"
 is how many samples are buffered before a commit (default 50000). ⚠ It is

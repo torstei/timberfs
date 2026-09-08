@@ -673,12 +673,10 @@ enum Command {
         /// against a real store until a provisioned `--run` can write
         /// them.
         ///
-        /// ⚠ It names a DIRECTORY, which every other timberfs argument
-        /// deliberately does not — "a store is found by what it
-        /// declares". That is not a choice: a block store has no
-        /// identity yet, its manifest's id being designed and unbuilt
-        /// (docs/plans/tally-design.md), so there is nothing to address
-        /// it by. When there is, this takes a store.
+        /// ⚠ It names a DIRECTORY where every other timberfs argument
+        /// names a store: the manifest carries an id, but nothing
+        /// searches for block stores by it, so a path is the only
+        /// address there is.
         ///
         /// ⚠ One store in, one directory out. Not on `--provision`'s
         /// `--run`, which serves a SELECTION with a sink per source

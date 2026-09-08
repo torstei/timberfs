@@ -1184,14 +1184,10 @@ pub fn query(
 ///
 /// ⚠ It BUFFERS, and the buffer is the write-amplification control. A
 /// block is a day, so committing one sample rewrites up to a megabyte;
-/// buffering `limit` samples makes that once per `limit` instead. The
-/// cost of the buffer is VISIBILITY — a sample is not in a block until
-/// it is flushed — and the cost of losing it to a crash is a re-read,
-/// the position not having moved.
-///
-/// The durable version of this is a WAL for samples in the `.sap`
-/// shape; see docs/plans/tally-design.md, which has that as the open
-/// question this buffer stands in for.
+/// buffering `limit` samples makes that once per `limit` instead. Two
+/// costs: a sample is not in a block until it is flushed, and the
+/// buffer is not durable — losing it to a crash costs a re-read, the
+/// position not having moved.
 pub struct Writer {
     dir: std::path::PathBuf,
     m: Manifest,
