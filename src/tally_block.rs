@@ -46,12 +46,8 @@ use crate::tally::{Field, Sample};
 const MAGIC: &[u8; 4] = b"TBLK";
 const VERSION: u8 = 1;
 
-/// One series' identity, written once per block.
-///
-/// ⚠ Which DEFINITION produced it is deliberately NOT here: a metric
-/// maps to one definition, so it belongs on the block's metric table
-/// where there is one of it (`Block::definitions`), not on each series
-/// of that metric.
+/// One series' identity, written once per block. Which DEFINITION
+/// produced it is on `Block::definitions`, keyed by metric.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Series {
     pub metric: String,

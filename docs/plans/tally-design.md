@@ -9,18 +9,24 @@ are kept for their reasoning, not their conclusions —
 region are gone). Where any of them disagrees with this file, this file is
 right and that one has an amendment marker.
 
-⚠ **Read "What a tally is NOT" before changing anything here.** Every item in
-it was in the design at some point and was removed for a reason, and most of
-them are what a TAPE needs rather than what a tally needs. The failure mode
-this document exists to prevent is reintroducing one because it looks like the
-obvious way to do things.
+⚠ **Read "It is not a timberfs store" before adding a mechanism here.** The
+failure mode this document exists to prevent is reaching for a tape's answer
+because it looks like the obvious way to do things — and the test for one is
+in that section.
 
 ## What a tally is
 
 A **grid**: series down one axis, bucket starts along the other, one number
-per cell per measure. Stored columnar, in files, in a directory. Not a log, not
-a tape, and not append-only — a tally is a set of CONCLUSIONS about a log, and
-a conclusion can be improved when more of its input arrives.
+per cell per measure, stored columnar in files in a directory.
+
+A tally is a set of CONCLUSIONS about a log, and a conclusion can be improved
+when more of its input arrives — so **a cell is mutable and a value is
+corrected in place**, and a file is replaced whole rather than appended to.
+
+**The grid holds numbers.** Anything that states something about a RUN rather
+than about a bucket — how many lines a definition claimed and could not
+measure, that a sample arrived for a range the store no longer answers for —
+is a report, and reports go where an operator reads them.
 
 ## On disk
 
@@ -132,7 +138,7 @@ and not a correctness one.
 depended on the watermark, and so on where the read started. Purity is a
 property this design GAINS.
 
-## Copying, and why there is no replication protocol
+## Copying is a file sync or a bundle
 
 Blocks that are immutable once past the floor, under a manifest with a crc32
 per entry, are copied correctly by a file sync — and `read_block` verifies that
@@ -148,41 +154,30 @@ delete after. ⚠ **A bundle beats a directory sync** — `export`'s `.timber`
 shape — because a single file takes its atomicity from the container, so the
 ordering rule stops being load-bearing.
 
-## ⚠ What a tally is NOT
+## ⚠ It is not a timberfs store
 
-Every one of these was in the design and was removed. Most are what an
-append-only TAPE needs.
+That is the whole warning, and it is enough. A tally store is a directory of
+files with a manifest; it is not a `.bark`/`.trunk` pair, and the mechanisms
+that belong to one do not belong here.
 
-* **NOT sealed.** Sealing is the tape's answer to getting one write per
-  bucket. A block is a file, replaced by temp-and-rename, so the premise does
-  not exist. What bounds rewriting is the floor.
-* **NOT holding an open region.** The seal manufactured it: a block assumed
-  immutable needed the filling edge to live elsewhere. A filling block is a
-  block.
-* **NOT immutable.** Cells are mutable, deliberately — that is how a
-  provisional value stops needing a revision. A block is immutable only once
-  its range is past the floor, and that is a consequence of time passing
-  rather than a state anyone records.
-* **NOT displacing late entries.** They go in their own bucket.
-* **NOT carrying revisions.** Nothing supersedes anything; a number is
-  corrected in place. The newest-line-wins rule is the TAPE's, and readers of
-  the tape still need it.
-* **NOT capping cardinality.** `max_series` asked a document's author to
-  predict traffic that had not happened. A fold spills; the disk is bounded by
-  retention.
-* **NOT storing markers.** All four are reports about a RUN, not numbers:
-  `!meta` is subsumed by the definitions, `!cap` goes with the cap, `!late`
-  with displacement, and `!drop` counts lines a definition claimed and could
-  not measure — a diagnostic for `--try`, and a number that appears only when
-  the definition is wrong.
-* **NOT declaring itself in a `.bark`.** `DECLARE` is bark's vocabulary, and
-  `index=true`, `timestamp_regex` and the rest have no meaning here. Identity
-  and retention are in the manifest.
-* **NOT replicated by a protocol.** See above.
-* **NOT using the grain index.** A fold reads everything in its window, and an
-  index exists to avoid reading. Skipping a chunk for lacking a token would
-  also make "no matching lines" indistinguishable from "not read", which is
-  the invariant the presence bitmap exists to keep.
+**The property everything follows from: a tape gets ONE write per bucket.** It
+is append-only text, so a bucket is stated once and cannot be revisited —
+which is what sealing, `grace`, displacement and revisions all exist to serve.
+A block is a file replaced whole by temp-and-rename, so that premise never
+holds, and every one of those mechanisms is answering a question this design
+does not have.
+
+⚠ **So when a mechanism suggests itself, ask what it assumes.** If it assumes
+one write per bucket, it is a tape's, and the properties above already cover
+the case it was for: a cell is mutable and corrected in place, a sample goes
+in its own bucket, a filling block is a block, the floor is what bounds a
+rewrite, nothing refuses a series, and the grid holds numbers while statements
+about a RUN are reports.
+
+Its history is in [tally-partials.md](tally-partials.md), which is where the
+mechanisms that were tried and removed are argued out one at a time. This file
+does not list them, because a reader learning what a tally is should not have
+to learn what it once was.
 
 ## What is measured
 

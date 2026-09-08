@@ -925,11 +925,10 @@ here.
   in, one immutable file per applied set named by the offset it takes effect
   at, and applying is ONE act. Recovery is re-derivation, copying is a file
   sync or a bundle, and there is no replication protocol. ⚠ Measured 5.5×
-  smaller than the shipped store's `.trunk`. ⚠ And it says what a tally is
-  NOT, which is the part to read first: no seal, no open region, no
-  displacement, no revisions, no markers, no cardinality cap, no `.bark`, no
-  grain index — every one of them was in the design once, and most are what an
-  append-only tape needs rather than what a tally needs. Design note:
+  smaller than the shipped store's `.trunk`. ⚠ And it states the one property
+  that decides which mechanisms belong: a TAPE gets one write per bucket, so
+  sealing, grace, displacement and revisions all serve a premise a block —
+  replaced whole by temp-and-rename — never has. Design note:
   [docs/plans/tally-design.md](docs/plans/tally-design.md).
 - **A tally store designed from the data**: measured on one real day of a
   site's own performance tally (2.7M log lines in, 268,140 tally lines out,

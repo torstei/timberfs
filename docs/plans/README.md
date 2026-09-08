@@ -84,12 +84,12 @@ messages and pull requests are for.
   entry is a fact, a tally bucket is a conclusion, and only the prefix older
   than the source's retention horizon is irreplaceable.
 - [tally-design.md](tally-design.md) — **the tally design as agreed, stated
-  rather than argued.** What a tally is (a grid in columnar blocks, identity
-  and retention in the manifest, definitions copied in), what bounds it, how it
-  is written, read, recovered and copied — and a "what a tally is NOT" section
-  listing every tape-shaped mechanism that was in the design and was removed,
-  because reintroducing one looks like the obvious way to do things. The three
-  notes below are the arguments that reached it; this one is the answer.
+  rather than argued.** What a tally is (a grid in columnar blocks, a mutable
+  cell, identity and retention in the manifest, definitions copied in), what
+  bounds it, how it is written, read, recovered and copied. It is not a
+  timberfs store, and the one property that decides which mechanisms belong is
+  that a TAPE gets one write per bucket where a block is replaced whole. The
+  three notes below are the arguments that reached it; this one is the answer.
 - [tally-partials.md](tally-partials.md) — a tally that never holds a bucket
   to completion, and therefore needs no cardinality cap. `window.max_series`
   asks its author to predict traffic that has not happened, and it does not

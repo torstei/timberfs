@@ -1416,13 +1416,11 @@ overlap \(em measured on real logs, three of six days fell from ~900 KB to
 ~22 KB in silence. A cell present in both takes the newer value, which is
 the rule a tape already had for two lines of one bucket.
 .IP
-⚠ A bucket still filling is in a block like any other: there is no
-sealed-versus-open distinction and no separate file, because a block can
-be rewritten for as long as the store answers for its range. So a
-provisional value needs no revision either \(em the value and its final
-value are the same CELL at two times. What bounds the rewriting is the
-manifest's floor, the range this store no longer answers for; a sample
-older than that has nothing to write into and is a bounded loss.
+A block is REWRITTEN as its range fills, and stays rewritable for as long
+as the store answers for that range. The manifest's
+.B floor
+is where that stops: it names the oldest bucket the store answers for, and
+a sample older than it has nothing to write into and is a bounded loss.
 .IP
 ⚠ It refuses the MARKERS
 .RB ( !cap ,
