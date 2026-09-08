@@ -951,9 +951,14 @@ here.
   instead, and cardinality costs I/O and disk — the resource `retain_size`
   and head-drop already govern. `max_series`, `!cap`, `grace_ms` as a
   correctness boundary, displacement/`!late`, and the 0.33.0 revision rule all
-  go with it. ⚠ Additive partials are NOT idempotent, so anything that can
-  re-deliver one needs a dedup identity: the block manifest's
-  `(range, generation)` has one and a tape line does not. Design note:
+  go with it. ⚠ Additive partials are NOT idempotent, and crash recovery is the
+  same problem — it is free today only because the tape REPLACES, so a restart
+  that re-reads folded bytes merely restates them. What identifies a partial is
+  the source offset range it consumed (`cursor::At::offset`, exact and
+  retention-stable), never its citation (a widened, optional "range to READ"),
+  and consecutive ranges must TILE so two partials of a bucket are either
+  identical or disjoint. That also frees `generation` of a second job: a
+  generation replaces, a consumed range adds. Design note:
   [docs/plans/tally-partials.md](docs/plans/tally-partials.md).
 - **A metric is a series, and combining it is the reader's decision** (a real
   defect): `tally --fold` sums two definitions' measurements into one number,

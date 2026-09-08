@@ -89,8 +89,10 @@ messages and pull requests are for.
   is accumulated in memory until complete, then written once — and the input
   is replayable while `Field::combine` is already the associative merge, so
   spilling partials is legal. Four other mechanisms dissolve with the cap; the
-  bill is mandatory compaction, and the sharp edge is that additive partials
-  are not idempotent.
+  bill is mandatory compaction. Its second half is a design for crash recovery,
+  which is the same problem: additive partials are not idempotent, and what
+  identifies one is the source offset range it consumed — not its citation,
+  which is provenance and cannot serve.
 - [tally.md](tally.md) — metrics derived from the log as a tape of their own:
   the extractor as a consumer (and therefore backfillable), the one invariant
   that decides the line format, and how a site declares extractors of its own.

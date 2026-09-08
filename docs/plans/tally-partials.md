@@ -1,7 +1,8 @@
 # Partial aggregates: never holding a bucket to completion
 
 **Status: design, nothing built.** It removes a knob rather than adding one,
-and it amends three notes: [tally.md](tally.md) (grace and displacement as the
+and its second half is a design for CRASH RECOVERY, which turns out to be the
+same problem — see "Provenance is not coverage". It amends three notes: [tally.md](tally.md) (grace and displacement as the
 lateness mechanism), [consumer-holding.md](consumer-holding.md) (the
 provisional bucket and the revision rule it introduced), and
 [tally-as-a-tally.md](tally-as-a-tally.md) (the block's cell merge, which is
@@ -118,15 +119,78 @@ Cost moves from write to read. A bucket may exist as several partials until
 something merges them, so **compaction stops being optional** and the read path
 merges forever. That is the bill to measure before committing.
 
-⚠ **And additive partials are not idempotent.** This is the sharp edge, and it
-is new: a revision is a replace, so applying it twice is harmless, while
-applying an additive partial twice double-counts (`Min`/`Max` survive it,
-`Count`/`Sum` do not). Everything that can re-deliver a partial therefore needs
-a dedup identity — a re-fed range, a retried ship, a replayed replication
-stream. The block manifest already supplies one: `Entry` addresses a block by
-`(t0, n_buckets, generation)` and carries `bytes` and `crc32`, so a duplicate
-block is recognisable. **A tape line has no such identity**, which is the
-argument for the grid being where partials live.
+⚠ **And additive partials are not idempotent.** This is the sharp edge: a
+revision is a replace, so applying it twice is harmless, while applying an
+additive partial twice double-counts (`Min`/`Max` survive it, `Count`/`Sum` do
+not). So everything that can re-deliver one needs an identity for what it
+accounts for — a re-fed range, a retried ship, a replayed replication stream.
+
+⚠ **Crash recovery is that same problem, not a separate one.** Today it is free
+*because* the tape replaces: a position is only advanced on a progress report,
+so a restart re-reads bytes already folded, and restating those buckets is
+harmless. Additive partials remove exactly that safety net. So a design for
+partials is a design for recovery, and the note below is both.
+
+The block manifest addresses a block by **`(t0, generation)`** — `Manifest::put`
+supersedes on `had.t0 == e.t0` alone, and `Entry`'s own comment says "the
+address is `(t0, generation)`, never a position in a sequence"; `n_buckets` is
+coverage that `covering` filters on, not identity. That address is enough to
+recognise a duplicated *generation*, and not enough for a partial, because two
+partials of one bucket must coexist rather than supersede. **A tape line has no
+identity at all**, which is the argument for the grid being where partials
+live.
+
+## Provenance is not coverage
+
+Two byte ranges live in this design, and conflating them would be the third
+silent defect in this format rather than the first.
+
+| | what it is | exact? | optional? |
+|---|---|---|---|
+| a **cite**, `(offset, len)` per bucket | where to READ to see the lines behind a number | no — a widened union | yes |
+| a **position**, `cursor::At::offset` | where to RESUME; everything before it is accounted | yes | no |
+
+A cite is provenance, and `Sample::cite` says so: *"the span of source-store
+tape this counted... **a range to READ, not the set of entries** — a rule
+matching one line in a hundred cites the ninety-nine between them."* `Roller`
+widens it to the min and max over the bucket's series, and a block widens it
+again to one span per bucket. So it cannot serve as a resume point three times
+over: the span contains bytes that fed *other* buckets, bytes outside it may
+have been read and folded elsewhere, and a source offset is **not monotone in
+event time** — which is the very reason `!late` exists — so no offset partitions
+the buckets into done and not-done. ⚠ And it is switchable: `Metric::cite`
+defaults to true and can be set false, so recovery resting on it would stop
+working silently when someone turned provenance off.
+
+**The exact quantity already exists**, and `cursor::At` already draws this
+distinction in its own comment — "TWO positions, because they answer different
+questions and neither can answer the other's: the offset is where to RESUME,
+exact and valid inside the write-ahead segment; this is the RETENTION FLOOR,
+chunks strictly below it being fully consumed". The `offset` is absolute on the
+store's tape so retention cannot move it. **So a partial's identity is the
+offset range it consumed**, and nothing new needs inventing — it is the number
+the consumer protocol already persists.
+
+⚠ **An interval is not enough; the ranges must TILE.** Dedup by overlap does
+not survive the crash it exists for: a partial covering `[0,1000)` is applied,
+the process dies before its position is durable, the fold resumes at 500 and
+produces `[500,1500)` for the same bucket. It can neither be added (500–1000
+counted twice) nor dropped (1000–1500 lost). The rule that works is that a
+partial always begins where the previous one ended, so two partials of a bucket
+are **either identical — drop it — or disjoint — add it**, and dedup is an
+equality test rather than an interval calculus.
+
+That in turn requires **the position to be committed with the partial, in one
+write**, not beside it: if the two can diverge the tiling breaks, and a
+diverged pair is exactly what a crash produces. The manifest's temp-and-rename
+is already that commit point, which is the second argument for the grid.
+
+**And `generation` stops doing two jobs.** A generation is a RE-DERIVATION — a
+definition changed, a range recomputed — and it *replaces*, which is what
+`Manifest::put` implements. A consumed range says which slice of the source a
+partial accounts for, and it *adds*. Two axes, neither overloaded: a partial
+cannot be expressed as a generation without making `put` mean both replace and
+accumulate depending on which field moved.
 
 ## Three things that block it today
 
@@ -146,14 +210,16 @@ implementing this:
 
 ## What it does to the other threads
 
-**Re-generation is unchanged.** `How::Regenerate` stays a replace scoped to a
-range and generation — which is now also what keeps re-derivation idempotent
+**Re-generation is unchanged.** `How::Regenerate` stays a replace scoped to
+`(t0, generation)` — which is now also what keeps re-derivation idempotent
 while partials are not.
 
 **Replication is unaffected in shape and gains one requirement.** It is still a
 manifest diff; a partial is simply another block. But the receiver must dedup
-by `(range, generation)` rather than appending what it is handed, for the
-non-idempotence reason above.
+rather than append what it is handed: by `(t0, generation)` for a generation,
+and by the consumed offset range for a partial. A sender that retries is the
+ordinary case, not the exceptional one, so this is a requirement on the
+protocol and not a repair for it.
 
 **The marker question gets easier.** `Block::pack` refuses markers today
 because where they live is unsettled, and `!cap` was the marker that could not
@@ -173,6 +239,17 @@ remains to place cannot corrupt the grid by being lost.
   unsettled; both are answerable, unlike a series count.
 - **Compaction's schedule**, and whether a query merges partials or refuses to
   answer from an uncompacted range.
+- **Where a partial's consumed range is written.** `Entry` would carry it, and
+  it must be committed with the block rather than in the positions file, which
+  is a separate write that can diverge. Whether `Positions` then becomes
+  derived from the manifest — the manifest holding the truth and the positions
+  file a cache of it — or the two stay independent with the manifest winning on
+  disagreement, is unsettled.
+- **How a partial's range is bounded.** Memory pressure does not respect chunk
+  boundaries, so a partial may end mid-chunk; the position is exact there
+  (`At::offset` is valid inside the write-ahead segment) but the retention
+  floor is chunk-granular. Whether a spill may end anywhere or must reach a
+  chunk boundary is a choice between write amplification and a simpler floor.
 - **Gauges.** If `Last` keeps its timestamp on the wire, nothing is held to
   completion. If not, gauge series need their own bound, and the argument
   against a cap applies to them unchanged.
