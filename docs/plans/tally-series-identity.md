@@ -485,6 +485,21 @@ The rest follows from the name being a boundary rather than a label:
   Definitions outlive the numbers they describe, or the numbers stop being
   readable — which is the whole reason for storing them.
 
+**Finding the ACTIVE set is a readdir and a sort, and that is deliberately not
+optimised.** The cost is a rounding error against what the same directory
+already holds — one block per day, so ~730 entries at a two-year retention,
+against a definitions file per CHANGE, which is a handful a year — and the
+lookup happens once when a reader opens the store, never per bucket or per
+series.
+
+⚠ **If it ever does need optimising, extend the MANIFEST; do not add a
+`current` file.** A rewritten pointer is exactly the mutable, tearable,
+lock-needing thing this scheme removes, and it would be the first thing anyone
+reached for. The manifest is loaded anyway, is committed by temp-and-rename,
+and is the store's commit point — so a pointer there costs no I/O and becomes
+atomic with the blocks written under that set. The files stay the record;
+the manifest would carry only the newest offset.
+
 ⚠ **A lone block is deliberately not self-describing.** It names its
 definition by id; the store holds the text. That is the split the assigned id
 buys, and it answers the replica question below: a bundle carries the
