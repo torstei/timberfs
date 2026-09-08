@@ -440,6 +440,57 @@ without it. Both forms are served, each by what suits it: the id inside the
 block, the prefix in the text interchange, which has no metric table and needs
 a name a reader can tell apart.
 
+## Settled: one immutable file per applied set, named by its offset
+
+`definitions/<zero-padded offset>.json` in the store's directory, written once
+and never rewritten. **The filenames ARE the replacement log** the section
+above requires — no separate log to keep consistent, nothing to rewrite, no
+locking, and "which definitions were in force at X" is the newest file whose
+offset is not greater than X.
+
+⚠ **It fits the BLOCK store and not the tape, which is itself an argument for
+where this belongs.** `format::every_path` is extension-keyed — `<name>.<ext>`
+for a fixed list — so a tape sidecar must be exactly ONE file per store; a
+file per applied set is not expressible there without inventing a directory
+beside the pair. A block store is already a directory of many files.
+
+⚠ **And the enumerator that has to learn about it is `Manifest::unreferenced`,
+not `every_path`.** It treats every entry that is not `manifest.json`, `open`
+or `*.tmp` as a block file, so a definitions file would be reported as debris
+for the caller to unlink. This note's warning — "a part nothing picks up is
+worse than a missing one" — was right and pointed one level away from where it
+lands.
+
+The rest follows from the name being a boundary rather than a label:
+
+* **Zero-padded**, or `10` sorts before `9`. The block names are fixed-width
+  for the same reason.
+* **The offset is the tally consumer's position in its source store**, which
+  is unambiguous because one tally has one source — the provisioning refuses a
+  template naming one store for several sources, so a release that starts a
+  new source store starts a new tally beside it and offsets never mix.
+* ⚠ **The wall clock goes INSIDE, not in the name.** A reader asking "which
+  definition produced this bucket" holds a bucket start, not an offset, and
+  converting needs the citation — which is widened and switchable off. That is
+  survivable only because this is provenance for a person looking at a step in
+  a graph rather than a contract, and it is why the file carries `applied_at`
+  in UTC for the human while the name stays exact and zone-free.
+* **Content**: the assigned ids, the resolved documents, `applied_at`, the
+  source store's id, and the id counter's high-water mark — the counter living
+  with the definitions is what keeps it monotone across a removal.
+* **Written only when the resolved content DIFFERS from the newest.** A
+  provisioning converges on a timer and at every deploy, so an unconditional
+  write would file one set per run and bury the changes that mattered.
+* **Retention keeps the file in force for the OLDEST surviving block.**
+  Definitions outlive the numbers they describe, or the numbers stop being
+  readable — which is the whole reason for storing them.
+
+⚠ **A lone block is deliberately not self-describing.** It names its
+definition by id; the store holds the text. That is the split the assigned id
+buys, and it answers the replica question below: a bundle carries the
+directory, so a replicated block store is whole, where a tape's `.bark` never
+travelled.
+
 ## What changes
 
 A first cut, in order, and none of it needs the generation conventions:
@@ -461,15 +512,13 @@ state, the generation naming, and the shared-property split.
 
 ## Open
 
-* **Where the definitions live.** A sidecar beside `.bark`, or inside it.
-  ⚠ A sidecar must be added to `format::every_path`, which is what delete,
-  rotation and retention enumerate — a part nothing picks up is worse than a
-  missing one. `.bark` avoids that but is read constantly and would carry
-  every applied document.
-* **Whether a replica is self-describing.** `.timber` bundles carry `.rings`
-  and `.trunk`; the `.bark` does not travel today. So "the definition follows
-  the tape" across replication is unanswered, and it is the case that matters
-  most for a tally kept longer than its log.
+* ~~Where the definitions live.~~ **A file per applied set, named by the
+  offset it takes effect at, in the block store's directory** — see above. The
+  `.bark`-or-sidecar question was a tape question, and the tape is not the form
+  this is being built for.
+* ~~Whether a replica is self-describing.~~ **Yes, for a block store**: a
+  bundle carries the directory, definitions included. A lone block names its
+  definition without spelling it, which is intended.
 * ~~Whether the prefix is mandatory or only on collision.~~ **Mandatory**,
   following from the prefix being the display form: a name that changes when a
   second document arrives is a worse display name than a uniform one, and a

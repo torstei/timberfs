@@ -789,6 +789,10 @@ impl Manifest {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            // ⚠ Every other entry is taken for a block, so a file this
+            // store grows later must be named here or be reported as
+            // debris — the definitions set is the one already designed
+            // (docs/plans/tally-series-identity.md).
             if name == MANIFEST || name == OPEN || name.ends_with(".tmp") {
                 continue;
             }
