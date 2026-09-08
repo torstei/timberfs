@@ -667,9 +667,18 @@ enum Command {
         /// format --fold takes
         #[arg(long)]
         observations: bool,
-        /// EXPERIMENTAL: write the numbers as columnar BLOCKS into DIR
-        /// instead of as tally lines on stdout — the storage the design
-        /// note settles on, where a line is the interchange form.
+        /// EXPERIMENTAL, and a HARNESS rather than an interface: write
+        /// the numbers as columnar BLOCKS into DIR instead of as tally
+        /// lines on stdout, which is how the block writer is exercised
+        /// against a real store until a provisioned `--run` can write
+        /// them.
+        ///
+        /// ⚠ It names a DIRECTORY, which every other timberfs argument
+        /// deliberately does not — "a store is found by what it
+        /// declares". That is not a choice: a block store has no
+        /// identity yet, its manifest's id being designed and unbuilt
+        /// (docs/plans/tally-design.md), so there is nothing to address
+        /// it by. When there is, this takes a store.
         ///
         /// ⚠ One store in, one directory out. Not on `--provision`'s
         /// `--run`, which serves a SELECTION with a sink per source

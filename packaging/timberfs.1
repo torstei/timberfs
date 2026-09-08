@@ -1332,13 +1332,21 @@ shows the tape as written, both lines included, which is what a tape
 viewer should do. See LATENESS below for when a provisional line is
 written.
 .PP
-.B WRITING THE GRID (EXPERIMENTAL)
+.B WRITING THE GRID (EXPERIMENTAL, A HARNESS)
 .PP
 .BI \-\-blocks " DIR"
 writes the numbers as columnar BLOCKS into DIR instead of as tally lines
 on stdout \(em the storage the design settles on, where a line is the
 INTERCHANGE form and not the store. Verified against 300,000 real log
 lines: the blocks render back to exactly what the line path wrote.
+.IP
+⚠ A HARNESS rather than an interface. Nothing in a provisioned deployment
+runs this: it is how the writer is exercised against a real store until
+.B \-\-run
+can write blocks itself. And it names a DIRECTORY, which every other
+timberfs argument deliberately does not \(em a store is found by what it
+declares \(em because a block store has no identity yet. When its
+manifest carries one, this takes a store.
 .IP
 .BI \-\-block\-flush " N"
 is how many samples are buffered before a commit (default 50000). ⚠ It is
