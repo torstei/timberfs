@@ -254,11 +254,32 @@ What the arrival says is operational — the producer is later than this store's
 retention — and it belongs in a run-level count or a consumer `note`, where a
 fact about a run belongs.
 
-**Which leaves ONE marker with a claim on the grid.** `!meta` is subsumed by
-the definitions travelling with the store; `!cap` goes with the cap; `!late`
-goes with displacement. `!drop` survives, and deserves to: a claimed line that
-could not be read makes a stored bucket SHORT, which is an annotation on data
-the store actually holds.
+**Which leaves NO markers at all**, and that is the answer to "where do
+markers live in a block": they do not. `!meta` is subsumed by the definitions
+travelling with the store; `!cap` goes with the cap; `!late` goes with
+displacement.
+
+⚠ **`!drop` goes too**, which took three passes to see. It counts lines a
+metric CLAIMED and then could not read — not lines that failed to match, which
+are skipped and counted nowhere. So it exists only where a definition claims
+more than it can measure: a capture loose enough to match a non-number, an
+optional group that did not participate, or a decode source where a claimed
+line does not carry the measured key. A self-inflicted category, and a number
+that appears only when the definition is wrong does not belong in the storage
+format.
+
+The distinction between "not mine" and "mine but unusable" is a DIAGNOSTIC,
+and it already has a home: `--try` reports claimed/skipped/dropped/observations
+per metric against a sample, which is where a loose capture is found and fixed.
+⚠ And the general alarm beats the specific one — a producer whose format
+changes makes the metric FLATLINE, which is the signal either way, and if the
+claim stops matching too there are no drops at all. So `Outcome::Dropped` and
+the `Seen` counters stay as accounting; what goes is `note_drop` writing a
+sample into the tally.
+
+⚠ This is a decision about the BLOCK design. The tape writes `!drop` today and
+that shipped in 0.33.0; whether to stop it there is a separate call, and while
+the tape is being superseded the answer is probably no.
 
 ⚠ **And no imposed lateness limit should be added**, tempting as it is for
 making part of the store stable. The trade would be a number that is stable
@@ -340,9 +361,9 @@ decision rather than a deferral.
 **The marker question gets easier.** `Block::pack` refuses markers today
 because where they live is unsettled, and `!cap` was the marker that could not
 be dropped — it declares the numbers understated. With no cap there is no
-`!cap` and no `!late` either, so the only marker left to place is `!drop` —
-and it is the one whose claim on the grid is real, a bucket being genuinely
-short when a claimed line could not be read.
+`!cap`, no `!late` and no `!drop` either — so there is nothing left to place,
+and `Block::pack`'s refusal of markers is right by design rather than a
+placeholder. A marker states something about a RUN; the grid holds numbers.
 
 ## Why there is no replication
 

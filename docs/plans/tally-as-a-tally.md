@@ -571,10 +571,12 @@ that would want designing.
 * ~~Where the dictionary lives.~~ **Per block, for self-containedness** — and
   the six-day measurement shows it is worth ~1% of the store either way, so
   it is an architectural choice rather than an economic one.
-* **What `!cap`, `!late` and `!drop` become.** They are per-bucket statements
-  about quality, so probably their own columns or bits beside the presence
-  bitmap — which would make them selectable rather than markers a reader has
-  to notice.
+* ~~What `!cap`, `!late` and `!drop` become.~~ **Nothing — a block holds no
+  markers** ([tally-partials.md](tally-partials.md)). `!meta` is subsumed by
+  the definitions stored with the tally, `!cap` goes with the cardinality cap,
+  `!late` with displacement, and `!drop` counts only lines a definition
+  claimed and could not measure, which is a diagnostic for `--try` rather than
+  a number to store. So `Block::pack` refusing them is right by design.
 * **How the live edge is made durable** — a WAL, or short segments appended to
   the day's block, or nothing at all, the cells being re-derivable from the
   source. ⚠ Whatever it is, it decides how freely a consumer's position may
