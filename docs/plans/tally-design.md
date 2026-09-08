@@ -135,6 +135,28 @@ and not a correctness one.
 nothing else. Nothing consults a watermark, so a re-derivation does not depend
 on where the read started.
 
+⚠ **And a record stream is forward-only, which is fine for a CRASH and not
+for a repair.** The tally is fed a stream and cannot ask for bytes again, so
+the two cases separate:
+
+* **A crash needs no seek**, because of `Roller::safe_offset` — "the oldest
+  source byte any OPEN bucket still depends on. A consumer may not report past
+  this". The position is therefore always behind every unfinished bucket, so a
+  restart re-sends from before that bucket's FIRST entry, re-folds it whole,
+  and the complete total replaces the partial one. ⚠ **This is the invariant
+  the block writer's `How::Merge` rests on**, and it is invisible from the
+  writer: tighten `safe_offset` to advance further — and it sat in the middle
+  of the 51-entries/s deadlock, so it has been optimisation-bait once already
+  — and blocks are corrupted by code that never mentions them.
+* **A repair does need to go back**, and it is not the writer's job: "the
+  regex was wrong, recompute last week" means resetting a follower's POSITION,
+  which is an operator act like applying a definition. ⚠ There is no verb for
+  it: `timberfs follower` has create/list/status/update/delete/run, `update`
+  changes a declaration rather than state, and a position lives in the
+  follower's own `positions.json`. So re-derivation today means deleting and
+  recreating a follower — re-reading everything — or editing that file by
+  hand.
+
 ## Copying is a file sync or a bundle
 
 Blocks that are immutable once past the floor, under a manifest with a crc32
@@ -188,7 +210,11 @@ a working set that saturates rather than drifting.
   for a partial — and it is also the atomicity defect below;
 * **compaction's schedule**, and whether a query merges or refuses;
 * **the write-batching mechanism** — a WAL for samples in the `.sap` shape is
-  the candidate, since one late sample otherwise rewrites a whole day block.
+  the candidate, since one late sample otherwise rewrites a whole day block;
+* **a rewind verb**, without which the re-derivation this design leans on is
+  only reachable by deleting a follower or editing its positions file. It is
+  what makes "fix the definition and recompute" an operation rather than a
+  plan.
 
 ⚠ **A defect that exists today:** `commit` renames a block into place and THEN
 saves the manifest, so a rewrite at the same `(t0, generation)` leaves a window
