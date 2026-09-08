@@ -254,8 +254,8 @@ two candidate answers, neither settled:
 * a **WAL for tally samples**, the `.sap` shape one level up: append what
   arrives, cheaply and durably, and fold it into blocks in batches. This is the
   mechanism the tree already has vocabulary and precedent for;
-* a **sealed bucket is appended to the current day's block as a SEGMENT** — a
-  short column region covering the buckets that sealed since the last append;
+* a **flush appends a SEGMENT to the current day's block** — a short column
+  region covering the buckets written since the last append;
 * when the day closes the segments are **compacted** into one column region,
   which is where the compression knee is actually collected. Compaction reads
   immutable input and writes a new generation of the same block, so it is the
@@ -409,13 +409,17 @@ more time.
 
 ## How the files are named
 
+⚠ **Amended** — this sketch showed a `.bark`, a `b/` subdirectory and an
+`open` file, none of which survive: identity moved into the manifest and the
+open region went with the seal. What the prototype writes, and what
+[tally-design.md](tally-design.md) states:
+
     web-access-tally/
-      web-access-tally.bark          declared properties, as any store
-      web-access-tally.tally        the MANIFEST — authoritative
-      b/20260906T000000Z.g1         a sealed day, generation 1
-      b/20260907T000000Z.g1
-      b/20260908T000000Z.g2         this day was regenerated
-      open                          the unsealed buckets, temp+rename
+      manifest.json                 identity, retention, the floor, the blocks
+      20260906T000000.g1            one day, generation 1
+      20260907T000000.g1
+      20260908T000000.g2            this day was regenerated
+      definitions/00000000123.json  the documents in force from that offset
 
 Four properties, each the reason for a part of it:
 
@@ -425,12 +429,14 @@ Four properties, each the reason for a part of it:
   generation is visibly a different file. ⚠ Deliberately not content-addressed:
   a digest as the filename makes replication idempotent and dedupes, but makes
   a directory an operator inspects completely opaque. The digest goes in the
-  manifest, where the replication protocol wants it anyway.
-* **Derivable from `(range, generation)`**, so a receiver can place a shipped
-  block without asking anything.
-* **A subdirectory**, so 730 block files do not sit beside the manifest and
-  the `.bark`, and a forest scan — which looks for a store's marker files —
-  does not see them at all.
+  manifest, where a receiver comparing what it holds wants it anyway.
+* **Derivable from `(t0, generation)`**, so a copy can be placed without
+  asking anything.
+* ⚠ **Amended: no subdirectory.** It was there so 730 block files would not
+  sit beside a `.bark` that a forest scan looks for — and there is no `.bark`,
+  the store not being a timberfs store. The blocks sit beside the manifest,
+  and `Manifest::unreferenced` takes every entry that is not the manifest,
+  a `.tmp` or the definitions for a block.
 
 ### The manifest is the commit point
 
@@ -449,24 +455,27 @@ already makes in this tree.
 
 ## A block, concretely enough to argue with
 
-    header    magic, version, width_ms, t0, n_buckets, generation
-    series    [ series_id, metric, labels, unit, definition_id ]   (or a ref
-              to a store-level dictionary — see Open)
-    segments  one or more, appended as buckets seal; a compacted block has
-              exactly one:
-                bucket range covered
-                presence  bitmap, n_series × n_buckets_in_segment bits
-                columns   per (series, measure): the segment's values,
-                          delta + zigzag + varint, then zstd per column region
-    footer    digest, segment offsets
+⚠ **Amended to what the prototype actually writes.** The series row carried a
+metric name, a unit and a definition id; the metric name and the definition id
+moved to a metric table (one home for one fact) and the unit moved to the
+definitions stored with the tally. Segments are a candidate for batching and
+not part of the format yet, and their trigger would be a flush, never a seal.
+
+    header    magic, version, width_ms, t0, n_buckets, generation, n_series
+              (outside the zstd frame, so coverage is readable without it)
+    metrics   [ name, definition_id ]        definition 0 means "not recorded"
+    series    [ metric_idx, labels ]
+    columns   per series, per measure: a presence bitmap over the buckets,
+              then the PRESENT values delta + zigzag + varint
+    cites     one bitmap and two columns — one source span per BUCKET
 
 Everything a reader needs to answer "metric M matching P over this range" is
 in the header and the series table; the columns are fetched only for the
 series that matched, which is the query-planning property
 [chunks-by-address.md](chunks-by-address.md) wants and gets here for free.
 
-⚠ A compacted block has one segment and an open one has many, so **a reader
-does not care which it is** — it reads the segments it needs. Compaction is
+⚠ A compacted block has one segment and a recently-written one has many, so
+**a reader does not care which it is** — it reads the segments it needs. Compaction is
 then a pure optimisation that can be skipped, deferred, or run by something
 other than the writer, which is the property that makes it safe to leave out
 of a first cut.
@@ -616,7 +625,7 @@ that would want designing.
 * **Segment length**, which is now the ONLY sizing question left open — the
   block range is settled at a day by two independent measurements, synthetic
   and then six real days at +4% against a six-day block. Segment length is:
-  how many sealed buckets accumulate before a segment is appended. Short
+  how many buckets accumulate before a segment is appended. Short
   segments cost compression (2.07 B/cell at 15 minutes against 1.31 at a day)
   and long ones cost a longer replay after a crash. The block range is
   settled at a day by the measurements; the segment inside it is not.
