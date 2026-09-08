@@ -445,10 +445,16 @@ provide: a hazard made structurally impossible beats a hazard documented.
   map is approximate — `String` labels, a `BTreeMap` per cell, allocator slack.
   Approximation is affordable here precisely because being wrong costs write
   amplification rather than truth; it would not have been under a cap.
-- **Where the ceiling comes from.** A process can read its own cgroup limit and
-  target a fraction of it, which needs no new knob and tracks whatever the unit
-  was given. Whether that is better than one number in `limits.conf` is
-  unsettled; both are answerable, unlike a series count.
+- **Where the MEMORY ceiling comes from.** A process can read its own cgroup
+  limit and target a fraction of it, which needs no new knob and tracks
+  whatever the unit was given. Whether that is better than one number in
+  `limits.conf` is unsettled; both are answerable, unlike a series count.
+  ⚠ Two different ceilings, and only this one is open: how much MEMORY before
+  spilling is a performance knob, while what stops an unbounded label filling
+  the DISK is `retain_size` on the store, settled in
+  [tally-as-a-tally.md](tally-as-a-tally.md) — dropped from the oldest end,
+  where timberfs already puts resource bounds. An earlier argument in this
+  note for "bound the resource, not the count" conflated the two.
 - **Compaction's schedule**, and whether a query merges partials or refuses to
   answer from an uncompacted range.
 - **Where a partial's consumed range is written.** `Entry` would carry it, and

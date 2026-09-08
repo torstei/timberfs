@@ -475,6 +475,58 @@ of a first cut.
   defect — and `--try` is exactly what an operator points at a day of log to
   develop a document, which is the case that makes it matter.
 
+## Identity and retention live in the block manifest
+
+**Settled.** `DECLARE` in a provisioning is passed straight to
+`bark::cmd_create`, so it IS bark's vocabulary — and a block store has no
+bark. That splits it three ways:
+
+| what `DECLARE` carries | under blocks |
+|---|---|
+| `index=true`, `timestamp_regex`, `retain_unconsumed`, … | **meaningless.** A block store has no keyword index and no line-stamp parsing to declare |
+| `retain`, `retain_size` | **an analogue**, below |
+| provenance and labels | **essential, and this is where they go** |
+
+The manifest is already the commit point and already read on every query, so
+it is where all of it belongs — the same argument that put the active
+definitions pointer there.
+
+**Its own id**, because a block store is a store in its own right: copied,
+replicated, cached and referred to. A replica is the store in another place.
+
+**The SOURCE store's id**, because a tally always comes from one — and this is
+load-bearing rather than provenance. ⚠ **A citation is an offset into the
+source's tape, so it is uninterpretable without knowing which store it
+indexes.** Re-derivation needs it too, and so does keeping a tally from being
+tallied into infinite regress.
+
+**The source's labels, copied at creation**, because the source may be DELETED
+long before the tally is. A tally kept two years against a log kept weeks is
+the only surviving witness of what it measured — which host, which service,
+which release — and without the labels an aged store is an anonymous grid.
+⚠ Copied, so they are a record of what the source said at creation and not a
+live view: relabel or rename the source and they are stale. That is the same
+rule the definitions already follow — a record, not a lock.
+
+### Retention is a whole number of blocks, which is days
+
+Retention drops whole blocks (`drop_before` removes those ending at or before
+a stamp), so **the granularity of retention IS the block range**. The range is
+settled at a day by two measurements, so `retain=730d` is honest and anything
+finer would be a rounding dressed as a setting.
+
+**And `retain_size` should exist too** — mechanically easier here than on a
+tape, since `Entry.bytes` is already in the manifest: sum it and drop from the
+oldest until under budget.
+
+⚠ **It is not a nicety. It is the backstop that the cardinality cap was
+standing in for.** [tally-partials.md](tally-partials.md) removes
+`max_series` on the grounds that a fold should spill rather than refuse, which
+leaves the question of what stops an unbounded label filling the disk. The
+answer is a size bound on the STORE, dropped from the oldest end — a resource
+bound where timberfs already puts resource bounds, rather than a cardinality
+guess in a document nobody revisits.
+
 ## Why zstd, and why the lack of seek does not decide it
 
 Asked before replication, on the reasoning that a wire format is
@@ -582,6 +634,7 @@ that would want designing.
   source. ⚠ Whatever it is, it decides how freely a consumer's position may
   advance, which is the knot that produced the 51-entries/s deadlock
   ([consumer-holding.md](consumer-holding.md)) seen from the storage end.
-* **Whether a tally store is still a timberfs "store"** for `list`, `info`,
-  selection and the follower registry. It should be — those read `.bark`, and
-  a manifest can sit beside one.
+* ~~Whether a tally store is still a timberfs "store".~~ **It is not, so its
+  identity goes in the block manifest** — see below. The old answer assumed
+  a `.bark` beside the blocks; the point of the block design is that there is
+  no `.bark`.
