@@ -128,9 +128,15 @@ expressed directly instead of re-derived from text.
 
 ## The open edge stops being a special case
 
-A block whose range has not closed is **open**: mutable, checkpointed,
-rewritten as its cells fill. When the range passes `grace` it is **finalised**
-and compressed.
+A block whose range is still filling is **just a block**, rewritten as its
+cells fill, for as long as the store answers for that range at all.
+
+⚠ **Amended by [tally-partials.md](tally-partials.md):** an earlier version of
+this section had such a block "open" and then "finalised" once its range
+passed `grace`, in a file of its own. There is no such distinction — sealing is
+the tape's answer to getting one write per bucket, and it was the seal that
+manufactured the open region. The bound on rewriting is `Manifest::floor`, the
+range the store no longer answers for.
 
 ⚠ **There is no revision concept, because there is nothing to revise.** A
 provisional value is a cell in an open block; its final value is the same cell
@@ -227,19 +233,23 @@ cardinality an explicit decision rather than a surprise.
 
 ### ⚠ The last column is the catch, and it is the `.sap` tension again
 
-A day's block is 184 KB at 50 series and 3.7 MB at 1000, and an open block
-rewritten on every checkpoint means rewriting that much every couple of
-seconds. Which is exactly the bind
+A day's block is 184 KB at 50 series and 3.7 MB at 1000, and rewriting one on
+every flush means rewriting that much every couple of seconds. Which is exactly
+the bind
 [docs/design.md](../design.md) names for logs — "chunking has two masters that
 want opposite things: compression wants chunks big and infrequent; durability
 wants every byte on disk the instant it arrives" — arriving here as
 *compression wants a day and checkpointing wants a handful of buckets*.
 
-**The resolution is the same shape: decouple them.**
+**The resolution is the same shape: decouple them** — and ⚠ the first version
+of this list decoupled them with an *open region*, a mutable file of the
+unsealed buckets. That went with the seal
+([tally-partials.md](tally-partials.md)). What is left is the same tension and
+two candidate answers, neither settled:
 
-* the **open region** holds only the buckets that have not sealed — `width +
-  grace`, so three of them at the defaults. 3 buckets × 1000 series × 2
-  measures is ~12 KB, cheap to rewrite at any cardinality;
+* a **WAL for tally samples**, the `.sap` shape one level up: append what
+  arrives, cheaply and durably, and fold it into blocks in batches. This is the
+  mechanism the tree already has vocabulary and precedent for;
 * a **sealed bucket is appended to the current day's block as a SEGMENT** — a
   short column region covering the buckets that sealed since the last append;
 * when the day closes the segments are **compacted** into one column region,
@@ -552,7 +562,7 @@ that would want designing.
   and then six real days at +4% against a six-day block. Segment length is:
   how many sealed buckets accumulate before a segment is appended. Short
   segments cost compression (2.07 B/cell at 15 minutes against 1.31 at a day)
-  and long ones cost a bigger open region to rewrite. The block range is
+  and long ones cost a longer replay after a crash. The block range is
   settled at a day by the measurements; the segment inside it is not.
 * **Whether compaction is the writer's job or a sweep's.** It reads immutable
   input and writes a new generation, so it need not be, and a `trim`-shaped
@@ -565,11 +575,10 @@ that would want designing.
   about quality, so probably their own columns or bits beside the presence
   bitmap — which would make them selectable rather than markers a reader has
   to notice.
-* **The open block's checkpoint interval**, and whether it is durable at all:
-  the cells are re-derivable from the source, which is what
-  `Roller::safe_offset` currently holds a consumer's position back for. ⚠ A
-  durable open block would let that position advance freely, which is the
-  same knot that produced the 51-entries/s deadlock
+* **How the live edge is made durable** — a WAL, or short segments appended to
+  the day's block, or nothing at all, the cells being re-derivable from the
+  source. ⚠ Whatever it is, it decides how freely a consumer's position may
+  advance, which is the knot that produced the 51-entries/s deadlock
   ([consumer-holding.md](consumer-holding.md)) seen from the storage end.
 * **Whether a tally store is still a timberfs "store"** for `list`, `info`,
   selection and the follower registry. It should be — those read `.bark`, and

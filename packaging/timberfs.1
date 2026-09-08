@@ -1416,20 +1416,13 @@ overlap \(em measured on real logs, three of six days fell from ~900 KB to
 ~22 KB in silence. A cell present in both takes the newer value, which is
 the rule a tape already had for two lines of one bucket.
 .IP
-⚠ The buckets that have NOT SEALED live in a separate
-.B open
-file, rewritten in place as they fill and read back by
-.BR \-\-unpack
-after the sealed blocks. That is what makes a quiet store's newest minute
-visible without writing anything to a sealed block \(em and why a
-provisional value needs no revision on a tape: the value and its final
-value are the same CELL at two times, and a reader knows which it has
-from where it read it. Measured, three buckets of a thousand series with
-three measures each is 11.6 KB written in 2.3 ms, which is what makes
-checkpointing it on a tick affordable where rewriting a day-sized block
-(megabytes at that cardinality) would not be. Losing the file costs a
-re-read and never a number: the consumer's position is held behind every
-open bucket, so a restart re-derives them.
+⚠ A bucket still filling is in a block like any other: there is no
+sealed-versus-open distinction and no separate file, because a block can
+be rewritten for as long as the store answers for its range. So a
+provisional value needs no revision either \(em the value and its final
+value are the same CELL at two times. What bounds the rewriting is the
+manifest's floor, the range this store no longer answers for; a sample
+older than that has nothing to write into and is a bounded loss.
 .IP
 ⚠ It refuses the MARKERS
 .RB ( !cap ,

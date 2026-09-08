@@ -842,7 +842,7 @@ impl Manifest {
             // store grows later must be named here or be reported as
             // debris — the definitions set is the one already designed
             // (docs/plans/tally-series-identity.md).
-            if name == MANIFEST || name == OPEN || name.ends_with(".tmp") {
+            if name == MANIFEST || name.ends_with(".tmp") {
                 continue;
             }
             if !named.contains(name) {
@@ -1026,84 +1026,6 @@ pub fn read_block(dir: &std::path::Path, e: &Entry) -> anyhow::Result<Block> {
 
 // ------------------------------------------------------------ the open edge
 
-/// The open region's file name. One per store, rewritten in place —
-/// unlike a sealed block, whose name IS its `(range, generation)`,
-/// because the open region's range moves and a name that moved with it
-/// would leave a trail of files nothing references.
-pub const OPEN: &str = "open";
-
-/// Write the open region: the buckets that have not sealed.
-///
-/// ⚠ **A block that is not finished, and that is the whole idea.** The
-/// tape could only append, so surfacing a bucket before it was complete
-/// meant emitting a line and superseding it later — which put revisions
-/// on the tape and made newest-line-wins load-bearing for every reader.
-/// A cell that can be rewritten needs none of that: the provisional
-/// value and the final value are the same cell at two times, and a
-/// reader knows which it has from WHERE IT READ IT.
-///
-/// ⚠ **Temp-plus-rename, and no write-ahead discipline**, because the
-/// open region is RECONSTRUCTIBLE: the consumer's position is held
-/// behind every open bucket (`Roller::safe_offset`), so a restart
-/// re-reads those entries and re-derives these cells. Losing this file
-/// costs a re-read, never a number — which is what makes checkpointing
-/// it cheap enough to do often.
-pub fn checkpoint(dir: &std::path::Path, open: &[Sample], level: i32) -> anyhow::Result<usize> {
-    let path = dir.join(OPEN);
-    if open.is_empty() {
-        // Nothing open: remove the file rather than leave a stale one,
-        // which a reader would add to the sealed blocks as though those
-        // buckets were still filling.
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
-        }
-        return Ok(0);
-    }
-    // ⚠ ONE block over exactly the open span, at its own t0 rather than
-    // a floored one: the region is three buckets wide and a floored
-    // block could straddle a boundary, which would make the checkpoint
-    // two files' worth of nothing.
-    let width = open[0].width_ms;
-    if let Some(s) = open.iter().find(|s| s.width_ms != width) {
-        bail!(
-            "two widths in one open region ({} and {})",
-            crate::tally::render_width(width),
-            crate::tally::render_width(s.width_ms)
-        );
-    }
-    let (lo, hi) = open
-        .iter()
-        .fold((u64::MAX, 0u64), |(lo, hi), s| (lo.min(s.ts), hi.max(s.ts)));
-    let n = ((hi - lo) / width.max(1)) as usize + 1;
-    let refs: Vec<&Sample> = open.iter().collect();
-    let bytes = Block::at(&refs, lo, width, n).encode(level)?;
-    let tmp = dir.join(format!("{OPEN}.tmp"));
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(bytes.len())
-}
-
-/// Read the open region back, or nothing if there is none.
-pub fn read_open(dir: &std::path::Path) -> anyhow::Result<Vec<Sample>> {
-    let path = dir.join(OPEN);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let mut out = Vec::new();
-    let mut at = 0usize;
-    while at < bytes.len() {
-        let block = Block::decode(&bytes[at..])
-            .with_context(|| format!("decoding the open region at byte {at}"))?;
-        at += Block::size_of(&bytes[at..])?;
-        out.extend(block.samples());
-    }
-    Ok(out)
-}
-
 // ------------------------------------------------------------------ reading
 
 /// What a read touched, so a caller can say what it did NOT do.
@@ -1126,9 +1048,9 @@ pub struct Touched {
 ///    series it holds, so the columns of those the selector did not pick
 ///    are stepped over.
 ///
-/// ⚠ The OPEN region is read last and always, because its buckets are
-/// still filling and are in no block yet. A window that ends before them
-/// filters them out on time; one that reaches now sees them.
+/// ⚠ A bucket still filling is in a block like any other, so there is
+/// one source here and not two: a block is rewritten as more of its
+/// range arrives, up to the manifest's floor.
 pub fn query(
     dir: &std::path::Path,
     sel: &crate::select::Selector,
@@ -1168,17 +1090,6 @@ pub fn query(
                 .into_iter()
                 .filter(|s| s.ts >= from && s.ts <= to),
         );
-    }
-    for s in read_open(dir)? {
-        if s.ts >= from && s.ts <= to {
-            let series = Series {
-                metric: s.metric.clone(),
-                labels: s.labels.clone(),
-            };
-            if sel.matches(&series.as_fields()) {
-                out.push(s);
-            }
-        }
     }
     out.sort_by(|a, b| (a.ts, &a.metric, &a.labels).cmp(&(b.ts, &b.metric, &b.labels)));
     Ok((out, t))
@@ -1373,22 +1284,7 @@ pub fn cmd_unpack(dir: &std::path::Path) -> anyhow::Result<()> {
             writeln!(out, "{}", s.render())?;
         }
     }
-    // ⚠ The open region LAST, and it is why a quiet store's newest
-    // minute is visible at all. Its buckets are still filling, so what
-    // it says is provisional — and a reader knows that because of where
-    // it came from rather than by finding a later line that supersedes
-    // it, which is what the tape had to do.
-    let open = read_open(dir)?;
-    let provisional = open.len();
-    for s in &open {
-        writeln!(out, "{}", s.render())?;
-    }
     out.flush()?;
-    if provisional > 0 {
-        crate::note!(
-            "timberfs: the last {provisional} line(s) are from the OPEN region — those buckets              are still filling"
-        );
-    }
     Ok(())
 }
 
@@ -1756,25 +1652,33 @@ mod tests {
         );
     }
 
-    /// ⚠ The OPEN region is part of the answer, because its buckets are
-    /// in no block yet — and a window that ends before them must not
-    /// take them.
+    /// The manifest selects a block, and then the WINDOW still has to
+    /// bound the buckets inside it — a block is a range, so selecting it
+    /// is not the same as wanting all of it.
     #[test]
-    fn a_query_includes_the_open_region_and_respects_the_window() {
+    fn a_window_bounds_the_buckets_inside_a_selected_block() {
         let dir = tmpdir("q3");
         let mut m = Manifest::new(60_000, 60);
         let t0 = crate::tally::parse_stamp("2026-09-06T00:00:00.000Z").unwrap();
-        let sealed = pack1(&["2026-09-06T00:00:00.000Z 60s m count=1"], 60);
-        commit(&dir, &mut m, &sealed, 3, How::Merge).unwrap();
-        checkpoint(&dir, &[s("2026-09-06T00:30:00.000Z 60s m count=99")], 3).unwrap();
+        let block = pack1(
+            &[
+                "2026-09-06T00:00:00.000Z 60s m count=1",
+                "2026-09-06T00:30:00.000Z 60s m count=99",
+            ],
+            60,
+        );
+        commit(&dir, &mut m, &block, 3, How::Merge).unwrap();
 
         let (whole, _) = query(&dir, &sel("[]"), 0, u64::MAX).unwrap();
-        assert_eq!(whole.len(), 2, "the sealed bucket and the open one");
-        assert_eq!(whole[1].render(), "2026-09-06T00:30:00.000Z 60s m count=99");
+        assert_eq!(whole.len(), 2);
 
-        let (early, _) = query(&dir, &sel("[]"), t0, t0 + 60_000).unwrap();
-        assert_eq!(early.len(), 1, "the open bucket is outside this window");
+        let (early, t) = query(&dir, &sel("[]"), t0, t0 + 60_000).unwrap();
+        assert_eq!(early.len(), 1, "the later bucket is outside this window");
         assert_eq!(early[0].render(), "2026-09-06T00:00:00.000Z 60s m count=1");
+        assert_eq!(
+            t.blocks_opened, 1,
+            "and the block it was in was opened once"
+        );
     }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -2086,168 +1990,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The open region round-trips, which is what lets a reader see the
-    /// current minute without anything being written to a sealed block.
-    #[test]
-    fn the_open_region_round_trips_through_a_checkpoint() {
-        let dir = std::env::temp_dir().join(format!("tb-open-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let open = vec![
-            s("2026-09-06T13:37:00.000Z 60s m a=1 count=5 @100+10"),
-            s("2026-09-06T13:38:00.000Z 60s m a=1 count=2"),
-            s("2026-09-06T13:38:00.000Z 60s m a=2 count=9"),
-        ];
-        let n = checkpoint(&dir, &open, 3).unwrap();
-        assert!(n > 0);
-        let back = read_open(&dir).unwrap();
-        let mut want: Vec<String> = open
-            .iter()
-            .map(|x| {
-                let mut c = x.clone();
-                c.cite = None;
-                c.render()
-            })
-            .collect();
-        let mut got: Vec<String> = back
-            .iter()
-            .map(|x| {
-                let mut c = x.clone();
-                c.cite = None;
-                c.render()
-            })
-            .collect();
-        want.sort();
-        got.sort();
-        assert_eq!(want, got);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// ⚠ A checkpoint REPLACES the previous one — the open region is one
-    /// file rewritten, not a trail — and an emptied region removes it
-    /// rather than leaving a stale one a reader would add to the sealed
-    /// blocks as though those buckets were still filling.
-    #[test]
-    fn a_checkpoint_replaces_the_last_and_an_empty_one_removes_it() {
-        let dir = std::env::temp_dir().join(format!("tb-open2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        checkpoint(&dir, &[s("2026-09-06T13:37:00.000Z 60s m count=5")], 3).unwrap();
-        // The same bucket, now larger: the CELL changed, and no
-        // revision was written anywhere.
-        checkpoint(&dir, &[s("2026-09-06T13:37:00.000Z 60s m count=9")], 3).unwrap();
-        let back = read_open(&dir).unwrap();
-        assert_eq!(back.len(), 1, "one bucket, not two lines for it");
-        assert_eq!(back[0].render(), "2026-09-06T13:37:00.000Z 60s m count=9");
-
-        assert_eq!(checkpoint(&dir, &[], 3).unwrap(), 0);
-        assert!(read_open(&dir).unwrap().is_empty());
-        assert!(!dir.join(OPEN).exists(), "an empty region leaves no file");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The open region takes its own `t0` rather than a floored one, so
-    /// a three-bucket span that straddles a block boundary is still one
-    /// block.
-    #[test]
-    fn an_open_span_across_a_block_boundary_is_still_one_block() {
-        let dir = std::env::temp_dir().join(format!("tb-open3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // 23:59, 00:00, 00:01 — across midnight, which a day-floored
-        // block would split.
-        let open = vec![
-            s("2026-09-06T23:59:00.000Z 60s m count=1"),
-            s("2026-09-07T00:00:00.000Z 60s m count=2"),
-            s("2026-09-07T00:01:00.000Z 60s m count=3"),
-        ];
-        checkpoint(&dir, &open, 3).unwrap();
-        let bytes = std::fs::read(dir.join(OPEN)).unwrap();
-        assert_eq!(
-            Block::size_of(&bytes).unwrap(),
-            bytes.len(),
-            "one block, not two"
-        );
-        let back = read_open(&dir).unwrap();
-        assert_eq!(back.len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A roller's open buckets are what a checkpoint writes, and taking
-    /// them must not consume or clean anything — a checkpoint is a copy
-    /// of state that is still changing.
-    #[test]
-    fn peeking_the_open_buckets_changes_nothing() {
-        let mut r = crate::tally::Roller::new(60_000, 120_000, 1000);
-        r.add(&s("2026-09-06T13:37:10.000Z 0s m count=1"));
-        let once = r.open_buckets();
-        let twice = r.open_buckets();
-        assert_eq!(once.len(), 1);
-        assert_eq!(
-            once.iter().map(|x| x.render()).collect::<Vec<_>>(),
-            twice.iter().map(|x| x.render()).collect::<Vec<_>>(),
-            "peeking twice must say the same thing"
-        );
-        // And the bucket is still there to be drained.
-        assert_eq!(r.drain(crate::tally::Drain::Final).len(), 1);
-    }
-
-    /// ⚠ THE NUMBER THE DESIGN TURNS ON. A day-sized block is 184 KB
-    /// at 50 series and 3.7 MB at 1000, and rewriting that on every
-    /// checkpoint is what makes a whole-day open block impossible. The
-    /// open region is only `width + grace` of buckets, so this measures
-    /// what a checkpoint actually costs at the cardinality a real store
-    /// carries — 992 series was measured on one real day.
-    #[test]
-    fn a_checkpoint_is_small_at_a_real_cardinality() {
-        let dir = std::env::temp_dir().join(format!("tb-open4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // Three open buckets — width 60s plus a 120s grace — and a
-        // thousand series, each with the three measures a real document
-        // asks for.
-        let mut open = Vec::new();
-        for b in 0..3u64 {
-            for i in 0..1000u64 {
-                let mut x = Sample::new(
-                    crate::tally::parse_stamp("2026-09-06T13:37:00.000Z").unwrap() + b * 60_000,
-                    60_000,
-                    "service_calls",
-                );
-                x = x
-                    .label("klass", &format!("SomeServiceImplementation{i}"))
-                    .label("method", &format!("someMethodName{}", i % 40));
-                x = x.field(Field::Count, (i % 97) as f64);
-                x = x.field(Field::Sum, (i * 13 % 5000) as f64);
-                x = x.field(Field::Max, (i % 700) as f64);
-                x.cite = Some((i * 700, 700));
-                open.push(x);
-            }
-        }
-        let t = std::time::Instant::now();
-        let n = checkpoint(&dir, &open, 3).unwrap();
-        let took = t.elapsed();
-        // Printed as well as asserted: a bound that passes says nothing
-        // about how much room is left under it.
-        println!(
-            "    checkpoint: 3 buckets x 1000 series x 3 measures = {} cells -> {} bytes in {:?}",
-            3 * 1000 * 3,
-            n,
-            took
-        );
-        // A day-sized block at this cardinality is megabytes; the open
-        // region must be kilobytes, or checkpointing it every couple of
-        // seconds is the thing that cannot be done.
-        assert!(
-            n < 256 * 1024,
-            "a checkpoint of 3 buckets x 1000 series is {n} bytes, which is too big to \
-             rewrite on a tick — the open region has stopped being small"
-        );
-        assert_eq!(read_open(&dir).unwrap().len(), 3000, "and it reads back");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// The name is the address: sortable by time, generation visible.
     #[test]
     fn a_block_name_sorts_by_time_and_shows_its_generation() {
@@ -2264,12 +2006,10 @@ mod tests {
         assert!(a < b, "directory order must be time order");
     }
 
-    /// Garbage in must not panic, and the OPEN REGION is where it can
-    /// arrive: every sealed block has a crc32 in the manifest that
-    /// `read_block` checks before decoding, while `open` is read by name
-    /// with nothing vouching for its bytes. `read_open` also walks
-    /// concatenated blocks by `size_of`, so a disagreement there hands
-    /// decode a suffix from inside the file.
+    /// Garbage in must not panic. Defence in depth rather than a
+    /// scenario: every production path reaches `decode` through
+    /// `read_block`, which checks the manifest's crc32 first, so this
+    /// asserts the parser is safe for a caller that does not.
     #[test]
     fn a_truncated_or_foreign_block_is_an_error_not_a_panic() {
         assert!(Block::decode(b"").is_err());

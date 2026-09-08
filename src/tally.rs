@@ -545,38 +545,6 @@ impl Roller {
         }
     }
 
-    /// The OPEN buckets, as samples, without consuming or marking
-    /// anything.
-    ///
-    /// What a checkpoint of the open region writes: the buckets that
-    /// have not sealed, which is `width + grace` of them and therefore
-    /// small whatever the cardinality. See
-    /// docs/plans/tally-as-a-tally.md — the open region is a block that
-    /// is not finished, and a reader that reads it sees the current
-    /// minute without anything having been written to a sealed block.
-    ///
-    /// ⚠ Non-consuming, unlike `drain`, and that is the point: a
-    /// checkpoint is a COPY of state that is still changing, so a
-    /// checkpoint that evicted would be a drain by another name, and a
-    /// checkpoint that marked buckets clean would make the NEXT one skip
-    /// them and lose whatever arrived meanwhile.
-    pub fn open_buckets(&self) -> Vec<Sample> {
-        let mut out = Vec::new();
-        for (key, b) in self.buckets.iter() {
-            if self.sealed(key.0) {
-                continue;
-            }
-            let mut s = Sample::new(key.0, self.width_ms, &key.1);
-            s.labels = key.2.clone();
-            s.fields = b.fields.iter().map(|(f, (v, _))| (*f, *v)).collect();
-            if let (Some(lo), Some(hi)) = (b.cite_lo, b.cite_hi) {
-                s.cite = Some((lo, hi - lo));
-            }
-            out.push(s);
-        }
-        out
-    }
-
     /// The buckets `how` asks for, with whatever markers they owe.
     ///
     /// A sealed bucket is written once and evicted; an open one, under
