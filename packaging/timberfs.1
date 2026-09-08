@@ -1363,6 +1363,29 @@ bound the entries it counted: a displaced entry (see LATENESS) came from
 outside the bucket's window, so a time-range lookup would miss exactly
 the entries that made a number surprising.
 .IP
+⚠ A
+.B manifest.json
+beside the blocks is the store's STATE and its COMMIT POINT: which ranges
+it holds, at which generation, with what size and crc32, and a
+.B floor
+saying how far back it still answers for \(em so a window retention took
+away and a window nothing ever measured are told apart, which is "zero and
+unknown are different" one level up. A block is written, then the manifest
+is rewritten (temp\-plus\-rename, and that rename IS the commit), then the
+superseded block is unlinked; a crash in either window leaves a file no
+manifest entry names, which is collectable debris rather than a store that
+lies. Reads go through the manifest and not the directory, so such debris
+is invisible.
+.IP
+⚠ Packing a range the store ALREADY HOLDS is a MERGE, at the same
+generation, and never a re\-derivation inferred from having seen the range
+before. That inference lost data: a log does not rotate on UTC midnight,
+so each day's tally spills a few buckets into the previous day, and
+treating the spill as a regeneration replaced a full day's block with the
+overlap \(em measured on real logs, three of six days fell from ~900 KB to
+~22 KB in silence. A cell present in both takes the newer value, which is
+the rule a tape already had for two lines of one bucket.
+.IP
 ⚠ The buckets that have NOT SEALED live in a separate
 .B open
 file, rewritten in place as they fill and read back by

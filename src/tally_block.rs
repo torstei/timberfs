@@ -526,6 +526,345 @@ impl Block {
     }
 }
 
+// -------------------------------------------------------------- the manifest
+
+/// The manifest's file name, beside the store's `.bark`.
+pub const MANIFEST: &str = "manifest.json";
+
+/// One block, as the manifest knows it — enough to plan a query and to
+/// diff against another holder, without opening a block.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Entry {
+    /// The first bucket the block covers.
+    pub t0: u64,
+    pub n_buckets: usize,
+    /// Which derivation of this range. The address is
+    /// `(t0, generation)`, never a position in a sequence.
+    pub generation: u32,
+    pub bytes: u64,
+    /// ⚠ A crc32, and deliberately not a cryptographic digest. Its job
+    /// is "does the far end hold THESE bytes" and "did this file rot",
+    /// not resisting an adversary who is already writing to the store
+    /// directory. At a 730-block retention the collision chance is
+    /// ~4e-6, and the tree already has this crc32 with a check-value
+    /// test rather than a dependency to add.
+    pub crc32: u32,
+}
+
+impl Entry {
+    pub fn file_name(&self) -> String {
+        block_name(self.t0, self.generation)
+    }
+
+    /// Does this block hold any bucket in `[from, to]`?
+    fn covers(&self, from: u64, to: u64, width: u64) -> bool {
+        let end = self.t0 + self.n_buckets as u64 * width;
+        self.t0 <= to && end > from
+    }
+}
+
+/// What a tally store IS: the blocks it has, and where its history stops.
+///
+/// ⚠ **The manifest is the COMMIT POINT**, and that is the whole reason
+/// it exists rather than the directory being the truth. Writing a block
+/// then rewriting the manifest then unlinking the superseded one means a
+/// crash in either window leaves a file NOTHING REFERENCES — collectable
+/// debris — instead of a store that lies. With the directory as truth,
+/// every partial write would be a corrupt store, which is the trade
+/// `.bark`'s temp-plus-rename already makes in this tree.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Manifest {
+    pub v: u32,
+    pub width_ms: u64,
+    pub block_buckets: usize,
+    /// The oldest bucket this store still claims to know about.
+    ///
+    /// ⚠ Not decoration: it separates DROPPED from NEVER WRITTEN, which
+    /// is tally's "zero and unknown are different" one level up. Without
+    /// it a window retention has taken away and a window nothing ever
+    /// measured are the same empty answer, and only one of them means
+    /// the numbers were there once.
+    pub floor: u64,
+    pub blocks: Vec<Entry>,
+}
+
+impl Manifest {
+    pub fn new(width_ms: u64, block_buckets: usize) -> Manifest {
+        Manifest {
+            v: 1,
+            width_ms,
+            block_buckets,
+            floor: 0,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Read it, or `None` where a store has none yet.
+    pub fn load(dir: &std::path::Path) -> anyhow::Result<Option<Manifest>> {
+        let path = dir.join(MANIFEST);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let m: Manifest = serde_json::from_str(&text)
+            .with_context(|| format!("{} is not a tally manifest", path.display()))?;
+        if m.v != 1 {
+            bail!(
+                "{} is a manifest of version {}; this build reads 1",
+                path.display(),
+                m.v
+            );
+        }
+        Ok(Some(m))
+    }
+
+    /// Write it. **This is the commit** — temp-plus-rename, so a reader
+    /// sees the old manifest or the new one and never half of either.
+    pub fn save(&self, dir: &std::path::Path) -> anyhow::Result<()> {
+        let path = dir.join(MANIFEST);
+        let tmp = dir.join(format!("{MANIFEST}.tmp"));
+        let mut text = serde_json::to_string_pretty(self)?;
+        text.push('\n');
+        std::fs::write(&tmp, &text).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("renaming to {}", path.display()))?;
+        Ok(())
+    }
+
+    /// The blocks holding any bucket in `[from, to]`.
+    ///
+    /// ⚠ The query-planning property, and it costs no data: a block's
+    /// coverage is in the manifest, so a window selects files before
+    /// anything is decompressed — and the columns of the series that did
+    /// not match are never read at all.
+    pub fn covering(&self, from: u64, to: u64) -> Vec<&Entry> {
+        self.blocks
+            .iter()
+            .filter(|e| e.covers(from, to, self.width_ms))
+            .collect()
+    }
+
+    /// Put this block in, replacing any other generation of its range.
+    ///
+    /// Returns the file names now superseded, for the caller to unlink
+    /// AFTER the manifest is saved — which is the order that makes a
+    /// crash benign.
+    pub fn put(&mut self, e: Entry) -> Vec<String> {
+        let mut superseded = Vec::new();
+        self.blocks.retain(|had| {
+            if had.t0 == e.t0 && had.generation != e.generation {
+                superseded.push(had.file_name());
+                false
+            } else {
+                had.t0 != e.t0
+            }
+        });
+        self.blocks.push(e);
+        self.blocks.sort_by_key(|e| (e.t0, e.generation));
+        superseded
+    }
+
+    /// Head-drop: forget every block ending at or before `t`, and raise
+    /// the floor to say so. Returns what to unlink after the save.
+    pub fn drop_before(&mut self, t: u64) -> Vec<String> {
+        let width = self.width_ms;
+        let mut gone = Vec::new();
+        self.blocks.retain(|e| {
+            if e.t0 + e.n_buckets as u64 * width <= t {
+                gone.push(e.file_name());
+                false
+            } else {
+                true
+            }
+        });
+        // ⚠ Raised even when nothing was dropped: the floor is a claim
+        // about what this store no longer answers for, and a retention
+        // sweep that found nothing to drop has still moved that line.
+        self.floor = self.floor.max(t);
+        gone
+    }
+
+    /// Files in the directory that the manifest does not name — crash
+    /// debris from either window, and safe to remove.
+    ///
+    /// ⚠ Never the open region or the manifest itself, which are not
+    /// blocks; and never a `.tmp`, which a concurrent writer may be
+    /// mid-rename on.
+    pub fn unreferenced(&self, dir: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        let named: std::collections::BTreeSet<String> =
+            self.blocks.iter().map(|e| e.file_name()).collect();
+        let mut out = Vec::new();
+        for ent in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = ent?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name == MANIFEST || name == OPEN || name.ends_with(".tmp") {
+                continue;
+            }
+            if !named.contains(name) {
+                out.push(path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+}
+
+impl Block {
+    /// This block with `other`'s cells folded in — for a range that is
+    /// still being filled.
+    ///
+    /// ⚠ A cell present in both takes the NEW value, which is the same
+    /// newest-wins rule a tape already had for two lines of one bucket.
+    /// Both blocks must cover the same range: merging across ranges
+    /// would silently move numbers between buckets.
+    pub fn merge(&self, other: &Block) -> anyhow::Result<Block> {
+        if (self.t0, self.n_buckets, self.width_ms) != (other.t0, other.n_buckets, other.width_ms) {
+            bail!(
+                "two blocks over different ranges cannot merge ({}+{} against {}+{})",
+                self.t0,
+                self.n_buckets,
+                other.t0,
+                other.n_buckets
+            );
+        }
+        let mut out = self.clone();
+        for (i, s) in other.series.iter().enumerate() {
+            let at = match out.series.iter().position(|had| had == s) {
+                Some(at) => at,
+                None => {
+                    out.series.push(s.clone());
+                    out.cells.push(BTreeMap::new());
+                    out.series.len() - 1
+                }
+            };
+            for (f, col) in &other.cells[i] {
+                let mine = out.cells[at]
+                    .entry(*f)
+                    .or_insert_with(|| vec![None; out.n_buckets]);
+                for (b, v) in col.iter().enumerate() {
+                    if v.is_some() {
+                        mine[b] = *v;
+                    }
+                }
+            }
+        }
+        for (b, c) in other.cites.iter().enumerate() {
+            if let Some((off, len)) = c {
+                out.cites[b] = match out.cites[b] {
+                    None => Some((*off, *len)),
+                    Some((l, n)) => {
+                        let (lo, hi) = (l.min(*off), (l + n).max(off + len));
+                        Some((lo, hi - lo))
+                    }
+                };
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// What a commit into a range that already has a block should do.
+///
+/// ⚠ **Never inferred, and this enum exists because inferring it lost
+/// data.** A first version treated "I already hold this range" as a
+/// regeneration and superseded the block. Real logs do not rotate on UTC
+/// midnight, so each day's tally spills a few buckets into the previous
+/// day — and that spill replaced a full 900 KB block with 22 KB of
+/// overlap, silently. A partial write to a range is an ADDITION; only a
+/// caller knows when it is a re-derivation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum How {
+    /// Fold into whatever the range holds, at the same generation. What
+    /// a range still being filled wants.
+    Merge,
+    /// Replace the range: a new generation, the old block unlinked once
+    /// the manifest no longer names it.
+    Regenerate,
+}
+
+/// Write a block and commit it, in the order that makes a crash benign.
+///
+/// 1. the block file, temp-plus-renamed;
+/// 2. the manifest — **the commit**;
+/// 3. the superseded block, unlinked.
+///
+/// ⚠ A crash between 1 and 2 leaves a block nothing references and a
+/// store still answering from the previous generation. A crash between 2
+/// and 3 leaves the previous generation unreferenced and the store
+/// answering from the new one. Both are `unreferenced` debris; neither
+/// is a store that lies, and that is the only property this order buys.
+pub fn commit(
+    dir: &std::path::Path,
+    m: &mut Manifest,
+    block: &Block,
+    level: i32,
+    how: How,
+) -> anyhow::Result<Entry> {
+    // What the range already holds decides what this write IS.
+    let existing = m.blocks.iter().find(|e| e.t0 == block.t0).cloned();
+    let block = match (&existing, how) {
+        (Some(e), How::Merge) => {
+            // ⚠ Read it back and fold, at the SAME generation: a range
+            // being filled is one derivation arriving in pieces, not
+            // several derivations.
+            let had = read_block(dir, e)?;
+            let mut merged = had.merge(block)?;
+            merged.generation = e.generation;
+            std::borrow::Cow::Owned(merged)
+        }
+        (Some(e), How::Regenerate) => {
+            let mut next = block.clone();
+            next.generation = e.generation + 1;
+            std::borrow::Cow::Owned(next)
+        }
+        (None, _) => std::borrow::Cow::Borrowed(block),
+    };
+    let block = block.as_ref();
+    let bytes = block.encode(level)?;
+    let e = Entry {
+        t0: block.t0,
+        n_buckets: block.n_buckets,
+        generation: block.generation,
+        bytes: bytes.len() as u64,
+        crc32: crate::sap::crc32(&bytes),
+    };
+    let path = dir.join(e.file_name());
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming to {}", path.display()))?;
+    let superseded = m.put(e.clone());
+    m.save(dir)?;
+    for name in superseded {
+        let old = dir.join(name);
+        match std::fs::remove_file(&old) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("removing {}", old.display())),
+        }
+    }
+    Ok(e)
+}
+
+/// Read a block the manifest names, checking it is the bytes the
+/// manifest recorded.
+pub fn read_block(dir: &std::path::Path, e: &Entry) -> anyhow::Result<Block> {
+    let path = dir.join(e.file_name());
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let had = crate::sap::crc32(&bytes);
+    if had != e.crc32 {
+        bail!(
+            "{}: the manifest records crc32 {:#010x} and the file is {:#010x} — the block \
+             changed under the manifest, which a sealed block may not do",
+            path.display(),
+            e.crc32,
+            had
+        );
+    }
+    Block::decode(&bytes).with_context(|| format!("decoding {}", path.display()))
+}
+
 // ------------------------------------------------------------ the open edge
 
 /// The open region's file name. One per store, rewritten in place —
@@ -662,23 +1001,36 @@ pub fn cmd_pack(dir: &std::path::Path, range_buckets: usize) -> anyhow::Result<(
     }
     let blocks = Block::pack(&samples, range_buckets)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let width = blocks[0].width_ms;
+    // An existing manifest is EXTENDED rather than replaced: packing a
+    // second day into a store must not forget the first, and packing the
+    // same day again must supersede it rather than sit beside it.
+    let mut m = match Manifest::load(dir)? {
+        Some(m) => m,
+        None => Manifest::new(width, range_buckets),
+    };
     let mut on_disk = 0usize;
     let (mut present, mut room) = (0usize, 0usize);
     let mut series = 0usize;
+    let mut merged = 0usize;
     for b in &blocks {
-        let bytes = b.encode(3)?;
-        on_disk += bytes.len();
         let (p, r) = b.occupancy();
         present += p;
         room += r;
         series += b.series.len();
-        let path = dir.join(block_name(b.t0, b.generation));
-        // Temp-plus-rename, so a reader never sees half a block and a
-        // crash leaves a file nothing references rather than a truncated
-        // one something does.
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("renaming to {}", path.display()))?;
+        // ⚠ Re-packing a range it already holds is a REGENERATION, so
+        // the generation goes up and the old block is superseded — which
+        // is the whole point of addressing a block by
+        // `(range, generation)` instead of a position.
+        // ⚠ MERGE, never a regeneration inferred from having seen the
+        // range: a log that does not rotate on UTC midnight spills into
+        // the previous day, and treating that spill as a re-derivation
+        // replaced a full day with the overlap.
+        if m.blocks.iter().any(|e| e.t0 == b.t0) {
+            merged += 1;
+        }
+        let e = commit(dir, &mut m, b, 3, How::Merge)?;
+        on_disk += e.bytes as usize;
     }
     crate::note!(
         "timberfs: {} block(s), {} series, {}/{} cells present ({}%)",
@@ -696,12 +1048,25 @@ pub fn cmd_pack(dir: &std::path::Path, range_buckets: usize) -> anyhow::Result<(
             "timberfs: {markers} marker(s) NOT packed — a block holds the grid, and where a              marker belongs is not settled. They are still in your input"
         );
     }
+    if merged > 0 {
+        crate::note!(
+            "timberfs: {merged} range(s) already held a block and were MERGED into — a range \
+             fills in pieces, and re-deriving one is a different operation asked for outright"
+        );
+    }
     crate::note!(
-        "timberfs: {} of tally lines -> {} on disk ({:.1}x)",
+        "timberfs: {} of tally lines -> {} in the block(s) touched ({:.1}x)",
         human(text),
         human(on_disk),
         text as f64 / on_disk.max(1) as f64
     );
+    let debris = m.unreferenced(dir)?;
+    if !debris.is_empty() {
+        crate::note!(
+            "timberfs: {} file(s) here are named by no manifest entry — debris from an              interrupted commit, safe to remove",
+            debris.len()
+        );
+    }
     Ok(())
 }
 
@@ -711,21 +1076,15 @@ pub fn cmd_pack(dir: &std::path::Path, range_buckets: usize) -> anyhow::Result<(
 /// storage — whatever read a tally store's lines still can.
 pub fn cmd_unpack(dir: &std::path::Path) -> anyhow::Result<()> {
     use std::io::Write;
-    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_none_or(|e| e != "tmp"))
-        .filter(|p| p.file_name().is_none_or(|n| n != OPEN))
-        .collect();
-    // Sortable by name IS sortable by time, which is the whole reason
-    // for the naming.
-    names.sort();
+    // ⚠ Through the MANIFEST and not the directory, which is what makes
+    // an interrupted commit invisible: a block the manifest does not
+    // name is debris, and reading the directory would serve it.
+    let m =
+        Manifest::load(dir)?.with_context(|| format!("{} holds no {MANIFEST}", dir.display()))?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    for path in names {
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let block =
-            Block::decode(&bytes).with_context(|| format!("decoding {}", path.display()))?;
+    for e in &m.blocks {
+        let block = read_block(dir, e)?;
         for s in block.samples() {
             writeln!(out, "{}", s.render())?;
         }
@@ -954,6 +1313,315 @@ mod tests {
         // here either.
         let at40 = got.iter().find(|x| x.ts == s(lines[3]).ts).unwrap();
         assert_eq!(at40.cite, None);
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("tb-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A window selects blocks from the MANIFEST, with no block opened —
+    /// which is the query-planning property, and the reason a block's
+    /// coverage is recorded rather than discovered.
+    #[test]
+    fn a_window_selects_blocks_without_opening_one() {
+        let mut m = Manifest::new(60_000, 60);
+        for day in 0..3u64 {
+            m.put(Entry {
+                t0: day * 60 * 60_000,
+                n_buckets: 60,
+                generation: 0,
+                bytes: 1,
+                crc32: 0,
+            });
+        }
+        // The middle hour only.
+        let got = m.covering(60 * 60_000, 60 * 60_000 + 1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].t0, 60 * 60_000);
+        // A window spanning the seam takes both.
+        assert_eq!(m.covering(59 * 60_000, 61 * 60_000).len(), 2);
+        // And one before everything takes nothing.
+        assert!(m.covering(0, 0).len() <= 1);
+    }
+
+    /// ⚠ THE BUG THIS ENUM EXISTS FOR, and it lost data. A first
+    /// version inferred a regeneration from "I already hold this range",
+    /// so a log that does not rotate on UTC midnight — every real one —
+    /// spilled a few buckets into the previous day and REPLACED that
+    /// day's full block with the overlap. Measured on real logs: three
+    /// of six days went from ~900 KB to ~22 KB, silently.
+    #[test]
+    fn a_later_spill_into_a_day_must_not_replace_it() {
+        let dir = tmpdir("mfspill");
+        let mut m = Manifest::new(60_000, 1440);
+
+        // A full day: a bucket every hour, 24 of them.
+        let mut full: Vec<Sample> = Vec::new();
+        for h in 0..24u64 {
+            let mut x = Sample::new(
+                crate::tally::parse_stamp("2026-09-06T00:00:00.000Z").unwrap() + h * 3_600_000,
+                60_000,
+                "m",
+            );
+            x = x.field(Field::Count, h as f64 + 1.0);
+            full.push(x);
+        }
+        for b in Block::pack(&full, 1440).unwrap() {
+            commit(&dir, &mut m, &b, 3, How::Merge).unwrap();
+        }
+        assert_eq!(read_all(&dir, &m).len(), 24, "the full day went in");
+
+        // The next day's log spills two buckets back into this one —
+        // which is what a rotation at 03:00 looks like.
+        let spill: Vec<Sample> = [1u64, 2]
+            .iter()
+            .map(|h| {
+                let mut x = Sample::new(
+                    crate::tally::parse_stamp("2026-09-06T00:00:00.000Z").unwrap()
+                        + h * 3_600_000
+                        + 60_000,
+                    60_000,
+                    "m",
+                );
+                x = x.field(Field::Count, 99.0);
+                x
+            })
+            .collect();
+        for b in Block::pack(&spill, 1440).unwrap() {
+            commit(&dir, &mut m, &b, 3, How::Merge).unwrap();
+        }
+
+        let after = read_all(&dir, &m);
+        assert_eq!(
+            after.len(),
+            26,
+            "the day must still hold its 24 buckets plus the 2 that spilled in, not 2"
+        );
+        assert_eq!(m.blocks.len(), 1, "still one block for the range");
+        assert_eq!(m.blocks[0].generation, 0, "a merge is not a new generation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And a regeneration, asked for explicitly, still replaces.
+    #[test]
+    fn an_explicit_regeneration_replaces_the_range() {
+        let dir = tmpdir("mfregen");
+        let mut m = Manifest::new(60_000, 60);
+        let a = pack1(
+            &[
+                "2026-09-06T13:37:00.000Z 60s m count=1",
+                "2026-09-06T13:38:00.000Z 60s m count=2",
+            ],
+            60,
+        );
+        commit(&dir, &mut m, &a, 3, How::Merge).unwrap();
+        let b = pack1(&["2026-09-06T13:37:00.000Z 60s m count=999"], 60);
+        commit(&dir, &mut m, &b, 3, How::Regenerate).unwrap();
+        let after = read_all(&dir, &m);
+        assert_eq!(after.len(), 1, "a regeneration REPLACES, so 13:38 is gone");
+        assert_eq!(
+            after[0].render(),
+            "2026-09-06T13:37:00.000Z 60s m count=999"
+        );
+        assert_eq!(m.blocks[0].generation, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cell in both takes the new value, which is the newest-wins rule
+    /// a tape already had for two lines of one bucket.
+    #[test]
+    fn a_merge_takes_the_newer_value_for_a_cell_in_both() {
+        let dir = tmpdir("mfnewer");
+        let mut m = Manifest::new(60_000, 60);
+        let a = pack1(&["2026-09-06T13:37:00.000Z 60s m count=1"], 60);
+        commit(&dir, &mut m, &a, 3, How::Merge).unwrap();
+        let b = pack1(&["2026-09-06T13:37:00.000Z 60s m count=7"], 60);
+        commit(&dir, &mut m, &b, 3, How::Merge).unwrap();
+        let after = read_all(&dir, &m);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].render(), "2026-09-06T13:37:00.000Z 60s m count=7");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn read_all(dir: &std::path::Path, m: &Manifest) -> Vec<Sample> {
+        let mut out = Vec::new();
+        for e in &m.blocks {
+            out.extend(read_block(dir, e).unwrap().samples());
+        }
+        out
+    }
+
+    /// ⚠ THE COMMIT ORDER, window one: a block written and NOT yet in
+    /// the manifest. The store must still answer from the previous
+    /// generation, and the new file must be collectable debris.
+    #[test]
+    fn a_crash_before_the_commit_leaves_debris_not_a_lie() {
+        let dir = tmpdir("mf1");
+        let mut m = Manifest::new(60_000, 60);
+        let v1 = pack1(&["2026-09-06T13:37:00.000Z 60s m count=1"], 60);
+        commit(&dir, &mut m, &v1, 3, How::Regenerate).unwrap();
+
+        // Now the first step of a regeneration, and then a "crash".
+        let mut v2 = pack1(&["2026-09-06T13:37:00.000Z 60s m count=999"], 60);
+        v2.generation = 1;
+        let bytes = v2.encode(3).unwrap();
+        std::fs::write(dir.join(block_name(v2.t0, 1)), &bytes).unwrap();
+
+        // A reader loads the manifest, which still names generation 0.
+        let seen = Manifest::load(&dir).unwrap().unwrap();
+        assert_eq!(seen.blocks.len(), 1);
+        assert_eq!(seen.blocks[0].generation, 0, "the commit had not happened");
+        let back = read_block(&dir, &seen.blocks[0]).unwrap();
+        assert_eq!(
+            back.samples()[0].render(),
+            "2026-09-06T13:37:00.000Z 60s m count=1",
+            "the store answers from the generation the manifest names"
+        );
+        // And the half-done generation is collectable.
+        let debris = seen.unreferenced(&dir).unwrap();
+        assert_eq!(debris.len(), 1);
+        assert!(debris[0].ends_with(block_name(v2.t0, 1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠ Window two: the manifest committed and the superseded block NOT
+    /// yet unlinked. The store must answer from the NEW generation, and
+    /// the old file must be collectable.
+    #[test]
+    fn a_crash_after_the_commit_leaves_debris_not_a_lie() {
+        let dir = tmpdir("mf2");
+        let mut m = Manifest::new(60_000, 60);
+        let v1 = pack1(&["2026-09-06T13:37:00.000Z 60s m count=1"], 60);
+        commit(&dir, &mut m, &v1, 3, How::Regenerate).unwrap();
+
+        // The commit, by hand, stopping before the unlink.
+        let mut v2 = pack1(&["2026-09-06T13:37:00.000Z 60s m count=999"], 60);
+        v2.generation = 1;
+        let bytes = v2.encode(3).unwrap();
+        std::fs::write(dir.join(block_name(v2.t0, 1)), &bytes).unwrap();
+        let superseded = m.put(Entry {
+            t0: v2.t0,
+            n_buckets: v2.n_buckets,
+            generation: 1,
+            bytes: bytes.len() as u64,
+            crc32: crate::sap::crc32(&bytes),
+        });
+        m.save(&dir).unwrap();
+        assert_eq!(superseded.len(), 1, "generation 0 is superseded");
+
+        let seen = Manifest::load(&dir).unwrap().unwrap();
+        assert_eq!(seen.blocks.len(), 1);
+        assert_eq!(seen.blocks[0].generation, 1);
+        assert_eq!(
+            read_block(&dir, &seen.blocks[0]).unwrap().samples()[0].render(),
+            "2026-09-06T13:37:00.000Z 60s m count=999",
+            "the store answers from the new generation the moment the manifest names it"
+        );
+        // The old generation is now debris.
+        let debris = seen.unreferenced(&dir).unwrap();
+        assert_eq!(debris.len(), 1);
+        assert!(debris[0].ends_with(block_name(v1.t0, 0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full regeneration leaves nothing behind, which is the case the
+    /// two windows above bracket.
+    #[test]
+    fn a_completed_regeneration_leaves_no_debris() {
+        let dir = tmpdir("mf3");
+        let mut m = Manifest::new(60_000, 60);
+        let v1 = pack1(&["2026-09-06T13:37:00.000Z 60s m count=1"], 60);
+        commit(&dir, &mut m, &v1, 3, How::Regenerate).unwrap();
+        let mut v2 = pack1(&["2026-09-06T13:37:00.000Z 60s m count=999"], 60);
+        v2.generation = 1;
+        commit(&dir, &mut m, &v2, 3, How::Regenerate).unwrap();
+        assert_eq!(m.blocks.len(), 1);
+        assert_eq!(m.blocks[0].generation, 1);
+        assert!(m.unreferenced(&dir).unwrap().is_empty());
+        assert!(!dir.join(block_name(v1.t0, 0)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠ A sealed block may not change under its manifest, and the crc32
+    /// is what says so — the property every cache and every replica
+    /// downstream relies on.
+    #[test]
+    fn a_block_that_changed_under_the_manifest_is_refused() {
+        let dir = tmpdir("mf4");
+        let mut m = Manifest::new(60_000, 60);
+        let b = pack1(&["2026-09-06T13:37:00.000Z 60s m count=1"], 60);
+        let e = commit(&dir, &mut m, &b, 3, How::Regenerate).unwrap();
+        let mut bytes = std::fs::read(dir.join(e.file_name())).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xff;
+        std::fs::write(dir.join(e.file_name()), &bytes).unwrap();
+        let err = read_block(&dir, &e).unwrap_err().to_string();
+        assert!(err.contains("crc32"), "unhelpful: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠ The FLOOR separates dropped from never-written, which is "zero
+    /// and unknown are different" one level up: a window retention took
+    /// away and a window nothing ever measured are both empty, and only
+    /// one of them means the numbers were once there.
+    #[test]
+    fn the_floor_says_dropped_rather_than_never_written() {
+        let dir = tmpdir("mf5");
+        let mut m = Manifest::new(60_000, 60);
+        for h in 0..3u64 {
+            let mut b = pack1(&["2026-09-06T13:37:00.000Z 60s m count=1"], 60);
+            b.t0 = h * 60 * 60_000;
+            commit(&dir, &mut m, &b, 3, How::Regenerate).unwrap();
+        }
+        assert_eq!(m.floor, 0, "nothing dropped yet");
+        let gone = m.drop_before(2 * 60 * 60_000);
+        m.save(&dir).unwrap();
+        for name in &gone {
+            std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        assert_eq!(gone.len(), 2);
+        assert_eq!(m.blocks.len(), 1);
+        assert_eq!(
+            m.floor,
+            2 * 60 * 60_000,
+            "the floor records what was let go"
+        );
+        // The dropped window is empty AND below the floor, so a reader
+        // can tell it apart from one that never existed.
+        assert!(m.covering(0, 60_000).is_empty());
+        assert!(60_000 < m.floor, "below the floor: dropped, not unknown");
+        let far = 99 * 60 * 60_000;
+        assert!(m.covering(far, far + 1).is_empty());
+        assert!(far > m.floor, "above the floor: never written");
+        assert!(m.unreferenced(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The manifest survives a round trip, and a future version is
+    /// refused rather than read under rules it may not share.
+    #[test]
+    fn a_manifest_round_trips_and_a_future_version_is_refused() {
+        let dir = tmpdir("mf6");
+        let mut m = Manifest::new(60_000, 1440);
+        m.put(Entry {
+            t0: 1_000_000,
+            n_buckets: 1440,
+            generation: 3,
+            bytes: 42,
+            crc32: 7,
+        });
+        m.floor = 999;
+        m.save(&dir).unwrap();
+        assert_eq!(Manifest::load(&dir).unwrap().unwrap(), m);
+
+        let text = std::fs::read_to_string(dir.join(MANIFEST)).unwrap();
+        std::fs::write(dir.join(MANIFEST), text.replace("\"v\": 1", "\"v\": 2")).unwrap();
+        let err = Manifest::load(&dir).unwrap_err().to_string();
+        assert!(err.contains("version 2"), "unhelpful: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The open region round-trips, which is what lets a reader see the

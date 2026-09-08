@@ -71,7 +71,7 @@ const CRC32_TABLE: [u32; 256] = build_crc32_table();
 /// Standard zlib/gzip CRC-32 (polynomial 0xEDB88320), hand-rolled and
 /// table-driven — no new dependency, same discipline as the FNV-1a in
 /// grain.rs.
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
         let idx = ((crc ^ b as u32) & 0xFF) as usize;
