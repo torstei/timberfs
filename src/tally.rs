@@ -1894,6 +1894,17 @@ pub fn cmd_tally(opts: &TallyOpts) -> anyhow::Result<()> {
             crate::records::Rec::Entry(e) => {
                 run.feed(&e, axis, &mut out, blocks.as_mut(), opts.observations)?;
             }
+            // ⚠ The stream says which store it came from, and a block
+            // store records it: a citation is an offset into ONE tape.
+            // A record without an id came from no store (a pipe), so
+            // there is nothing to attribute.
+            crate::records::Rec::Source(fields) => {
+                if let Some(w) = blocks.as_mut() {
+                    if let Some((_, id)) = fields.iter().find(|(k, _)| k == "id") {
+                        w.source_is(id)?;
+                    }
+                }
+            }
             crate::records::Rec::End(_) => ended = true,
             _ => {}
         }
