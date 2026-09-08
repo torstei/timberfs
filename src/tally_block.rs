@@ -86,16 +86,32 @@ pub struct Block {
     /// `cells[s][f]` is series `s`'s column for field `f`, as
     /// `Option<f64>` per bucket — `None` being ABSENT and not zero.
     cells: Vec<BTreeMap<Field, Vec<Option<f64>>>>,
-    /// The CITATION per cell: the span of source tape a bucket counted.
+    /// The CITATION, one span of source tape PER BUCKET rather than per
+    /// cell: the offset range every series in that bucket counted
+    /// within.
     ///
-    /// ⚠ Two more columns rather than dropped, though it is 14% of a
-    /// tally line's bytes and dropping it would have flattered every
-    /// measurement here. It is what makes a spike openable — "a sample
-    /// CITES the entries it counted, by tape offset" — so losing it
-    /// would be losing the property that distinguishes this from every
-    /// other metrics store. It costs almost nothing: an offset column is
-    /// monotonic, so its deltas are small.
-    cites: Vec<Vec<Option<(u64, u64)>>>,
+    /// ⚠ Kept, and kept coarse, and both halves matter.
+    ///
+    /// Kept, because a bucket's TIME does not bound the entries it
+    /// counted. Displacement puts an entry whose own bucket had already
+    /// sealed into the CURRENT one — that is what `!late` records — so a
+    /// time-range lookup on the source would miss exactly the entries
+    /// that made a number surprising. An offset range is exact whatever
+    /// the clock did and whatever arrived late. It is also why a
+    /// citation cannot be replaced by "the bucket's minute": that
+    /// answer is wrong in the one case anybody looks.
+    ///
+    /// Coarse, because per-cell it cost 60% of a block — 1.94 bytes a
+    /// cell, an offset delta being ~650 KB of tape per bucket where a
+    /// count is one byte — and the citation was ALREADY approximate:
+    /// "a range to READ, not the set of entries — a metric matching one
+    /// line in a hundred cites the ninety-nine between them". One span
+    /// per bucket widens an approximation rather than introducing one.
+    ///
+    /// ⚠ So a citation does NOT round-trip byte-identically: it comes
+    /// back widened, CONTAINING what it went in as. `samples` says so
+    /// and the tests assert containment rather than equality.
+    cites: Vec<Option<(u64, u64)>>,
 }
 
 impl Block {
@@ -149,8 +165,7 @@ impl Block {
                 series.iter().enumerate().map(|(i, s)| (s, i)).collect();
             let mut cells: Vec<BTreeMap<Field, Vec<Option<f64>>>> =
                 vec![BTreeMap::new(); series.len()];
-            let mut cites: Vec<Vec<Option<(u64, u64)>>> =
-                vec![vec![None; range_buckets]; series.len()];
+            let mut cites: Vec<Option<(u64, u64)>> = vec![None; range_buckets];
             for s in group {
                 let si = index[&Series::of(s)];
                 let bucket = ((s.ts - t0) / width) as usize;
@@ -160,8 +175,13 @@ impl Block {
                         .or_insert_with(|| vec![None; range_buckets]);
                     col[bucket] = Some(*v);
                 }
-                if let Some(c) = s.cite {
-                    cites[si][bucket] = Some(c);
+                if let Some((off, len)) = s.cite {
+                    // The bucket's span is the union of its series'.
+                    let (lo, hi) = match cites[bucket] {
+                        None => (off, off + len),
+                        Some((l, n)) => (l.min(off), (l + n).max(off + len)),
+                    };
+                    cites[bucket] = Some((lo, hi - lo));
                 }
             }
             out.push(Block {
@@ -201,7 +221,7 @@ impl Block {
                     metric: s.metric.clone(),
                     labels: s.labels.clone(),
                     fields,
-                    cite: self.cites[si][b],
+                    cite: self.cites[b],
                 });
             }
         }
@@ -339,23 +359,26 @@ impl Block {
                     prev = scaled;
                 }
             }
-            // Then the citation, its own bitmap and two columns. ⚠ The
-            // offset is delta-coded because a tape offset only grows, so
-            // the deltas are small where the absolute numbers are not.
-            let cite = &self.cites[si];
+        }
+        // Then ONE citation section for the block: a bitmap over buckets
+        // and two columns. ⚠ The offset is delta-coded because a tape
+        // offset only grows, so the deltas are small where the absolute
+        // numbers are not — and there are now n_buckets of them rather
+        // than one per occupied cell, which is the whole saving.
+        {
             let mut bits = vec![0u8; self.n_buckets.div_ceil(8)];
-            for (i, c) in cite.iter().enumerate() {
+            for (i, c) in self.cites.iter().enumerate() {
                 if c.is_some() {
                     bits[i >> 3] |= 1 << (i & 7);
                 }
             }
             body.extend_from_slice(&bits);
             let mut prev = 0i64;
-            for (off, _) in cite.iter().flatten() {
+            for (off, _) in self.cites.iter().flatten() {
                 put_uvarint(&mut body, zigzag(*off as i64 - prev));
                 prev = *off as i64;
             }
-            for (_, len) in cite.iter().flatten() {
+            for (_, len) in self.cites.iter().flatten() {
                 put_uvarint(&mut body, *len);
             }
         }
@@ -420,7 +443,6 @@ impl Block {
             series.push(Series { metric, labels });
         }
         let mut cells = Vec::with_capacity(n_series);
-        let mut cites = Vec::with_capacity(n_series);
         let bitmap_len = n_buckets.div_ceil(8);
         for _ in 0..n_series {
             let n_cols = get_uvarint(&body, &mut p)? as usize;
@@ -449,9 +471,11 @@ impl Block {
                 cols.insert(f, col);
             }
             cells.push(cols);
+        }
+        let cites = {
             let bits = body
                 .get(p..p + bitmap_len)
-                .context("a block ended inside a citation bitmap")?
+                .context("a block ended inside its citation bitmap")?
                 .to_vec();
             p += bitmap_len;
             let live: Vec<usize> = (0..n_buckets)
@@ -467,8 +491,8 @@ impl Block {
             for (n, i) in live.iter().enumerate() {
                 col[*i] = Some((offs[n], get_uvarint(&body, &mut p)?));
             }
-            cites.push(col);
-        }
+            col
+        };
         Ok(Block {
             width_ms,
             t0,
@@ -635,6 +659,9 @@ mod tests {
 
     /// The whole claim: the grid renders back to the lines it was built
     /// from. If this does not hold, no size measurement means anything.
+    /// ⚠ Values, identities and buckets are exact; a CITATION is not,
+    /// so these lines carry none — it has its own test, asserting
+    /// containment.
     #[test]
     fn a_block_renders_back_the_lines_it_was_packed_from() {
         let lines = [
@@ -769,26 +796,47 @@ mod tests {
         assert!(e.contains("one width"), "unhelpful: {e}");
     }
 
-    /// ⚠ The citation is what makes a spike openable, and it is 14% of a
-    /// tally line's bytes — so dropping it would have flattered every
-    /// measurement of this format. It round-trips.
+    /// ⚠ A citation comes back WIDENED to its bucket's span, and the
+    /// property is therefore CONTAINMENT rather than equality. Asserted
+    /// with TWO series in one bucket, because with one series a bucket's
+    /// union is that series' own span and the test would pass whether
+    /// the widening happened or not.
     #[test]
-    fn a_citation_survives_the_grid() {
+    fn a_citation_is_widened_to_its_bucket_and_still_contains() {
         let lines = [
-            "2026-09-06T13:37:00.000Z 60s m count=5 @0+4310",
-            "2026-09-06T13:38:00.000Z 60s m count=7 @4310+2200",
-            "2026-09-06T13:40:00.000Z 60s m count=1",
+            "2026-09-06T13:37:00.000Z 60s m a=1 count=5 @1000+100",
+            "2026-09-06T13:37:00.000Z 60s m a=2 count=5 @5000+100",
+            "2026-09-06T13:38:00.000Z 60s m a=1 count=7 @9000+50",
+            "2026-09-06T13:40:00.000Z 60s m a=1 count=1",
         ];
         let block = pack1(&lines, 60);
-        let back = Block::decode(&block.encode(3).unwrap()).unwrap();
-        assert_eq!(
-            back.samples()
+        let got = Block::decode(&block.encode(3).unwrap()).unwrap().samples();
+
+        // Both series in 13:37 cite the UNION, 1000..5100.
+        let at37: Vec<_> = got.iter().filter(|x| x.ts == s(lines[0]).ts).collect();
+        assert_eq!(at37.len(), 2, "both series came back");
+        for x in &at37 {
+            assert_eq!(x.cite, Some((1000, 4100)), "the bucket's union, widened");
+        }
+
+        // Containment, for every line that carried one.
+        for want in lines.iter().map(|l| s(l)) {
+            let Some((wo, wl)) = want.cite else { continue };
+            let had = got
                 .iter()
-                .map(|x| x.render())
-                .collect::<Vec<_>>(),
-            lines.iter().map(|l| s(l).render()).collect::<Vec<_>>(),
-            "a citation must come back, and a bucket without one must stay without"
-        );
+                .find(|x| x.ts == want.ts && x.labels == want.labels)
+                .expect("the line came back");
+            let (go, gl) = had.cite.expect("its bucket cited something");
+            assert!(
+                go <= wo && go + gl >= wo + wl,
+                "the widened span {go}+{gl} must contain {wo}+{wl}"
+            );
+        }
+
+        // And a bucket nothing cited cites nothing — absent is not zero
+        // here either.
+        let at40 = got.iter().find(|x| x.ts == s(lines[3]).ts).unwrap();
+        assert_eq!(at40.cite, None);
     }
 
     /// The name is the address: sortable by time, generation visible.

@@ -1348,10 +1348,20 @@ the on-disk shape may still move. It exists because 83% of a tally line
 is not the number — the series identity is written once per bucket, the
 bucket stamp on every line — and the only honest way to argue about that
 is to encode a real tally both ways and compare. Measured on one real
-day: 30.8 MiB of lines, 5.0 MiB as a store, 2.3 MiB as blocks, and
-268,136 lines round-tripping exactly. See
+day: 30.8 MiB of lines, 5.0 MiB as a store, 918 KiB as blocks — 5.5x —
+with 268,136 lines round-tripping and every citation containing the one it
+replaced. See
 .B docs/plans/tally-as-a-tally.md
 for what it does and does not settle.
+.IP
+⚠ A CITATION is stored once per BUCKET rather than per line, so it comes
+back WIDENED — containing the span it replaced, not equal to it. Per line
+it cost 60% of a block, and the citation is already a range to read
+rather than the set of entries, so this widens an approximation instead
+of introducing one. It is not dropped, because a bucket's TIME does not
+bound the entries it counted: a displaced entry (see LATENESS) came from
+outside the bucket's window, so a time-range lookup would miss exactly
+the entries that made a number surprising.
 .IP
 ⚠ It refuses the MARKERS
 .RB ( !cap ,
