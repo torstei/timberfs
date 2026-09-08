@@ -10,6 +10,10 @@ provisional bucket and the revision rule it introduced), and
 [tally-as-a-tally.md](tally-as-a-tally.md) (the block's cell merge, which is
 replace and would have to add).
 
+⚠ **The design is STATED in [tally-design.md](tally-design.md); this note is
+one of the arguments that reached it.** Where the two disagree, that one is
+right. Read its "What a tally is NOT" before reintroducing anything here.
+
 ## The question that has no answer
 
 `window.max_series` asks a document's author how many distinct series a bucket

@@ -6,6 +6,10 @@ times over, so this one starts from the data instead. Follows
 [tally-series-identity.md](tally-series-identity.md), which established that
 the tape model was inherited rather than chosen.
 
+⚠ **The design is STATED in [tally-design.md](tally-design.md); this note is
+one of the arguments that reached it.** Where the two disagree, that one is
+right. Read its "What a tally is NOT" before reintroducing anything here.
+
 ## What a tally actually is, measured on a real one
 
 One day of a real site's performance log — 2.7M lines, 780 MB — through that

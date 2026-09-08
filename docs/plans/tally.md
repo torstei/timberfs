@@ -12,6 +12,12 @@ derived from the file, and `--run` is the consumer that follower execs. Not
 built: the `samples` response kind, rollups, the session, and the `!gap`
 marker.
 
+⚠ **This describes the TAPE, which ships and works.** The design that
+supersedes it is [tally-design.md](tally-design.md), and a tally there is a
+grid of columnar blocks rather than a tape — so seal-once, displacement,
+`!late`, revisions and `max_series` below are all facts about what runs today
+and none of them survive into that. Do not read this file as the direction.
+
 ⚠ **The provisioned path was defective until the `taken` report** and a tally
 store written before it holds numbers that are silently short: it deadlocked
 against the follower's park and ran at 51 entries/s whatever the hardware.
