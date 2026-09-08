@@ -109,7 +109,8 @@ _timberfs() {
         --keep | --drain-every | --idle | --timeout | --from-chunk | --wait-for-writer | \
         --deadline | --positions | --batch-size | --follow-from | --delete-empty | \
         --look-in | --etc | --extractor | --metric | --width | --grace | \
-        --provision | --run)
+        --provision | --run | --pack | --unpack | --block-buckets | \
+        --query | --series | --since | --until)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0
         ;;

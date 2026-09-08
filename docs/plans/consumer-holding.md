@@ -197,6 +197,10 @@ bucket to its newest line took the last fragment for the whole. So:
   is still open. That falls out of keeping it: `safe_offset` still names its
   oldest byte.
 
+⚠ **Amended by [tally-partials.md](tally-partials.md):** a bucket never held
+to completion is never restated, so revisions and provisional buckets both
+dissolve. Until that is built, the rule below holds and readers must apply it.
+
 ⚠ **A tally tape therefore carries revisions in normal operation**, where
 before it only did in principle ("nothing emits a revision", `timbergraph`).
 Reading one newest-line-wins per bucket is now load-bearing rather than a

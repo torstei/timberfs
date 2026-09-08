@@ -61,6 +61,41 @@ messages and pull requests are for.
   wal's seal already recovers its own, the on-disk stage marker that makes the
   rest decidable, and the source witness that would let `file-intake` adopt one
   (and serve a live edge) without writing every byte twice.
+- [tally-as-a-tally.md](tally-as-a-tally.md) — a tally store designed from the
+  data rather than from the tape it inherited. Measured on a real day: 83% of
+  a tally line is not the number, the grid is 21% dense, and a columnar block
+  is **5.5× smaller than the shipped store's `.trunk`** — 0.69 GB against
+  3.76 GB over a two-year retention, measured rather than estimated. A series becomes an object and a bucket
+  start a position, which makes the presence bitmap enforce "zero and unknown
+  are different", makes provisional values a mutable cell rather than a
+  revision, and makes regeneration a manifest diff — and a replication
+  protocol unnecessary, per [tally-partials.md](tally-partials.md). Sized
+  against six contiguous real days: a day-sized block costs +4% over a
+  six-day one, and the working set saturates rather than drifting.
+- [tally-series-identity.md](tally-series-identity.md) — a metric is a series,
+  and whether two series combine is the READER's decision: the shipped fold
+  makes it at storage time and irreversibly. The remedy is that the definitions
+  travel with the tally store and their names are the namespace, so a metric
+  name is unique within one tally. The ordinary edit — a regex fixed, a metric
+  added or removed — is an in-place update that breaks no series; a changed
+  MEANING is the exception the generation machinery serves. Why an
+  offset-scoped definition fails as a reader's contract and works as
+  provenance; and why the tape model was inherited rather than chosen — a log
+  entry is a fact, a tally bucket is a conclusion, and only the prefix older
+  than the source's retention horizon is irreplaceable.
+- [tally-partials.md](tally-partials.md) — a tally that never holds a bucket
+  to completion, and therefore needs no cardinality cap. `window.max_series`
+  asks its author to predict traffic that has not happened, and it does not
+  bound the memory it exists to bound. It comes from one decision — a bucket
+  is accumulated in memory until complete, then written once — and the input
+  is replayable while `Field::combine` is already the associative merge, so
+  spilling partials is legal. Four other mechanisms dissolve with the cap; the
+  bill is mandatory compaction. Its second half is about recovery, where being
+  a tally rather than a follower pays: the output is a function of source
+  entries still on disk, so a crash is answered by re-deriving rather than by
+  reconciling partials — and the citation, useless as a dedup key, is the right
+  rewind point. Provenance and coverage are two byte ranges that must stop
+  being one word.
 - [tally.md](tally.md) — metrics derived from the log as a tape of their own:
   the extractor as a consumer (and therefore backfillable), the one invariant
   that decides the line format, and how a site declares extractors of its own.

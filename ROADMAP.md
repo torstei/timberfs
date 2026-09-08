@@ -916,6 +916,83 @@ here.
   `Roller::add`'s per-new-series scan being a 4.16 s → 61.7 s cliff — and the
   in-flight bound question. Note:
   [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
+- **A tally store designed from the data**: measured on one real day of a
+  site's own performance tally (2.7M log lines in, 268,140 tally lines out,
+  992 series over 1,260 buckets), 83% of a line is not the number — series
+  identity 44%, bucket stamps 24%, citations 14% — because the row key is
+  written into every occupied cell of a grid that is only 21% dense, and
+  compression cannot recover it: **a columnar block is 5.5× smaller than the
+  shipped store's `.trunk`** (measured, not estimated: 917.5 KiB against
+  5,034 KiB for one real day), 0.69 GB against 3.76 GB over a two-year
+  retention. ⚠ 6.2× against the whole store on disk, but that compares a
+  searchable store with a block carrying no token index, so 5.5× is the figure
+  to quote.
+  So: a series is an object with an id, a definition and a unit, written once;
+  a bucket start is a POSITION in a block and costs no bytes; measures are
+  columns, which is what makes coarsening a column operation under the rule
+  the field name already names. Three things fall out — a presence bitmap
+  enforces "zero and unknown are different" structurally, a provisional value
+  is a mutable cell so the 0.33.0 supersede rule disappears, and a block
+  addressed `(t0, generation)` makes regeneration a manifest diff — and makes
+  a REPLICATION protocol unnecessary, since immutable crc32'd blocks under a
+  manifest are copied correctly by any file sync that writes the manifest last
+  ([docs/plans/tally-partials.md](docs/plans/tally-partials.md) records that
+  decision and the two rules a hand copy needs). The text line format survives
+  as the INTERCHANGE form, so
+  `query`, `timbergraph` and `--fold` keep working. Design note:
+  [docs/plans/tally-as-a-tally.md](docs/plans/tally-as-a-tally.md).
+- **A tally that never holds a bucket to completion** (removes a knob):
+  `window.max_series` asks a document's author how many distinct series a
+  bucket will hold, which is a prediction about traffic that has not happened
+  — so moving it to a site file changes who guesses, not whether it is one.
+  Measured over six real days, the count the cap sees (367 per bucket at
+  worst) is 2.3× smaller than the day's union somebody would size it on, the
+  document that produced it sets 4,000, and per-metric enforcement over three
+  open bucket-starts permits ~48,000 live series that no file states — while
+  no unit sets `MemoryMax`, so this unsettable count is the only bound on
+  memory. It comes from one decision, not a hazard: a bucket is accumulated
+  in memory until complete, then written once. A database would have spilled
+  and merged instead (PostgreSQL 13 added exactly that to `HashAgg`, removing
+  the need to estimate cardinality in advance). It is not forced here either:
+  the input is a store with a recorded position, so the accumulator is
+  replayable, and `Field::combine` is already the associative merge. Spill
+  instead, and cardinality costs I/O and disk — the resource `retain_size`
+  and head-drop already govern. `max_series`, `!cap`, `grace_ms` as a
+  correctness boundary, displacement/`!late`, and the 0.33.0 revision rule all
+  go with it. ⚠ Additive partials are NOT idempotent, but recovery is not the
+  place that bites: unlike a follower, which shipped bytes it cannot un-ship, a
+  tally is a function of source entries still on disk, so it RE-DERIVES what it
+  is unsure of and a position is efficiency rather than correctness — and the
+  citation, useless as a dedup key, is exactly the right rewind point.
+  ⚠ Re-derivation is exact only once DISPLACEMENT is gone, so purity is a
+  property this design gains rather than assumes. What remains is
+  representation and identity: keep partials as blocks in a set and merge at
+  read, never fold on receipt, and `Manifest::put` retains one block per `t0`
+  — right for a generation, fatal for a partial. Design note:
+  [docs/plans/tally-partials.md](docs/plans/tally-partials.md).
+- **A metric is a series, and combining it is the reader's decision** (a real
+  defect): `tally --fold` sums two definitions' measurements into one number,
+  because `Roller` keys a bucket on `(start, metric, labels)` and nothing on
+  the line says which definition produced it — so the question "are these one
+  series" is answered by the STORAGE layer, at write time, irreversibly.
+  `Run::new`'s refusal is the symptom rather than the rule, and contradicts
+  itself in one function: its comment says apache's and nginx's
+  `http_requests` are the same measurement, its error says they are two. The
+  remedy is small: the resolved definitions are copied into the tally store at
+  creation and their short names prefix the metrics, so a name is unique within
+  one tally by construction, "which definition produced this" is answerable
+  from the store rather than from whatever is installed locally, and drift is
+  reported so the operator can apply it. The id that keys a series to its
+  definition is settled: an ASSIGNED counter (never a position — removing a
+  metric is an ordinary edit), living on a metric table rather than on every
+  series, with the prefix demoted to the DISPLAY form a human types in a
+  query. It also carries the unit, which the current `!meta` inference asks
+  the reader's own host for. ⚠ The ordinary edit — a regex fixed,
+  a metric added or removed — is an in-place update that breaks no series;
+  only a changed MEANING wants a new tally, which makes the source store's
+  retention the budget for changing your mind. `:` is already legal in a
+  metric name, so none of it is a format change. Design note:
+  [docs/plans/tally-series-identity.md](docs/plans/tally-series-identity.md).
 - **Declarations scoped to a range of the tape**: everything a store
   declares about itself is true of the WHOLE store, and some of it is only
   ever true of a stretch. A producer that changed its line format mid-life

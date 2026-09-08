@@ -225,7 +225,7 @@ impl Sample {
 /// Whole seconds, always: a width is written in the syntax `retain`
 /// takes and rendered back canonically, so `5m` in a rule and `300s` on
 /// the tape are the same width said twice.
-fn render_width(ms: u64) -> String {
+pub(crate) fn render_width(ms: u64) -> String {
     format!("{}s", ms / 1000)
 }
 
@@ -237,7 +237,7 @@ fn parse_width(t: &str) -> anyhow::Result<u64> {
     Ok(ms)
 }
 
-fn parse_stamp(t: &str) -> anyhow::Result<u64> {
+pub(crate) fn parse_stamp(t: &str) -> anyhow::Result<u64> {
     let dt = chrono::DateTime::parse_from_rfc3339(t)
         .with_context(|| format!("{t:?} is not an RFC3339 timestamp"))?;
     let ms = dt.timestamp_millis();
@@ -543,6 +543,38 @@ impl Roller {
             b.cite_hi = Some(b.cite_hi.map_or(off + len, |hi| hi.max(off + len)));
             b.off_lo = Some(b.off_lo.map_or(off, |lo| lo.min(off)));
         }
+    }
+
+    /// The OPEN buckets, as samples, without consuming or marking
+    /// anything.
+    ///
+    /// What a checkpoint of the open region writes: the buckets that
+    /// have not sealed, which is `width + grace` of them and therefore
+    /// small whatever the cardinality. See
+    /// docs/plans/tally-as-a-tally.md — the open region is a block that
+    /// is not finished, and a reader that reads it sees the current
+    /// minute without anything having been written to a sealed block.
+    ///
+    /// ⚠ Non-consuming, unlike `drain`, and that is the point: a
+    /// checkpoint is a COPY of state that is still changing, so a
+    /// checkpoint that evicted would be a drain by another name, and a
+    /// checkpoint that marked buckets clean would make the NEXT one skip
+    /// them and lose whatever arrived meanwhile.
+    pub fn open_buckets(&self) -> Vec<Sample> {
+        let mut out = Vec::new();
+        for (key, b) in self.buckets.iter() {
+            if self.sealed(key.0) {
+                continue;
+            }
+            let mut s = Sample::new(key.0, self.width_ms, &key.1);
+            s.labels = key.2.clone();
+            s.fields = b.fields.iter().map(|(f, (v, _))| (*f, *v)).collect();
+            if let (Some(lo), Some(hi)) = (b.cite_lo, b.cite_hi) {
+                s.cite = Some((lo, hi - lo));
+            }
+            out.push(s);
+        }
+        out
     }
 
     /// The buckets `how` asks for, with whatever markers they owe.

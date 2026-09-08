@@ -1332,6 +1332,114 @@ shows the tape as written, both lines included, which is what a tape
 viewer should do. See LATENESS below for when a provisional line is
 written.
 .PP
+.B PACKING THE GRID (EXPERIMENTAL, A MEASUREMENT)
+.PP
+.BI \-\-pack " DIR"
+reads tally lines and writes them as columnar BLOCKS — the grid of
+series × buckets, one file per range, each measure a column — and
+.BI \-\-unpack " DIR"
+renders them back to lines.
+.BI \-\-block\-buckets " N"
+sets how many buckets one block spans (default 1440, a day of 60s
+buckets, which is where compression stops improving).
+.IP
+⚠ A MEASUREMENT rather than a feature: nothing else reads these yet, and
+the on-disk shape may still move. It exists because 83% of a tally line
+is not the number — the series identity is written once per bucket, the
+bucket stamp on every line — and the only honest way to argue about that
+is to encode a real tally both ways and compare. Measured on one real
+day: 30.8 MiB of lines, 5.0 MiB as a store, 918 KiB as blocks — 5.5x —
+with 268,136 lines round-tripping and every citation containing the one it
+replaced. See
+.B docs/plans/tally-as-a-tally.md
+for what it does and does not settle.
+.IP
+⚠ A CITATION is stored once per BUCKET rather than per line, so it comes
+back WIDENED — containing the span it replaced, not equal to it. Per line
+it cost 60% of a block, and the citation is already a range to read
+rather than the set of entries, so this widens an approximation instead
+of introducing one. It is not dropped, because a bucket's TIME does not
+bound the entries it counted: a displaced entry (see LATENESS) came from
+outside the bucket's window, so a time-range lookup would miss exactly
+the entries that made a number surprising.
+.IP
+.BI \-\-query " DIR"
+reads lines back out, selecting series with
+.BI \-\-series " EXPR"
+(the predicate
+.B "list \-\-select"
+takes, with the metric as the key
+.BR metric ,
+so
+.BR "[metric=http_requests,status=500]" )
+and bounding them with
+.BI \-\-since " T"
+and
+.BI \-\-until " T".
+.IP
+⚠ It reports what it did NOT touch, which is the number worth having and
+the one most log stores cannot give without doing the work: TWO prunings,
+neither reading a number it does not need. The manifest says which blocks
+hold a bucket in the window, so the rest are never opened at all; and the
+series table at the front of each opened block says which series it holds,
+so the columns of those the predicate did not pick are STEPPED OVER
+instead of decoded. Measured on six real days: the whole store is
+1,351,587 lines in 624 ms reading 4.2 MiB, and one metric of one day is
+357 lines in 12 ms reading 924 KiB with 990 of 997 series stepped over
+\(em 53x, on the same data.
+.IP
+⚠ Decompression is the FLOOR: a block is one zstd frame and zstd has no
+seek, so an opened block is decompressed whole and what selection saves
+is the parsing. Framing per series to save the decompression too would
+cost compression on every block to speed up a minority of reads.
+.PP
+⚠ A
+.B manifest.json
+beside the blocks is the store's STATE and its COMMIT POINT: which ranges
+it holds, at which generation, with what size and crc32, and a
+.B floor
+saying how far back it still answers for \(em so a window retention took
+away and a window nothing ever measured are told apart, which is "zero and
+unknown are different" one level up. A block is written, then the manifest
+is rewritten (temp\-plus\-rename, and that rename IS the commit), then the
+superseded block is unlinked; a crash in either window leaves a file no
+manifest entry names, which is collectable debris rather than a store that
+lies. Reads go through the manifest and not the directory, so such debris
+is invisible.
+.IP
+⚠ Packing a range the store ALREADY HOLDS is a MERGE, at the same
+generation, and never a re\-derivation inferred from having seen the range
+before. That inference lost data: a log does not rotate on UTC midnight,
+so each day's tally spills a few buckets into the previous day, and
+treating the spill as a regeneration replaced a full day's block with the
+overlap \(em measured on real logs, three of six days fell from ~900 KB to
+~22 KB in silence. A cell present in both takes the newer value, which is
+the rule a tape already had for two lines of one bucket.
+.IP
+⚠ The buckets that have NOT SEALED live in a separate
+.B open
+file, rewritten in place as they fill and read back by
+.BR \-\-unpack
+after the sealed blocks. That is what makes a quiet store's newest minute
+visible without writing anything to a sealed block \(em and why a
+provisional value needs no revision on a tape: the value and its final
+value are the same CELL at two times, and a reader knows which it has
+from where it read it. Measured, three buckets of a thousand series with
+three measures each is 11.6 KB written in 2.3 ms, which is what makes
+checkpointing it on a tick affordable where rewriting a day-sized block
+(megabytes at that cardinality) would not be. Losing the file costs a
+re-read and never a number: the consumer's position is held behind every
+open bucket, so a restart re-derives them.
+.IP
+⚠ It refuses the MARKERS
+.RB ( !cap ,
+.BR !late ,
+.BR !drop ,
+.BR !meta )
+rather than dropping them: a marker says a bucket's numbers are wrong or
+short, and where one belongs in a grid is not decided. They stay in your
+input.
+.PP
 .B THE EXTRACTOR DOCUMENT
 .PP
 .RS

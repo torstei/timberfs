@@ -95,9 +95,15 @@ again compressed into the chunk).
 
 The invariant that makes this simple: **the sap and the in-memory buffer
 hold the same bytes, by construction.** It is write-only in steady state and
-is read exactly once, ever — by a writer's `FileStore::open`, after a crash.
-Readers (`query`/`info`/`grep`) never touch it; the "unflushed tail not
-included" note in `query`'s output stays true regardless of `--wal`.
+is read by a writer's `FileStore::open` after a crash — the one path that
+recovers it.
+
+⚠ **Readers touch it too, since the live tail.** `query` reads the sap's LIVE
+EDGE when the store declares a wal (`live.rs`), which is how an entry reaches
+a follower in 0.2 s rather than waiting out the flush age; `info` reports what
+is buffered there as `sap_pending_bytes`. The "unflushed tail not included"
+note applies to a store with no wal, where there is no readable edge to
+serve.
 
 On disk:
 

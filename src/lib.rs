@@ -46,3 +46,4 @@ pub mod sink;
 pub mod store;
 pub mod store_json;
 pub mod tally;
+pub mod tally_block;

@@ -188,6 +188,11 @@ has passed its end by `grace`, written, and **evicted**.
 > **If an entry's own bucket has already sealed, it goes in the CURRENT bucket.
 > Otherwise it goes in its own.**
 
+⚠ **Amended by [tally-partials.md](tally-partials.md):** displacement is only
+necessary because a bucket gets exactly one line. A bucket written as partials
+takes a late entry as an ordinary append to its own bucket, and `grace` stops
+being a correctness boundary.
+
 So lateness is a DISPLACEMENT, never a loss. The current bucket is unsealed by
 construction — sealing needs `watermark >= end + grace`, and the watermark is
 inside it — so nothing ever re-opens, and the placement is monotonic without
@@ -405,7 +410,11 @@ across both documents, which is worth more than the format change on its own.
 
 **The name is declared INSIDE**, never taken from the filename: renaming a file
 must not change what a document IS, the same rule a metric name and a store
-identity already follow. Two documents claiming one name is refused, naming
+identity already follow. ⚠ That sentence is wrong about the metric name, and
+the error is load-bearing: a store identity is a MINTED id and not a name,
+which is the whole of why a store is found by what it declares. A metric name
+is a string two unrelated definitions can both write, and the fold merges them.
+See [tally-series-identity.md](tally-series-identity.md). Two documents claiming one name is refused, naming
 both files.
 
 ⚠ **What JSON costs, honestly**: regexes double-escape (`\\S`, `\\d{3}`),
