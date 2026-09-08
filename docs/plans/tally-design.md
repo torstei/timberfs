@@ -147,15 +147,22 @@ the two cases separate:
   the block writer's `How::Merge` rests on**, and it is invisible from the
   writer: tighten `safe_offset` to advance further — and it sat in the middle
   of the 51-entries/s deadlock, so it has been optimisation-bait once already
-  — and blocks are corrupted by code that never mentions them.
-* **A repair does need to go back**, and it is not the writer's job: "the
-  regex was wrong, recompute last week" means resetting a follower's POSITION,
-  which is an operator act like applying a definition. ⚠ There is no verb for
-  it: `timberfs follower` has create/list/status/update/delete/run, `update`
-  changes a declaration rather than state, and a position lives in the
-  follower's own `positions.json`. So re-derivation today means deleting and
-  recreating a follower — re-reading everything — or editing that file by
-  hand.
+  — and blocks are corrupted by code that never mentions them. ⚠⚠ **And that
+  conservatism is itself a tape-shaped leftover, not a law**: it is a
+  consequence of merge REPLACING a cell. Additive partials
+  ([tally-partials.md](tally-partials.md)) let the position advance freely,
+  which is the same knot as the 51-entries/s deadlock seen from the storage
+  end. So it is load-bearing today and should not be written into the design
+  as permanent.
+* **A repair does need to go back, and a REWIND is the wrong way to do it.**
+  A tally is not only a consumer: `query --records --from X --to Y | tally`
+  is a bounded DIRECT read of the source, and it already exists. So "the regex
+  was wrong, recompute last week" is a one-shot pass over that window while
+  the follower keeps going forward — no position is moved, and the live path
+  is never interrupted. ⚠ What it needs is `How::Regenerate` rather than
+  `Merge`, which the writer does not expose: merging a recomputation into
+  what is there would replace cell by cell and leave any series the new
+  definition no longer produces standing.
 
 ## Copying is a file sync or a bundle
 
@@ -211,10 +218,11 @@ a working set that saturates rather than drifting.
 * **compaction's schedule**, and whether a query merges or refuses;
 * **the write-batching mechanism** — a WAL for samples in the `.sap` shape is
   the candidate, since one late sample otherwise rewrites a whole day block;
-* **a rewind verb**, without which the re-derivation this design leans on is
-  only reachable by deleting a follower or editing its positions file. It is
-  what makes "fix the definition and recompute" an operation rather than a
-  plan.
+* **a repair pass** — a bounded read with `How::Regenerate`, which is what
+  makes "fix the definition and recompute" an operation rather than a plan.
+  ⚠ Not a rewind of the follower: the direct read already exists, and moving
+  a live position to recompute history would stop the live path to fix the
+  past.
 
 ⚠ **A defect that exists today:** `commit` renames a block into place and THEN
 saves the manifest, so a rewrite at the same `(t0, generation)` leaves a window
