@@ -1,7 +1,7 @@
 use timberfs::{
     append, bark, export, feed, follow, follower, forest, forward, fs, grain, import, incus,
     incus_intake, list, note, otlp_intake, query, querydoc, rotate, select, ship, sink, store,
-    tally,
+    tally, tally_block,
 };
 
 use std::path::PathBuf;
@@ -644,7 +644,7 @@ enum Command {
         #[arg(
             long = "extractor",
             value_name = "PATH",
-            required_unless_present_any = ["fold", "provision", "run"]
+            required_unless_present_any = ["fold", "provision", "run", "pack", "unpack"]
         )]
         extractors: Vec<PathBuf>,
         /// Validate the extractors and apply them to PLAIN LOG LINES on
@@ -667,6 +667,24 @@ enum Command {
         /// format --fold takes
         #[arg(long)]
         observations: bool,
+        /// EXPERIMENTAL, and a measurement rather than a feature: read
+        /// tally lines on stdin and write them as columnar BLOCKS into
+        /// DIR — the grid of series x buckets, one file per range,
+        /// stored as columns. Reports what it cost against the lines it
+        /// was given. See docs/plans/tally-as-a-tally.md; nothing else
+        /// reads these yet
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["extractors", "fold", "provision", "run", "try_it", "check"])]
+        pack: Option<PathBuf>,
+        /// The inverse of --pack: render the blocks in DIR back to tally
+        /// lines on stdout, which is the claim that the line format is
+        /// the INTERCHANGE form and not the storage
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["extractors", "fold", "provision", "run", "try_it", "check", "pack"])]
+        unpack: Option<PathBuf>,
+        /// With --pack: how many buckets one block spans. A day of
+        /// 60s buckets is 1440, which is where compression stops
+        /// improving (measured; +4% against a six-day block)
+        #[arg(long, value_name = "N", default_value_t = 1440, requires = "pack")]
+        block_buckets: usize,
         /// Only these metrics — for recomputing one over history without
         /// rewriting the rest. Repeatable
         #[arg(long, value_name = "NAME")]
@@ -1877,6 +1895,9 @@ fn main() -> anyhow::Result<()> {
             try_it,
             check,
             observations,
+            pack,
+            unpack,
+            block_buckets,
             metric,
             provision,
             dry_run,
@@ -1887,6 +1908,12 @@ fn main() -> anyhow::Result<()> {
             width,
             grace,
         } => {
+            if let Some(dir) = pack {
+                return tally_block::cmd_pack(&dir, block_buckets);
+            }
+            if let Some(dir) = unpack {
+                return tally_block::cmd_unpack(&dir);
+            }
             if let Some(set) = run {
                 return tally::cmd_run(&set, &tally::RunOpts { etc, create: true });
             }

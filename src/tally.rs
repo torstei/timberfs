@@ -225,7 +225,7 @@ impl Sample {
 /// Whole seconds, always: a width is written in the syntax `retain`
 /// takes and rendered back canonically, so `5m` in a rule and `300s` on
 /// the tape are the same width said twice.
-fn render_width(ms: u64) -> String {
+pub(crate) fn render_width(ms: u64) -> String {
     format!("{}s", ms / 1000)
 }
 
@@ -237,7 +237,7 @@ fn parse_width(t: &str) -> anyhow::Result<u64> {
     Ok(ms)
 }
 
-fn parse_stamp(t: &str) -> anyhow::Result<u64> {
+pub(crate) fn parse_stamp(t: &str) -> anyhow::Result<u64> {
     let dt = chrono::DateTime::parse_from_rfc3339(t)
         .with_context(|| format!("{t:?} is not an RFC3339 timestamp"))?;
     let ms = dt.timestamp_millis();

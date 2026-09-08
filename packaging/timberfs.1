@@ -1332,6 +1332,36 @@ shows the tape as written, both lines included, which is what a tape
 viewer should do. See LATENESS below for when a provisional line is
 written.
 .PP
+.B PACKING THE GRID (EXPERIMENTAL, A MEASUREMENT)
+.PP
+.BI \-\-pack " DIR"
+reads tally lines and writes them as columnar BLOCKS — the grid of
+series × buckets, one file per range, each measure a column — and
+.BI \-\-unpack " DIR"
+renders them back to lines.
+.BI \-\-block\-buckets " N"
+sets how many buckets one block spans (default 1440, a day of 60s
+buckets, which is where compression stops improving).
+.IP
+⚠ A MEASUREMENT rather than a feature: nothing else reads these yet, and
+the on-disk shape may still move. It exists because 83% of a tally line
+is not the number — the series identity is written once per bucket, the
+bucket stamp on every line — and the only honest way to argue about that
+is to encode a real tally both ways and compare. Measured on one real
+day: 30.8 MiB of lines, 5.0 MiB as a store, 2.3 MiB as blocks, and
+268,136 lines round-tripping exactly. See
+.B docs/plans/tally-as-a-tally.md
+for what it does and does not settle.
+.IP
+⚠ It refuses the MARKERS
+.RB ( !cap ,
+.BR !late ,
+.BR !drop ,
+.BR !meta )
+rather than dropping them: a marker says a bucket's numbers are wrong or
+short, and where one belongs in a grid is not decided. They stay in your
+input.
+.PP
 .B THE EXTRACTOR DOCUMENT
 .PP
 .RS
