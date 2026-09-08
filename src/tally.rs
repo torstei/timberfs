@@ -1391,6 +1391,19 @@ pub struct TallyOpts {
     pub metrics: Vec<String>,
     /// Override the extractors' own window.
     pub width_ms: Option<u64>,
+    /// Write the numbers as columnar BLOCKS into this directory instead
+    /// of as lines on stdout (docs/plans/tally-design.md).
+    ///
+    /// ⚠ One store in, one directory out, which is why it is on this
+    /// path and not on `--run`: a provisioned run serves a SELECTION,
+    /// one sink per source store, and where each one's blocks go is a
+    /// provisioning question rather than a writer one.
+    pub blocks: Option<PathBuf>,
+    /// Samples buffered before a commit. The write-amplification
+    /// control: a block is a day, so a commit rewrites up to a
+    /// megabyte.
+    pub block_flush: usize,
+    pub block_buckets: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1436,9 +1449,9 @@ pub fn fold_stream(
             );
         }
         roller.add(&s);
-        let _ = emit(out, roller.drain(Drain::Sealed))?;
+        let _ = emit(out, None, roller.drain(Drain::Sealed))?;
     }
-    let _ = emit(out, roller.drain(Drain::Final))?;
+    let _ = emit(out, None, roller.drain(Drain::Final))?;
     Ok(())
 }
 
@@ -1675,10 +1688,12 @@ impl Run {
         e: &crate::records::EntryRec,
         axis: Axis,
         out: &mut impl Write,
+        blocks: Option<&mut crate::tally_block::Writer>,
         observations: bool,
     ) -> anyhow::Result<Option<(u64, u64)>> {
         let mut batch: Vec<Sample> = Vec::new();
         let mut meta: Option<(u64, u64)> = None;
+        let to_blocks = blocks.is_some();
         for l in self.live.iter_mut() {
             let ts = match axis {
                 Axis::Logline => e.ts,
@@ -1706,7 +1721,12 @@ impl Run {
                     // every line: the tape outlives the document that
                     // described it, and a number whose unit is unknown is
                     // a number nobody can act on.
-                    if !l.announced {
+                    // ⚠ Announced only on the LINE path. A block store
+                    // carries the definitions, and a unit is a property
+                    // of a definition — so writing it here would be the
+                    // same fact in two places, one of them a marker the
+                    // grid does not hold (docs/plans/tally-design.md).
+                    if !l.announced && !to_blocks {
                         l.announced = true;
                         if let Some(u) = &l.unit {
                             meta = span(meta, Some((ts, ts)));
@@ -1733,7 +1753,7 @@ impl Run {
                 batch.extend(l.roller.drain(Drain::Sealed));
             }
         }
-        Ok(span(meta, emit(out, batch)?))
+        Ok(span(meta, emit(out, blocks, batch)?))
     }
 
     /// A quiet stream: let wall clock stand in for event time, write
@@ -1746,7 +1766,19 @@ impl Run {
     /// has not reached — and every entry arriving after that is then
     /// displaced out of its own bucket. So the newest bucket is shown
     /// rather than sealed, and superseded when it is complete.
-    fn idle(&mut self, now_ms: u64, out: &mut impl Write) -> anyhow::Result<Option<(u64, u64)>> {
+    ///
+    /// ⚠ Into BLOCKS this rests on `Block::merge` REPLACING a cell: a
+    /// provisional bucket states its total so far, and the complete one
+    /// later states the whole total again. When merge becomes additive
+    /// for partials (docs/plans/tally-partials.md) this double-counts,
+    /// and the third identity component that note asks for is what
+    /// stops it.
+    fn idle(
+        &mut self,
+        now_ms: u64,
+        out: &mut impl Write,
+        blocks: Option<&mut crate::tally_block::Writer>,
+    ) -> anyhow::Result<Option<(u64, u64)>> {
         let mut batch: Vec<Sample> = Vec::new();
         for l in self.live.iter_mut() {
             if l.roller.watermark() == 0 {
@@ -1757,12 +1789,13 @@ impl Run {
             l.roller.advance_to(now_ms);
             batch.extend(l.roller.drain(Drain::Provisional));
         }
-        emit(out, batch)
+        emit(out, blocks, batch)
     }
 
     fn finish(
         &mut self,
         out: &mut impl Write,
+        blocks: Option<&mut crate::tally_block::Writer>,
         observations: bool,
     ) -> anyhow::Result<Option<(u64, u64)>> {
         if observations {
@@ -1772,7 +1805,7 @@ impl Run {
         for l in self.live.iter_mut() {
             batch.extend(l.roller.drain(Drain::Final));
         }
-        emit(out, batch)
+        emit(out, blocks, batch)
     }
 }
 
@@ -1838,20 +1871,48 @@ pub fn cmd_tally(opts: &TallyOpts) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let mut blocks = match &opts.blocks {
+        None => None,
+        Some(dir) => {
+            if opts.observations {
+                bail!("--observations prints width-0s observations, which are not a grid");
+            }
+            Some(crate::tally_block::Writer::open(
+                dir,
+                width_of(&docs, opts)?,
+                opts.block_buckets,
+                opts.block_flush,
+                3,
+            )?)
+        }
+    };
     let stdin = std::io::stdin();
     let mut reader = crate::records::Reader::new(stdin.lock());
     let mut ended = false;
     while let Some(rec) = reader.next_rec()? {
         match rec {
             crate::records::Rec::Entry(e) => {
-                run.feed(&e, axis, &mut out, opts.observations)?;
+                run.feed(&e, axis, &mut out, blocks.as_mut(), opts.observations)?;
             }
             crate::records::Rec::End(_) => ended = true,
             _ => {}
         }
     }
-    run.finish(&mut out, opts.observations)?;
+    run.finish(&mut out, blocks.as_mut(), opts.observations)?;
     out.flush()?;
+    if let Some(w) = &mut blocks {
+        w.flush()?;
+        crate::note!(
+            "timberfs: {} sample(s) into {} block write(s){}",
+            w.committed,
+            w.blocks_written,
+            if w.markers > 0 {
+                format!("; {} marker(s) not stored", w.markers)
+            } else {
+                String::new()
+            }
+        );
+    }
     if !ended {
         bail!("the record stream ended without stream-end — the answer is truncated");
     }
@@ -1885,9 +1946,9 @@ pub fn try_text(
     let entries = entries_of_text(text)?;
     let mut tally: Vec<u8> = Vec::new();
     for e in &entries {
-        run.feed(e, axis, &mut tally, opts.observations)?;
+        run.feed(e, axis, &mut tally, None, opts.observations)?;
     }
-    run.finish(&mut tally, opts.observations)?;
+    run.finish(&mut tally, None, opts.observations)?;
     Ok(Tried {
         entries: entries.len(),
         tally: String::from_utf8_lossy(&tally).into_owned(),
@@ -1917,6 +1978,44 @@ fn axis_of(docs: &[(PathBuf, Extractor)]) -> anyhow::Result<Axis> {
         }
     }
     Ok(first.window.axis)
+}
+
+/// Samples buffered before a commit, and buckets per block.
+///
+/// ⚠ The flush default is a WRITE-AMPLIFICATION choice, not a latency
+/// one: a block is a day, so each commit rewrites up to a megabyte, and
+/// a real day of a busy store is ~268,000 samples — so this is a
+/// handful of rewrites a day rather than one per batch. A sample is not
+/// in a block until it is flushed, which is the cost.
+pub const DEFAULT_BLOCK_FLUSH: usize = 50_000;
+/// A day at 60s, which two measurements settled
+/// (docs/plans/tally-as-a-tally.md).
+pub const DEFAULT_BLOCK_BUCKETS: usize = 1440;
+
+/// The one bucket width a run makes, which a block store must hold.
+///
+/// ⚠ Refused rather than reconciled when the documents disagree: a
+/// store holds one width, and combining two would be coarsening one of
+/// them silently.
+fn width_of(docs: &[(PathBuf, Extractor)], opts: &TallyOpts) -> anyhow::Result<u64> {
+    if let Some(w) = opts.width_ms {
+        return Ok(w);
+    }
+    let mut it = docs.iter();
+    let (first_path, first) = it.next().expect("load_extractors refuses an empty set");
+    for (path, doc) in it {
+        if doc.window.width_ms != first.window.width_ms {
+            bail!(
+                "{} buckets at {} and {} at {} — one block store holds one width, \
+                 so give --width to pick it",
+                first_path.display(),
+                render_width(first.window.width_ms),
+                path.display(),
+                render_width(doc.window.width_ms)
+            );
+        }
+    }
+    Ok(first.window.width_ms)
 }
 
 /// Plain text into the SAME entries a store would yield: the real
@@ -1958,14 +2057,27 @@ fn entries_of_text(text: &[u8]) -> anyhow::Result<Vec<crate::records::EntryRec>>
 ///
 /// Reports the BUCKET WINDOW it wrote, which is what stamps the chunk:
 /// a tally store's write axis is the minutes its lines are about.
-fn emit(out: &mut impl Write, mut batch: Vec<Sample>) -> anyhow::Result<Option<(u64, u64)>> {
+fn emit(
+    out: &mut impl Write,
+    blocks: Option<&mut crate::tally_block::Writer>,
+    mut batch: Vec<Sample>,
+) -> anyhow::Result<Option<(u64, u64)>> {
     batch.sort_by(|a, b| (a.ts, &a.metric, &a.labels).cmp(&(b.ts, &b.metric, &b.labels)));
     let window = match (batch.first(), batch.last()) {
         (Some(f), Some(l)) => Some((f.ts, l.ts)),
         _ => None,
     };
-    for s in batch {
-        writeln!(out, "{}", s.render())?;
+    // ⚠ One destination or the other, never both: the position this
+    // returns is what advances a consumer, and a sample counted twice
+    // by a downstream that reads the lines AND the blocks would be
+    // double-counted rather than merged.
+    match blocks {
+        Some(w) => w.take(batch)?,
+        None => {
+            for s in batch {
+                writeln!(out, "{}", s.render())?;
+            }
+        }
     }
     Ok(window)
 }
@@ -2611,6 +2723,11 @@ impl TallyOpts {
             metrics: Vec::new(),
             width_ms,
             fold: None,
+            // A provisioned run writes its sinks' tapes; where each
+            // sink's blocks would go is the provisioning's question.
+            blocks: None,
+            block_flush: DEFAULT_BLOCK_FLUSH,
+            block_buckets: DEFAULT_BLOCK_BUCKETS,
         }
     }
 }
@@ -2687,7 +2804,7 @@ pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
                 let now = crate::store::now_ms();
                 for (id, sink) in sinks.iter_mut() {
                     let mut lines: Vec<u8> = Vec::new();
-                    let window = sink.run.idle(now, &mut lines)?;
+                    let window = sink.run.idle(now, &mut lines, None)?;
                     sink.write(&lines, window)?;
                     report(&mut reports, id, sink)?;
                 }
@@ -2731,7 +2848,7 @@ pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
                 }
                 let sink = sinks.get_mut(&id).expect("just inserted");
                 let mut lines: Vec<u8> = Vec::new();
-                let window = sink.run.feed(&e, axis, &mut lines, false)?;
+                let window = sink.run.feed(&e, axis, &mut lines, None, false)?;
                 sink.write(&lines, window)?;
                 if let Some(off) = e.offset {
                     sink.delivered_to = Some(off + e.payload.len() as u64);
@@ -2747,7 +2864,7 @@ pub fn cmd_run(set: &str, opts: &RunOpts) -> anyhow::Result<()> {
     // no half-counted minute behind.
     for (id, sink) in sinks.iter_mut() {
         let mut lines: Vec<u8> = Vec::new();
-        let window = sink.run.finish(&mut lines, false)?;
+        let window = sink.run.finish(&mut lines, None, false)?;
         sink.write(&lines, window)?;
         let cfg = sink.store.cfg;
         if let Some(f) = sink.store.files.get_mut(&sink.name) {
@@ -3535,6 +3652,9 @@ mod tests {
                 etc: PathBuf::from("/etc/timberfs"),
                 try_it: true,
                 check: false,
+                blocks: None,
+                block_flush: DEFAULT_BLOCK_FLUSH,
+                block_buckets: DEFAULT_BLOCK_BUCKETS,
                 observations: false,
                 metrics: Vec::new(),
                 width_ms: None,
@@ -3694,7 +3814,9 @@ mod tests {
         // stamp — so the window must cover it or the chunk holding it is
         // stamped from somewhere else entirely.
         let first = entries_of_text(b"2026-09-06T13:37:10.000Z hello\n").unwrap();
-        let meta = run.feed(&first[0], Axis::Logline, &mut out, false).unwrap();
+        let meta = run
+            .feed(&first[0], Axis::Logline, &mut out, None, false)
+            .unwrap();
         assert_eq!(
             meta,
             Some((
@@ -3706,8 +3828,9 @@ mod tests {
         // Two buckets seal at the end: the window is the first and the
         // last, not the moment they were folded.
         let later = entries_of_text(b"2026-09-06T13:39:10.000Z hello\n").unwrap();
-        run.feed(&later[0], Axis::Logline, &mut out, false).unwrap();
-        let sealed = run.finish(&mut out, false).unwrap();
+        run.feed(&later[0], Axis::Logline, &mut out, None, false)
+            .unwrap();
+        let sealed = run.finish(&mut out, None, false).unwrap();
         assert_eq!(
             sealed,
             Some((

@@ -1332,6 +1332,34 @@ shows the tape as written, both lines included, which is what a tape
 viewer should do. See LATENESS below for when a provisional line is
 written.
 .PP
+.B WRITING THE GRID (EXPERIMENTAL)
+.PP
+.BI \-\-blocks " DIR"
+writes the numbers as columnar BLOCKS into DIR instead of as tally lines
+on stdout \(em the storage the design settles on, where a line is the
+INTERCHANGE form and not the store. Verified against 300,000 real log
+lines: the blocks render back to exactly what the line path wrote.
+.IP
+.BI \-\-block\-flush " N"
+is how many samples are buffered before a commit (default 50000). ⚠ It is
+a WRITE\-AMPLIFICATION control and not a latency one: a block is a day, so
+each commit rewrites up to a megabyte, and one real day of a busy store is
+~268,000 samples. Measured on 300,000 lines, the same numbers cost 43, 5
+or 1 block writes at 1000, 10000 and 50000. The cost of buffering is
+VISIBILITY \(em a sample is not in a block until it is flushed \(em and the
+cost of losing the buffer to a crash is a re\-read, the position not
+having moved. The durable form of it would be a write\-ahead log for
+samples.
+.IP
+⚠ ONE store in, one directory out, which is why it is here and not on
+.BR \-\-run :
+a provisioned run serves a SELECTION, one sink per source store, and
+where each one's blocks go is a provisioning question rather than a
+writer one.
+.IP
+⚠ Nothing is written to stdout, the unit announcement included: a block
+store carries its own definitions, and a unit is a property of one.
+.PP
 .B PACKING THE GRID (EXPERIMENTAL, A MEASUREMENT)
 .PP
 .BI \-\-pack " DIR"

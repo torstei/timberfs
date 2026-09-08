@@ -110,6 +110,7 @@ _timberfs() {
         --deadline | --positions | --batch-size | --follow-from | --delete-empty | \
         --look-in | --etc | --extractor | --metric | --width | --grace | \
         --provision | --run | --pack | --unpack | --block-buckets | \
+        --blocks | --block-flush | \
         --query | --series | --since | --until)
         COMPREPLY=($(compgen -f -- "$cur"))
         return 0

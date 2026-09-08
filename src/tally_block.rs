@@ -1091,6 +1091,109 @@ pub fn query(
     Ok((out, t))
 }
 
+/// Writes sealed samples into a store's blocks as they arrive.
+///
+/// ⚠ It BUFFERS, and the buffer is the write-amplification control. A
+/// block is a day, so committing one sample rewrites up to a megabyte;
+/// buffering `limit` samples makes that once per `limit` instead. The
+/// cost of the buffer is VISIBILITY — a sample is not in a block until
+/// it is flushed — and the cost of losing it to a crash is a re-read,
+/// the position not having moved.
+///
+/// The durable version of this is a WAL for samples in the `.sap`
+/// shape; see docs/plans/tally-design.md, which has that as the open
+/// question this buffer stands in for.
+pub struct Writer {
+    dir: std::path::PathBuf,
+    m: Manifest,
+    block_buckets: usize,
+    level: i32,
+    limit: usize,
+    held: Vec<Sample>,
+    pub committed: usize,
+    pub blocks_written: usize,
+    pub markers: usize,
+}
+
+impl Writer {
+    /// Open a store to write into, creating its manifest if there is
+    /// none. ⚠ The width is the WINDOW's, and a manifest that disagrees
+    /// is refused rather than adopted: a store holds one bucket width,
+    /// and coarsening is a different operation on a column.
+    pub fn open(
+        dir: &std::path::Path,
+        width_ms: u64,
+        block_buckets: usize,
+        limit: usize,
+        level: i32,
+    ) -> anyhow::Result<Writer> {
+        if block_buckets == 0 {
+            bail!("a block spans at least one bucket");
+        }
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let m = match Manifest::load(dir)? {
+            Some(m) => {
+                if m.width_ms != width_ms {
+                    bail!(
+                        "{} holds {} buckets and this run makes {}",
+                        dir.display(),
+                        crate::tally::render_width(m.width_ms),
+                        crate::tally::render_width(width_ms)
+                    );
+                }
+                m
+            }
+            None => Manifest::new(width_ms, block_buckets),
+        };
+        Ok(Writer {
+            dir: dir.to_path_buf(),
+            m,
+            block_buckets,
+            level,
+            limit: limit.max(1),
+            held: Vec::new(),
+            committed: 0,
+            blocks_written: 0,
+            markers: 0,
+        })
+    }
+
+    /// Take a batch. Markers are counted and not stored — a marker
+    /// states something about a RUN and the grid holds numbers
+    /// (docs/plans/tally-design.md).
+    pub fn take(&mut self, batch: Vec<Sample>) -> anyhow::Result<()> {
+        for s in batch {
+            if s.is_marker() {
+                self.markers += 1;
+            } else {
+                self.held.push(s);
+            }
+        }
+        if self.held.len() >= self.limit {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Commit what is held. ⚠ `How::Merge`, always: a range being
+    /// filled is one derivation arriving in pieces, and inferring a
+    /// regeneration from having seen the range before is the defect that
+    /// silently replaced three of six real days.
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let held = std::mem::take(&mut self.held);
+        let n = held.len();
+        for b in Block::pack(&held, self.block_buckets)? {
+            commit(&self.dir, &mut self.m, &b, self.level, How::Merge)?;
+            self.blocks_written += 1;
+        }
+        self.committed += n;
+        Ok(())
+    }
+}
+
 // ------------------------------------------------------------- the verbs
 
 /// A block's file name: sortable by time, generation visible, derivable
@@ -2000,6 +2103,77 @@ mod tests {
         assert_eq!(a, "20260906T000000.g0");
         assert_eq!(b, "20260907T000000.g2");
         assert!(a < b, "directory order must be time order");
+    }
+
+    /// What the writer stores is what the lines would have said. If this
+    /// does not hold, the block path is a different tally rather than
+    /// the same one stored differently — which is the whole claim.
+    /// ⚠ A flush limit of 2 forces several commits over one range, so
+    /// this also exercises the merge every commit after the first is.
+    #[test]
+    fn what_the_writer_stores_is_what_the_lines_said() {
+        let dir = tmpdir("w1");
+        let lines = [
+            "2026-09-06T13:37:00.000Z 60s m a=1 count=1 sum=10",
+            "2026-09-06T13:38:00.000Z 60s m a=1 count=2 sum=20",
+            "2026-09-06T13:38:00.000Z 60s m a=2 count=3 sum=30",
+            "2026-09-06T13:39:00.000Z 60s other b=1 count=4",
+        ];
+        let mut w = Writer::open(&dir, 60_000, 60, 2, 3).unwrap();
+        for l in lines {
+            w.take(vec![s(l)]).unwrap();
+        }
+        w.flush().unwrap();
+        assert_eq!(w.committed, 4);
+        assert!(w.blocks_written > 1, "the limit should have forced commits");
+
+        let (got, _) = query(&dir, &sel("[]"), 0, u64::MAX).unwrap();
+        assert_eq!(
+            got.iter().map(|x| x.render()).collect::<Vec<_>>(),
+            lines,
+            "the grid must render back to the lines it was given"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Markers are counted and not stored: a marker states something
+    /// about a RUN and the grid holds numbers
+    /// (docs/plans/tally-design.md).
+    #[test]
+    fn the_writer_counts_markers_and_stores_none() {
+        let dir = tmpdir("w2");
+        let mut w = Writer::open(&dir, 60_000, 60, 100, 3).unwrap();
+        w.take(vec![
+            s("2026-09-06T13:37:00.000Z 60s m a=1 count=1"),
+            s("2026-09-06T13:37:00.000Z 60s !drop metric=m reason=unreadable count=2"),
+            s("2026-09-06T13:37:00.000Z 0s !meta metric=m unit=calls"),
+        ])
+        .unwrap();
+        w.flush().unwrap();
+        assert_eq!((w.committed, w.markers), (1, 2));
+        let (got, _) = query(&dir, &sel("[]"), 0, u64::MAX).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].metric, "m");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store holds ONE bucket width, so reopening it with another is
+    /// refused rather than adopted — coarsening is a different
+    /// operation on a column, not something a second run may do by
+    /// arriving with a different window.
+    #[test]
+    fn a_writer_will_not_change_a_stores_width() {
+        let dir = tmpdir("w3");
+        let mut w = Writer::open(&dir, 60_000, 60, 100, 3).unwrap();
+        w.take(vec![s("2026-09-06T13:37:00.000Z 60s m a=1 count=1")])
+            .unwrap();
+        w.flush().unwrap();
+        let err = match Writer::open(&dir, 300_000, 60, 100, 3) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a second width was accepted"),
+        };
+        assert!(err.contains("60s") && err.contains("300s"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Garbage in must not panic. Defence in depth rather than a
