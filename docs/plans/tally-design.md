@@ -123,6 +123,42 @@ the host reading it.
   where the documents say one thing and the numbers are another, and nothing in
   it is wrong enough to notice.
 
+## It is fed sequentially, by a follower
+
+**Settled, with numbers.** The fold reads its source from beginning to end,
+once, in one process — the follower's `--run` consumer. The follower is not
+merely the delivery mechanism: it holds the position durably, holds the
+source's retention back while the tally is behind it, supplies the registry
+and the systemd lifecycle, and restarts into exactly the re-fold `safe_offset`
+makes correct.
+
+⚠ **Parallel workers were considered and are not the first thing to reach
+for.** Two facts:
+
+* **It needs additive partials**, which is their THIRD use after spilling and
+  repair — two workers can both contribute to one bucket, and with a merge
+  that replaces a cell the second silently erases the first. And it must
+  partition by SOURCE POSITION rather than by day: a day's entries are not
+  contiguous in the source (late arrivals are why a citation exists at all),
+  and there is no per-chunk logline range to find them by
+  ([logline-order.md](logline-order.md)). Partitioning by chunk range falls
+  out for free, a worker's consumed range being the partial identity already
+  wanted.
+* **The gain is small.** Measured over 300,000 real lines: reading records
+  0.52 s, the fold 4.53 s, writing blocks 0.05 s — so blocks are 1% and the
+  fold is 90%. A day is ~47 s single-threaded, and the largest backfill that
+  can ever be asked for is the SOURCE's retention (weeks, not years, since
+  nothing can tally what was dropped), so a 30-day rebuild is ~24 minutes
+  once.
+
+⚠ **And the obvious fold optimisation is not there either**, which is worth
+recording so it is not re-proposed: the four metrics of the measured document
+each run their own extract regex over every line, but cost is spread evenly
+and the metric with the SMALLEST regex (17 characters) is joint-most expensive
+at 1.31 s, because it is a histogram of 22 buckets and turns one line into 22
+samples. The cost is per sample produced and per metric evaluated, not per
+regex byte, so sharing the extraction wins much less than it looks.
+
 ## Recovery is re-derivation
 
 A follower's position is precious because it shipped bytes it cannot un-ship.
