@@ -1363,6 +1363,21 @@ bound the entries it counted: a displaced entry (see LATENESS) came from
 outside the bucket's window, so a time-range lookup would miss exactly
 the entries that made a number surprising.
 .IP
+⚠ The buckets that have NOT SEALED live in a separate
+.B open
+file, rewritten in place as they fill and read back by
+.BR \-\-unpack
+after the sealed blocks. That is what makes a quiet store's newest minute
+visible without writing anything to a sealed block \(em and why a
+provisional value needs no revision on a tape: the value and its final
+value are the same CELL at two times, and a reader knows which it has
+from where it read it. Measured, three buckets of a thousand series with
+three measures each is 11.6 KB written in 2.3 ms, which is what makes
+checkpointing it on a tick affordable where rewriting a day-sized block
+(megabytes at that cardinality) would not be. Losing the file costs a
+re-read and never a number: the consumer's position is held behind every
+open bucket, so a restart re-derives them.
+.IP
 ⚠ It refuses the MARKERS
 .RB ( !cap ,
 .BR !late ,
