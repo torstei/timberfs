@@ -68,7 +68,8 @@ messages and pull requests are for.
   3.77 GB over a two-year retention. A series becomes an object and a bucket
   start a position, which makes the presence bitmap enforce "zero and unknown
   are different", makes provisional values a mutable cell rather than a
-  revision, and makes regeneration and replication a manifest diff. Sized
+  revision, and makes regeneration a manifest diff — and a replication
+  protocol unnecessary, per [tally-partials.md](tally-partials.md). Sized
   against six contiguous real days: a day-sized block costs +4% over a
   six-day one, and the working set saturates rather than drifting.
 - [tally-series-identity.md](tally-series-identity.md) — a metric is a series,

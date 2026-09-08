@@ -929,8 +929,12 @@ here.
   the field name already names. Three things fall out — a presence bitmap
   enforces "zero and unknown are different" structurally, a provisional value
   is a mutable cell so the 0.33.0 supersede rule disappears, and a block
-  addressed `(range, generation)` makes regeneration and replication a
-  manifest diff. The text line format survives as the INTERCHANGE form, so
+  addressed `(t0, generation)` makes regeneration a manifest diff — and makes
+  a REPLICATION protocol unnecessary, since immutable crc32'd blocks under a
+  manifest are copied correctly by any file sync that writes the manifest last
+  ([docs/plans/tally-partials.md](docs/plans/tally-partials.md) records that
+  decision and the two rules a hand copy needs). The text line format survives
+  as the INTERCHANGE form, so
   `query`, `timbergraph` and `--fold` keep working. Design note:
   [docs/plans/tally-as-a-tally.md](docs/plans/tally-as-a-tally.md).
 - **A tally that never holds a bucket to completion** (removes a knob):

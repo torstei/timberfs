@@ -257,18 +257,77 @@ implementing this:
 `(t0, generation)` — which is now also what keeps re-derivation idempotent
 while partials are not.
 
-**Replication is unaffected in shape and gains one requirement.** It is still a
-manifest diff; a partial is simply another block. But the receiver must dedup
-rather than append what it is handed: by `(t0, generation)` for a generation,
-and by the consumed offset range for a partial. A sender that retries is the
-ordinary case, not the exceptional one, so this is a requirement on the
-protocol and not a repair for it.
+**Replication is not being built** — see the section below, which is the
+decision rather than a deferral.
 
 **The marker question gets easier.** `Block::pack` refuses markers today
 because where they live is unsettled, and `!cap` was the marker that could not
 be dropped — it declares the numbers understated. With no cap there is no
 `!cap`, and `!late` becomes provenance rather than a correction, so what
 remains to place cannot corrupt the grid by being lost.
+
+## Why there is no replication
+
+Decided rather than deferred, on the numbers. Measured on one real day: the
+source log is 780 MB over 2.7M lines, the tally it produces is 30.8 MB of text
+and **2.38 MB as a block** — 0.3% of its source — and re-deriving it costs
+about 9 s of CPU at the extractor's measured 310,000 entries/s. Both shipping
+and recomputing are so cheap that cost cannot decide, so the failure modes do.
+
+**Two use cases, and neither needs a protocol.**
+
+*Somewhere else with a longer retention.* Either re-derive there from the
+source that was shipped anyway, or copy the files. Copying is the safer of the
+two because it gives **one answer** rather than two: a receiver folding with a
+different version of a document produces numbers that silently disagree with
+the sender's, which is the hazard
+[tally-series-identity.md](tally-series-identity.md) exists about. And copying
+needs nothing built — the format is immutable blocks named `(t0, generation)`
+under a manifest with a crc32 per entry, which `read_block` already verifies
+and refuses on mismatch, so **a copied store self-validates on read**.
+
+*Reading the tally somewhere local, for graphs.* That is a query, and it
+already works.
+
+⚠ **This is a property the block format bought, and it cost something to buy.**
+A tally store TODAY is an ordinary timberfs store, so the existing frames
+machinery already ships it; the block format takes that away. What it gives
+back is a directory a plain file copy handles correctly, which an append-only
+tape cannot be — the live edge is why frames exists at all.
+
+**The one case where the bytes are irreplaceable** is worth naming, because it
+is not either of the above: a tally kept for two years against a source kept
+for weeks cannot be re-derived once the source ages out, anywhere. That argues
+for BACKUP, and a backup is a file copy too.
+
+### What the invariant rests on
+
+Regenerating centrally is sound because the references run one way — tally to
+source, never back. Verified at the four places it could fail: the tally store
+inherits its source's provenance and cites source offsets; a store's manifest
+names no consumer; a follower's `positions.json` lives in the follower's own
+directory rather than the store's; and `retain_unconsumed`, the only place a
+store depends on consumers at all, is resolved by `TickInterest::floor` reading
+the follower REGISTRY, so followers find the store by selection and the store
+holds no reference to any of them.
+
+⚠ But `retain_unconsumed` travels in a shipped manifest. It is inert where no
+follower is registered, and pins retention where one is registered and stalls —
+bounded only by the `retain_size` that bark requires alongside it for this
+reason.
+
+### Until then, the copy is documented rather than provided
+
+A `timberfs tally push`/`pull`/`sync` is where the ordering and any locking
+belong when this is wanted. Doing it by hand needs two rules:
+
+- **Blocks first, manifest last.** The manifest is the commit point, so the
+  reverse order leaves a receiver holding a manifest that cites files it does
+  not have. It is the same order the local commit already follows — superseded
+  blocks are unlinked only AFTER the manifest is saved — and a deleting sync
+  must delete after the transfer for the same reason.
+- **Do not copy `open`.** It is rewritten in place, so a copy can be torn.
+  Sealed history copies; the live edge is queried.
 
 ## Open
 

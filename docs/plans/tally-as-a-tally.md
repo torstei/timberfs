@@ -452,7 +452,10 @@ of a first cut.
 ## Why zstd, and why the lack of seek does not decide it
 
 Asked before replication, on the reasoning that a wire format is
-expensive to change. Measured on one real day:
+expensive to change. ⚠ There is no replication protocol — see
+[tally-partials.md](tally-partials.md) — but the reasoning stands for the
+block itself, which is the durable form either way. Measured on one real
+day:
 
 **zstd earns its place.** The block body is already delta+zigzag+varint
 coded and zstd still finds **2.42×** on top of it — 2,276,648 bytes of
