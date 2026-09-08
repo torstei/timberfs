@@ -48,12 +48,13 @@ const VERSION: u8 = 1;
 
 /// One series' identity, written once per block.
 ///
-/// ⚠ The DEFINITION belongs here too, and is why a name needs no
-/// prefix: what a number means is a property of the series, not of a
-/// string somebody chose. Not carried yet — the extractor has no id to
-/// put in it (docs/plans/tally-series-identity.md), so the field is
-/// deliberately absent rather than filled with the document's name,
-/// which is a handle and not an identity.
+/// ⚠ Which DEFINITION produced it is not carried yet, and belongs on a
+/// metric table rather than here: a metric maps to one definition, so a
+/// field here would repeat it once per series. An assigned id into the
+/// definitions stored with the tally is the settled shape
+/// (docs/plans/tally-series-identity.md); until it exists, "which
+/// definition" is answerable only from whatever documents the reader's
+/// own host happens to have.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Series {
     pub metric: String,

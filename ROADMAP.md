@@ -982,7 +982,12 @@ here.
   creation and their short names prefix the metrics, so a name is unique within
   one tally by construction, "which definition produced this" is answerable
   from the store rather than from whatever is installed locally, and drift is
-  reported so the operator can apply it. ⚠ The ordinary edit — a regex fixed,
+  reported so the operator can apply it. The id that keys a series to its
+  definition is settled: an ASSIGNED counter (never a position — removing a
+  metric is an ordinary edit), living on a metric table rather than on every
+  series, with the prefix demoted to the DISPLAY form a human types in a
+  query. It also carries the unit, which the current `!meta` inference asks
+  the reader's own host for. ⚠ The ordinary edit — a regex fixed,
   a metric added or removed — is an in-place update that breaks no series;
   only a changed MEANING wants a new tally, which makes the source store's
   retention the budget for changing your mind. `:` is already legal in a

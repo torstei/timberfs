@@ -406,6 +406,40 @@ Worth keeping as an idea for elsewhere: a producer that changed its line format
 mid-life has one `timestamp_regex` today, and that IS a range-scoped
 declaration problem where regeneration is not an option.
 
+## Settled: an assigned id, and the prefix is the display form
+
+The id was open because a name is a handle rather than an identity. That
+objection only bites if the id must CARRY identity — and it does not, once the
+definition is stored beside the numbers: then the stored content is the
+identity and the id is a pointer into it, unambiguous within one tally store
+and nowhere else. So it is a small assigned number, and being short is free
+rather than a trade.
+
+* ⚠ **Assigned, never positional.** A monotone counter kept with the
+  definitions, never reused. Removing a metric is an ordinary edit (above), and
+  an index into a list renumbers everything after the hole while written blocks
+  still hold the old numbers. `tally_block`'s `Entry` already carries this
+  rule — "the address is `(t0, generation)`, never a position in a sequence".
+* **It attaches to the METRIC, not the series.** Within a store a metric maps
+  to exactly one definition, which is what makes uniqueness mechanical, so an
+  id per series would repeat it once per series — 843 times for one metric on
+  the measured day. A metric table in the block gives it one home, and stops
+  the metric NAME being repeated across the dictionary too. Not a size win,
+  zstd already squashing that repetition; one home rather than N is the reason.
+* **The record is `id -> definition` plus an append-only log of replacements**
+  — when, and at what offset. That is the provenance this note already
+  requires, and it is why an id's definition may be replaced while the id
+  never moves.
+* **Ids never travel.** Fleet comparison is a comparison of definitions, so two
+  stores' id 1 are unrelated, and nothing should try to make them global.
+
+**And the prefix is the display form** — what a human types in a query and what
+a rendered line shows. It is therefore NOT structural: inside a block,
+`http_requests` under definition 1 and under definition 2 are already distinct
+without it. Both forms are served, each by what suits it: the id inside the
+block, the prefix in the text interchange, which has no metric table and needs
+a name a reader can tell apart.
+
 ## What changes
 
 A first cut, in order, and none of it needs the generation conventions:
@@ -436,9 +470,11 @@ state, the generation naming, and the shared-property split.
   and `.trunk`; the `.bark` does not travel today. So "the definition follows
   the tape" across replication is unanswered, and it is the case that matters
   most for a tally kept longer than its log.
-* **Whether the prefix is mandatory or only on collision.** Mandatory is
-  uniform and makes every existing name change; on-collision keeps today's
-  names and makes the prefix conditional, which is a rule with an exception.
+* ~~Whether the prefix is mandatory or only on collision.~~ **Mandatory**,
+  following from the prefix being the display form: a name that changes when a
+  second document arrives is a worse display name than a uniform one, and a
+  query typed against a name has to keep working. Uniqueness does not rest on
+  it either way, the id being the discriminator where one is needed.
 * **Whether the shipped `-apache-combined` and `-nginx-combined` should
   declare a shared measurement id**, so drawing them as one line is a stated
   fact rather than a name coincidence — the smallest test of whether the
