@@ -508,6 +508,36 @@ recorded definitions against the documents on disk. Its home is the
 provisioning's converge run, which already executes on a timer and at every
 deploy and is where an operator already looks.
 
+### Applying makes them current, in one act
+
+⚠ **What this must never become is "apply, and then remember to restart
+something".** A configuration write that needs a remembered second step is a
+defect rather than a procedure: the interval between the two is a state where
+the documents say one thing and the numbers are another, and nothing in it is
+wrong enough to notice. So APPLY is one command with one outcome — the
+definitions are current when it returns, or it failed and said so.
+
+Whether that involves restarting a follower, stopping one, or only writing a
+file is an implementation detail, and today it is a restart: the writer reads
+its documents once — `load_extractors` and `Run::new` are each called once,
+and the record loop never re-reads — so a document edited under a running
+writer changes nothing until it starts again.
+
+**That forces the order, and the obvious order is wrong.** Stop the follower
+so its position becomes durable, write `definitions/<that position>.json` if
+the content differs, then start it. Writing the file FIRST and restarting
+after leaves the follower free to advance past the recorded offset before it
+stops, so the file claims a set applied from a point where the previous one
+was still producing numbers. Each step is idempotent, so a re-run converges;
+and if the start fails the filed definitions are not merely harmless but
+correct, the position not having moved.
+
+⚠ **So there is no drift to report, and that is the point** — an unapplied
+edit is a no-op by design, and the state where a store's record disagrees with
+what is running is unreachable rather than monitored. What remains useful is
+"what would applying change", which is `--dry-run` on the same command rather
+than a mechanism of its own.
+
 **Finding the ACTIVE set is a readdir and a sort, and that is deliberately not
 optimised.** The cost is a rounding error against what the same directory
 already holds — one block per day, so ~730 entries at a two-year retention,
@@ -532,6 +562,16 @@ ways: the restarting writer either finds its definitions identical and files
 nothing, or files a newer set and leaves the premature one standing as a
 record of definitions nothing was produced under. Misleading provenance at
 worst, never a wrong number.
+
+**The write order is `definitions -> blocks -> manifest`**, each step
+referenced only by the next, so every crash window leaves unreferenced debris
+rather than a dangling reference — a block must never cite an id nothing
+defines. ⚠ A definitions file is found by readdir rather than named by the
+manifest, so an orphan from a crash IS taken as the active set. Benign,
+because the position it names has not moved: the restarting writer either
+finds its definitions identical and files nothing, or files a newer set and
+leaves the premature one standing as a record of definitions nothing was
+produced under.
 
 ⚠ **A lone block is deliberately not self-describing.** It names its
 definition by id; the store holds the text. That is the split the assigned id
