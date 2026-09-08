@@ -362,9 +362,9 @@ while partials are not.
 **Replication is not being built** — see the section below, which is the
 decision rather than a deferral.
 
-**The marker question gets easier.** `Block::pack` refuses markers today
-because where they live is unsettled, and `!cap` was the marker that could not
-be dropped — it declares the numbers understated. With no cap there is no
+**The marker question is answered, by deletion.** `Block::pack` refuses
+markers today because where they live was unsettled, and `!cap` was the marker
+that could not be dropped — it declares the numbers understated. With no cap there is no
 `!cap`, no `!late` and no `!drop` either — so there is nothing left to place,
 and `Block::pack`'s refusal of markers is right by design rather than a
 placeholder. A marker states something about a RUN; the grid holds numbers.

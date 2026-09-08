@@ -51,6 +51,11 @@ find blocks. It holds:
   separates DROPPED from NEVER WRITTEN;
 * one **entry per block**: `t0`, `n_buckets`, `generation`, `bytes`, `crc32`.
 
+⚠ Of those, only `v`, `width_ms`, `block_buckets`, `floor` and the entries
+exist in `Manifest` today. The identity, the source, the labels and the
+retention are designed and unbuilt — do not read this section as a description
+of the struct.
+
 ## Writing
 
 The extractor folds entries into buckets and writes them into blocks. A bucket
