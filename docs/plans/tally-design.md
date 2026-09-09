@@ -125,15 +125,14 @@ the host reading it.
 
 ## It is fed sequentially, by a follower
 
-**Settled, with numbers.** The fold reads its source from beginning to end,
-once, in one process — the follower's `--run` consumer. The follower is not
+The fold reads its source from beginning to end, once, in one process — the follower's `--run` consumer. The follower is not
 merely the delivery mechanism: it holds the position durably, holds the
 source's retention back while the tally is behind it, supplies the registry
 and the systemd lifecycle, and restarts into exactly the re-fold `safe_offset`
 makes correct.
 
-⚠ **Parallel workers were considered and are not the first thing to reach
-for.** Two facts:
+⚠ **Parallel workers are not the first thing to reach for**, for two
+reasons:
 
 * **It needs additive partials**, which is their THIRD use after spilling and
   repair — two workers can both contribute to one bucket, and with a merge
@@ -151,9 +150,9 @@ for.** Two facts:
   nothing can tally what was dropped), so a 30-day rebuild is ~24 minutes
   once.
 
-⚠ **And the obvious fold optimisation is not there either**, which is worth
-recording so it is not re-proposed: the four metrics of the measured document
-each run their own extract regex over every line, but cost is spread evenly
+⚠ **Nor is sharing the extraction, obvious as it looks.** The four metrics of
+the measured document each run their own extract regex over every line, and
+cost is spread evenly
 and the metric with the SMALLEST regex (17 characters) is joint-most expensive
 at 1.31 s, because it is a histogram of 22 buckets and turns one line into 22
 samples. The cost is per sample produced and per metric evaluated, not per
@@ -179,17 +178,11 @@ the two cases separate:
   source byte any OPEN bucket still depends on. A consumer may not report past
   this". The position is therefore always behind every unfinished bucket, so a
   restart re-sends from before that bucket's FIRST entry, re-folds it whole,
-  and the complete total replaces the partial one. ⚠ **This is the invariant
-  the block writer's `How::Merge` rests on**, and it is invisible from the
-  writer: tighten `safe_offset` to advance further — and it sat in the middle
-  of the 51-entries/s deadlock, so it has been optimisation-bait once already
-  — and blocks are corrupted by code that never mentions them. ⚠⚠ **And that
-  conservatism is itself a tape-shaped leftover, not a law**: it is a
-  consequence of merge REPLACING a cell. Additive partials
-  ([tally-partials.md](tally-partials.md)) let the position advance freely,
-  which is the same knot as the 51-entries/s deadlock seen from the storage
-  end. So it is load-bearing today and should not be written into the design
-  as permanent.
+  and the complete total replaces the partial one. ⚠ **The block writer's
+  `How::Merge` depends on this, invisibly**: advance `safe_offset` any further
+  and blocks are corrupted by code that never mentions them. ⚠ That dependency
+  is a consequence of a merge REPLACING a cell — under additive partials
+  ([tally-partials.md](tally-partials.md)) the position may advance freely.
 * **A repair does need to go back, and a REWIND is the wrong way to do it.**
   A tally is not only a consumer: `query --records --from X --to Y | tally`
   is a bounded DIRECT read of the source, and it already exists. So "the regex
