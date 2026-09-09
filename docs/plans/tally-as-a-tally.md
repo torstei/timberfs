@@ -6,6 +6,9 @@ times over, so this one starts from the data instead. Follows
 [tally-series-identity.md](tally-series-identity.md), which established that
 the tape model was inherited rather than chosen.
 
+⚠ **[tally-design.md](tally-design.md) is the design and is authoritative
+where this note differs.** This one holds the reasoning.
+
 ## What a tally actually is, measured on a real one
 
 One day of a real site's performance log — 2.7M lines, 780 MB — through that
@@ -128,9 +131,15 @@ expressed directly instead of re-derived from text.
 
 ## The open edge stops being a special case
 
-A block whose range has not closed is **open**: mutable, checkpointed,
-rewritten as its cells fill. When the range passes `grace` it is **finalised**
-and compressed.
+A block whose range is still filling is **just a block**, rewritten as its
+cells fill, for as long as the store answers for that range at all.
+
+⚠ **Amended by [tally-partials.md](tally-partials.md):** an earlier version of
+this section had such a block "open" and then "finalised" once its range
+passed `grace`, in a file of its own. There is no such distinction — sealing is
+the tape's answer to getting one write per bucket, and it was the seal that
+manufactured the open region. The bound on rewriting is `Manifest::floor`, the
+range the store no longer answers for.
 
 ⚠ **There is no revision concept, because there is nothing to revise.** A
 provisional value is a cell in an open block; its final value is the same cell
@@ -227,21 +236,25 @@ cardinality an explicit decision rather than a surprise.
 
 ### ⚠ The last column is the catch, and it is the `.sap` tension again
 
-A day's block is 184 KB at 50 series and 3.7 MB at 1000, and an open block
-rewritten on every checkpoint means rewriting that much every couple of
-seconds. Which is exactly the bind
+A day's block is 184 KB at 50 series and 3.7 MB at 1000, and rewriting one on
+every flush means rewriting that much every couple of seconds. Which is exactly
+the bind
 [docs/design.md](../design.md) names for logs — "chunking has two masters that
 want opposite things: compression wants chunks big and infrequent; durability
 wants every byte on disk the instant it arrives" — arriving here as
 *compression wants a day and checkpointing wants a handful of buckets*.
 
-**The resolution is the same shape: decouple them.**
+**The resolution is the same shape: decouple them** — and ⚠ the first version
+of this list decoupled them with an *open region*, a mutable file of the
+unsealed buckets. That went with the seal
+([tally-partials.md](tally-partials.md)). What is left is the same tension and
+two candidate answers, neither settled:
 
-* the **open region** holds only the buckets that have not sealed — `width +
-  grace`, so three of them at the defaults. 3 buckets × 1000 series × 2
-  measures is ~12 KB, cheap to rewrite at any cardinality;
-* a **sealed bucket is appended to the current day's block as a SEGMENT** — a
-  short column region covering the buckets that sealed since the last append;
+* a **WAL for tally samples**, the `.sap` shape one level up: append what
+  arrives, cheaply and durably, and fold it into blocks in batches. This is the
+  mechanism the tree already has vocabulary and precedent for;
+* a **flush appends a SEGMENT to the current day's block** — a short column
+  region covering the buckets written since the last append;
 * when the day closes the segments are **compacted** into one column region,
   which is where the compression knee is actually collected. Compaction reads
   immutable input and writes a new generation of the same block, so it is the
@@ -395,13 +408,17 @@ more time.
 
 ## How the files are named
 
+⚠ **Amended** — this sketch showed a `.bark`, a `b/` subdirectory and an
+`open` file, none of which survive: identity moved into the manifest and the
+open region went with the seal. What the prototype writes, and what
+[tally-design.md](tally-design.md) states:
+
     web-access-tally/
-      web-access-tally.bark          declared properties, as any store
-      web-access-tally.tally        the MANIFEST — authoritative
-      b/20260906T000000Z.g1         a sealed day, generation 1
-      b/20260907T000000Z.g1
-      b/20260908T000000Z.g2         this day was regenerated
-      open                          the unsealed buckets, temp+rename
+      manifest.json                 identity, retention, the floor, the blocks
+      20260906T000000.g1            one day, generation 1
+      20260907T000000.g1
+      20260908T000000.g2            this day was regenerated
+      definitions/00000000123.json  the documents in force from that offset
 
 Four properties, each the reason for a part of it:
 
@@ -411,12 +428,14 @@ Four properties, each the reason for a part of it:
   generation is visibly a different file. ⚠ Deliberately not content-addressed:
   a digest as the filename makes replication idempotent and dedupes, but makes
   a directory an operator inspects completely opaque. The digest goes in the
-  manifest, where the replication protocol wants it anyway.
-* **Derivable from `(range, generation)`**, so a receiver can place a shipped
-  block without asking anything.
-* **A subdirectory**, so 730 block files do not sit beside the manifest and
-  the `.bark`, and a forest scan — which looks for a store's marker files —
-  does not see them at all.
+  manifest, where a receiver comparing what it holds wants it anyway.
+* **Derivable from `(t0, generation)`**, so a copy can be placed without
+  asking anything.
+* ⚠ **Amended: no subdirectory.** It was there so 730 block files would not
+  sit beside a `.bark` that a forest scan looks for — and there is no `.bark`,
+  the store not being a timberfs store. The blocks sit beside the manifest,
+  and `Manifest::unreferenced` takes every entry that is not the manifest,
+  a `.tmp` or the definitions for a block.
 
 ### The manifest is the commit point
 
@@ -435,24 +454,27 @@ already makes in this tree.
 
 ## A block, concretely enough to argue with
 
-    header    magic, version, width_ms, t0, n_buckets, generation
-    series    [ series_id, metric, labels, unit, definition_id ]   (or a ref
-              to a store-level dictionary — see Open)
-    segments  one or more, appended as buckets seal; a compacted block has
-              exactly one:
-                bucket range covered
-                presence  bitmap, n_series × n_buckets_in_segment bits
-                columns   per (series, measure): the segment's values,
-                          delta + zigzag + varint, then zstd per column region
-    footer    digest, segment offsets
+⚠ **Amended to what the prototype actually writes.** The series row carried a
+metric name, a unit and a definition id; the metric name and the definition id
+moved to a metric table (one home for one fact) and the unit moved to the
+definitions stored with the tally. Segments are a candidate for batching and
+not part of the format yet, and their trigger would be a flush, never a seal.
+
+    header    magic, version, width_ms, t0, n_buckets, generation, n_series
+              (outside the zstd frame, so coverage is readable without it)
+    metrics   [ name, definition_id ]        definition 0 means "not recorded"
+    series    [ metric_idx, labels ]
+    columns   per series, per measure: a presence bitmap over the buckets,
+              then the PRESENT values delta + zigzag + varint
+    cites     one bitmap and two columns — one source span per BUCKET
 
 Everything a reader needs to answer "metric M matching P over this range" is
 in the header and the series table; the columns are fetched only for the
 series that matched, which is the query-planning property
 [chunks-by-address.md](chunks-by-address.md) wants and gets here for free.
 
-⚠ A compacted block has one segment and an open one has many, so **a reader
-does not care which it is** — it reads the segments it needs. Compaction is
+⚠ A compacted block has one segment and a recently-written one has many, so
+**a reader does not care which it is** — it reads the segments it needs. Compaction is
 then a pure optimisation that can be skipped, deferred, or run by something
 other than the writer, which is the property that makes it safe to leave out
 of a first cut.
@@ -464,6 +486,58 @@ of a first cut.
   them. The follower path streams and does not do this, so it is `--try`'s own
   defect — and `--try` is exactly what an operator points at a day of log to
   develop a document, which is the case that makes it matter.
+
+## Identity and retention live in the block manifest
+
+**Settled.** `DECLARE` in a provisioning is passed straight to
+`bark::cmd_create`, so it IS bark's vocabulary — and a block store has no
+bark. That splits it three ways:
+
+| what `DECLARE` carries | under blocks |
+|---|---|
+| `index=true`, `timestamp_regex`, `retain_unconsumed`, … | **meaningless.** A block store has no keyword index and no line-stamp parsing to declare |
+| `retain`, `retain_size` | **an analogue**, below |
+| provenance and labels | **essential, and this is where they go** |
+
+The manifest is already the commit point and already read on every query, so
+it is where all of it belongs — the same argument that put the active
+definitions pointer there.
+
+**Its own id**, because a block store is a store in its own right: copied,
+replicated, cached and referred to. A replica is the store in another place.
+
+**The SOURCE store's id**, because a tally always comes from one — and this is
+load-bearing rather than provenance. ⚠ **A citation is an offset into the
+source's tape, so it is uninterpretable without knowing which store it
+indexes.** Re-derivation needs it too, and so does keeping a tally from being
+tallied into infinite regress.
+
+**The source's labels, copied at creation**, because the source may be DELETED
+long before the tally is. A tally kept two years against a log kept weeks is
+the only surviving witness of what it measured — which host, which service,
+which release — and without the labels an aged store is an anonymous grid.
+⚠ Copied, so they are a record of what the source said at creation and not a
+live view: relabel or rename the source and they are stale. That is the same
+rule the definitions already follow — a record, not a lock.
+
+### Retention is a whole number of blocks, which is days
+
+Retention drops whole blocks (`drop_before` removes those ending at or before
+a stamp), so **the granularity of retention IS the block range**. The range is
+settled at a day by two measurements, so `retain=730d` is honest and anything
+finer would be a rounding dressed as a setting.
+
+**And `retain_size` should exist too** — mechanically easier here than on a
+tape, since `Entry.bytes` is already in the manifest: sum it and drop from the
+oldest until under budget.
+
+⚠ **It is not a nicety. It is the backstop that the cardinality cap was
+standing in for.** [tally-partials.md](tally-partials.md) removes
+`max_series` on the grounds that a fold should spill rather than refuse, which
+leaves the question of what stops an unbounded label filling the disk. The
+answer is a size bound on the STORE, dropped from the oldest end — a resource
+bound where timberfs already puts resource bounds, rather than a cardinality
+guess in a document nobody revisits.
 
 ## Why zstd, and why the lack of seek does not decide it
 
@@ -550,9 +624,9 @@ that would want designing.
 * **Segment length**, which is now the ONLY sizing question left open — the
   block range is settled at a day by two independent measurements, synthetic
   and then six real days at +4% against a six-day block. Segment length is:
-  how many sealed buckets accumulate before a segment is appended. Short
+  how many buckets accumulate before a segment is appended. Short
   segments cost compression (2.07 B/cell at 15 minutes against 1.31 at a day)
-  and long ones cost a bigger open region to rewrite. The block range is
+  and long ones cost a longer replay after a crash. The block range is
   settled at a day by the measurements; the segment inside it is not.
 * **Whether compaction is the writer's job or a sweep's.** It reads immutable
   input and writes a new generation, so it need not be, and a `trim`-shaped
@@ -561,16 +635,18 @@ that would want designing.
 * ~~Where the dictionary lives.~~ **Per block, for self-containedness** — and
   the six-day measurement shows it is worth ~1% of the store either way, so
   it is an architectural choice rather than an economic one.
-* **What `!cap`, `!late` and `!drop` become.** They are per-bucket statements
-  about quality, so probably their own columns or bits beside the presence
-  bitmap — which would make them selectable rather than markers a reader has
-  to notice.
-* **The open block's checkpoint interval**, and whether it is durable at all:
-  the cells are re-derivable from the source, which is what
-  `Roller::safe_offset` currently holds a consumer's position back for. ⚠ A
-  durable open block would let that position advance freely, which is the
-  same knot that produced the 51-entries/s deadlock
+* ~~What `!cap`, `!late` and `!drop` become.~~ **Nothing — a block holds no
+  markers** ([tally-partials.md](tally-partials.md)). `!meta` is subsumed by
+  the definitions stored with the tally, `!cap` goes with the cardinality cap,
+  `!late` with displacement, and `!drop` counts only lines a definition
+  claimed and could not measure, which is a diagnostic for `--try` rather than
+  a number to store. So `Block::pack` refusing them is right by design.
+* **How the live edge is made durable** — a WAL, or short segments appended to
+  the day's block, or nothing at all, the cells being re-derivable from the
+  source. ⚠ Whatever it is, it decides how freely a consumer's position may
+  advance, which is the knot that produced the 51-entries/s deadlock
   ([consumer-holding.md](consumer-holding.md)) seen from the storage end.
-* **Whether a tally store is still a timberfs "store"** for `list`, `info`,
-  selection and the follower registry. It should be — those read `.bark`, and
-  a manifest can sit beside one.
+* ~~Whether a tally store is still a timberfs "store".~~ **It is not, so its
+  identity goes in the block manifest** — see below. The old answer assumed
+  a `.bark` beside the blocks; the point of the block design is that there is
+  no `.bark`.

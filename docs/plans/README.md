@@ -83,6 +83,13 @@ messages and pull requests are for.
   provenance; and why the tape model was inherited rather than chosen — a log
   entry is a fact, a tally bucket is a conclusion, and only the prefix older
   than the source's retention horizon is irreplaceable.
+- [tally-design.md](tally-design.md) — **the tally design, and authoritative
+  where the three notes below differ.** What a tally is (a grid in columnar
+  blocks, a mutable cell, identity and retention in the manifest, definitions
+  copied in), what bounds it, how it is written, read, recovered and copied.
+  It is not a timberfs store, and the property that decides which mechanisms
+  belong is that a TAPE gets one write per bucket where a block is replaced
+  whole.
 - [tally-partials.md](tally-partials.md) — a tally that never holds a bucket
   to completion, and therefore needs no cardinality cap. `window.max_series`
   asks its author to predict traffic that has not happened, and it does not

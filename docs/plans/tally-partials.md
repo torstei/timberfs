@@ -10,6 +10,9 @@ provisional bucket and the revision rule it introduced), and
 [tally-as-a-tally.md](tally-as-a-tally.md) (the block's cell merge, which is
 replace and would have to add).
 
+⚠ **[tally-design.md](tally-design.md) is the design and is authoritative
+where this note differs.** This one holds the reasoning.
+
 ## The question that has no answer
 
 `window.max_series` asks a document's author how many distinct series a bucket
@@ -105,15 +108,18 @@ What goes away with it:
 - **`grace_ms` as a correctness boundary.** It exists so a bucket gets exactly
   one line. As a latency and write-amplification choice it needs no correctness
   argument.
-- **Displacement and `!late`.** An entry whose bucket has sealed is shoved into
-  the current one because a sealed bucket cannot be reopened. A partial for an
-  older bucket is an ordinary append.
+- **Displacement.** An entry whose bucket has sealed is shoved into the
+  current one because a sealed bucket cannot be reopened. A write for an older
+  bucket is ordinary, and `!late` goes with it — see below.
 - **Revisions and provisional buckets.** The newest-line-wins rule exists so an
   incomplete bucket can be restated. A bucket never held to completion is never
   restated — which is the elegant answer to "I had not completed that bucket
   after all", by dissolving the requirement rather than serving it.
+- **The SEAL, and with it the open region.** See its own section below: it is
+  the tape's answer to "you get one shot at this bucket", and a block has no
+  such constraint.
 
-One mechanism instead of five is the argument that the cap was a symptom.
+One mechanism instead of six is the argument that the cap was a symptom.
 
 ## What it costs
 
@@ -209,6 +215,101 @@ displacement, which partials do, is what makes re-derivation exact. **Purity is
 a property this design gains, not one it assumes**, and it is a further
 argument for it rather than a precondition.
 
+## There is no seal, and the bound is the floor
+
+⚠ **This section corrects something an earlier draft of this note said**:
+that `grace` stops being a correctness boundary full stop. It stops being a
+write-once boundary; what replaces it as the bound on rewriting is below, and
+it is not `grace`.
+
+**What sealing was for.** A tape is append-only text, so a bucket gets ONE
+line and you cannot go back — you must know it is complete before writing it.
+That is what `grace` buys. A block has no such constraint: it is a file,
+replaced by temp-and-rename, addressed so a range can be re-stated. The
+premise sealing answers does not exist here.
+
+**And the seal manufactured the open region.** A block was assumed immutable,
+so the still-filling edge needed somewhere else to live — a separate file, a
+separate read path, and the only file in the store whose bytes nothing
+vouches for. Drop the seal and a filling block is just a block that gets
+rewritten. `checkpoint`, `read_open` and `Roller::open_buckets` go with it.
+
+**So what stops a block changing?** ⚠ Not the source's retention, which was
+this note's first answer and is wrong in the direction that matters: retention
+drops the OLDEST source bytes, while a late entry comes from the newest end —
+an entry the tally has not read yet, carrying an old stamp. Source retention
+bounds RE-DERIVATION (what
+[tally-series-identity.md](tally-series-identity.md) means by irreplaceable)
+and bounds lateness not at all.
+
+**The bound is the tally's own `Manifest::floor`** — already there, already
+"a claim about what this store no longer answers for". A late entry has two
+fates and no third: its block still exists, so the block is rewritten and the
+numbers get BETTER; or it is below the floor, so there is nothing to write
+into and it is a bounded loss.
+
+⚠ **And that loss is REPORTED, not stored.** A marker is keyed by bucket, so
+recording one below the floor would mean storing a fact about a bucket the
+store has forgotten, in a store organised entirely by range. So there is no
+`!late` in this design: a sample whose block still exists needs no annotation
+(the number is simply right), and one below the floor has nothing to annotate.
+What the arrival says is operational — the producer is later than this store's
+retention — and it belongs in a run-level count or a consumer `note`, where a
+fact about a run belongs.
+
+**Which leaves NO markers at all**, and that is the answer to "where do
+markers live in a block": they do not. `!meta` is subsumed by the definitions
+travelling with the store; `!cap` goes with the cap; `!late` goes with
+displacement.
+
+⚠ **`!drop` goes too**, which took three passes to see. It counts lines a
+metric CLAIMED and then could not read — not lines that failed to match, which
+are skipped and counted nowhere. So it exists only where a definition claims
+more than it can measure: a capture loose enough to match a non-number, an
+optional group that did not participate, or a decode source where a claimed
+line does not carry the measured key. A self-inflicted category, and a number
+that appears only when the definition is wrong does not belong in the storage
+format.
+
+The distinction between "not mine" and "mine but unusable" is a DIAGNOSTIC,
+and it already has a home: `--try` reports claimed/skipped/dropped/observations
+per metric against a sample, which is where a loose capture is found and fixed.
+⚠ And the general alarm beats the specific one — a producer whose format
+changes makes the metric FLATLINE, which is the signal either way, and if the
+claim stops matching too there are no drops at all. So `Outcome::Dropped` and
+the `Seen` counters stay as accounting; what goes is `note_drop` writing a
+sample into the tally.
+
+⚠ This is a decision about the BLOCK design. The tape writes `!drop` today and
+that shipped in 0.33.0; whether to stop it there is a separate call, and while
+the tape is being superseded the answer is probably no.
+
+⚠ **And no imposed lateness limit should be added**, tempting as it is for
+making part of the store stable. The trade would be a number that is stable
+but knowingly incomplete against one that improves when late data arrives, and
+for a tally the second is plainly right — correcting a number in place is the
+whole reason a mutable cell was the point. Stability is not a property anything
+here needs; a flag claiming a range is "done" would be a claim about the
+future.
+
+**What survives of `grace` is write batching**: how long to hold before
+writing, which decides how often a block is rewritten. Performance, not
+correctness. ⚠ And the cost is real — a single late entry forces
+read-merge-rewrite of a whole day block, ~917 KB measured. The answer to that
+is to BATCH late arrivals, which is what a WAL for tally samples would be for
+(the `.sap` shape, one level up): append cheaply, fold into blocks in batches.
+Never to bound them, which would pay in truth.
+
+⚠ **A defect this makes normal rather than exceptional.** `commit` renames the
+new block into place, THEN saves the manifest, so between the two the file is
+the new bytes and the manifest records the old crc32 — and `read_block` fails
+with "the block changed under the manifest, which a sealed block may not do".
+A new block and a regeneration are both safe, their names being unreferenced
+until the manifest names them; the window belongs to a rewrite at the same
+`(t0, generation)`, which was the exception and is now the common case. The fix
+is the third identity component this note already asks for, so that a write
+never lands on a name the manifest already points at.
+
 ## What that leaves for the consumed range
 
 ⚠ **A partial must never be folded on receipt.** Keep partials as blocks in a
@@ -260,11 +361,12 @@ while partials are not.
 **Replication is not being built** — see the section below, which is the
 decision rather than a deferral.
 
-**The marker question gets easier.** `Block::pack` refuses markers today
-because where they live is unsettled, and `!cap` was the marker that could not
-be dropped — it declares the numbers understated. With no cap there is no
-`!cap`, and `!late` becomes provenance rather than a correction, so what
-remains to place cannot corrupt the grid by being lost.
+**The marker question is answered, by deletion.** `Block::pack` refuses
+markers today because where they live was unsettled, and `!cap` was the marker
+that could not be dropped — it declares the numbers understated. With no cap there is no
+`!cap`, no `!late` and no `!drop` either — so there is nothing left to place,
+and `Block::pack`'s refusal of markers is right by design rather than a
+placeholder. A marker states something about a RUN; the grid holds numbers.
 
 ## Why there is no replication
 
@@ -346,10 +448,16 @@ provide: a hazard made structurally impossible beats a hazard documented.
   map is approximate — `String` labels, a `BTreeMap` per cell, allocator slack.
   Approximation is affordable here precisely because being wrong costs write
   amplification rather than truth; it would not have been under a cap.
-- **Where the ceiling comes from.** A process can read its own cgroup limit and
-  target a fraction of it, which needs no new knob and tracks whatever the unit
-  was given. Whether that is better than one number in `limits.conf` is
-  unsettled; both are answerable, unlike a series count.
+- **Where the MEMORY ceiling comes from.** A process can read its own cgroup
+  limit and target a fraction of it, which needs no new knob and tracks
+  whatever the unit was given. Whether that is better than one number in
+  `limits.conf` is unsettled; both are answerable, unlike a series count.
+  ⚠ Two different ceilings, and only this one is open: how much MEMORY before
+  spilling is a performance knob, while what stops an unbounded label filling
+  the DISK is `retain_size` on the store, settled in
+  [tally-as-a-tally.md](tally-as-a-tally.md) — dropped from the oldest end,
+  where timberfs already puts resource bounds. An earlier argument in this
+  note for "bound the resource, not the count" conflated the two.
 - **Compaction's schedule**, and whether a query merges partials or refuses to
   answer from an uncompacted range.
 - **Where a partial's consumed range is written.** `Entry` would carry it, and

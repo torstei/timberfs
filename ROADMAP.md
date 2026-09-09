@@ -916,6 +916,20 @@ here.
   `Roller::add`'s per-new-series scan being a 4.16 s → 61.7 s cliff — and the
   in-flight bound question. Note:
   [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
+- **The tally design** (authoritative where the notes below it differ): a tally is
+  a GRID — series by bucket, columnar, in day-sized blocks in a directory —
+  and not a tape. Its manifest is the commit point and holds its identity, the
+  SOURCE store's id (load-bearing: a citation is an offset into that tape),
+  the source's labels copied at creation (the source may be deleted first),
+  retention in whole blocks, and the floor. The extractor documents are copied
+  in, one immutable file per applied set named by the offset it takes effect
+  at, and applying is ONE act. Recovery is re-derivation, copying is a file
+  sync or a bundle, and there is no replication protocol. ⚠ Measured 5.5×
+  smaller than the shipped store's `.trunk`. ⚠ And it states the one property
+  that decides which mechanisms belong: a TAPE gets one write per bucket, so
+  sealing, grace, displacement and revisions all serve a premise a block —
+  replaced whole by temp-and-rename — never has. Design note:
+  [docs/plans/tally-design.md](docs/plans/tally-design.md).
 - **A tally store designed from the data**: measured on one real day of a
   site's own performance tally (2.7M log lines in, 268,140 tally lines out,
   992 series over 1,260 buckets), 83% of a line is not the number — series
