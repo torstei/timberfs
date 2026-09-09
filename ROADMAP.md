@@ -916,7 +916,7 @@ here.
   `Roller::add`'s per-new-series scan being a 4.16 s → 61.7 s cliff — and the
   in-flight bound question. Note:
   [docs/plans/consumer-holding.md](docs/plans/consumer-holding.md).
-- **The tally design, as agreed** (the statement, not an argument): a tally is
+- **The tally design** (authoritative where the notes below it differ): a tally is
   a GRID — series by bucket, columnar, in day-sized blocks in a directory —
   and not a tape. Its manifest is the commit point and holds its identity, the
   SOURCE store's id (load-bearing: a citation is an offset into that tape),

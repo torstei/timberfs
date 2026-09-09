@@ -6,9 +6,8 @@ times over, so this one starts from the data instead. Follows
 [tally-series-identity.md](tally-series-identity.md), which established that
 the tape model was inherited rather than chosen.
 
-⚠ **The design is STATED in [tally-design.md](tally-design.md); this note is
-one of the arguments that reached it.** Where the two disagree, that one is
-right, and this one keeps the argument rather than the answer.
+⚠ **[tally-design.md](tally-design.md) is the design and is authoritative
+where this note differs.** This one holds the reasoning.
 
 ## What a tally actually is, measured on a real one
 

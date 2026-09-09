@@ -10,9 +10,8 @@ provisional bucket and the revision rule it introduced), and
 [tally-as-a-tally.md](tally-as-a-tally.md) (the block's cell merge, which is
 replace and would have to add).
 
-⚠ **The design is STATED in [tally-design.md](tally-design.md); this note is
-one of the arguments that reached it.** Where the two disagree, that one is
-right, and this one keeps the argument rather than the answer.
+⚠ **[tally-design.md](tally-design.md) is the design and is authoritative
+where this note differs.** This one holds the reasoning.
 
 ## The question that has no answer
 

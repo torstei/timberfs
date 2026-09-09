@@ -6,9 +6,8 @@ irreversibly — and the remedy, which is small: the definitions travel with the
 tally store, and their names are the namespace. Amends [tally.md](tally.md),
 whose `Run::new` guard is right for a reason it does not give.
 
-⚠ **The design is STATED in [tally-design.md](tally-design.md); this note is
-one of the arguments that reached it.** Where the two disagree, that one is
-right, and this one keeps the argument rather than the answer.
+⚠ **[tally-design.md](tally-design.md) is the design and is authoritative
+where this note differs.** This one holds the reasoning.
 
 ⚠ The ordinary change to a definition — a regex fixed, a metric added, a
 metric removed — is an in-place UPDATE that does not break a series, and this

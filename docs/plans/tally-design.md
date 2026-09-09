@@ -1,18 +1,16 @@
-# The tally design, as agreed
+# The tally design
 
-**Status: design. Nothing of it is built except the block prototype.** This is
-the STATEMENT; the three notes beside it are the arguments that reached it and
-are kept for their reasoning, not their conclusions —
-[tally-as-a-tally.md](tally-as-a-tally.md) (the format, measured),
-[tally-series-identity.md](tally-series-identity.md) (definitions and ids),
-[tally-partials.md](tally-partials.md) (why the cap, the seal and the open
-region are gone). Where any of them disagrees with this file, this file is
-right and that one has an amendment marker.
+**Status: design. Nothing of it is built except the block prototype.**
 
-⚠ **Read "It is not a timberfs store" before adding a mechanism here.** The
-failure mode this document exists to prevent is reaching for a tape's answer
-because it looks like the obvious way to do things — and the test for one is
-in that section.
+This file is the design; **it is authoritative where the notes beside it
+differ.** Those hold the reasoning behind parts of it —
+[tally-as-a-tally.md](tally-as-a-tally.md) the format and its measurements,
+[tally-series-identity.md](tally-series-identity.md) definitions and ids,
+[tally-partials.md](tally-partials.md) the cardinality and durability
+arguments.
+
+⚠ Whether a mechanism belongs here is decided by **"It is not a timberfs
+store"** below.
 
 ## What a tally is
 
@@ -57,10 +55,9 @@ find blocks. It holds:
   separates DROPPED from NEVER WRITTEN;
 * one **entry per block**: `t0`, `n_buckets`, `generation`, `bytes`, `crc32`.
 
-⚠ Of those, only `v`, `width_ms`, `block_buckets`, `floor` and the entries
-exist in `Manifest` today. The identity, the source, the labels and the
-retention are designed and unbuilt — do not read this section as a description
-of the struct.
+⚠ `Manifest` holds `v`, `width_ms`, `block_buckets`, `floor` and the entries;
+the identity, the source, the labels and the retention are designed and
+unbuilt.
 
 ## Writing
 
@@ -134,19 +131,20 @@ still on disk, so it discards what may be incomplete and recomputes. A
 position is an EFFICIENCY device — do not re-read 700 GB at every restart —
 and not a correctness one.
 
-⚠ Which is exact only because displacement is gone: which bucket was "current"
-depended on the watermark, and so on where the read started. Purity is a
-property this design GAINS.
+⚠ It is exact because a sample's bucket is decided by its own stamp and
+nothing else. Nothing consults a watermark, so a re-derivation does not depend
+on where the read started.
 
 ## Copying is a file sync or a bundle
 
 Blocks that are immutable once past the floor, under a manifest with a crc32
 per entry, are copied correctly by a file sync — and `read_block` verifies that
-crc, so a copied store self-validates on read. Measured: a day is 2.38 MB of
-block against 780 MB of source, and re-deriving it costs ~9 s of CPU, so
-neither cost decides and the failure modes do. Copying gives ONE answer where
-re-deriving gives two, a receiver folding with a different document version
-disagreeing silently.
+crc, so a copied store self-validates on read.
+
+**Copy rather than re-derive**, though both are cheap (a day is 2.38 MB of
+block against 780 MB of source, and re-deriving it costs ~9 s of CPU): a copy
+gives ONE answer, where a receiver folding with a different version of a
+document disagrees with the sender silently.
 
 A hand copy needs two rules: **blocks first, manifest last** (the reverse
 leaves a manifest citing files that are not there), and a deleting sync must
@@ -156,28 +154,20 @@ ordering rule stops being load-bearing.
 
 ## ⚠ It is not a timberfs store
 
-That is the whole warning, and it is enough. A tally store is a directory of
-files with a manifest; it is not a `.bark`/`.trunk` pair, and the mechanisms
-that belong to one do not belong here.
+A tally store is a directory of files with a manifest, not a `.bark`/`.trunk`
+pair, and a tape's mechanisms do not belong in it.
 
-**The property everything follows from: a tape gets ONE write per bucket.** It
-is append-only text, so a bucket is stated once and cannot be revisited —
-which is what sealing, `grace`, displacement and revisions all exist to serve.
-A block is a file replaced whole by temp-and-rename, so that premise never
-holds, and every one of those mechanisms is answering a question this design
-does not have.
+**The property that decides it: a tape gets ONE write per bucket.** It is
+append-only text, so a bucket is stated once and cannot be revisited — which
+is what sealing, `grace`, displacement and revisions serve. A block is a file
+replaced whole by temp-and-rename, so that premise never holds here and those
+mechanisms answer a question this design does not have.
 
-⚠ **So when a mechanism suggests itself, ask what it assumes.** If it assumes
-one write per bucket, it is a tape's, and the properties above already cover
-the case it was for: a cell is mutable and corrected in place, a sample goes
-in its own bucket, a filling block is a block, the floor is what bounds a
-rewrite, nothing refuses a series, and the grid holds numbers while statements
-about a RUN are reports.
-
-Its history is in [tally-partials.md](tally-partials.md), which is where the
-mechanisms that were tried and removed are argued out one at a time. This file
-does not list them, because a reader learning what a tally is should not have
-to learn what it once was.
+⚠ **So ask of a mechanism what it assumes.** If it assumes one write per
+bucket it is a tape's, and the properties above cover the case: a cell is
+mutable and corrected in place, a sample goes in its own bucket, a filling
+block is a block, the floor bounds a rewrite, nothing refuses a series, and
+the grid holds numbers while statements about a RUN are reports.
 
 ## What is measured
 
