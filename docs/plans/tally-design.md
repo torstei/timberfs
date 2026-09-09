@@ -123,6 +123,41 @@ the host reading it.
   where the documents say one thing and the numbers are another, and nothing in
   it is wrong enough to notice.
 
+## It is fed sequentially, by a follower
+
+The fold reads its source from beginning to end, once, in one process — the follower's `--run` consumer. The follower is not
+merely the delivery mechanism: it holds the position durably, holds the
+source's retention back while the tally is behind it, supplies the registry
+and the systemd lifecycle, and restarts into exactly the re-fold `safe_offset`
+makes correct.
+
+⚠ **Parallel workers are not the first thing to reach for**, for two
+reasons:
+
+* **It needs additive partials**, which is their THIRD use after spilling and
+  repair — two workers can both contribute to one bucket, and with a merge
+  that replaces a cell the second silently erases the first. And it must
+  partition by SOURCE POSITION rather than by day: a day's entries are not
+  contiguous in the source (late arrivals are why a citation exists at all),
+  and there is no per-chunk logline range to find them by
+  ([logline-order.md](logline-order.md)). Partitioning by chunk range falls
+  out for free, a worker's consumed range being the partial identity already
+  wanted.
+* **The gain is small.** Measured over 300,000 real lines: reading records
+  0.52 s, the fold 4.53 s, writing blocks 0.05 s — so blocks are 1% and the
+  fold is 90%. A day is ~47 s single-threaded, and the largest backfill that
+  can ever be asked for is the SOURCE's retention (weeks, not years, since
+  nothing can tally what was dropped), so a 30-day rebuild is ~24 minutes
+  once.
+
+⚠ **Nor is sharing the extraction, obvious as it looks.** The four metrics of
+the measured document each run their own extract regex over every line, and
+cost is spread evenly
+and the metric with the SMALLEST regex (17 characters) is joint-most expensive
+at 1.31 s, because it is a histogram of 22 buckets and turns one line into 22
+samples. The cost is per sample produced and per metric evaluated, not per
+regex byte, so sharing the extraction wins much less than it looks.
+
 ## Recovery is re-derivation
 
 A follower's position is precious because it shipped bytes it cannot un-ship.
@@ -134,6 +169,29 @@ and not a correctness one.
 ⚠ It is exact because a sample's bucket is decided by its own stamp and
 nothing else. Nothing consults a watermark, so a re-derivation does not depend
 on where the read started.
+
+⚠ **And a record stream is forward-only, which is fine for a CRASH and not
+for a repair.** The tally is fed a stream and cannot ask for bytes again, so
+the two cases separate:
+
+* **A crash needs no seek**, because of `Roller::safe_offset` — "the oldest
+  source byte any OPEN bucket still depends on. A consumer may not report past
+  this". The position is therefore always behind every unfinished bucket, so a
+  restart re-sends from before that bucket's FIRST entry, re-folds it whole,
+  and the complete total replaces the partial one. ⚠ **The block writer's
+  `How::Merge` depends on this, invisibly**: advance `safe_offset` any further
+  and blocks are corrupted by code that never mentions them. ⚠ That dependency
+  is a consequence of a merge REPLACING a cell — under additive partials
+  ([tally-partials.md](tally-partials.md)) the position may advance freely.
+* **A repair does need to go back, and a REWIND is the wrong way to do it.**
+  A tally is not only a consumer: `query --records --from X --to Y | tally`
+  is a bounded DIRECT read of the source, and it already exists. So "the regex
+  was wrong, recompute last week" is a one-shot pass over that window while
+  the follower keeps going forward — no position is moved, and the live path
+  is never interrupted. ⚠ What it needs is `How::Regenerate` rather than
+  `Merge`, which the writer does not expose: merging a recomputation into
+  what is there would replace cell by cell and leave any series the new
+  definition no longer produces standing.
 
 ## Copying is a file sync or a bundle
 
@@ -188,7 +246,12 @@ a working set that saturates rather than drifting.
   for a partial — and it is also the atomicity defect below;
 * **compaction's schedule**, and whether a query merges or refuses;
 * **the write-batching mechanism** — a WAL for samples in the `.sap` shape is
-  the candidate, since one late sample otherwise rewrites a whole day block.
+  the candidate, since one late sample otherwise rewrites a whole day block;
+* **a repair pass** — a bounded read with `How::Regenerate`, which is what
+  makes "fix the definition and recompute" an operation rather than a plan.
+  ⚠ Not a rewind of the follower: the direct read already exists, and moving
+  a live position to recompute history would stop the live path to fix the
+  past.
 
 ⚠ **A defect that exists today:** `commit` renames a block into place and THEN
 saves the manifest, so a rewrite at the same `(t0, generation)` leaves a window

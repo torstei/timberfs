@@ -667,6 +667,28 @@ enum Command {
         /// format --fold takes
         #[arg(long)]
         observations: bool,
+        /// EXPERIMENTAL, and a HARNESS rather than an interface: write
+        /// the numbers as columnar BLOCKS into DIR instead of as tally
+        /// lines on stdout, which is how the block writer is exercised
+        /// against a real store until a provisioned `--run` can write
+        /// them.
+        ///
+        /// ⚠ It names a DIRECTORY where every other timberfs argument
+        /// names a store: the manifest carries an id, but nothing
+        /// searches for block stores by it, so a path is the only
+        /// address there is.
+        ///
+        /// ⚠ One store in, one directory out. Not on `--provision`'s
+        /// `--run`, which serves a SELECTION with a sink per source
+        /// store: where each one's blocks go is a provisioning question.
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["fold", "provision", "run", "try_it", "check", "pack", "unpack", "query", "observations"])]
+        blocks: Option<PathBuf>,
+        /// With --blocks: samples buffered before a commit. A block is a
+        /// day, so each commit rewrites up to a megabyte — this is the
+        /// write-amplification control, and a sample is not in a block
+        /// until it is flushed
+        #[arg(long, value_name = "N", default_value_t = timberfs::tally::DEFAULT_BLOCK_FLUSH, requires = "blocks")]
+        block_flush: usize,
         /// EXPERIMENTAL, and a measurement rather than a feature: read
         /// tally lines on stdin and write them as columnar BLOCKS into
         /// DIR — the grid of series x buckets, one file per range,
@@ -1910,6 +1932,8 @@ fn main() -> anyhow::Result<()> {
             grain::cmd_reindex(&file)?;
         }
         Command::Tally {
+            blocks,
+            block_flush,
             extractors,
             try_it,
             check,
@@ -1958,6 +1982,9 @@ fn main() -> anyhow::Result<()> {
                 .map(append::parse_duration_ms)
                 .transpose()?;
             tally::cmd_tally(&tally::TallyOpts {
+                blocks,
+                block_flush,
+                block_buckets,
                 extractors,
                 etc,
                 try_it,

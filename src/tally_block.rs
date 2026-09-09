@@ -710,6 +710,45 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
     pub v: u32,
+    /// This store's own identity, minted once and never touched after —
+    /// bark's rule, and for bark's reason: a path is an address and the
+    /// id is what the store IS, across renames, moves and copies.
+    ///
+    /// ⚠ `Option` because a manifest written before identity existed has
+    /// none, and minting one on read would hand an old store a new
+    /// identity in silence. Missing is a defect to repair deliberately,
+    /// which is how `timberfs identity` treats the same absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// When that identity was established, RFC3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    /// The SOURCE store's id, which is load-bearing rather than
+    /// provenance: a citation is an offset into that store's tape and
+    /// means nothing without knowing which tape. Absent for a store
+    /// packed from tally lines, which came from no store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The source's labels, copied when this store was created.
+    ///
+    /// ⚠ A record of what the source said THEN, never a live view: the
+    /// source may be relabelled, renamed or deleted long before a
+    /// two-year tally, and when it is deleted this is the only surviving
+    /// witness of what was measured.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub labels: serde_json::Map<String, serde_json::Value>,
+    /// Retention: how long, and how much.
+    ///
+    /// ⚠ Numbers where a `.bark` holds the strings an operator wrote,
+    /// because that file holds a DECLARATION and this holds the resolved
+    /// policy. And `retain_ms` is checked to be a whole number of BLOCKS
+    /// (`set_retain`), retention dropping whole blocks and nothing
+    /// finer — so a value between two of them would be a rounding
+    /// dressed as a setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_bytes: Option<u64>,
     pub width_ms: u64,
     pub block_buckets: usize,
     /// The oldest bucket this store still claims to know about.
@@ -727,10 +766,60 @@ impl Manifest {
     pub fn new(width_ms: u64, block_buckets: usize) -> Manifest {
         Manifest {
             v: 1,
+            id: crate::bark::new_uuid().ok(),
+            created: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            source: None,
+            labels: serde_json::Map::new(),
+            retain_ms: None,
+            retain_bytes: None,
             width_ms,
             block_buckets,
             floor: 0,
             blocks: Vec::new(),
+        }
+    }
+
+    /// How long one block covers, which is retention's granularity.
+    pub fn block_span_ms(&self) -> u64 {
+        self.width_ms * self.block_buckets as u64
+    }
+
+    /// Declare how long to keep. ⚠ Refused unless it is a whole number
+    /// of blocks: `drop_before` removes blocks whole, so a finer value
+    /// would be a promise this store cannot keep.
+    pub fn set_retain(&mut self, ms: Option<u64>) -> anyhow::Result<()> {
+        if let Some(ms) = ms {
+            let span = self.block_span_ms();
+            if span == 0 || ms == 0 || ms % span != 0 {
+                bail!(
+                    "a retention of {} is not a whole number of blocks — this store's block \
+                     covers {}, and retention drops blocks whole",
+                    crate::tally::render_width(ms),
+                    crate::tally::render_width(span)
+                );
+            }
+        }
+        self.retain_ms = ms;
+        Ok(())
+    }
+
+    /// Record which store the numbers came from.
+    ///
+    /// ⚠ Refused when it disagrees with what is recorded: a store's
+    /// source does not change, and feeding one store's records into
+    /// another's blocks would leave every citation pointing into the
+    /// wrong tape — silently, the offsets being plausible either way.
+    pub fn set_source(&mut self, id: &str) -> anyhow::Result<bool> {
+        match &self.source {
+            Some(had) if had == id => Ok(false),
+            Some(had) => bail!(
+                "these blocks were derived from store {had} and this run reads {id} — a \
+                 citation is an offset into ONE tape"
+            ),
+            None => {
+                self.source = Some(id.to_string());
+                Ok(true)
+            }
         }
     }
 
@@ -1089,6 +1178,114 @@ pub fn query(
     }
     out.sort_by(|a, b| (a.ts, &a.metric, &a.labels).cmp(&(b.ts, &b.metric, &b.labels)));
     Ok((out, t))
+}
+
+/// Writes sealed samples into a store's blocks as they arrive.
+///
+/// ⚠ It BUFFERS, and the buffer is the write-amplification control. A
+/// block is a day, so committing one sample rewrites up to a megabyte;
+/// buffering `limit` samples makes that once per `limit` instead. Two
+/// costs: a sample is not in a block until it is flushed, and the
+/// buffer is not durable — losing it to a crash costs a re-read, the
+/// position not having moved.
+pub struct Writer {
+    dir: std::path::PathBuf,
+    m: Manifest,
+    block_buckets: usize,
+    level: i32,
+    limit: usize,
+    held: Vec<Sample>,
+    pub committed: usize,
+    pub blocks_written: usize,
+    pub markers: usize,
+}
+
+impl Writer {
+    /// Open a store to write into, creating its manifest if there is
+    /// none. ⚠ The width is the WINDOW's, and a manifest that disagrees
+    /// is refused rather than adopted: a store holds one bucket width,
+    /// and coarsening is a different operation on a column.
+    pub fn open(
+        dir: &std::path::Path,
+        width_ms: u64,
+        block_buckets: usize,
+        limit: usize,
+        level: i32,
+    ) -> anyhow::Result<Writer> {
+        if block_buckets == 0 {
+            bail!("a block spans at least one bucket");
+        }
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let m = match Manifest::load(dir)? {
+            Some(m) => {
+                if m.width_ms != width_ms {
+                    bail!(
+                        "{} holds {} buckets and this run makes {}",
+                        dir.display(),
+                        crate::tally::render_width(m.width_ms),
+                        crate::tally::render_width(width_ms)
+                    );
+                }
+                m
+            }
+            None => Manifest::new(width_ms, block_buckets),
+        };
+        Ok(Writer {
+            dir: dir.to_path_buf(),
+            m,
+            block_buckets,
+            level,
+            limit: limit.max(1),
+            held: Vec::new(),
+            committed: 0,
+            blocks_written: 0,
+            markers: 0,
+        })
+    }
+
+    /// Record which store these numbers come from, refusing a second
+    /// one — see `Manifest::set_source`. It reaches disk with the next
+    /// commit, the manifest being the commit point: a run that learns a
+    /// source and writes no block has nothing to attribute.
+    pub fn source_is(&mut self, id: &str) -> anyhow::Result<()> {
+        self.m.set_source(id)?;
+        Ok(())
+    }
+
+    /// Take a batch. Markers are counted and not stored — a marker
+    /// states something about a RUN and the grid holds numbers
+    /// (docs/plans/tally-design.md).
+    pub fn take(&mut self, batch: Vec<Sample>) -> anyhow::Result<()> {
+        for s in batch {
+            if s.is_marker() {
+                self.markers += 1;
+            } else {
+                self.held.push(s);
+            }
+        }
+        if self.held.len() >= self.limit {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Commit what is held. ⚠ `How::Merge`, always: a range being
+    /// filled is one derivation arriving in pieces, and inferring a
+    /// regeneration from having seen the range before is the defect that
+    /// silently replaced three of six real days.
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let held = std::mem::take(&mut self.held);
+        let n = held.len();
+        for b in Block::pack(&held, self.block_buckets)? {
+            commit(&self.dir, &mut self.m, &b, self.level, How::Merge)?;
+            self.blocks_written += 1;
+        }
+        self.committed += n;
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------- the verbs
@@ -2000,6 +2197,158 @@ mod tests {
         assert_eq!(a, "20260906T000000.g0");
         assert_eq!(b, "20260907T000000.g2");
         assert!(a < b, "directory order must be time order");
+    }
+
+    /// A store has an identity, minted once, and reloading never
+    /// touches it — bark's rule, for bark's reason: a path is an
+    /// address and the id is what the store IS.
+    #[test]
+    fn a_store_is_minted_an_identity_that_a_reload_never_changes() {
+        let dir = tmpdir("id1");
+        let m = Manifest::new(60_000, 60);
+        let id = m.id.clone().expect("minted");
+        let created = m.created.clone().expect("stamped");
+        m.save(&dir).unwrap();
+        let back = Manifest::load(&dir).unwrap().unwrap();
+        assert_eq!(back.id.as_deref(), Some(id.as_str()));
+        assert_eq!(back.created, Some(created));
+        // And a second store is a different store.
+        assert_ne!(Manifest::new(60_000, 60).id, Some(id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠ A manifest written before identity existed loads, and is NOT
+    /// handed one on the way in: minting on read would give an old
+    /// store a new identity in silence, where absence is a defect to
+    /// repair deliberately.
+    #[test]
+    fn a_manifest_without_an_identity_is_not_given_one_by_reading_it() {
+        let dir = tmpdir("id2");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(MANIFEST),
+            r#"{"v":1,"width_ms":60000,"block_buckets":60,"floor":0,"blocks":[]}"#,
+        )
+        .unwrap();
+        let m = Manifest::load(&dir).unwrap().unwrap();
+        assert_eq!(m.id, None, "reading minted an identity");
+        assert_eq!(m.source, None);
+        assert!(m.labels.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store's source does not change. Feeding one store's records
+    /// into another's blocks would leave every citation pointing into
+    /// the wrong tape, and the offsets are plausible either way — so it
+    /// is refused rather than noticed later.
+    #[test]
+    fn a_second_source_for_one_block_store_is_refused() {
+        let mut m = Manifest::new(60_000, 60);
+        assert!(m.set_source("aaaa-1111").unwrap(), "the first is recorded");
+        assert!(
+            !m.set_source("aaaa-1111").unwrap(),
+            "the same one again is a no-op"
+        );
+        let err = m.set_source("bbbb-2222").unwrap_err().to_string();
+        assert!(
+            err.contains("aaaa-1111") && err.contains("bbbb-2222"),
+            "{err}"
+        );
+        assert_eq!(
+            m.source.as_deref(),
+            Some("aaaa-1111"),
+            "and it did not move"
+        );
+    }
+
+    /// Retention drops whole blocks, so a value between two of them is
+    /// a promise the store cannot keep — refused rather than rounded.
+    #[test]
+    fn a_retention_finer_than_a_block_is_refused() {
+        let mut m = Manifest::new(60_000, 1440);
+        assert_eq!(m.block_span_ms(), 86_400_000, "a day of 60s buckets");
+        m.set_retain(Some(730 * 86_400_000)).unwrap();
+        assert_eq!(m.retain_ms, Some(730 * 86_400_000));
+        let err = m.set_retain(Some(36 * 3_600_000)).unwrap_err().to_string();
+        assert!(err.contains("whole number of blocks"), "{err}");
+        assert_eq!(
+            m.retain_ms,
+            Some(730 * 86_400_000),
+            "a refusal must not have moved it"
+        );
+        m.set_retain(None).unwrap();
+        assert_eq!(m.retain_ms, None, "and it can be cleared");
+    }
+
+    /// What the writer stores is what the lines would have said. If this
+    /// does not hold, the block path is a different tally rather than
+    /// the same one stored differently — which is the whole claim.
+    /// ⚠ A flush limit of 2 forces several commits over one range, so
+    /// this also exercises the merge every commit after the first is.
+    #[test]
+    fn what_the_writer_stores_is_what_the_lines_said() {
+        let dir = tmpdir("w1");
+        let lines = [
+            "2026-09-06T13:37:00.000Z 60s m a=1 count=1 sum=10",
+            "2026-09-06T13:38:00.000Z 60s m a=1 count=2 sum=20",
+            "2026-09-06T13:38:00.000Z 60s m a=2 count=3 sum=30",
+            "2026-09-06T13:39:00.000Z 60s other b=1 count=4",
+        ];
+        let mut w = Writer::open(&dir, 60_000, 60, 2, 3).unwrap();
+        for l in lines {
+            w.take(vec![s(l)]).unwrap();
+        }
+        w.flush().unwrap();
+        assert_eq!(w.committed, 4);
+        assert!(w.blocks_written > 1, "the limit should have forced commits");
+
+        let (got, _) = query(&dir, &sel("[]"), 0, u64::MAX).unwrap();
+        assert_eq!(
+            got.iter().map(|x| x.render()).collect::<Vec<_>>(),
+            lines,
+            "the grid must render back to the lines it was given"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Markers are counted and not stored: a marker states something
+    /// about a RUN and the grid holds numbers
+    /// (docs/plans/tally-design.md).
+    #[test]
+    fn the_writer_counts_markers_and_stores_none() {
+        let dir = tmpdir("w2");
+        let mut w = Writer::open(&dir, 60_000, 60, 100, 3).unwrap();
+        w.take(vec![
+            s("2026-09-06T13:37:00.000Z 60s m a=1 count=1"),
+            s("2026-09-06T13:37:00.000Z 60s !drop metric=m reason=unreadable count=2"),
+            s("2026-09-06T13:37:00.000Z 0s !meta metric=m unit=calls"),
+        ])
+        .unwrap();
+        w.flush().unwrap();
+        assert_eq!((w.committed, w.markers), (1, 2));
+        let (got, _) = query(&dir, &sel("[]"), 0, u64::MAX).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].metric, "m");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store holds ONE bucket width, so reopening it with another is
+    /// refused rather than adopted — coarsening is a different
+    /// operation on a column, not something a second run may do by
+    /// arriving with a different window.
+    #[test]
+    fn a_writer_will_not_change_a_stores_width() {
+        let dir = tmpdir("w3");
+        let mut w = Writer::open(&dir, 60_000, 60, 100, 3).unwrap();
+        w.take(vec![s("2026-09-06T13:37:00.000Z 60s m a=1 count=1")])
+            .unwrap();
+        w.flush().unwrap();
+        let err = match Writer::open(&dir, 300_000, 60, 100, 3) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a second width was accepted"),
+        };
+        assert!(err.contains("60s") && err.contains("300s"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Garbage in must not panic. Defence in depth rather than a
