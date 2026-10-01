@@ -288,14 +288,12 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     let out = OpenOptions::new().write(true).open(&gpath)?;
     out.set_len(off as u64)?;
     let mut woff = off as u64;
-    let mut total_tokens = 0u64;
     for c in &records[covered..] {
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
         let data = zstd::stream::decode_all(&comp[..])
             .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
         let tokens = tokenize(&data);
-        total_tokens += tokens.len() as u64;
         let filter = build_filter(&tokens);
         out.write_all_at(&(filter.len() as u32).to_le_bytes(), woff)?;
         woff += 4;
@@ -303,12 +301,6 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         woff += filter.len() as u64;
     }
     out.sync_all()?;
-    crate::note!(
-        "timberfs: grain extended: {} new chunk(s) indexed ({} tokens), {} total",
-        records.len() - covered,
-        total_tokens,
-        records.len()
-    );
     Ok(())
 }
 
