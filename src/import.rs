@@ -13,6 +13,9 @@
 //!     space instead of T, `.` as the date separator, and `.`/`,`/`:`
 //!     before the fraction (logback's `yyyy.MM.dd HH:mm:ss:SSS` included)
 //!   - a leading epoch in seconds or milliseconds
+//!   - syslog's `Oct  1 00:00:02`, which carries no year: it is the latest
+//!     one that does not put the stamp after the extractor's reference
+//!     (see `Extractor::anchor`)
 //!   - Apache/CLF `[10/Jul/2026:09:23:45 +0200]` — the one non-anchored
 //!     exception, since CLF puts the bracketed timestamp mid-line
 //!   - --timestamp-regex + --timestamp-format for everything else (the
@@ -29,13 +32,21 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context};
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 
 use crate::query::{fmt_ms, resolve_backing};
 use crate::store::{self, Config, Store};
+
+/// How far past the reference a yearless stamp may sit and still be taken as
+/// this year: clocks and zones disagree by hours, never by a year.
+const YEARLESS_SLACK_MS: i64 = 24 * 3_600_000;
+
+/// Years searched below the reference before a yearless stamp is refused.
+const YEARLESS_REACH: i32 = 4;
 
 /// Give up if none of the first this-many lines have a timestamp.
 const DETECT_WINDOW: usize = 1000;
@@ -50,6 +61,7 @@ struct Builtins {
     clf: Regex,
     ctime: Regex,
     epoch: Regex,
+    syslog: Regex,
 }
 
 fn builtins() -> &'static Builtins {
@@ -68,6 +80,7 @@ fn builtins() -> &'static Builtins {
         )
         .unwrap(),
         epoch: Regex::new(r"^(\d{13}|\d{10})\b").unwrap(),
+        syslog: Regex::new(r"^([A-Z][a-z]{2}) ([ 0-9]\d \d{2}:\d{2}:\d{2})").unwrap(),
     })
 }
 
@@ -75,7 +88,30 @@ pub struct Extractor {
     /// The only pattern that varies by store, and the only one this can
     /// therefore have to compile.
     custom: Option<(Regex, String)>,
+    /// The declared format names no year, so one is put in front of it.
+    custom_yearless: bool,
     utc: bool,
+    /// Unix ms the yearless stamps are resolved against; 0 means now.
+    reference_ms: AtomicU64,
+}
+
+fn names_no_year(format: &str) -> bool {
+    use chrono::format::{Fixed, Item, Numeric};
+    !chrono::format::StrftimeItems::new(format).any(|i| {
+        matches!(
+            i,
+            Item::Numeric(
+                Numeric::Year
+                    | Numeric::YearDiv100
+                    | Numeric::YearMod100
+                    | Numeric::IsoYear
+                    | Numeric::IsoYearDiv100
+                    | Numeric::IsoYearMod100
+                    | Numeric::Timestamp,
+                _
+            ) | Item::Fixed(Fixed::RFC2822 | Fixed::RFC3339)
+        )
+    })
 }
 
 impl Extractor {
@@ -95,7 +131,46 @@ impl Extractor {
             (None, None) => None,
             _ => bail!("--timestamp-regex and --timestamp-format go together"),
         };
-        Ok(Extractor { custom, utc })
+        let custom_yearless = custom.as_ref().is_some_and(|(_, f)| names_no_year(f));
+        Ok(Extractor {
+            custom,
+            custom_yearless,
+            utc,
+            reference_ms: AtomicU64::new(0),
+        })
+    }
+
+    /// Resolve yearless stamps against `ms`: the end of what is being read,
+    /// so a stamp is never taken to be later than the data that holds it.
+    pub fn anchor(&self, ms: u64) {
+        self.reference_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// `anchor` to a file's modification time.
+    pub fn anchor_to(&self, meta: &fs::Metadata) {
+        let ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64);
+        if let Some(ms) = ms {
+            self.anchor(ms);
+        }
+    }
+
+    /// The latest year for which `parse` yields a stamp not after the
+    /// reference. Years that cannot hold the stamp (29 February) are skipped.
+    fn in_latest_year(&self, parse: impl Fn(i32) -> Option<NaiveDateTime>) -> Option<u64> {
+        let reference = match self.reference_ms.load(Ordering::Relaxed) {
+            0 => Utc::now().timestamp_millis(),
+            ms => ms as i64,
+        };
+        let year = Utc.timestamp_millis_opt(reference).single()?.year();
+        (year - YEARLESS_REACH..=year + 1)
+            .rev()
+            .filter_map(|y| parse(y).and_then(|n| self.naive_to_ms(n)))
+            .find(|&ms| ms <= reference + YEARLESS_SLACK_MS)
+            .and_then(|ms| u64::try_from(ms).ok())
     }
 
     fn naive_to_ms(&self, naive: NaiveDateTime) -> Option<i64> {
@@ -114,6 +189,12 @@ impl Extractor {
     pub fn extract(&self, head: &str) -> Option<u64> {
         if let Some((re, fmt)) = &self.custom {
             let m = re.captures(head)?.get(1)?.as_str().to_string();
+            if self.custom_yearless {
+                let with_year = format!("%Y {fmt}");
+                return self.in_latest_year(|y| {
+                    NaiveDateTime::parse_from_str(&format!("{y} {m}"), &with_year).ok()
+                });
+            }
             let ms = DateTime::parse_from_str(&m, fmt)
                 .map(|dt| dt.timestamp_millis())
                 .ok()
@@ -176,6 +257,14 @@ impl Extractor {
             // ctime carries no zone; Apache writes it in local time.
             let ms = self.naive_to_ms(naive)?;
             return u64::try_from(ms).ok();
+        }
+
+        if let Some(c) = builtins().syslog.captures(head) {
+            let (month, rest) = (c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str());
+            return self.in_latest_year(|y| {
+                NaiveDateTime::parse_from_str(&format!("{y} {month} {rest}"), "%Y %b %e %H:%M:%S")
+                    .ok()
+            });
         }
 
         if let Some(c) = builtins().epoch.captures(head) {
@@ -384,6 +473,7 @@ pub(crate) fn overlap_line_counts(
 /// First parsed timestamp in a file, scanning at most DETECT_WINDOW lines.
 pub(crate) fn first_stamp(path: &Path, extractor: &Extractor) -> anyhow::Result<u64> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    extractor.anchor_to(&f.metadata()?);
     let mut reader = BufReader::new(f);
     let mut line: Vec<u8> = Vec::new();
     for _ in 0..DETECT_WINDOW {
@@ -822,6 +912,7 @@ pub fn cmd_import(
 
         let mut src = File::open(source_path)
             .with_context(|| format!("opening {}", source_path.display()))?;
+        extractor.anchor_to(&src.metadata()?);
         if source_idx == 0 && resume_from > 0 {
             use std::io::Seek;
             src.seek(std::io::SeekFrom::Start(resume_from))?;
@@ -1055,5 +1146,91 @@ mod tests {
         // The declared pattern absent, and a built-in one present.
         assert_eq!(custom.extract("2026-08-15T10:26:09Z no marker"), None);
         assert!(plain.extract("2026-08-15T10:26:09Z no marker").is_some());
+    }
+
+    /// Syslog's stamp has no year: it is the latest one that does not put
+    /// the line after the data holding it, which also carries a file that
+    /// spans New Year without any state between lines.
+    #[test]
+    fn a_syslog_stamp_takes_the_latest_year_not_after_the_anchor() {
+        let e = Extractor::new(None, None, true).unwrap();
+        let at = |s: &str| {
+            e.extract(s).map(|ms| {
+                Utc.timestamp_millis_opt(ms as i64)
+                    .unwrap()
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+        };
+        let line = "Oct  1 00:00:02 services01 systemd[1]: logrotate.service: Succeeded.";
+
+        e.anchor(
+            Utc.with_ymd_and_hms(2025, 10, 1, 6, 0, 0)
+                .unwrap()
+                .timestamp_millis() as u64,
+        );
+        let same_day = at(line).unwrap();
+        assert!(same_day.starts_with("2025-10-01"), "{same_day}");
+
+        // The file ends in January: its December lines belong to the year before.
+        e.anchor(
+            Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0)
+                .unwrap()
+                .timestamp_millis() as u64,
+        );
+        assert!(at("Dec 31 23:59:59 h a").unwrap().starts_with("2025-12-31"));
+        assert!(at("Jan  1 00:00:01 h a").unwrap().starts_with("2026-01-01"));
+
+        // 29 February skips a year that has none.
+        e.anchor(
+            Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0)
+                .unwrap()
+                .timestamp_millis() as u64,
+        );
+        assert!(at("Feb 29 12:00:00 h a").unwrap().starts_with("2024-02-29"));
+
+        // Not a syslog head.
+        assert!(at("Foo  1 00:00:02 h a").is_none());
+        assert!(at("  Oct  1 00:00:02 indented").is_none());
+    }
+
+    /// A yearless syslog line and an ISO one in the same set are both
+    /// stamped with nothing declared, and a declared yearless format gets
+    /// the same year rule.
+    #[test]
+    fn a_declared_format_without_a_year_is_resolved_like_the_builtin() {
+        let anchor = Utc
+            .with_ymd_and_hms(2025, 10, 1, 6, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let plain = Extractor::new(None, None, true).unwrap();
+        plain.anchor(anchor as u64);
+        assert_eq!(
+            plain.extract("2025-10-01T00:00:02Z h a"),
+            plain.extract("Oct  1 00:00:02 h a")
+        );
+
+        let custom = Extractor::new(
+            Some(r"^(\w{3} [ \d]\d \d\d:\d\d:\d\d)"),
+            Some("%b %e %H:%M:%S"),
+            true,
+        )
+        .unwrap();
+        custom.anchor(anchor as u64);
+        assert_eq!(
+            custom.extract("Oct  1 00:00:02 h a"),
+            plain.extract("Oct  1 00:00:02 h a")
+        );
+
+        let dated = Extractor::new(
+            Some(r"^(\d{4} \w{3} \d\d \d\d:\d\d:\d\d)"),
+            Some("%Y %b %d %H:%M:%S"),
+            true,
+        )
+        .unwrap();
+        assert!(
+            dated.extract("1999 Oct 01 00:00:00 x").unwrap()
+                < anchor as u64 - 20 * 365 * 86_400_000 / 4
+        );
     }
 }

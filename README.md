@@ -135,6 +135,13 @@ by write time, so old data lands under today's timestamps. Historical
 files go through `import`, which parses their own timestamps (and is
 resumable, deduplicating and idempotent).
 
+Classic syslog stamps (`Oct  1 00:00:02`) carry no year and are recognised
+with nothing declared: the year is the latest one that does not put the line
+after the file's modification time, so a file spanning New Year resolves
+correctly. A copied or touched file whose mtime is wrong resolves to the wrong
+year. The same set therefore serves hosts that write classic syslog and hosts
+that write ISO-8601.
+
 The token index needs no attention either way: once `index` is declared,
 every writer maintains it — a streaming one on its once-a-second tick, so
 the grain trails the newest chunk by at most that tick, and an uncovered

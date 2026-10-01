@@ -144,6 +144,9 @@ fn drain(
         }
         consumed += n as u64;
         open.offset += n as u64;
+        if let Ok(m) = open.file.metadata() {
+            extractor.anchor_to(&m);
+        }
         open.pending.extend_from_slice(&buf[..n]);
         // Commit up to the last newline; keep the rest.
         if let Some(last) = open.pending.iter().rposition(|b| *b == b'\n') {
@@ -259,6 +262,7 @@ fn catch_up(
 
     // Stream the file, dropping lines the store already has.
     let mut open = Open::at(path, 0)?;
+    extractor.anchor_to(&open.file.metadata()?);
     let mut skipped = 0u64;
     let mut added = 0u64;
     let mut buf = vec![0u8; 256 * 1024];

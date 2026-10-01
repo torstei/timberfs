@@ -1,6 +1,6 @@
 # A stamp with no year: syslog's `Oct  1 00:00:02`
 
-**Status: proposed.** Nothing here is built.
+**Status: built.** The sections below say where the build differs from the proposal.
 
 Traditional syslog writes `Oct  1 00:00:02 services01 systemd[1]: …` — no year,
 no zone. Newer rsyslog/journald configurations write ISO-8601 instead. One
@@ -22,15 +22,16 @@ CLF and ctime already are, anchored at the start of the line. The same set file
 then works on every host: the ISO hosts match the ISO built-in, the old ones
 match this one, and nothing is declared. A declared `timestamp_regex` still wins.
 
-**The year comes from a reference instant plus rollover.** The year is the
-latest one that does not put the stamp after the reference. Within one source
-the `Stamper` carries the previous stamp, and a stamp whose month falls
-*behind* the previous one's by more than a few days is the next year, so a file
-spanning New Year resolves correctly.
+**The year comes from a reference instant.** The year is the latest one that
+does not put the stamp after the reference (a day's slack for zones). That is
+stateless, and it carries a file spanning New Year by itself: with the reference
+in January, December's lines fall in the year before. No rollover state is
+kept between lines, which the first draft proposed; it would only matter for a
+source spanning more than a year.
 
-- Write path: the reference is the source's mtime (`now` for a live tail).
-- Read path: there is no file. The reference is the end of the chunk's write
-  window, the same window the divergence report already uses.
+- Write path: the reference is the source's mtime, re-read as a tail reads.
+- Read path: the end of the chunk's write window. Imported chunks carry the
+  stamps resolved at import, so the window is never earlier than a line in it.
 
 **An explicit year declaration is not offered.** It is per-file configuration,
 which is what sharing one set across hosts is meant to avoid. A copied or
@@ -39,10 +40,5 @@ limit, and the divergence report against the write window is where it shows.
 
 **The zone is local unless `timestamp_utc`**, as for every other naive stamp.
 
-## Open
-
-- Whether the write path resolves once and the read path re-parses only for
-  entry filtering must be confirmed against `entry.rs` before the reference
-  is threaded through `extract`.
-- The rollover threshold: a backwards month step is certain; a backwards step
-  inside one month is disorder, not a new year.
+A declared `timestamp_format` that names no year gets the same rule: the
+year is put in front of it.

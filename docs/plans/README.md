@@ -41,7 +41,7 @@ messages and pull requests are for.
   set of a system's log files tailed by one process, and why this one needs no
   registry.
 - [yearless-stamps.md](yearless-stamps.md) — syslog's `Oct  1 00:00:02`: a
-  built-in stamp whose year comes from the source's mtime plus rollover, so one
+  built-in stamp whose year is the latest not after the source's mtime, so one
   file-intake set serves old and new hosts alike.
 - [consumer-protocol.md](consumer-protocol.md) — timberfs holds the
   position and a consumer says how far to move it: three messages, why the

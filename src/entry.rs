@@ -159,6 +159,7 @@ impl EntrySink {
     ) -> io::Result<()> {
         self.cur_write_win = write_win;
         self.cur_chunk = chunk;
+        self.extractor.anchor(write_win.1);
         // A line that began in the previous chunk keeps the offset it
         // started at — it is absolute, so it stays right across the seam.
         if self.line.is_empty() {
