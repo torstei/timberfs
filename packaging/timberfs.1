@@ -519,7 +519,16 @@ before the milliseconds \(em logback's
 .B yyyy.MM.dd HH:mm:ss:SSS
 included) and leading epoch seconds/milliseconds; Apache/CLF
 .RB ( [10/Jul/2026:09:23:45\ +0200] )
-is the one mid-line exception. Anything else via
+is the one mid-line exception, and Apache's bracketed ctime error stamp
+.RB ( [Sat\ Aug\ 15\ 10:26:09.123456\ 2026] )
+is read the same way. Classic syslog
+.RB ( "Oct\ \ 1 00:00:02" )
+carries no year: it is the latest one that does not put the line after the
+file's modification time (after the chunk's write window, when read back), so
+a file spanning New Year resolves correctly and a touched file whose mtime is
+wrong gets the wrong year. A declared
+.B \-\-timestamp\-format
+that names no year gets the same rule. Anything else via
 .B \-\-timestamp\-regex
 (one capture group, searched \(em anchor with
 .B ^
