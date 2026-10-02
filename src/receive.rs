@@ -188,6 +188,7 @@ pub struct Session {
     cfg: crate::store::Config,
     adopt_pages: bool,
     out: Received,
+    runs: Vec<Run>,
     _dir_lock: std::fs::File,
     _file_lock: std::fs::File,
 }
@@ -307,7 +308,14 @@ impl Session {
             }
         }
 
+        let runs = crate::serve::runs_of(
+            st.files
+                .get(&name)
+                .into_iter()
+                .flat_map(|f| f.chunks.iter().map(|c| c.seq)),
+        );
         Ok(Session {
+            runs,
             out: Received {
                 store: dest.to_path_buf(),
                 created: !existed,
@@ -340,8 +348,7 @@ impl Session {
 
     /// What this destination holds now — the ack, and a coverage answer.
     pub fn coverage(&self) -> Vec<Run> {
-        let file = self.st.files.get(&self.name).expect("created in open");
-        crate::serve::runs_of(file.chunks.iter().map(|c| c.seq))
+        self.runs.clone()
     }
 
     /// Apply one frame. Returns false for a frame that ends the stream
@@ -382,6 +389,9 @@ impl Session {
                 .with_context(|| format!("appending chunk {seq} to {}", self.name))?;
                 self.out.chunks += 1;
                 self.out.comp_bytes += comp_len;
+                if let Some(c) = self.st.files.get(&self.name).and_then(|f| f.chunks.last()) {
+                    crate::serve::push_seq(&mut self.runs, c.seq);
+                }
                 for s in &sidecars {
                     if self.adopt_pages
                         && s.kind == crate::frame::Sidecar::tag(crate::serve::GRAIN_TAG)

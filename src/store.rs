@@ -173,16 +173,21 @@ fn parse_trim_marker(text: &str) -> Option<(u64, u64, u64)> {
 /// all — they synthesize the same numbers when parsing v1.
 fn migrate_rings(dir: &Path, name: &str) -> io::Result<()> {
     let p = format::rings_path(dir, name);
-    let buf = match fs::read(&p) {
-        Ok(b) => b,
+    let f = match fs::File::open(&p) {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
     // Absent, empty, already v2, or something else entirely: not ours to
     // touch. A bad magic is left for `open` to report as it always has.
-    if buf.len() < 8 || &buf[..8] != format::RINGS_MAGIC_V1 {
-        return Ok(());
+    let mut magic = [0u8; 8];
+    match f.read_exact_at(&mut magic, 0) {
+        Ok(()) if &magic == format::RINGS_MAGIC_V1 => {}
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e),
     }
+    let buf = fs::read(&p)?;
     let (records, _) = format::parse_index_versioned(&buf)?;
     let next_seq = records.last().map(|c| c.seq + 1).unwrap_or(0);
     let mut idx =
@@ -3269,5 +3274,18 @@ mod tests {
             f.buffer_start,
             "the sap's logical base must track buffer_start after a head trim"
         );
+    }
+
+    #[test]
+    fn migrating_leaves_alone_whatever_is_not_a_v1_index() {
+        let dir = TempDir::new();
+        let p = format::rings_path(dir.path(), "app");
+        migrate_rings(dir.path(), "app").unwrap();
+        assert!(!p.exists(), "a missing index stays missing");
+        for body in [&b""[..], &b"short"[..], &b"NOTRINGS and then some more"[..]] {
+            fs::write(&p, body).unwrap();
+            migrate_rings(dir.path(), "app").unwrap();
+            assert_eq!(fs::read(&p).unwrap(), body, "{body:?} is not ours to touch");
+        }
     }
 }

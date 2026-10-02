@@ -680,15 +680,15 @@ pub fn cmd_rotate(
                 }
             })?;
             println!("rotated through the live mount on {}", mp.display());
-            let after = format::read_index(&rings)?;
-            println!("  source keeps {} chunk(s)", after.len());
+            let (kept, _) = format::read_index_last(&rings)?;
+            println!("  source keeps {kept} chunk(s)");
             if let Some(t) = &target_name {
-                let ti = format::read_index(&format::rings_path(&dir, t))?;
+                let (chunks, last) = format::read_index_last(&format::rings_path(&dir, t))?;
                 println!(
                     "  {} now has {} chunk(s), {} on disk",
                     t,
-                    ti.len(),
-                    human_bytes(ti.last().map(|c| c.comp_end()).unwrap_or(0))
+                    chunks,
+                    human_bytes(last.map(|c| c.comp_end()).unwrap_or(0))
                 );
             }
         }
