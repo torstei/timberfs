@@ -3069,6 +3069,8 @@ nothing says so.
 .TP
 .BR .grain ", " .rings ", " .trunk " and " .sap
 are derived or are the data itself.
+.B .grain.commit
+beside the grain is a hint about where it ends; deleting it costs one walk.
 .B reindex
 rebuilds the first;
 .B identity

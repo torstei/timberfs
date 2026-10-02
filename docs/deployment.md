@@ -40,6 +40,7 @@ pass its own paths.
     <name>.log.trunk                        the data — chunked zstd frames
     <name>.log.rings                        the write-time index (per-chunk time bounds)
     <name>.log.grain                        optional token index (present with --index)
+    <name>.log.grain.commit                 where the grain ends; a hint, safe to delete
     <name>.log.bark                         JSON manifest: durable identity + retention
     <name>.log.sap                          optional write-ahead sidecar (present with --wal;
                                             always, for the acking network intakes)

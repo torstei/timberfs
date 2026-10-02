@@ -358,6 +358,14 @@ append-only entry per chunk. Three rules:
    source and re-check it after loading the grain, dropping the grain (and
    scanning) rather than trusting a mismatched pair.
 
+The grain states neither how many records it holds nor where the last one
+ends, so a write that had to find out would read it whole. `<name>.grain.commit`
+records both after each completed write, bound to the grain's inode and the
+bytes at its two ends, so a grain replaced or rebased by anyone else is walked
+once instead of trusted. Whatever lies past the committed end is a torn write
+and is cut before the next append. It is a hint under rule 1: delete it and the
+next write walks the grain once.
+
 Consequences worth knowing: chunk size is an index-selectivity knob
 (smaller chunks → sharper lookups, more overhead), the grain trails a live
 writer by at most its once-a-second maintenance tick (lagging entries just
