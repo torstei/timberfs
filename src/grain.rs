@@ -379,15 +379,15 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     let Some((tail, known)) = locate(dir, name, &out)? else {
         return build_grain(dir, name);
     };
-    let records = format::read_index(&format::rings_path(dir, name))?;
     let covered = tail.count as usize;
-    if covered > records.len() {
+    let (chunks, new) = format::read_index_tail(&format::rings_path(dir, name), covered)?;
+    if covered > chunks {
         return build_grain(dir, name);
     }
     if out.metadata()?.len() > tail.end {
         out.set_len(tail.end)?;
     }
-    if covered == records.len() {
+    if covered == chunks {
         if !known {
             save_commit(dir, name, &out, tail)?;
         }
@@ -396,7 +396,7 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     let trunk = File::open(format::trunk_path(dir, name))
         .with_context(|| format!("opening {}", format::trunk_path(dir, name).display()))?;
     let mut woff = tail.end;
-    for c in &records[covered..] {
+    for c in &new {
         let mut comp = vec![0u8; c.comp_len as usize];
         trunk.read_exact_at(&mut comp, c.comp_start)?;
         let data = zstd::stream::decode_all(&comp[..])
@@ -414,7 +414,7 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         name,
         &out,
         Tail {
-            count: records.len() as u64,
+            count: chunks as u64,
             end: woff,
         },
     )?;

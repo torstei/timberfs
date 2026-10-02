@@ -477,34 +477,29 @@ pub fn read_header_next_seq(f: &File) -> io::Result<u64> {
     }
 }
 
-/// Parse rings content wherever it came from (a file, a bundle member).
-pub fn parse_index_bytes(buf: &[u8]) -> io::Result<Vec<ChunkRecord>> {
-    parse_index_versioned(buf).map(|(recs, _)| recs)
-}
-
-/// As `parse_index_bytes`, plus which layout it found — what a WRITER needs,
-/// since it must migrate a v1 file before appending rather than mixing two
-/// record strides in one file.
-pub fn parse_index_versioned(buf: &[u8]) -> io::Result<(Vec<ChunkRecord>, RingsVersion)> {
+/// The layout a `.rings` file declares, from its first bytes and its total
+/// length: which version, how long its header is, and the stride of its
+/// records. `prefix` need only reach the fixed header fields.
+fn index_layout(prefix: &[u8], total_len: u64) -> io::Result<(RingsVersion, usize, usize)> {
     let bad = || {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "not a timberfs index (bad magic)",
         )
     };
-    if buf.len() < RINGS_HEADER_LEN_V1 as usize {
+    if prefix.len() < RINGS_HEADER_LEN_V1 as usize {
         return Err(bad());
     }
-    let (version, header, rec_len) = match &buf[..8] {
+    let (version, header, rec_len) = match &prefix[..8] {
         // The FILE's header length, not ours: a longer header from a later
         // version must shift record offsets for this reader too, which is
         // the whole point of declaring it.
         m if m == RINGS_MAGIC => {
-            if buf.len() < RINGS_HEADER_MIN as usize {
+            if prefix.len() < RINGS_HEADER_MIN as usize {
                 return Err(bad());
             }
-            let declared = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            if declared < RINGS_HEADER_MIN || declared > buf.len() as u64 {
+            let declared = u64::from_le_bytes(prefix[8..16].try_into().unwrap());
+            if declared < RINGS_HEADER_MIN || declared > total_len {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -516,7 +511,7 @@ pub fn parse_index_versioned(buf: &[u8]) -> io::Result<(Vec<ChunkRecord>, RingsV
             // older reader has to stop rather than answer from a layout it
             // does not know. Optional additions live in the reserved bytes
             // and set nothing, precisely so this stays rare.
-            let incompat = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+            let incompat = u64::from_le_bytes(prefix[16..24].try_into().unwrap());
             if incompat != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -535,6 +530,50 @@ pub fn parse_index_versioned(buf: &[u8]) -> io::Result<(Vec<ChunkRecord>, RingsV
         ),
         _ => return Err(bad()),
     };
+    Ok((version, header, rec_len))
+}
+
+/// How many records a `.rings` file holds, and the ones from `from` on,
+/// reading only those: the records are a fixed stride after a declared
+/// header, so the count is the file's length and the tail is one seek. For
+/// a caller that wants the end of a long index and not all of it.
+pub fn read_index_tail(path: &Path, from: usize) -> io::Result<(usize, Vec<ChunkRecord>)> {
+    let wrap =
+        |e: io::Error| io::Error::new(e.kind(), format!("reading index {}: {e}", path.display()));
+    let f = File::open(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("opening index {}: {e}", path.display())))?;
+    let total = f.metadata().map_err(wrap)?.len();
+    let mut prefix = vec![0u8; total.min(RINGS_HEADER_LEN) as usize];
+    f.read_exact_at(&mut prefix, 0).map_err(wrap)?;
+    let (version, header, rec_len) = index_layout(&prefix, total).map_err(wrap)?;
+    let n = ((total - header as u64) / rec_len as u64) as usize;
+    if from >= n {
+        return Ok((n, Vec::new()));
+    }
+    let mut buf = vec![0u8; (n - from) * rec_len];
+    f.read_exact_at(&mut buf, header as u64 + (from * rec_len) as u64)
+        .map_err(wrap)?;
+    let recs = buf
+        .chunks_exact(rec_len)
+        .enumerate()
+        .map(|(j, b)| match version {
+            RingsVersion::V2 => ChunkRecord::from_bytes(b),
+            RingsVersion::V1 => ChunkRecord::from_bytes_v1(b, (from + j) as u64),
+        })
+        .collect();
+    Ok((n, recs))
+}
+
+/// Parse rings content wherever it came from (a file, a bundle member).
+pub fn parse_index_bytes(buf: &[u8]) -> io::Result<Vec<ChunkRecord>> {
+    parse_index_versioned(buf).map(|(recs, _)| recs)
+}
+
+/// As `parse_index_bytes`, plus which layout it found — what a WRITER needs,
+/// since it must migrate a v1 file before appending rather than mixing two
+/// record strides in one file.
+pub fn parse_index_versioned(buf: &[u8]) -> io::Result<(Vec<ChunkRecord>, RingsVersion)> {
+    let (version, header, rec_len) = index_layout(buf, buf.len() as u64)?;
     let n = (buf.len() - header) / rec_len;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -696,5 +735,72 @@ mod tests {
         let v1 = &r.to_bytes()[..RECORD_LEN_V1];
         let back = ChunkRecord::from_bytes_v1(v1, 99);
         assert_eq!((back.seq, back.uncomp_start), (99, 70));
+    }
+
+    fn write_image(name: &str, buf: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("timberfs-tail-{}-{name}", std::process::id()));
+        std::fs::write(&p, buf).unwrap();
+        p
+    }
+
+    #[test]
+    fn the_tail_is_the_full_parse_from_that_point() {
+        for (label, buf) in [
+            ("v2", image(RINGS_HEADER_LEN, 0, 9)),
+            ("later", image(128, 0, 9)),
+        ] {
+            let p = write_image(label, &buf);
+            let all = read_index(&p).unwrap();
+            for from in [0, 1, 4, 8, 9, 10, 100] {
+                let (n, tail) = read_index_tail(&p, from).unwrap();
+                assert_eq!(n, all.len(), "{label} from {from}");
+                let want = &all[from.min(all.len())..];
+                assert_eq!(
+                    tail.iter().map(|c| c.seq).collect::<Vec<_>>(),
+                    want.iter().map(|c| c.seq).collect::<Vec<_>>(),
+                    "{label} from {from}"
+                );
+            }
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn the_tail_numbers_a_v1_index_the_way_the_full_parse_does() {
+        let mut buf = RINGS_MAGIC_V1.to_vec();
+        for i in 0..5u64 {
+            buf.extend_from_slice(&rec(i).to_bytes()[..RECORD_LEN_V1]);
+        }
+        let p = write_image("v1", &buf);
+        let all = read_index(&p).unwrap();
+        let (n, tail) = read_index_tail(&p, 2).unwrap();
+        assert_eq!((n, tail.len()), (5, 3));
+        assert_eq!(
+            tail.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            all[2..].iter().map(|c| c.seq).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn a_partial_trailing_record_is_not_counted() {
+        let mut buf = image(RINGS_HEADER_LEN, 0, 4);
+        buf.extend_from_slice(&[7u8; 20]);
+        let p = write_image("partial", &buf);
+        let (n, tail) = read_index_tail(&p, 3).unwrap();
+        assert_eq!((n, tail.len()), (4, 1));
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn the_tail_refuses_what_the_full_parse_refuses() {
+        let p = write_image("incompat", &image(RINGS_HEADER_LEN, 0b10, 2));
+        let e = read_index_tail(&p, 0).unwrap_err();
+        assert!(e.to_string().contains("unsupported features"), "{e}");
+        let _ = std::fs::remove_file(p);
+
+        let p = write_image("magic", b"NOTRINGS and then some bytes");
+        assert!(read_index_tail(&p, 0).is_err());
+        let _ = std::fs::remove_file(p);
     }
 }
