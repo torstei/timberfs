@@ -538,6 +538,22 @@ fn index_layout(prefix: &[u8], total_len: u64) -> io::Result<(RingsVersion, usiz
 /// header, so the count is the file's length and the tail is one seek. For
 /// a caller that wants the end of a long index and not all of it.
 pub fn read_index_tail(path: &Path, from: usize) -> io::Result<(usize, Vec<ChunkRecord>)> {
+    index_from(path, |_| from)
+}
+
+/// How many records a `.rings` file holds and the last of them, from one
+/// header read and one record read: for a caller that wants where the tape
+/// ends and not the index.
+pub fn read_index_last(path: &Path) -> io::Result<(usize, Option<ChunkRecord>)> {
+    let (n, mut recs) = index_from(path, |n| n.saturating_sub(1))?;
+    Ok((n, recs.pop()))
+}
+
+/// The records from the index `start(count)` on, and the count.
+fn index_from(
+    path: &Path,
+    start: impl FnOnce(usize) -> usize,
+) -> io::Result<(usize, Vec<ChunkRecord>)> {
     let wrap =
         |e: io::Error| io::Error::new(e.kind(), format!("reading index {}: {e}", path.display()));
     let f = File::open(path)
@@ -547,6 +563,7 @@ pub fn read_index_tail(path: &Path, from: usize) -> io::Result<(usize, Vec<Chunk
     f.read_exact_at(&mut prefix, 0).map_err(wrap)?;
     let (version, header, rec_len) = index_layout(&prefix, total).map_err(wrap)?;
     let n = ((total - header as u64) / rec_len as u64) as usize;
+    let from = start(n);
     if from >= n {
         return Ok((n, Vec::new()));
     }
@@ -801,6 +818,43 @@ mod tests {
 
         let p = write_image("magic", b"NOTRINGS and then some bytes");
         assert!(read_index_tail(&p, 0).is_err());
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn the_last_record_is_what_a_full_parse_ends_with() {
+        for (label, buf) in [
+            ("last-v2", image(RINGS_HEADER_LEN, 0, 6)),
+            ("last-later", image(128, 0, 6)),
+            ("last-empty", image(RINGS_HEADER_LEN, 0, 0)),
+        ] {
+            let p = write_image(label, &buf);
+            let all = read_index(&p).unwrap();
+            let (n, last) = read_index_last(&p).unwrap();
+            assert_eq!(n, all.len(), "{label}");
+            assert_eq!(last.map(|c| c.seq), all.last().map(|c| c.seq), "{label}");
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn the_last_record_ignores_a_partial_one_and_numbers_v1_by_position() {
+        let mut buf = image(RINGS_HEADER_LEN, 0, 3);
+        buf.extend_from_slice(&[9u8; 17]);
+        let p = write_image("last-partial", &buf);
+        assert_eq!(read_index_last(&p).unwrap().1.map(|c| c.seq), Some(2));
+        let _ = std::fs::remove_file(p);
+
+        let mut v1 = RINGS_MAGIC_V1.to_vec();
+        for i in 0..4u64 {
+            v1.extend_from_slice(&rec(i).to_bytes()[..RECORD_LEN_V1]);
+        }
+        let p = write_image("last-v1", &v1);
+        let all = read_index(&p).unwrap();
+        assert_eq!(
+            read_index_last(&p).unwrap().1.map(|c| c.seq),
+            all.last().map(|c| c.seq)
+        );
         let _ = std::fs::remove_file(p);
     }
 }

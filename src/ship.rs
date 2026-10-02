@@ -100,9 +100,10 @@ fn instant(s: Option<&str>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
 /// writer's own lock.
 fn tape_end(dir: &Path, name: &str) -> u64 {
     let dropped = crate::query::dropped_bytes_of(&dir.join(name));
-    let chunks =
-        crate::format::read_index(&crate::format::rings_path(dir, name)).unwrap_or_default();
-    dropped + chunks.last().map(|c| c.uncomp_end()).unwrap_or(0)
+    let last = crate::format::read_index_last(&crate::format::rings_path(dir, name))
+        .ok()
+        .and_then(|(_, last)| last);
+    dropped + last.map(|c| c.uncomp_end()).unwrap_or(0)
 }
 
 /// How many stores a batch may span, and how many entries it may hold, by

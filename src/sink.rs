@@ -169,10 +169,18 @@ pub fn cmd_records_sink(
         } else {
             None
         };
-        // Chunks already folded into the declared grain. Extending re-reads
-        // the whole grain file, so we only do it when the flushed-chunk set
-        // actually changed — not every idle second.
+        // Chunks already folded into the declared grain: extend only when
+        // the flushed-chunk set actually changed, not every idle second.
         let mut indexed_chunks: usize = 0;
+        let mut live = crate::append::LivePolicy {
+            dir: dir.clone(),
+            name: name.clone(),
+            last: crate::bark::Retention::default(),
+            fields: Default::default(),
+            warned: false,
+            stamp: None,
+            reparsed: false,
+        };
         Some(thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(1000));
@@ -218,33 +226,33 @@ pub fn cmd_records_sink(
                 }
                 st.lock().unwrap().flush_aged();
                 st.lock().unwrap().sap_sync_all();
-                st.lock().unwrap().sync_wal_declarations();
-                match crate::bark::declared_retention(&dir, &name) {
-                    Ok(policy) if policy.is_some() => {
-                        let fields = crate::follower::subject_of(&dir, &name);
-                        let next_seq = st.lock().unwrap().next_seq(&name).unwrap_or(0);
-                        let held = crate::follower::TickInterest::default()
-                            .floor(&policy, &fields, next_seq);
-                        match st.lock().unwrap().enforce_retention(
-                            &name,
-                            policy.max_age_ms,
-                            policy.max_comp_bytes,
-                            held.floor,
-                        ) {
-                            Err(e) => {
-                                eprintln!("timberfs: {name}: background retention failed: {e}")
-                            }
-                            Ok(Some(stats)) => {
-                                if let Some(record) =
-                                    crate::follower::override_record(&name, &policy, &stats, &held)
-                                {
-                                    eprintln!("{record}");
-                                }
-                            }
-                            Ok(None) => {}
+                let policy = live.refresh();
+                if live.reparsed {
+                    st.lock().unwrap().sync_wal_declarations();
+                }
+                if policy.is_some() {
+                    let fields = live.fields.clone();
+                    let next_seq = st.lock().unwrap().next_seq(&name).unwrap_or(0);
+                    let held =
+                        crate::follower::TickInterest::default().floor(&policy, &fields, next_seq);
+                    match st.lock().unwrap().enforce_retention(
+                        &name,
+                        policy.max_age_ms,
+                        policy.max_comp_bytes,
+                        held.floor,
+                    ) {
+                        Err(e) => {
+                            eprintln!("timberfs: {name}: background retention failed: {e}")
                         }
+                        Ok(Some(stats)) => {
+                            if let Some(record) =
+                                crate::follower::override_record(&name, &policy, &stats, &held)
+                            {
+                                eprintln!("{record}");
+                            }
+                        }
+                        Ok(None) => {}
                     }
-                    _ => {}
                 }
                 // Keep the declared index current while streaming: extend the
                 // grain whenever the flushed-chunk set changed (a flush added

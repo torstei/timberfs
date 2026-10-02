@@ -101,13 +101,18 @@ pub struct LastSent {
 pub fn runs_of(seqs: impl IntoIterator<Item = u64>) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     for s in seqs {
-        match out.last_mut() {
-            Some(last) if s == last.end + 1 => last.end = s,
-            Some(last) if s <= last.end => {} // duplicate or out of order
-            _ => out.push(Run { start: s, end: s }),
-        }
+        push_seq(&mut out, s);
     }
     out
+}
+
+/// One step of `runs_of`, for a caller that keeps the runs as chunks arrive.
+pub fn push_seq(out: &mut Vec<Run>, s: u64) {
+    match out.last_mut() {
+        Some(last) if s == last.end + 1 => last.end = s,
+        Some(last) if s <= last.end => {} // duplicate or out of order
+        _ => out.push(Run { start: s, end: s }),
+    }
 }
 
 /// Write `input`'s answer to `req` as frames.
@@ -308,8 +313,10 @@ fn grain_path(input: &Path) -> Option<std::path::PathBuf> {
 /// The `.grain`'s 16-byte parameter header, which is store-level and so
 /// rides `stream-open` rather than every chunk.
 fn grain_header(input: &Path) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(grain_path(input)?).ok()?;
-    (bytes.len() >= 16).then(|| bytes[..16].to_vec())
+    let f = std::fs::File::open(grain_path(input)?).ok()?;
+    let mut header = [0u8; 16];
+    std::os::unix::fs::FileExt::read_exact_at(&f, &mut header, 0).ok()?;
+    Some(header.to_vec())
 }
 
 #[cfg(test)]
@@ -623,5 +630,38 @@ mod tests {
             Frame::Coverage { runs } => assert!(runs.is_empty(), "no runs, not no answer"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn keeping_runs_as_chunks_arrive_is_the_fold_over_all_of_them() {
+        let seqs = [0u64, 1, 2, 2, 5, 6, 4, 9, 10, 11, 11, 30];
+        let mut kept = Vec::new();
+        for s in seqs {
+            push_seq(&mut kept, s);
+        }
+        assert_eq!(kept, runs_of(seqs));
+        assert_eq!(
+            kept,
+            vec![
+                Run { start: 0, end: 2 },
+                Run { start: 5, end: 6 },
+                Run { start: 9, end: 11 },
+                Run { start: 30, end: 30 },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_grain_header_is_its_first_sixteen_bytes_and_nothing_else_is() {
+        let d = TempDir::new();
+        let store = a_store(d.path(), "g", 2);
+        assert_eq!(grain_header(&store), None, "no grain, no header");
+        let (dir, name) = crate::query::resolve_backing(&store).unwrap();
+        let gpath = crate::format::grain_path(&dir, &name);
+        let bytes: Vec<u8> = (0..64u8).collect();
+        std::fs::write(&gpath, &bytes).unwrap();
+        assert_eq!(grain_header(&store), Some(bytes[..16].to_vec()));
+        std::fs::write(&gpath, &bytes[..15]).unwrap();
+        assert_eq!(grain_header(&store), None, "shorter than a header");
     }
 }
