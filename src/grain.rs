@@ -320,6 +320,19 @@ impl Grain {
     }
 }
 
+/// The grain's size and how many chunks it covers, without loading it:
+/// the commit when it still describes the file, otherwise one walk. Opens
+/// nothing for writing, so a caller that may only read the store can use it.
+pub fn coverage(dir: &Path, name: &str) -> Option<(u64, usize)> {
+    let f = File::open(format::grain_path(dir, name)).ok()?;
+    let s = stamp(&f).ok()??;
+    let tail = match load_commit(dir, name, &s) {
+        Some(t) => t,
+        None => walk(&f, s.first, s.len, u64::MAX).ok()?,
+    };
+    Some((s.len, tail.count as usize))
+}
+
 pub fn load(path: &Path) -> anyhow::Result<Grain> {
     let buf = fs::read(path).with_context(|| format!("reading grain index {}", path.display()))?;
     let Some(first) = first_record_offset(&buf) else {
@@ -1103,5 +1116,47 @@ mod tests {
             assert!(g.may_contain_all(i - 6, &marker(i)));
         }
         assert!(!g.may_contain_all(0, &marker(0)));
+    }
+
+    #[test]
+    fn coverage_agrees_with_loading_the_grain() {
+        let d = TempDir::new();
+        let _st = a_store(d.path(), 7);
+        extend_grain(d.path(), "a.log").unwrap();
+        let loaded = load(&format::grain_path(d.path(), "a.log")).unwrap();
+        let len = grain_bytes(d.path()).len() as u64;
+
+        assert_eq!(
+            coverage(d.path(), "a.log"),
+            Some((len, loaded.chunk_count()))
+        );
+        // Without the commit it walks, and gets the same answer without
+        // writing one: the caller may be unable to write the store at all.
+        fs::remove_file(format::grain_commit_path(d.path(), "a.log")).unwrap();
+        assert_eq!(coverage(d.path(), "a.log"), Some((len, 7)));
+        assert!(!format::grain_commit_path(d.path(), "a.log").exists());
+    }
+
+    #[test]
+    fn coverage_does_not_count_a_torn_tail_or_a_missing_grain() {
+        let d = TempDir::new();
+        assert_eq!(coverage(d.path(), "a.log"), None);
+        let _st = a_store(d.path(), 4);
+        extend_grain(d.path(), "a.log").unwrap();
+        let g = OpenOptions::new()
+            .append(true)
+            .open(format::grain_path(d.path(), "a.log"))
+            .unwrap();
+        (&g).write_all(&100u32.to_le_bytes()).unwrap();
+        drop(g);
+        fs::remove_file(format::grain_commit_path(d.path(), "a.log")).unwrap();
+        assert_eq!(coverage(d.path(), "a.log").map(|c| c.1), Some(4));
+
+        fs::write(
+            format::grain_path(d.path(), "a.log"),
+            b"not a grain at all, no",
+        )
+        .unwrap();
+        assert_eq!(coverage(d.path(), "a.log"), None);
     }
 }
