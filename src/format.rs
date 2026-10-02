@@ -52,6 +52,9 @@ pub enum RingsVersion {
 pub const TRUNK_EXT: &str = "trunk";
 pub const RINGS_EXT: &str = "rings";
 pub const GRAIN_EXT: &str = "grain";
+/// Where the grain's records end and how many there are, as of its last
+/// completed write (grain.rs). A hint bound to the file it describes.
+pub const GRAIN_COMMIT_EXT: &str = "grain.commit";
 pub const BARK_EXT: &str = "bark";
 /// The collapse-head seqlock counter (store.rs): even means idle, odd
 /// means a collapse is in flight. Missing reads as 0 (never collapsed).
@@ -80,6 +83,7 @@ pub fn every_path(dir: &Path, name: &str) -> Vec<PathBuf> {
         RINGS_EXT,
         TRUNK_EXT,
         GRAIN_EXT,
+        GRAIN_COMMIT_EXT,
         BARK_EXT,
         SEQ_EXT,
         TRIM_EXT,
@@ -102,6 +106,10 @@ pub fn rings_path(dir: &Path, name: &str) -> PathBuf {
 
 pub fn grain_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.{GRAIN_EXT}"))
+}
+
+pub fn grain_commit_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.{GRAIN_COMMIT_EXT}"))
 }
 
 pub fn bark_path(dir: &Path, name: &str) -> PathBuf {

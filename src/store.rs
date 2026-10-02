@@ -1566,6 +1566,7 @@ impl Store {
         let _ = fs::remove_file(format::trunk_path(&self.dir, name));
         let _ = fs::remove_file(format::rings_path(&self.dir, name));
         let _ = fs::remove_file(format::grain_path(&self.dir, name));
+        let _ = fs::remove_file(format::grain_commit_path(&self.dir, name));
         let _ = fs::remove_file(format::bark_path(&self.dir, name));
         let _ = fs::remove_file(format::sap_path(&self.dir, name));
         let _ = fs::remove_file(format::sap_seal_path(&self.dir, name));
@@ -1599,6 +1600,10 @@ impl Store {
         let _ = fs::rename(
             format::grain_path(&self.dir, old),
             format::grain_path(&self.dir, new),
+        );
+        let _ = fs::rename(
+            format::grain_commit_path(&self.dir, old),
+            format::grain_commit_path(&self.dir, new),
         );
         let _ = fs::rename(
             format::bark_path(&self.dir, old),

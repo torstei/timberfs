@@ -792,6 +792,7 @@ mod tests {
             format::TRUNK_EXT,
             format::RINGS_EXT,
             format::GRAIN_EXT,
+            format::GRAIN_COMMIT_EXT,
             format::BARK_EXT,
             format::SEQ_EXT,
             format::TRIM_EXT,
