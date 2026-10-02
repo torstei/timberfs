@@ -115,6 +115,22 @@ pub fn push_seq(out: &mut Vec<Run>, s: u64) {
     }
 }
 
+/// True when `input` provably holds no chunk at or after `first_seq`: its
+/// last record is older, or it has none. Answers false for anything it
+/// cannot read, so the request is served and says why.
+pub fn nothing_from(input: &Path, first_seq: u64) -> bool {
+    if crate::query::is_bundle(input) {
+        return false;
+    }
+    let Ok((dir, name)) = crate::query::resolve_backing(input) else {
+        return false;
+    };
+    matches!(
+        crate::format::read_index_last(&crate::format::rings_path(&dir, &name)),
+        Ok((_, last)) if last.is_none_or(|c| c.seq < first_seq)
+    )
+}
+
 /// Write `input`'s answer to `req` as frames.
 pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Result<Served> {
     let mut handle = crate::query::open_source(input)?;
@@ -137,23 +153,12 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
 
     // Which chunks the request selects. Done before stream-open so its
     // declared range is what is actually coming, not what was asked for.
-    let selected: Vec<crate::format::ChunkRecord> = handle
-        .records
-        .iter()
-        .filter(|c| {
-            c.seq >= req.first_seq && (req.last_seq == frame::OPEN_ENDED || c.seq <= req.last_seq)
-        })
-        .copied()
-        .collect();
-    let positions: Vec<usize> = handle
-        .records
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| {
-            c.seq >= req.first_seq && (req.last_seq == frame::OPEN_ENDED || c.seq <= req.last_seq)
-        })
-        .map(|(i, _)| i)
-        .collect();
+    // By position, not copied out: a store is far larger than a turn.
+    let wanted = |c: &crate::format::ChunkRecord| {
+        c.seq >= req.first_seq && (req.last_seq == frame::OPEN_ENDED || c.seq <= req.last_seq)
+    };
+    let first = handle.records.iter().position(wanted);
+    let last = handle.records.iter().rposition(wanted);
 
     let mut buf = Vec::new();
     frame::encode(
@@ -162,8 +167,12 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
             frame: Frame::StreamOpen {
                 origin_id: origin_of(&bark),
                 sender_id: id_of(&bark),
-                first_seq: selected.first().map(|c| c.seq).unwrap_or(req.first_seq),
-                last_seq: selected.last().map(|c| c.seq).unwrap_or(frame::OPEN_ENDED),
+                first_seq: first
+                    .map(|i| handle.records[i].seq)
+                    .unwrap_or(req.first_seq),
+                last_seq: last
+                    .map(|i| handle.records[i].seq)
+                    .unwrap_or(frame::OPEN_ENDED),
                 mode: req.mode,
                 provenance: serde_json::to_vec(&travels(&bark, input))
                     .context("serializing what the store is")?,
@@ -181,7 +190,7 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
             &Framed {
                 stream: req.stream,
                 frame: Frame::Coverage {
-                    runs: runs_of(selected.iter().map(|c| c.seq)),
+                    runs: runs_of(handle.records.iter().filter(|c| wanted(c)).map(|c| c.seq)),
                 },
             },
             &mut buf,
@@ -191,22 +200,33 @@ pub fn serve(input: &Path, req: &Request, out: &mut impl Write) -> anyhow::Resul
         return Ok(stats);
     }
 
-    let grain = if req.sidecars {
-        grain_path(input).and_then(|p| crate::grain::load(&p).ok())
-    } else {
-        None
+    let Some((first, last)) = first.zip(last) else {
+        return Ok(stats);
+    };
+    // Only the pages this request can send: a grain is read by position,
+    // and the chunks it ships are the ones from `first` on.
+    let span = req
+        .max_chunks
+        .map_or(last - first + 1, |n| (n as usize).min(last - first + 1));
+    let pages = match req.sidecars.then(|| grain_path(input)).flatten() {
+        Some(p) => crate::grain::read_pages(&p, first, span),
+        None => Vec::new(),
     };
 
-    for (c, pos) in selected.into_iter().zip(positions) {
+    for pos in first..=last {
+        let c = handle.records[pos];
+        if !wanted(&c) {
+            continue;
+        }
         if req.max_chunks.is_some_and(|n| stats.chunks >= n) {
             break;
         }
         stats.last_examined = Some(c.seq);
         let mut sidecars = Vec::new();
-        if let Some(page) = grain.as_ref().and_then(|g| g.page(pos)) {
+        if let Some(page) = pos.checked_sub(first).and_then(|i| pages.get(i)) {
             sidecars.push(Sidecar {
                 kind: Sidecar::tag(GRAIN_TAG),
-                bytes: page.to_vec(),
+                bytes: page.clone(),
             });
         }
         let comp = if req.mode == Mode::Frames {
@@ -663,5 +683,46 @@ mod tests {
         assert_eq!(grain_header(&store), Some(bytes[..16].to_vec()));
         std::fs::write(&gpath, &bytes[..15]).unwrap();
         assert_eq!(grain_header(&store), None, "shorter than a header");
+    }
+
+    #[test]
+    fn a_resume_mid_store_sends_the_pages_of_its_own_chunks() {
+        let d = TempDir::new();
+        let p = a_store(d.path(), "mid", 6);
+        let (dir, name) = crate::query::resolve_backing(&p).unwrap();
+        crate::grain::extend_grain(&dir, &name).unwrap();
+        let g = crate::grain::load(&crate::format::grain_path(&dir, &name)).unwrap();
+
+        let mut req = Request::everything(Mode::Index);
+        req.first_seq = 2;
+        req.max_chunks = Some(3);
+        let mut buf = Vec::new();
+        let served = serve(&p, &req, &mut buf).unwrap();
+        assert_eq!(served.chunks, 3);
+        let got: Vec<(u64, Vec<u8>)> = frames(&buf)
+            .iter()
+            .filter_map(|f| match &f.frame {
+                Frame::Chunk { seq, sidecars, .. } => Some((*seq, sidecars[0].bytes.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), [2, 3, 4]);
+        for (seq, page) in got {
+            assert_eq!(page, g.page(seq as usize).unwrap(), "chunk {seq}");
+        }
+    }
+
+    #[test]
+    fn nothing_from_is_true_only_past_the_last_chunk() {
+        let d = TempDir::new();
+        let p = a_store(d.path(), "idle", 3);
+        assert!(!nothing_from(&p, 0));
+        assert!(!nothing_from(&p, 2), "the last chunk is still to send");
+        assert!(nothing_from(&p, 3));
+        assert!(nothing_from(&p, 100));
+        assert!(
+            !nothing_from(&d.path().join("absent.log"), 3),
+            "unreadable is served, so the reason is said"
+        );
     }
 }

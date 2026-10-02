@@ -106,6 +106,29 @@ fn tape_end(dir: &Path, name: &str) -> u64 {
     dropped + last.map(|c| c.uncomp_end()).unwrap_or(0)
 }
 
+/// True when reading `name` from tape offset `at` provably returns nothing:
+/// the cursor sits exactly at the end of the flushed chunks, and the live
+/// edge, which the read also follows, has no write-ahead entries pending or
+/// mid-handoff. Anything it cannot read answers false, so the read happens
+/// and says why.
+fn nothing_to_read(dir: &Path, name: &str, at: u64) -> bool {
+    use crate::format;
+    if format::sap_seal_path(dir, name).exists() {
+        return false;
+    }
+    if let Ok(m) = std::fs::metadata(format::sap_path(dir, name)) {
+        if m.len() > crate::sap::HEADER_LEN {
+            return false;
+        }
+    }
+    let Ok((_, last)) = format::read_index_last(&format::rings_path(dir, name)) else {
+        return false;
+    };
+    let end =
+        crate::query::dropped_bytes_of(&dir.join(name)) + last.map(|c| c.uncomp_end()).unwrap_or(0);
+    end == at
+}
+
 /// How many stores a batch may span, and how many entries it may hold, by
 /// default. The entry cap is the destination's batch size; the store cap
 /// bounds a poll's syscalls, since every store in the selection is opened
@@ -328,7 +351,6 @@ impl Shipper {
         if stores.is_empty() {
             return Ok((Vec::new(), stores, matched));
         }
-        let files: Vec<PathBuf> = stores.iter().map(|(_, p, _)| p.clone()).collect();
         let mut cursor = self.positions.cursor();
         for (id, _, _) in &stores {
             // Never backwards: the recorded position is the floor, so a
@@ -338,6 +360,22 @@ impl Shipper {
                 cursor.insert(id.clone(), at);
             }
         }
+        // The read opens every store it is given, so an idle one is left
+        // out of it, and out of the answer: most stores are idle on most
+        // polls. The stores returned are the ones read, because the parse
+        // pairs them with the buffer.
+        let stores: Vec<Store> = stores
+            .into_iter()
+            .filter(|(id, path, _)| {
+                let at = cursor.get(id).copied();
+                let (dir, name) = (path.parent(), path.file_name().and_then(|n| n.to_str()));
+                !matches!((at, dir, name), (Some(at), Some(d), Some(n)) if nothing_to_read(d, n, at))
+            })
+            .collect();
+        if stores.is_empty() {
+            return Ok((Vec::new(), stores, matched));
+        }
+        let files: Vec<PathBuf> = stores.iter().map(|(_, p, _)| p.clone()).collect();
         let mut buf = Vec::new();
         crate::query::read_forward(&mut buf, &files, &cursor, self.batch_entries)?;
         Ok((buf, stores, matched))
@@ -988,6 +1026,60 @@ mod tests {
         assert_eq!(b.matched, 2, "it matched");
         assert_eq!(b.slices.len(), 1, "and only one of them is followed");
         assert!(bodies(&b).iter().all(|l| l.contains("web")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_store_is_idle_only_at_exactly_its_tape_end_with_nothing_live() {
+        let root = forest("idle", &[("a", "x", 3)]);
+        let (dir, name) = (root.join("a"), "a.log");
+        let end = tape_end(&dir, name);
+        assert!(end > 0);
+        assert!(nothing_to_read(&dir, name, end));
+        assert!(!nothing_to_read(&dir, name, end - 1), "behind it: to read");
+        assert!(!nothing_to_read(&dir, name, end + 1), "beyond it: say so");
+
+        // The live edge is read too: entries pending in the write-ahead
+        // segment, or a segment mid-handoff, are not idle.
+        let sap = crate::format::sap_path(&dir, name);
+        std::fs::write(&sap, vec![0u8; crate::sap::HEADER_LEN as usize]).unwrap();
+        assert!(nothing_to_read(&dir, name, end), "a header alone is empty");
+        std::fs::write(&sap, vec![0u8; crate::sap::HEADER_LEN as usize + 1]).unwrap();
+        assert!(!nothing_to_read(&dir, name, end), "pending entries");
+        std::fs::remove_file(&sap).unwrap();
+        std::fs::write(crate::format::sap_seal_path(&dir, name), b"x").unwrap();
+        assert!(!nothing_to_read(&dir, name, end), "a handoff in flight");
+
+        assert!(
+            !nothing_to_read(&dir, "absent.log", 0),
+            "unreadable is read, so the reason is said"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_caught_up_store_is_left_out_of_the_read_and_wakes_when_it_grows() {
+        let root = forest("wake", &[("a", "x", 3), ("b", "x", 3)]);
+        let mut sh = shipper(&root, "service=x", 100);
+        let first = sh.poll().unwrap();
+        assert_eq!(first.slices.len(), 2);
+        sh.accept(&first).unwrap();
+
+        let idle = sh.poll().unwrap();
+        assert!(idle.slices.is_empty(), "both caught up: nothing is read");
+        assert_eq!(idle.matched, 2, "still matched, just idle");
+
+        append(&root, "b", 2);
+        let woke = sh.poll().unwrap();
+        let ids: Vec<_> = woke.slices.iter().map(|s| s.path.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![root.join("b").join("b.log")],
+            "only the grown one"
+        );
+        assert_eq!(woke.slices[0].entries.len(), 2);
+        sh.accept(&woke).unwrap();
+        assert!(sh.poll().unwrap().slices.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
