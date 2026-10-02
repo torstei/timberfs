@@ -924,6 +924,11 @@ fn open_send_stream(
 /// Serve one store's turn: from where its stream stands, up to
 /// `CHUNKS_PER_TURN`. Returns how many chunks went on the wire.
 fn ship_turn(w: &mut impl Write, s: &mut Stream, opts: &SendOpts) -> anyhow::Result<u64> {
+    // An idle store is the common case on every poll: a header and one
+    // record say so, where serving reads the whole index to find nothing.
+    if crate::serve::nothing_from(&s.path, s.resume) {
+        return Ok(0);
+    }
     let mut body = Vec::new();
     let served = crate::serve::serve(
         &s.path,

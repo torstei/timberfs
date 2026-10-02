@@ -320,6 +320,47 @@ impl Grain {
     }
 }
 
+/// The filters of records `from..from + count`, read by walking the length
+/// prefixes with a bounded buffer: memory is the pages asked for, not the
+/// grain. Shorter than `count` where the grain does not reach, which is
+/// "missing means scan" for the rest.
+pub fn read_pages(path: &Path, from: usize, count: usize) -> Vec<Vec<u8>> {
+    let mut pages = Vec::new();
+    let Ok(f) = File::open(path) else {
+        return pages;
+    };
+    let Ok(Some(s)) = stamp(&f) else {
+        return pages;
+    };
+    let mut r = BufReader::with_capacity(WALK_BUF, &f);
+    if r.seek(SeekFrom::Start(s.first)).is_err() {
+        return pages;
+    }
+    let (mut off, mut idx) = (s.first, 0usize);
+    while idx < from.saturating_add(count) && off + 4 <= s.len {
+        let mut p = [0u8; 4];
+        if r.read_exact(&mut p).is_err() {
+            break;
+        }
+        let len = u32::from_le_bytes(p) as u64;
+        if off + 4 + len > s.len {
+            break;
+        }
+        if idx >= from {
+            let mut page = vec![0u8; len as usize];
+            if r.read_exact(&mut page).is_err() {
+                break;
+            }
+            pages.push(page);
+        } else if r.seek_relative(len as i64).is_err() {
+            break;
+        }
+        off += 4 + len;
+        idx += 1;
+    }
+    pages
+}
+
 /// The grain's size and how many chunks it covers, without loading it:
 /// the commit when it still describes the file, otherwise one walk. Opens
 /// nothing for writing, so a caller that may only read the store can use it.
@@ -1158,5 +1199,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(coverage(d.path(), "a.log"), None);
+    }
+
+    #[test]
+    fn pages_read_by_range_are_the_loaded_ones() {
+        let d = TempDir::new();
+        write_grain(d.path(), "a.log", 9);
+        let path = format::grain_path(d.path(), "a.log");
+        let loaded = load(&path).unwrap();
+        for (from, count) in [(0, 9), (0, 3), (2, 4), (7, 2), (8, 50), (0, 0)] {
+            let got = read_pages(&path, from, count);
+            let want: Vec<Vec<u8>> = (from..(from + count).min(9))
+                .map(|i| loaded.page(i).unwrap().to_vec())
+                .collect();
+            assert_eq!(got, want, "pages {from}..{}", from + count);
+        }
+        assert!(read_pages(&path, 40, 3).is_empty(), "past the end");
+        assert!(read_pages(&d.path().join("none"), 0, 3).is_empty());
+    }
+
+    #[test]
+    fn pages_stop_at_a_torn_tail() {
+        let d = TempDir::new();
+        write_grain(d.path(), "a.log", 4);
+        let path = format::grain_path(d.path(), "a.log");
+        let g = OpenOptions::new().append(true).open(&path).unwrap();
+        (&g).write_all(&90u32.to_le_bytes()).unwrap();
+        (&g).write_all(&[7u8; 5]).unwrap();
+        drop(g);
+        assert_eq!(read_pages(&path, 0, 10).len(), 4);
+        assert_eq!(read_pages(&path, 3, 10).len(), 1);
     }
 }
