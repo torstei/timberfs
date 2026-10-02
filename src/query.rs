@@ -2682,12 +2682,7 @@ pub fn summarize_store(
     let dropped = std::fs::File::open(&rings_path)
         .and_then(|f| format::read_header_dropped(&f))
         .unwrap_or_default();
-    let gpath = format::grain_path(dir, name);
-    let grain = std::fs::metadata(&gpath).ok().and_then(|m| {
-        crate::grain::load(&gpath)
-            .ok()
-            .map(|g| (m.len(), g.chunk_count()))
-    });
+    let grain = crate::grain::coverage(dir, name);
     let get = |k: &str| {
         bark.and_then(|b| b.get(k))
             .and_then(|v| v.as_str())
