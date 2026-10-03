@@ -55,13 +55,20 @@ holds the file's bytes verbatim, so the file offset of its end is the tape
 position `dropped + size()`. Compare `B` with the file just before that offset.
 Equal: resume there. One chunk and `N` bytes read.
 
-**Step 1, the hinted candidate.** When the store and the file are no longer
-aligned (an earlier run dropped lines, the store holds several sources, the
-file was regenerated), the hint file records where the last run ended, as a
-file offset and the tape position it matched. If the store's tape end still
-equals the recorded one, compare `B` just before the recorded file offset.
+That alignment holds only until the first rotation. After it the same log is a
+different file, whose byte 0 sits at whatever the tape end was when it was
+opened, so the common case (one log, one store) stops being aligned after one
+rotation.
 
-**Step 2, the search.** For everything else.
+**Step 1, the hinted candidate.** The hint file records, per source file, the
+tape position of its byte 0 (`tape_start`), and where the last run ended (a file
+offset and the tape position it matched). The candidate is the tape end minus
+`tape_start`; compare `B` just before it. This covers rotation, and anything else
+that left the store and the file misaligned. It is only written by a run that
+verified its own position, so it never turns a guess into a belief.
+
+**Step 2, the search.** For everything else: a store with no hint yet (the first
+run after upgrading), a hint that no longer matches, a file regenerated in place.
 
 - *Head check, when the store still has its head* (`dropped == 0`): compare the
   first couple of KiB of the file with the store's. One chunk. It says "this
@@ -140,7 +147,8 @@ not in memory:
   passes 100 MiB and at each doubling, the state in the hint file, and in `info`.
 - A live source that legitimately has no stamps declares arrival stamping and is
   imported as it is read. That is a declaration and not a fallback: while a
-  file can still gain a stamp, the default is to wait rather than guess a time.
+  file can still gain a stamp, the default is to wait, for ever if need be,
+  rather than guess a time. **Decided.**
 - The hint also records which timestamp declaration it scanned with. A changed
   regex or format makes it stale, so fixing a declaration takes effect on a file
   that is still there, without anyone clearing state.
@@ -198,10 +206,12 @@ hint is a volatile guess about one file on one host.
 ## Open questions
 
 - `N`, the region size, and `W`.
-- Whether a *live* source that never gets a stamp waits for ever by default,
-  visibly (my lean), or falls back to arrival stamping after a bound.
 - A source with no parseable stamps: no probe can be classified, and the rings
   cannot select chunks for it, so only Steps 0 and 1 apply, then the whole file
   is scanned for `B`.
-- A store fed by several files: Step 0 does not hold, Step 1 is per source.
+- A store fed by a *set* of files (`import app.log*`, day files) keeps its
+  existing handling: sources ordered by first stamp, appended after the store's
+  end, or deduplicated where they overlap. It is a bulk and backfill use, and
+  re-running it rescans every overlap; a per-source "unchanged since last run"
+  check in the hint would turn that into a stat. Later, not part of the resume.
 - Whether the note belongs in the hint file or also in `info`.
