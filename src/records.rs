@@ -4,9 +4,42 @@
 //! kinds and keys are ignored (the format grows additively); EOF
 //! without stream-end is truncation — an error, never a short result.
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 use anyhow::{bail, Context};
+
+/// The longest metadata record accepted. They are a kind and a few
+/// key=value fields, never data, so a header that runs past this is not one.
+pub const MAX_RECORD_HEADER: u64 = 1 << 20;
+
+/// How much of a claimed payload length is allocated before any bytes have
+/// arrived: the rest grows with what the stream actually delivers.
+const PAYLOAD_PREALLOC: usize = 1 << 20;
+
+/// The next NUL-terminated header into `buf`, at most `MAX_RECORD_HEADER`
+/// bytes of it. Returns how many bytes were read, 0 at end of stream.
+pub fn read_header<R: BufRead>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    let n = r.take(MAX_RECORD_HEADER).read_until(0, buf)?;
+    if n as u64 == MAX_RECORD_HEADER && buf.last() != Some(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a record header longer than {MAX_RECORD_HEADER} bytes"),
+        ));
+    }
+    Ok(n)
+}
+
+/// Exactly `len` bytes of payload, allocated as they arrive. A length read
+/// from a stream says what the producer claims; a stream that claims more
+/// than it delivers fails short instead of reserving the claim.
+pub fn read_payload<R: Read>(r: &mut R, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(len.min(PAYLOAD_PREALLOC));
+    r.take(len as u64).read_to_end(&mut payload)?;
+    if payload.len() != len {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(payload)
+}
 
 /// One entry, with whatever the stream said about it.
 pub struct EntryRec {
@@ -178,7 +211,7 @@ impl<R: BufRead> Reader<R> {
     pub fn next_rec(&mut self) -> anyhow::Result<Option<Rec>> {
         loop {
             self.hdr.clear();
-            if self.r.read_until(0, &mut self.hdr)? == 0 {
+            if read_header(&mut self.r, &mut self.hdr)? == 0 {
                 if !self.complete {
                     bail!("record stream truncated — no stream-end (producer died or pipe broke)");
                 }
@@ -222,8 +255,7 @@ impl<R: BufRead> Reader<R> {
                     let wf = get("wf").and_then(|v| v.parse().ok());
                     let wl = get("wl").and_then(|v| v.parse().ok());
                     let chunk = get("chunk").and_then(|v| v.parse().ok());
-                    let mut payload = vec![0u8; len];
-                    self.r.read_exact(&mut payload).context(
+                    let payload = read_payload(&mut self.r, len).context(
                         "record stream truncated mid-entry (producer died or pipe broke)",
                     )?;
                     let mut nul = [0u8; 1];
@@ -396,5 +428,50 @@ mod tests {
             panic!("expected an entry");
         };
         assert!(e.src.is_none() && e.id.is_none());
+    }
+
+    #[test]
+    fn a_payload_that_claims_more_than_the_stream_holds_fails_short() {
+        // The claim is far larger than anything this test could allocate
+        // if it believed it.
+        let mut r = &b"only a few bytes"[..];
+        let e = read_payload(&mut r, usize::MAX / 2).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        let mut r = &b"exactly"[..];
+        assert_eq!(read_payload(&mut r, 7).unwrap(), b"exactly");
+        let mut r = &b"short"[..];
+        assert!(read_payload(&mut r, 6).is_err());
+        let mut r = &b""[..];
+        assert_eq!(read_payload(&mut r, 0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_header_has_a_length_and_a_stream_without_a_nul_is_refused() {
+        let mut buf = Vec::new();
+        let mut r = &b"\x1eone\x00\x1etwo\x00"[..];
+        assert_eq!(read_header(&mut r, &mut buf).unwrap(), 5);
+        buf.clear();
+        assert_eq!(read_header(&mut r, &mut buf).unwrap(), 5);
+        buf.clear();
+        assert_eq!(read_header(&mut r, &mut buf).unwrap(), 0, "end of stream");
+
+        let endless = vec![b'x'; MAX_RECORD_HEADER as usize + 10];
+        let mut r = &endless[..];
+        let e = read_header(&mut r, &mut Vec::new()).unwrap_err();
+        assert!(e.to_string().contains("longer than"), "{e}");
+    }
+
+    #[test]
+    fn an_entry_that_claims_a_huge_length_is_a_truncated_stream() {
+        let mut s = b"\x1estream-start\x1fv=1\x00".to_vec();
+        s.extend_from_slice(b"\x1eentry\x1flen=9000000000000\x00tiny\x00");
+        let mut reader = Reader::new(&s[..]);
+        assert!(matches!(reader.next_rec(), Ok(Some(Rec::Start(_)))));
+        let e = reader
+            .next_rec()
+            .err()
+            .expect("a claim the stream cannot meet");
+        assert!(format!("{e:#}").contains("truncated mid-entry"), "{e:#}");
     }
 }

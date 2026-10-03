@@ -533,6 +533,62 @@ fn index_layout(prefix: &[u8], total_len: u64) -> io::Result<(RingsVersion, usiz
     Ok((version, header, rec_len))
 }
 
+/// No chunk this timberfs writes comes near this size. A record claiming
+/// more is corrupt, and is refused before anything is allocated for it.
+pub const MAX_CHUNK_BYTES: u64 = 1 << 32;
+
+/// The stored (compressed) frame of chunk `c`, read from `file`.
+///
+/// A length taken from an index says what the index claims, not what the
+/// file holds, so a frame that would run past the end of the file, or that
+/// no chunk could be, is an error and not a buffer of that size.
+pub fn read_frame(file: &File, c: &ChunkRecord) -> io::Result<Vec<u8>> {
+    let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
+    if c.comp_len > MAX_CHUNK_BYTES {
+        return Err(bad(format!(
+            "chunk {} records {} stored bytes, which no chunk has — the index may be corrupt",
+            c.seq, c.comp_len
+        )));
+    }
+    let end = c.comp_start.saturating_add(c.comp_len);
+    if end > file.metadata()?.len() {
+        return Err(bad(format!(
+            "chunk {} points past the end of the trunk ({} + {}) — the index may be corrupt",
+            c.seq, c.comp_start, c.comp_len
+        )));
+    }
+    let mut comp = vec![0u8; c.comp_len as usize];
+    file.read_exact_at(&mut comp, c.comp_start)?;
+    Ok(comp)
+}
+
+/// Decompress one chunk's frame, refusing output beyond the `uncomp_len`
+/// its index promised: a bad frame is an error, not an allocation of
+/// whatever it expands to.
+pub fn decode_frame(comp: &[u8], uncomp_len: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    if uncomp_len > MAX_CHUNK_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a chunk records {uncomp_len} bytes, which no chunk has"),
+        ));
+    }
+    if comp.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(uncomp_len.min(1 << 24) as usize);
+    zstd::stream::Decoder::new(comp)?
+        .take(uncomp_len + 1)
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > uncomp_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a chunk expands past the {uncomp_len} bytes its index records"),
+        ));
+    }
+    Ok(out)
+}
+
 /// How many records a `.rings` file holds, and the ones from `from` on,
 /// reading only those: the records are a fixed stride after a declared
 /// header, so the count is the file's length and the tail is one seek. For
@@ -856,5 +912,58 @@ mod tests {
             all.last().map(|c| c.seq)
         );
         let _ = std::fs::remove_file(p);
+    }
+
+    fn chunk(start: u64, comp_len: u64, uncomp_len: u64) -> ChunkRecord {
+        ChunkRecord {
+            comp_start: start,
+            comp_len,
+            uncomp_len,
+            ..rec(7)
+        }
+    }
+
+    #[test]
+    fn a_frame_is_read_where_the_index_says_and_nowhere_else() {
+        let body = zstd::stream::encode_all(&b"hello world"[..], 1).unwrap();
+        let mut file = vec![0xAAu8; 16];
+        file.extend_from_slice(&body);
+        let p = write_image("frame", &file);
+        let f = File::open(&p).unwrap();
+
+        let c = chunk(16, body.len() as u64, 11);
+        let comp = read_frame(&f, &c).unwrap();
+        assert_eq!(decode_frame(&comp, 11).unwrap(), b"hello world");
+
+        for (label, bad) in [
+            ("past the end", chunk(16, body.len() as u64 + 1, 11)),
+            ("a start beyond the file", chunk(10_000, 4, 11)),
+            ("a length no chunk has", chunk(0, u64::MAX, 11)),
+            ("an overflowing range", chunk(u64::MAX - 1, 8, 11)),
+            ("just over the bound", chunk(0, MAX_CHUNK_BYTES + 1, 11)),
+        ] {
+            let e = read_frame(&f, &bad).expect_err(label);
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{label}: {e}");
+        }
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn a_frame_may_not_expand_past_what_the_index_records() {
+        let zeros = vec![0u8; 1 << 20];
+        let bomb = zstd::stream::encode_all(&zeros[..], 3).unwrap();
+        assert!(
+            bomb.len() < 1000,
+            "a megabyte of zeros is a few dozen bytes"
+        );
+        assert_eq!(decode_frame(&bomb, 1 << 20).unwrap().len(), 1 << 20);
+        let e = decode_frame(&bomb, 1000).unwrap_err();
+        assert!(e.to_string().contains("expands past"), "{e}");
+        assert!(
+            decode_frame(&bomb, u64::MAX).is_err(),
+            "a claim no chunk has"
+        );
+        assert!(decode_frame(b"not a zstd frame", 100).is_err());
+        assert_eq!(decode_frame(&[], 0).unwrap(), Vec::<u8>::new());
     }
 }

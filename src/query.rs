@@ -7,7 +7,6 @@
 use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -274,9 +273,10 @@ fn read_chunk(
     c: ChunkRecord,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     match read_chunk_raw(input, guard, handle, c)? {
-        Some(comp) => Ok(Some(zstd::stream::decode_all(&comp[..]).with_context(
-            || "decompressing a stored chunk — the .trunk may be corrupt",
-        )?)),
+        Some(comp) => Ok(Some(
+            format::decode_frame(&comp, c.uncomp_len)
+                .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?,
+        )),
         None => Ok(None),
     }
 }
@@ -296,8 +296,7 @@ pub(crate) fn read_chunk_raw(
     let mut tries = 0usize;
     loop {
         let before = guard.as_ref().map(|(d, n)| crate::store::read_seq(d, n));
-        let mut comp = vec![0u8; c.comp_len as usize];
-        let read_res = handle.file.read_exact_at(&mut comp, c.comp_start);
+        let read_res = format::read_frame(&handle.file, &c);
         let raced = if let (Some(before), Some((d, n))) = (before, guard.as_ref()) {
             let after = crate::store::read_seq(d, n);
             before % 2 == 1 || after % 2 == 1 || before != after
@@ -305,8 +304,7 @@ pub(crate) fn read_chunk_raw(
             false
         };
         if !raced {
-            read_res.context("reading a stored chunk")?;
-            return Ok(Some(comp));
+            return Ok(Some(read_res.context("reading a stored chunk")?));
         }
         tries += 1;
         if tries > 64 {
