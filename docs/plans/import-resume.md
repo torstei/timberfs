@@ -133,9 +133,26 @@ not in memory:
 - The wait is **visible**. Nothing is imported while it lasts, and a file that
   never carries a stamp looks exactly like a quiet one. So: a note when the scan
   passes 100 MiB and at each doubling, the state in the hint file, and in `info`.
-- A source that legitimately has no stamps declares arrival stamping and is
-  imported as it is read. That is a declaration and not a fallback: the default
-  is to wait rather than guess a time.
+- A live source that legitimately has no stamps declares arrival stamping and is
+  imported as it is read. That is a declaration and not a fallback: while a
+  file can still gain a stamp, the default is to wait rather than guess a time.
+- The hint also records which timestamp declaration it scanned with. A changed
+  regex or format makes it stale, so fixing a declaration takes effect on a file
+  that is still there, without anyone clearing state.
+
+**A file that is closed without ever carrying a stamp is different, because
+waiting stops being free.** While running, the tail holds the file's descriptor,
+so a rotation leaves it reading the rotated file to its end before it reopens
+the new one. That moment is the last time anything reads that file: logrotate
+deletes it in time, and at startup only `.1` and `.0` are looked for at all. A
+wait that cannot end is a loss that has not happened yet.
+
+So a file closed while awaiting a stamp is imported, stamped with its
+modification time: the end of its content's life, and the same reference the
+extractor already uses for a stamp with no year. The time is approximate (all
+of it at that instant) and the content is kept. One note says so: which file,
+how many bytes, and the time they were given. The hint records it, so a restart
+does not do it twice.
 
 A one-shot `import` of a file with no stamp has no live edge to stamp by
 arrival, so there it is a usage error: declare the format, or ask for arrival
@@ -176,8 +193,10 @@ hint is a volatile guess about one file on one host.
 ## Open questions
 
 - `N`, the region size, and `W`.
-- Whether a source that never gets a stamp waits for ever by default, visibly
-  (my lean), or falls back to arrival stamping after a bound.
+- Whether a *live* source that never gets a stamp waits for ever by default,
+  visibly (my lean), or falls back to arrival stamping after a bound.
+- Whether a file closed without a stamp is imported at its modification time
+  (my lean: the alternative is losing content we hold) or left with a note.
 - A source with no parseable stamps: no probe can be classified, and the rings
   cannot select chunks for it, so only Steps 0 and 1 apply, then the whole file
   is scanned for `B`.
