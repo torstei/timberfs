@@ -573,9 +573,6 @@ pub fn decode_frame(comp: &[u8], uncomp_len: u64) -> io::Result<Vec<u8>> {
             format!("a chunk records {uncomp_len} bytes, which no chunk has"),
         ));
     }
-    if comp.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::with_capacity(uncomp_len.min(1 << 24) as usize);
     zstd::stream::Decoder::new(comp)?
         .take(uncomp_len + 1)
@@ -964,6 +961,18 @@ mod tests {
             "a claim no chunk has"
         );
         assert!(decode_frame(b"not a zstd frame", 100).is_err());
-        assert_eq!(decode_frame(&[], 0).unwrap(), Vec::<u8>::new());
+        // Nothing is not a frame: zstd's own decode_all refuses it, and an index
+        // record that says a chunk is zero bytes long is corrupt.
+        assert!(decode_frame(&[], 0).is_err());
+    }
+
+    #[test]
+    fn a_chunk_recorded_as_zero_bytes_is_an_error_not_an_empty_chunk() {
+        let p = write_image("zero", &[0xAAu8; 32]);
+        let f = File::open(&p).unwrap();
+        let comp = read_frame(&f, &chunk(16, 0, 0)).unwrap();
+        assert!(comp.is_empty());
+        assert!(decode_frame(&comp, 0).is_err());
+        let _ = std::fs::remove_file(p);
     }
 }
