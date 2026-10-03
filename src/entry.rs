@@ -20,6 +20,10 @@ pub type EntryLimit = (Rc<Cell<u64>>, u64);
 
 /// A timestamp-less flood can't balloon memory (same cap as grep).
 const ENTRY_CAP: usize = 16 << 20;
+/// The longest a line is held waiting for its newline. Past it the line goes
+/// on as fragments, so data with no newline in it (a progress bar redrawing
+/// with carriage returns) is never buffered whole.
+pub const LINE_CAP: usize = ENTRY_CAP;
 
 /// How entries leave the sink.
 pub struct Framing {
@@ -90,6 +94,9 @@ pub struct EntrySink {
     /// Absolute, so retention cannot move it — `remove_head` rebases a
     /// chunk's own offset and the drop counter compensates exactly.
     line_begin: u64,
+    /// The line being accumulated already had a fragment emitted: what
+    /// follows continues it and carries no stamp of its own.
+    mid_line: bool,
     /// Just past the last entry this sink EMITTED. A caller resumes here:
     /// everything after it is re-examined, so an entry the window or a
     /// predicate rejected is simply rejected again, and nothing that was
@@ -133,6 +140,7 @@ impl EntrySink {
             offset_sum_ms: 0,
             offset_n: 0,
             line_begin: 0,
+            mid_line: false,
             emitted_end: None,
         }
     }
@@ -173,18 +181,38 @@ impl EntrySink {
                 let began = self.line_begin;
                 self.line_begin = base + start as u64;
                 let line = std::mem::take(&mut self.line);
-                self.take_line(line, began, out)?;
+                let continues = std::mem::take(&mut self.mid_line);
+                self.take_line(line, began, continues, out)?;
             }
         }
         self.line.extend_from_slice(&data[start..]);
+        while self.line.len() >= LINE_CAP {
+            let rest = self.line.split_off(LINE_CAP);
+            let fragment = std::mem::replace(&mut self.line, rest);
+            let began = self.line_begin;
+            self.line_begin += fragment.len() as u64;
+            let continues = std::mem::replace(&mut self.mid_line, true);
+            self.take_line(fragment, began, continues, out)?;
+        }
         Ok(())
     }
 
     /// `began` is where this line starts on the tape — which is also
     /// where the entry it interrupts ENDS, when it is a stamped one.
-    fn take_line(&mut self, line: Vec<u8>, began: u64, out: &mut dyn Write) -> io::Result<()> {
+    fn take_line(
+        &mut self,
+        line: Vec<u8>,
+        began: u64,
+        continues: bool,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
         let head = String::from_utf8_lossy(&line[..line.len().min(256)]);
-        match self.extractor.extract(&head) {
+        let stamp = if continues {
+            None
+        } else {
+            self.extractor.extract(&head)
+        };
+        match stamp {
             Some(ts) => {
                 self.close_at(began, out)?;
                 self.entry_ts = Some(ts);
@@ -383,6 +411,7 @@ impl EntrySink {
     /// apart, so the caller, which knows whether chunks remain, decides.
     pub fn discard_pending(&mut self) {
         self.line.clear();
+        self.mid_line = false;
         self.entry.clear();
         self.entry_ts = None;
     }
@@ -395,7 +424,8 @@ impl EntrySink {
         if !self.line.is_empty() {
             let began = self.line_begin;
             let line = std::mem::take(&mut self.line);
-            self.take_line(line, began, out)?;
+            let continues = std::mem::take(&mut self.mid_line);
+            self.take_line(line, began, continues, out)?;
         }
         self.close_at(end, out)?;
 
@@ -583,5 +613,78 @@ mod tests {
             "the number agrees with the window: {}",
             h[0]
         );
+    }
+
+    #[test]
+    fn a_line_with_no_newline_is_never_buffered_whole() {
+        let mut sink = records_sink();
+        let mut out = Vec::new();
+        let data = vec![b'x'; 3 * LINE_CAP + 12_345];
+        for (n, piece) in data.chunks(LINE_CAP / 2).enumerate() {
+            let base = (n * (LINE_CAP / 2)) as u64;
+            sink.push_chunk(piece, Some(n as u64), (100, 200), base, &mut out)
+                .unwrap();
+            assert!(sink.line.len() < LINE_CAP, "held {} bytes", sink.line.len());
+        }
+        sink.finish(&mut out).unwrap();
+
+        // Every byte comes out, in pieces no larger than the cap, and the
+        // positions chain: each begins where the previous one ended.
+        let mut next = 0u64;
+        let mut total = 0usize;
+        for rec in out
+            .split(|&b| b == 0x1e)
+            .filter(|r| r.starts_with(b"entry"))
+        {
+            let head = rec.split(|&b| b == 0).next().unwrap();
+            let field = |k: &str| {
+                String::from_utf8_lossy(head)
+                    .split('\x1f')
+                    .find_map(|f| f.strip_prefix(&format!("{k}=")).map(str::to_string))
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            };
+            assert_eq!(field("offset"), next, "the pieces chain");
+            assert!(field("len") as usize <= LINE_CAP + LINE_CAP / 2);
+            next += field("len");
+            total += field("len") as usize;
+        }
+        assert_eq!(total, data.len());
+        assert!(next >= 3 * LINE_CAP as u64);
+    }
+
+    #[test]
+    fn the_rest_of_a_cut_line_is_not_stamped_again() {
+        // The first line is one stamped entry that runs past the cap and
+        // ends at a newline; the line after it is a genuinely new entry.
+        // The bytes at the cut read as a timestamp and must not start one.
+        let mut sink = EntrySink::new(
+            crate::import::Extractor::new(None, None, false).unwrap(),
+            None,
+            Framing {
+                null_sep: false,
+                records: true,
+                show_write: false,
+                label: None,
+                store_id: None,
+            },
+            None,
+            "test",
+        );
+        let mut out = Vec::new();
+        let mut line = b"2026-10-03T10:00:00Z ".to_vec();
+        line.resize(LINE_CAP, b'x');
+        line.extend_from_slice(b"2026-10-03T10:00:09Z stamp-shaped, but a continuation\n");
+        line.extend_from_slice(b"2026-10-03T10:00:20Z a real second entry\n");
+        // In chunk-sized pieces, as a store hands them over: a line this
+        // long spans many of them.
+        for (n, piece) in line.chunks(1 << 20).enumerate() {
+            sink.push_chunk(piece, None, (0, u64::MAX), (n << 20) as u64, &mut out)
+                .unwrap();
+        }
+        sink.finish(&mut out).unwrap();
+
+        assert_eq!(sink.stamped, 2, "two real entries, not three");
     }
 }
