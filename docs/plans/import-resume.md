@@ -106,11 +106,35 @@ One line to stderr (the journal) and a note in the hint file say which. The
 hint is then written, so the next start takes Step 1: the fallback runs once
 per change of generation, not once per restart.
 
-**Permanent errors stop the unit.** No timestamp found in the first lines, a
-regex that does not compile: retrying cannot help. These exit with a distinct
-status (78, `EX_CONFIG`), and the units gain `RestartPreventExitStatus=78`.
-Transient faults (the source is missing, a writer holds the lock, the disk is
-full) exit non-zero as now, because a restart is the right answer to them.
+**What can change while the process runs is waited for, not exited on.** A
+followed file that does not exist yet already is: the tail waits for it. A file
+with no timestamp *yet* is the same kind of thing, and today it is not: the
+first stamp is looked for in the first 1000 lines and its absence is an error,
+which exits, which the unit restarts every two seconds, each time re-scanning
+the same lines until a stamp turns up. It recovers by accident and meanwhile
+loops. Stopping the unit instead would be worse: a file that gains a stamp
+later would never be looked at again.
+
+So for a followed source, no stamp yet is a state:
+
+- Lines read before the first stamp are held, bounded in lines and in bytes, and
+  written ahead of the first stamped line when it arrives, as now.
+- Past the bound they are imported stamped by arrival time, once, with a note
+  that says so. Arrival time is what a live `append` already uses.
+- The process keeps going. Every later line is still tried against the
+  extractor, so a file that gains stamps is read with its own stamps from then
+  on.
+
+A one-shot `import` of a file with no stamp has no live edge to stamp by
+arrival, so there it is a usage error: declare the format, or ask for arrival
+stamping.
+
+**Only what a restart cannot change stops the unit.** A timestamp regex that
+does not compile, an unknown format: retrying cannot help. These exit with a
+distinct status (78, `EX_CONFIG`), and the units gain
+`RestartPreventExitStatus=78`. Transient faults (a writer holds the lock, the
+disk is full) exit non-zero as now, because a restart is the right answer to
+them.
 
 ## Hints
 
@@ -138,7 +162,10 @@ hint is a volatile guess about one file on one host.
 ## Open questions
 
 - `N`, the region size, and `W`.
-- A source with no parseable stamps: no probe can be classified older than the
-  window, so only Steps 0 and 1 apply, then the whole file is scanned for `B`.
+- How long unstamped lines are held before arrival stamping, in lines and
+  bytes, for a followed source.
+- A source with no parseable stamps: no probe can be classified, and the rings
+  cannot select chunks for it, so only Steps 0 and 1 apply, then the whole file
+  is scanned for `B`.
 - A store fed by several files: Step 0 does not hold, Step 1 is per source.
 - Whether the note belongs in the hint file or also in `info`.
