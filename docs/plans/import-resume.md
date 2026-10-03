@@ -121,6 +121,11 @@ not in memory:
 - The follower reads on looking for the first stamp and keeps only a position:
   *awaiting a stamp, scanned through offset X*. The lines before the first stamp
   are not held. They are a byte range of the file, and the file already has them.
+- What stays in memory is constant, whatever the file holds: the descriptor, the
+  read buffer, X, the first 256 bytes of the line being read (all a stamp is
+  looked for in; once they hold none, the rest of that line is not kept, only X
+  moves on), and the hint. Today's `Stamper.leading` holds up to 1000 whole
+  lines, bounded by their number and not by their size.
 - The hint records it (identity, size, X, and a hash of the file's first KiB),
   refreshed as the scan advances, so a restart continues from X and does not
   read the same hundred megabytes again.
@@ -152,7 +157,7 @@ modification time: the end of its content's life, and the same reference the
 extractor already uses for a stamp with no year. The time is approximate (all
 of it at that instant) and the content is kept. One note says so: which file,
 how many bytes, and the time they were given. The hint records it, so a restart
-does not do it twice.
+does not do it twice. **Decided.**
 
 A one-shot `import` of a file with no stamp has no live edge to stamp by
 arrival, so there it is a usage error: declare the format, or ask for arrival
@@ -195,8 +200,6 @@ hint is a volatile guess about one file on one host.
 - `N`, the region size, and `W`.
 - Whether a *live* source that never gets a stamp waits for ever by default,
   visibly (my lean), or falls back to arrival stamping after a bound.
-- Whether a file closed without a stamp is imported at its modification time
-  (my lean: the alternative is losing content we hold) or left with a note.
 - A source with no parseable stamps: no probe can be classified, and the rings
   cannot select chunks for it, so only Steps 0 and 1 apply, then the whole file
   is scanned for `B`.
