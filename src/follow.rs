@@ -108,6 +108,9 @@ struct Open {
     offset: u64,
     /// A tail without its newline: the producer is mid-write.
     pending: Vec<u8>,
+    /// A fragment of the line now being written has already been committed
+    /// (it ran past `LINE_CAP`), so the rest continues it and is not stamped.
+    mid_line: bool,
 }
 
 impl Open {
@@ -121,6 +124,7 @@ impl Open {
             ino: m.ino(),
             offset: from,
             pending: Vec::new(),
+            mid_line: false,
         })
     }
 }
@@ -148,20 +152,45 @@ fn drain(
             extractor.anchor_to(&m);
         }
         open.pending.extend_from_slice(&buf[..n]);
-        // Commit up to the last newline; keep the rest.
-        if let Some(last) = open.pending.iter().rposition(|b| *b == b'\n') {
+        // Commit up to the last newline; keep the rest. What was pending
+        // had none, so only a read that brought one needs the search.
+        let last = buf[..n]
+            .contains(&b'\n')
+            .then(|| open.pending.iter().rposition(|b| *b == b'\n'))
+            .flatten();
+        if let Some(last) = last {
             let complete: Vec<u8> = open.pending.drain(..=last).collect();
             let mut s = store.lock().unwrap();
             let f = s.files.get_mut(name).expect("the store this tail opened");
-            for line in complete.split_inclusive(|b| *b == b'\n') {
-                let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
+            for (i, line) in complete.split_inclusive(|b| *b == b'\n').enumerate() {
+                let ts = if i == 0 && open.mid_line {
+                    None
+                } else {
+                    extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]))
+                };
                 stamper.feed(f, line, ts, cfg)?;
             }
+            open.mid_line = false;
             // Once per batch, not per line: put what we just read in front
             // of anyone tailing the sap now, rather than at the next
             // maintenance tick. A failure here is reported by that tick's
             // sap_sync, which hits the same file.
             let _ = f.sap_flush();
+        }
+        // A producer that never writes a newline (a progress bar redrawing
+        // with carriage returns) must not grow this without end: what has
+        // accumulated is committed as a fragment of the line it belongs to.
+        if open.pending.len() >= crate::entry::LINE_CAP {
+            let fragment = std::mem::take(&mut open.pending);
+            let ts = if open.mid_line {
+                None
+            } else {
+                extractor.extract(&String::from_utf8_lossy(&fragment[..256]))
+            };
+            let mut s = store.lock().unwrap();
+            let f = s.files.get_mut(name).expect("the store this tail opened");
+            stamper.feed(f, &fragment, ts, cfg)?;
+            open.mid_line = true;
         }
     }
     Ok(consumed)
@@ -186,7 +215,11 @@ fn commit_fragment(
          (the file was replaced mid-line)",
         line.len()
     );
-    let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
+    let ts = if std::mem::take(&mut open.mid_line) {
+        None
+    } else {
+        extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]))
+    };
     let mut s = store.lock().unwrap();
     let f = s.files.get_mut(name).expect("the store this tail opened");
     stamper.feed(f, &line, ts, cfg)
@@ -499,6 +532,7 @@ pub fn cmd_follow(
                     open.file.seek(SeekFrom::Start(0))?;
                     open.offset = 0;
                     open.pending.clear();
+                    open.mid_line = false;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -545,4 +579,106 @@ pub fn cmd_follow(
         }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entry::LINE_CAP;
+    use crate::import::Stamper;
+    use std::io::Write;
+
+    #[test]
+    fn a_producer_that_never_writes_a_newline_is_committed_in_fragments() {
+        let dir = std::env::temp_dir().join(format!("timberfs-follow-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("store")).unwrap();
+        let path = dir.join("in.log");
+
+        let mut text = b"2026-10-03T10:00:00Z ".to_vec();
+        text.resize(2 * LINE_CAP + 777, b'x');
+        fs::write(&path, &text).unwrap();
+
+        let cfg = Config {
+            chunk_size: 1 << 20,
+            level: 1,
+            flush_age_ms: u64::MAX,
+        };
+        let mut st = Store {
+            dir: dir.join("store"),
+            cfg,
+            files: std::collections::BTreeMap::new(),
+        };
+        st.create("f.log").unwrap();
+        let store = Mutex::new(st);
+        let extractor = Extractor::new(None, None, false).unwrap();
+        let mut stamper = Stamper::resuming_from(None);
+        let mut open = Open::at(&path, 0).unwrap();
+
+        drain(&mut open, &store, "f.log", &extractor, &mut stamper, &cfg).unwrap();
+        assert!(open.pending.len() < LINE_CAP, "held {}", open.pending.len());
+        assert!(open.mid_line, "a fragment of the line is already committed");
+
+        // The producer finishes the line, and writes another.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"2026-10-03T10:00:09Z the end of the long line\n")
+            .unwrap();
+        f.write_all(b"2026-10-03T10:00:10Z a second line\n")
+            .unwrap();
+        drop(f);
+        drain(&mut open, &store, "f.log", &extractor, &mut stamper, &cfg).unwrap();
+
+        assert!(!open.mid_line && open.pending.is_empty());
+        assert_eq!(
+            stamper.stamped, 2,
+            "the long line, and the next; the tail that merely looks stamped is not"
+        );
+        let mut s = store.lock().unwrap();
+        let f = s.files.get_mut("f.log").unwrap();
+        f.flush_chunk(&cfg).unwrap();
+        let held: u64 = f.chunks.iter().map(|c| c.uncomp_len).sum();
+        assert_eq!(held, fs::metadata(&path).unwrap().len(), "every byte kept");
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_end_of_a_cut_line_is_not_stamped_again() {
+        let dir =
+            std::env::temp_dir().join(format!("timberfs-follow-test-b-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("store")).unwrap();
+        let path = dir.join("in.log");
+
+        // One stamped line that fills the cap exactly, whose end then reads
+        // as a timestamp, and then a genuinely new line.
+        let mut text = b"2026-10-03T10:00:00Z ".to_vec();
+        text.resize(LINE_CAP, b'x');
+        text.extend_from_slice(b"2026-10-03T10:00:09Z looks stamped, but ends the long line\n");
+        text.extend_from_slice(b"2026-10-03T10:00:10Z a second line\n");
+        fs::write(&path, &text).unwrap();
+
+        let cfg = Config {
+            chunk_size: 1 << 20,
+            level: 1,
+            flush_age_ms: u64::MAX,
+        };
+        let mut st = Store {
+            dir: dir.join("store"),
+            cfg,
+            files: std::collections::BTreeMap::new(),
+        };
+        st.create("f.log").unwrap();
+        let store = Mutex::new(st);
+        let extractor = Extractor::new(None, None, false).unwrap();
+        let mut stamper = Stamper::resuming_from(None);
+        let mut open = Open::at(&path, 0).unwrap();
+
+        drain(&mut open, &store, "f.log", &extractor, &mut stamper, &cfg).unwrap();
+
+        assert_eq!(stamper.stamped, 2, "two lines, not three");
+        assert_eq!(stamper.inherited, 1, "the end of the long line inherits");
+        assert!(!open.mid_line && open.pending.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

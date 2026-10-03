@@ -2349,6 +2349,9 @@ fn write_multi<W: Write>(
         chunks: Vec<ChunkRecord>,
         pos: usize,
         carry: Vec<u8>,
+        /// A fragment of the line now in `carry` has already been written,
+        /// so what follows continues it without a label of its own.
+        mid_line: bool,
     }
     let mut srcs: Vec<Src> = Vec::new();
     let mut total_chunks = 0usize;
@@ -2381,6 +2384,7 @@ fn write_multi<W: Write>(
             chunks: selected.into_iter().map(|(_, c)| c).collect(),
             pos: 0,
             carry: Vec::new(),
+            mid_line: false,
         });
     }
 
@@ -2418,19 +2422,35 @@ fn write_multi<W: Write>(
             s.carry.extend_from_slice(&data);
             let complete = s.carry.iter().rposition(|&b| b == b'\n').map(|p| p + 1);
             if let Some(end) = complete {
-                for line in s.carry[..end].split_inclusive(|&b| b == b'\n') {
-                    out.write_all(&s.label)?;
-                    out.write_all(b":")?;
+                for (n, line) in s.carry[..end].split_inclusive(|&b| b == b'\n').enumerate() {
+                    if n > 0 || !s.mid_line {
+                        out.write_all(&s.label)?;
+                        out.write_all(b":")?;
+                    }
                     out.write_all(line)?;
                 }
+                s.mid_line = false;
                 s.carry.drain(..end);
+            }
+            // No newline in sight: past the cap, write what has accumulated
+            // as the start of the line and let the rest continue it.
+            if s.carry.len() >= crate::entry::LINE_CAP {
+                if !s.mid_line {
+                    out.write_all(&s.label)?;
+                    out.write_all(b":")?;
+                }
+                out.write_all(&s.carry)?;
+                s.carry.clear();
+                s.mid_line = true;
             }
         }
     }
     for s in &srcs {
         if !s.carry.is_empty() {
-            out.write_all(&s.label)?;
-            out.write_all(b":")?;
+            if !s.mid_line {
+                out.write_all(&s.label)?;
+                out.write_all(b":")?;
+            }
             out.write_all(&s.carry)?;
         }
     }
