@@ -224,7 +224,7 @@ pub fn cmd_export(
             serde_json::Value::String(crate::bark::ms_rfc3339(to_ms)),
         );
     }
-    let derived_bark = crate::bark::with_identity(derived)?;
+    let derived_bark = crate::bark::for_new_artifact(derived)?;
 
     // Rebase into a fresh offset space (chunk-by-chunk: the selection may
     // be non-contiguous in the source).
@@ -260,7 +260,7 @@ pub fn cmd_export(
     let mut rings_bytes = Vec::with_capacity(
         format::RINGS_HEADER_LEN as usize + out_records.len() * format::RECORD_LEN,
     );
-    // The bundle's OWN identity, minted by `with_identity` above — never
+    // The bundle's OWN identity, minted by `for_new_artifact` above — never
     // the source's: a derived artifact records lineage in `derived_from`,
     // and copying the id would give two stores one identity.
     rings_bytes.extend_from_slice(&format::rings_header(

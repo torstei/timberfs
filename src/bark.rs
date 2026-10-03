@@ -57,13 +57,21 @@ pub fn new_uuid() -> anyhow::Result<String> {
     Ok(format::uuid_text(&format::new_uuid_bytes()?))
 }
 
-/// The last resort: mint an identity for a map that has none and whose
-/// pair could not supply one. "id" stays constant across renames, moves
-/// and hosts (paths change, identity does not), and "created" records
-/// when the identity was established. Once present, neither is ever
-/// touched. `save` is what adopts the pair's own id first, so this only
-/// mints for a store that does not exist on disk yet.
-pub fn with_identity(mut map: Map<String, Value>) -> anyhow::Result<Map<String, Value>> {
+/// Mint an identity for a manifest that belongs to something not on disk
+/// yet, such as a bundle being written. A pair that already exists has an
+/// identity of its own, which `save` adopts: minting a second one first is
+/// how a manifest and an index come to name different stores, so a manifest
+/// for a pair goes through `save` and never through here.
+pub fn for_new_artifact(map: Map<String, Value>) -> anyhow::Result<Map<String, Value>> {
+    mint_if_absent(map)
+}
+
+/// The last resort, reached only from `save` (after it has adopted the
+/// pair's own id) and `for_new_artifact`: mint an identity for a map that
+/// has none. "id" stays constant across renames, moves and hosts (paths
+/// change, identity does not), and "created" records when the identity was
+/// established. Once present, neither is ever touched.
+fn mint_if_absent(mut map: Map<String, Value>) -> anyhow::Result<Map<String, Value>> {
     if !map.contains_key("id") {
         map.insert("id".to_string(), Value::String(new_uuid()?));
     }
@@ -88,7 +96,7 @@ pub fn save(dir: &Path, name: &str, map: &Map<String, Value>) -> anyhow::Result<
             map.insert("id".to_string(), Value::String(id));
         }
     }
-    let map = with_identity(map)?;
+    let map = mint_if_absent(map)?;
     let text = serde_json::to_string_pretty(&Value::Object(map))?;
     // Atomic (tmp + rename): live writers re-read the manifest on their
     // retention tick, and a torn read must be impossible.
