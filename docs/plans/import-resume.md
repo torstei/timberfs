@@ -115,15 +115,27 @@ the same lines until a stamp turns up. It recovers by accident and meanwhile
 loops. Stopping the unit instead would be worse: a file that gains a stamp
 later would never be looked at again.
 
-So for a followed source, no stamp yet is a state:
+So for a followed source, no stamp yet is a state, kept in the hint file and
+not in memory:
 
-- Lines read before the first stamp are held, bounded in lines and in bytes, and
-  written ahead of the first stamped line when it arrives, as now.
-- Past the bound they are imported stamped by arrival time, once, with a note
-  that says so. Arrival time is what a live `append` already uses.
-- The process keeps going. Every later line is still tried against the
-  extractor, so a file that gains stamps is read with its own stamps from then
-  on.
+- The follower reads on looking for the first stamp and keeps only a position:
+  *awaiting a stamp, scanned through offset X*. The lines before the first stamp
+  are not held. They are a byte range of the file, and the file already has them.
+- The hint records it (identity, size, X, and a hash of the file's first KiB),
+  refreshed as the scan advances, so a restart continues from X and does not
+  read the same hundred megabytes again.
+- When a stamp turns up at offset S, the range `[0, S)` is streamed from the file
+  into the store with that stamp's time, which is what holding the lines used to
+  do, and the follower carries on from S. A garbage or half-written first line
+  is simply part of that range.
+- If the file was replaced or truncated in the meantime (identity, size or head
+  hash no longer match) the hint is dropped and the scan starts over.
+- The wait is **visible**. Nothing is imported while it lasts, and a file that
+  never carries a stamp looks exactly like a quiet one. So: a note when the scan
+  passes 100 MiB and at each doubling, the state in the hint file, and in `info`.
+- A source that legitimately has no stamps declares arrival stamping and is
+  imported as it is read. That is a declaration and not a fallback: the default
+  is to wait rather than guess a time.
 
 A one-shot `import` of a file with no stamp has no live edge to stamp by
 arrival, so there it is a usage error: declare the format, or ask for arrival
@@ -141,8 +153,10 @@ them.
 `<name>.resume`, a sidecar beside the store, listed in `format::every_path`.
 Derived data under the sidecar contract: deleting it costs a search.
 
-Per source: its identity (dev, ino, path), the file offset and tape position the
-last run ended at, when, and the note of the last fallback taken. Written
+Per source: its identity (dev, ino, path), and either *resumed* (the file offset
+and tape position the last run ended at) or *awaiting a stamp* (the offset
+scanned through, the size, a hash of the first KiB); when; and the note of the
+last fallback taken. Written
 atomically, when a run ends and (for `--follow`) when the tape end moves at a
 flush tick.
 
@@ -162,8 +176,8 @@ hint is a volatile guess about one file on one host.
 ## Open questions
 
 - `N`, the region size, and `W`.
-- How long unstamped lines are held before arrival stamping, in lines and
-  bytes, for a followed source.
+- Whether a source that never gets a stamp waits for ever by default, visibly
+  (my lean), or falls back to arrival stamping after a bound.
 - A source with no parseable stamps: no probe can be classified, and the rings
   cannot select chunks for it, so only Steps 0 and 1 apply, then the whole file
   is scanned for `B`.
