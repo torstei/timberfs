@@ -110,12 +110,12 @@ impl<X> Intake<X> {
         }
     }
 
-    /// Apply `set wal=true|false` to every store this receiver writes —
+    /// Apply `set wal=true|false` to one store this receiver writes —
     /// the same no-restart contract the appender has, and the one that
     /// counts here: a receiver is restarted only by dropping its
     /// senders' connections.
-    pub fn sync_wal_declarations(&mut self) {
-        for s in self.stores.values_mut() {
+    pub fn sync_wal_declaration(&mut self, name: &str) {
+        if let Some(s) = self.stores.get_mut(name) {
             s.sync_wal_declarations();
         }
     }
@@ -317,6 +317,7 @@ where
     };
     let root = intake.lock().unwrap().root.clone();
     let mut indexed_chunks: BTreeMap<String, usize> = BTreeMap::new();
+    let mut live: BTreeMap<String, crate::append::LivePolicy> = BTreeMap::new();
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(1000));
@@ -349,7 +350,6 @@ where
                 let mut g = intake.lock().unwrap();
                 g.flush_aged();
                 g.sap_sync_all();
-                g.sync_wal_declarations();
                 g.names()
             };
             // One per tick, however many tags this receiver has fanned
@@ -358,32 +358,46 @@ where
             let mut interest = crate::follower::TickInterest::default();
             for name in &names {
                 let dir = store_dir(&root, name);
-                match crate::bark::declared_retention(&dir, name) {
-                    Ok(policy) if policy.is_some() => {
-                        let fields = crate::follower::subject_of(&dir, name);
-                        let next_seq = intake.lock().unwrap().next_seq(name).unwrap_or(0);
-                        let held = interest.floor(&policy, &fields, next_seq);
-                        let res = intake.lock().unwrap().enforce_retention(
-                            name,
-                            policy.max_age_ms,
-                            policy.max_comp_bytes,
-                            held.floor,
-                        );
-                        match res {
-                            Err(e) => {
-                                eprintln!("timberfs: {name}: background retention failed: {e}")
-                            }
-                            Ok(Some(stats)) => {
-                                if let Some(record) =
-                                    crate::follower::override_record(name, &policy, &stats, &held)
-                                {
-                                    eprintln!("{record}");
-                                }
-                            }
-                            Ok(None) => {}
+                // The manifest is re-read only when it changed: a stat per
+                // store per tick, where it was a read and a parse.
+                let live = live
+                    .entry(name.clone())
+                    .or_insert_with(|| crate::append::LivePolicy {
+                        dir: dir.clone(),
+                        name: name.clone(),
+                        last: crate::bark::Retention::default(),
+                        fields: Default::default(),
+                        warned: false,
+                        stamp: None,
+                        reparsed: false,
+                    });
+                let policy = live.refresh();
+                if live.reparsed {
+                    intake.lock().unwrap().sync_wal_declaration(name);
+                }
+                let fields = live.fields.clone();
+                if policy.is_some() {
+                    let next_seq = intake.lock().unwrap().next_seq(name).unwrap_or(0);
+                    let held = interest.floor(&policy, &fields, next_seq);
+                    let res = intake.lock().unwrap().enforce_retention(
+                        name,
+                        policy.max_age_ms,
+                        policy.max_comp_bytes,
+                        held.floor,
+                    );
+                    match res {
+                        Err(e) => {
+                            eprintln!("timberfs: {name}: background retention failed: {e}")
                         }
+                        Ok(Some(stats)) => {
+                            if let Some(record) =
+                                crate::follower::override_record(name, &policy, &stats, &held)
+                            {
+                                eprintln!("{record}");
+                            }
+                        }
+                        Ok(None) => {}
                     }
-                    _ => {}
                 }
                 let cur = intake
                     .lock()
@@ -626,5 +640,32 @@ mod tests {
         assert_eq!(store_name("nginx"), "nginx.log");
         assert_eq!(store_name("app.log"), "app.log.log");
         assert_eq!(store_name("../../etc/passwd"), "_.._etc_passwd.log");
+    }
+
+    #[test]
+    fn a_wal_declaration_is_applied_to_the_store_named_and_no_other() {
+        let d = TempDir::new("wal");
+        let mut intake = an_intake(&d.0);
+        open(&mut intake, "alpha").unwrap();
+        open(&mut intake, "beta").unwrap();
+        let (a, b) = (store_name("alpha"), store_name("beta"));
+        let has_sap = |n: &str| crate::format::sap_path(&store_dir(&d.0, n), n).exists();
+        assert!(
+            has_sap(&a) && has_sap(&b),
+            "an acking intake starts with one"
+        );
+
+        for n in [&a, &b] {
+            crate::bark::cmd_set(&store_dir(&d.0, n).join(n), &["wal=false".into()], &[]).unwrap();
+        }
+        assert!(has_sap(&a) && has_sap(&b), "declared, not yet applied");
+
+        intake.sync_wal_declaration(&a);
+        assert!(!has_sap(&a), "the one named stops its write-ahead segment");
+        assert!(has_sap(&b), "and no other does");
+
+        intake.sync_wal_declaration("not-a-store");
+        intake.sync_wal_declaration(&b);
+        assert!(!has_sap(&b));
     }
 }
