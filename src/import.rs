@@ -399,6 +399,36 @@ fn continuation(f: &mut crate::store::FileStore, src: &File) -> anyhow::Result<C
     Ok(Continuation::Yes(end))
 }
 
+/// Where in `src` the store's data ends, if `src` is the file the store was fed
+/// from, grown since. The bytes decide, not a timestamp, so it holds for a store
+/// whose head retention has dropped.
+///
+/// A source that begins where the store begins says it is the same file
+/// (`claims_same`), so if it fails the comparison, or is shorter, that is an
+/// error. Anything else that fails it is simply not a continuation, and the
+/// caller decides what to do with it. A live tail passes `false`: it must not
+/// stop on an ambiguity.
+pub(crate) fn resume_point(
+    f: &mut crate::store::FileStore,
+    src: &File,
+    claims_same: bool,
+) -> anyhow::Result<Option<u64>> {
+    match continuation(f, src)? {
+        Continuation::Yes(end) => Ok(Some(end)),
+        Continuation::TooSmall if claims_same => bail!(
+            "source ({} bytes) is smaller than the {} bytes already imported — \
+             rotated or truncated file? import it to a new target",
+            src.metadata()?.len(),
+            f.tape_end()
+        ),
+        Continuation::Differs if claims_same => bail!(
+            "already-imported data differs from the source — \
+             rotated or rewritten file? import it to a new target instead"
+        ),
+        _ => Ok(None),
+    }
+}
+
 /// FNV-1a 128 of a line (trailing newline stripped). Overlap dedup only
 /// needs collisions to be unlikelier than hardware failure, not
 /// cryptography: for 10^8 distinct lines the collision odds are ~10^-23.
@@ -801,25 +831,13 @@ pub fn cmd_import(
                 let src = File::open(src_path)
                     .with_context(|| format!("opening source {}", src_path.display()))?;
                 let claims_same = Some(*t0) == store_first;
-                match continuation(f, &src)? {
-                    Continuation::Yes(end) => {
-                        resume_from = end;
-                        crate::note!(
-                            "timberfs: {} of {} bytes already imported and verified; resuming",
-                            resume_from,
-                            total_bytes
-                        );
-                    }
-                    Continuation::TooSmall if claims_same => bail!(
-                        "source ({total_bytes} bytes) is smaller than the {} bytes \
-                         already imported — rotated or truncated file? import it to a new target",
-                        f.tape_end()
-                    ),
-                    Continuation::Differs if claims_same => bail!(
-                        "already-imported data differs from the source — \
-                         rotated or rewritten file? import it to a new target instead"
-                    ),
-                    _ => {}
+                if let Some(end) = resume_point(f, &src, claims_same)? {
+                    resume_from = end;
+                    crate::note!(
+                        "timberfs: {} of {} bytes already imported and verified; resuming",
+                        resume_from,
+                        total_bytes
+                    );
                 }
             }
             // Seed timestamp inheritance with the last imported stamp.

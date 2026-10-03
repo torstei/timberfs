@@ -66,8 +66,9 @@ StandardError=journal
 LogsDirectory=timberfs/%i
 
 # Restarting is cheap and safe: the store is this tail's checkpoint, so a
-# restart re-syncs against the store's own lines rather than a position file,
-# and can neither lose nor duplicate.
+# restart finds where the store ends in the file (re-syncing against the
+# store's own lines only where it cannot tell) rather than keeping a position
+# file, and can neither lose nor duplicate.
 Restart=always
 RestartSec=2
 # --exit-on-upgrade: exit 85 when this binary is replaced on disk, so the

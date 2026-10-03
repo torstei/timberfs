@@ -11,10 +11,12 @@
 //! is that position and rotation ARE the problem, and only the side that owns
 //! the store can solve them. Three invariants say how:
 //!
-//!   * **The store is the checkpoint.** A start re-syncs against what the
-//!     store already holds, line by line over the overlapping window, so a
-//!     restart can neither lose nor duplicate — and there is no position file
-//!     to go stale, be restored out of step, or disagree with the store.
+//!   * **The store is the checkpoint.** A start finds where the store's data
+//!     ends in the file by comparing bytes, and where it cannot tell it
+//!     re-syncs against what the store already holds, line by line over the
+//!     overlapping window, so a restart can neither lose nor duplicate — and
+//!     there is no position file to go stale, be restored out of step, or
+//!     disagree with the store.
 //!   * **A descriptor is never abandoned before EOF.** When the path is
 //!     replaced, the file we still hold is drained first, so rotation cannot
 //!     strand the lines written between the last read and the rename.
@@ -225,12 +227,29 @@ fn commit_fragment(
     stamper.feed(f, &line, ts, cfg)
 }
 
+/// Where in `path` the store's data ends, if the store was fed by that file:
+/// the store's last bytes are the file's bytes just before that offset. It
+/// decides by bytes and not by timestamps, so it holds for a store whose head
+/// retention has dropped; and it never errors on an ambiguity, which would
+/// restart a service, only says it cannot tell.
+fn resume_offset(store: &Mutex<Store>, name: &str, path: &Path) -> anyhow::Result<Option<u64>> {
+    let src = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut s = store.lock().unwrap();
+    let f = s.files.get_mut(name).expect("the store this tail opened");
+    if f.size() == 0 {
+        return Ok(None);
+    }
+    crate::import::resume_point(f, &src, false)
+}
+
 /// Bring the store up to date with one file, dropping what it already holds.
 ///
 /// This is the resume path, and it is deliberately content-based rather than
-/// offset-based: the store's own lines over the window this file covers are
-/// the checkpoint, so re-reading a file the store already has costs a scan
-/// and produces nothing. Returns the offset the file was read to.
+/// offset-based. When the store ends where it ends in this file, the bytes say
+/// so and it carries on from there. Otherwise the store's own lines over the
+/// window this file covers are the checkpoint, so re-reading a file the store
+/// already has costs a scan and produces nothing. Returns the offset the file
+/// was read to.
 fn catch_up(
     store: &Mutex<Store>,
     name: &str,
@@ -243,6 +262,25 @@ fn catch_up(
     let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if size == 0 {
         return Ok(0);
+    }
+    if let Some(end) = resume_offset(store, name, path)? {
+        crate::note!(
+            "timberfs: {}: {name} ends at byte {end} of it ({size} bytes); resuming there",
+            path.display()
+        );
+        if live {
+            return Ok(end);
+        }
+        let mut open = Open::at(path, end)?;
+        let tail = drain(&mut open, store, name, extractor, stamper, cfg)?;
+        commit_fragment(&mut open, store, name, extractor, stamper, cfg)?;
+        if tail > 0 {
+            crate::note!(
+                "timberfs: {}: {tail} byte(s) it gained since {name} last read it",
+                path.display()
+            );
+        }
+        return Ok(open.offset);
     }
     let t0 = first_stamp(path, extractor)?;
     // What does the store already cover?
@@ -679,6 +717,201 @@ mod tests {
         assert_eq!(stamper.stamped, 2, "two lines, not three");
         assert_eq!(stamper.inherited, 1, "the end of the long line inherits");
         assert!(!open.mid_line && open.pending.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Stamped lines whose padding is pseudo-random, so a few thousand of them
+    /// are several filesystem blocks of compressed data (size retention aims a
+    /// couple of blocks below its budget).
+    fn block(hour: usize, from: usize, to: usize) -> String {
+        let mix = |mut x: u64| {
+            x = x.wrapping_add(0x9e3779b97f4a7c15);
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+            x ^ (x >> 31)
+        };
+        (from..to)
+            .map(|i| {
+                format!(
+                    "2026-10-03T{:02}:{:02}:{:02}Z line {i} {:016x}{:016x}{:016x}\n",
+                    hour + i / 3600,
+                    i / 60 % 60,
+                    i % 60,
+                    mix(i as u64 * 3),
+                    mix(i as u64 * 3 + 1),
+                    mix(i as u64 * 3 + 2)
+                )
+            })
+            .collect()
+    }
+
+    fn lines(from: usize, to: usize) -> String {
+        block(10, from, to)
+    }
+
+    fn test_cfg() -> Config {
+        Config {
+            chunk_size: 4096,
+            level: 1,
+            flush_age_ms: u64::MAX,
+        }
+    }
+
+    /// What a process does when it starts: open the store, bring it level with
+    /// the rotated files and then the live one, and read on to the end. Returns
+    /// the store as a clean stop leaves it.
+    fn start(dir: &Path, source: &Path, rotated: &[PathBuf]) -> Mutex<Store> {
+        let cfg = test_cfg();
+        let mut st = Store {
+            dir: dir.join("store"),
+            cfg,
+            files: std::collections::BTreeMap::new(),
+        };
+        st.create("f.log").unwrap();
+        let last_ts = st.files.get("f.log").and_then(|f| f.last_write_ms());
+        let store = Mutex::new(st);
+        let extractor = Extractor::new(None, None, false).unwrap();
+        let mut stamper = Stamper::resuming_from(last_ts);
+        for c in rotated {
+            catch_up(&store, "f.log", c, &extractor, &mut stamper, &cfg, false).unwrap();
+        }
+        let from = catch_up(
+            &store,
+            "f.log",
+            source,
+            &extractor,
+            &mut stamper,
+            &cfg,
+            true,
+        )
+        .unwrap();
+        let mut open = Open::at(source, from).unwrap();
+        drain(&mut open, &store, "f.log", &extractor, &mut stamper, &cfg).unwrap();
+        store.lock().unwrap().flush_all();
+        store
+    }
+
+    /// Where the store's tape starts, and what it holds.
+    fn stored(store: &Mutex<Store>) -> (u64, Vec<u8>) {
+        let mut s = store.lock().unwrap();
+        let f = s.files.get_mut("f.log").unwrap();
+        let size = f.size();
+        (f.tape_start(), f.read(0, size as u32).unwrap())
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("timberfs-follow-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("store")).unwrap();
+        dir
+    }
+
+    fn append_to(path: &Path, text: &str) {
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    /// What a writer's retention tick does: drop the oldest chunks.
+    fn drop_the_head(store: &Mutex<Store>) {
+        let mut s = store.lock().unwrap();
+        let comp = s.files.get("f.log").unwrap().comp_size;
+        s.enforce_retention("f.log", None, Some(comp / 2), None)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_restart_after_retention_dropped_the_head_picks_up_what_was_written_while_down() {
+        let dir = scratch("retention");
+        let src = dir.join("app.log");
+        fs::write(&src, lines(0, 3000)).unwrap();
+        let store = start(&dir, &src, &[]);
+        drop_the_head(&store);
+        assert!(stored(&store).0 > 0, "the head is gone");
+        drop(store);
+
+        append_to(&src, &lines(3000, 3100));
+        let store = start(&dir, &src, &[]);
+
+        let (start_at, held) = stored(&store);
+        let file = fs::read(&src).unwrap();
+        assert_eq!(
+            &held[..],
+            &file[start_at as usize..],
+            "the new lines arrived"
+        );
+        assert_eq!(start_at + held.len() as u64, file.len() as u64);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_with_nothing_new_changes_nothing() {
+        let dir = scratch("quiet");
+        let src = dir.join("app.log");
+        fs::write(&src, lines(0, 400)).unwrap();
+        let first = stored(&start(&dir, &src, &[]));
+        let second = stored(&start(&dir, &src, &[]));
+        assert_eq!(first, second);
+        assert_eq!(second.1, fs::read(&src).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_still_being_written_when_it_stopped_arrives_whole() {
+        let dir = scratch("partial");
+        let src = dir.join("app.log");
+        let mut text = lines(0, 400);
+        text.push_str("2026-10-03T11:00:00Z a line still being writ");
+        fs::write(&src, &text).unwrap();
+        start(&dir, &src, &[]);
+
+        append_to(&src, "ten when it stopped\n");
+        append_to(&src, &lines(400, 460));
+        let store = start(&dir, &src, &[]);
+        assert_eq!(stored(&store).1, fs::read(&src).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_rotated_while_down_is_finished_and_then_the_new_one_is_read() {
+        let dir = scratch("rotated");
+        let src = dir.join("app.log");
+        fs::write(&src, lines(0, 3000)).unwrap();
+        let store = start(&dir, &src, &[]);
+        drop_the_head(&store);
+        drop(store);
+
+        // While it was down: the file gained lines, was rotated, and a new
+        // one began.
+        append_to(&src, &lines(3000, 3100));
+        let rotated = dir.join("app.log.1");
+        fs::rename(&src, &rotated).unwrap();
+        fs::write(&src, block(20, 0, 200)).unwrap();
+
+        let store = start(&dir, &src, std::slice::from_ref(&rotated));
+        let (start_at, held) = stored(&store);
+        let want = format!(
+            "{}{}",
+            fs::read_to_string(&rotated).unwrap(),
+            fs::read_to_string(&src).unwrap()
+        );
+        assert_eq!(&held[..], &want.as_bytes()[start_at as usize..]);
+        assert_eq!(start_at + held.len() as u64, want.len() as u64);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_does_not_continue_the_store_is_resynced_line_by_line_as_before() {
+        let dir = scratch("overlap");
+        let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+        fs::write(&a, lines(0, 1500)).unwrap();
+        start(&dir, &a, &[]);
+
+        // Another file that begins inside what the store holds.
+        fs::write(&b, lines(1490, 2000)).unwrap();
+        let store = start(&dir, &b, &[]);
+        let want = format!("{}{}", lines(0, 1500), lines(1500, 2000));
+        assert_eq!(stored(&store).1, want.as_bytes());
         let _ = fs::remove_dir_all(&dir);
     }
 }

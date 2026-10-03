@@ -35,8 +35,9 @@
 # longer list; it just has to run as whoever can read all of it.
 #
 # A restart is cheap and safe at any time: each store is its own tail's
-# checkpoint, so a restart re-syncs against the store's own lines and can
-# neither lose nor duplicate. There is no position file to go stale.
+# checkpoint, so a restart finds where the store ends in the file (re-syncing
+# against the store's own lines only where it cannot tell) and can neither lose
+# nor duplicate. There is no position file to go stale.
 
 [Unit]
 Description=timberfs file intake (%i)
