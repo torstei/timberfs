@@ -588,7 +588,7 @@ fn grep_records<R: BufRead, W: Write>(
     let mut hdr: Vec<u8> = Vec::new();
     loop {
         hdr.clear();
-        if reader.read_until(0, &mut hdr)? == 0 {
+        if timberfs::records::read_header(&mut reader, &mut hdr)? == 0 {
             break;
         }
         if hdr.pop() != Some(0) {
@@ -636,9 +636,7 @@ fn grep_records<R: BufRead, W: Write>(
                 let len: usize = kv(b"len")
                     .and_then(|v| v.parse().ok())
                     .context("entry record without len")?;
-                let mut payload = vec![0u8; len];
-                reader
-                    .read_exact(&mut payload)
+                let payload = timberfs::records::read_payload(&mut reader, len)
                     .context("record stream truncated mid-entry (producer died or pipe broke)")?;
                 let mut nul = [0u8; 1];
                 reader.read_exact(&mut nul)?;

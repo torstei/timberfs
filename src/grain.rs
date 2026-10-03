@@ -451,9 +451,8 @@ pub fn extend_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
         .with_context(|| format!("opening {}", format::trunk_path(dir, name).display()))?;
     let mut woff = tail.end;
     for c in &new {
-        let mut comp = vec![0u8; c.comp_len as usize];
-        trunk.read_exact_at(&mut comp, c.comp_start)?;
-        let data = zstd::stream::decode_all(&comp[..])
+        let comp = format::read_frame(&trunk, c)?;
+        let data = format::decode_frame(&comp, c.uncomp_len)
             .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
         let tokens = tokenize(&data);
         let filter = build_filter(&tokens);
@@ -704,9 +703,8 @@ pub fn build_grain(dir: &Path, name: &str) -> anyhow::Result<()> {
     let mut total_tokens: u64 = 0;
     let mut next_progress = records.len() / 10;
     for (i, c) in records.iter().enumerate() {
-        let mut comp = vec![0u8; c.comp_len as usize];
-        trunk.read_exact_at(&mut comp, c.comp_start)?;
-        let data = zstd::stream::decode_all(&comp[..])
+        let comp = format::read_frame(&trunk, c)?;
+        let data = format::decode_frame(&comp, c.uncomp_len)
             .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
         let tokens = tokenize(&data);
         total_tokens += tokens.len() as u64;

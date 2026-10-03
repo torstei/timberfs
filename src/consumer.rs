@@ -145,7 +145,7 @@ impl<R: BufRead> Reader<R> {
     pub fn next_report(&mut self) -> anyhow::Result<Option<Report>> {
         loop {
             self.buf.clear();
-            if self.r.read_until(0, &mut self.buf)? == 0 {
+            if crate::records::read_header(&mut self.r, &mut self.buf)? == 0 {
                 return Ok(None);
             }
             if self.buf.pop() != Some(0) {

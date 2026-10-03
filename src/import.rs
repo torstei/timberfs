@@ -377,11 +377,13 @@ fn verify_prefix(
     };
     for i in picks {
         let c = chunks[i];
-        let mut comp = vec![0u8; c.comp_len as usize];
-        trunk.read_exact_at(&mut comp, c.comp_start)?;
-        let imported = zstd::stream::decode_all(&comp[..])
+        let comp = crate::format::read_frame(&trunk, &c)?;
+        let imported = crate::format::decode_frame(&comp, c.uncomp_len)
             .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
-        let mut current = vec![0u8; c.uncomp_len as usize];
+        if imported.len() as u64 != c.uncomp_len {
+            bail!("chunk uncompressed length does not match index");
+        }
+        let mut current = vec![0u8; imported.len()];
         src.read_exact_at(&mut current, c.uncomp_start)
             .context("reading the source range matching already-imported data")?;
         if imported != current {
@@ -420,13 +422,11 @@ pub(crate) fn overlap_line_counts(
     trunk_path: &Path,
     t0: u64,
 ) -> anyhow::Result<HashMap<u128, u32>> {
-    use std::os::unix::fs::FileExt;
     let trunk =
         File::open(trunk_path).with_context(|| format!("opening {}", trunk_path.display()))?;
     let decomp = |c: &crate::format::ChunkRecord| -> anyhow::Result<Vec<u8>> {
-        let mut comp = vec![0u8; c.comp_len as usize];
-        trunk.read_exact_at(&mut comp, c.comp_start)?;
-        Ok(zstd::stream::decode_all(&comp[..])?)
+        let comp = crate::format::read_frame(&trunk, c)?;
+        Ok(crate::format::decode_frame(&comp, c.uncomp_len)?)
     };
     let k = chunks.iter().take_while(|c| c.last_write_ms < t0).count();
     // The tail of the line the overlap region starts inside, if any.

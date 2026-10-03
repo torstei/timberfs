@@ -924,9 +924,8 @@ impl FileStore {
     fn chunk_data(&mut self, idx: usize) -> io::Result<&Vec<u8>> {
         if self.cache.as_ref().map(|(i, _)| *i) != Some(idx) {
             let c = self.chunks[idx];
-            let mut comp = vec![0u8; c.comp_len as usize];
-            self.trunk.read_exact_at(&mut comp, c.comp_start)?;
-            let data = zstd::stream::decode_all(&comp[..])?;
+            let comp = format::read_frame(&self.trunk, &c)?;
+            let data = format::decode_frame(&comp, c.uncomp_len)?;
             if data.len() as u64 != c.uncomp_len {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
