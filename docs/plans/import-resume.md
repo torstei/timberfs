@@ -209,9 +209,11 @@ hint is a volatile guess about one file on one host.
 - A source with no parseable stamps: no probe can be classified, and the rings
   cannot select chunks for it, so only Steps 0 and 1 apply, then the whole file
   is scanned for `B`.
-- A store fed by a *set* of files (`import app.log*`, day files) keeps its
-  existing handling: sources ordered by first stamp, appended after the store's
-  end, or deduplicated where they overlap. It is a bulk and backfill use, and
-  re-running it rescans every overlap; a per-source "unchanged since last run"
-  check in the hint would turn that into a stat. Later, not part of the resume.
+- A store fed by a *set* of files (`import app.log*`, day files) is an initial or
+  bulk import: sources ordered by first stamp, appended after the store's end, or
+  deduplicated where they overlap. That handling stays as it is, and re-running
+  it rescans every overlap; a per-source "unchanged since last run" check in the
+  hint would turn that into a stat, later. Several *live* files feeding one store
+  is not a use: the writer lock allows one writer per store, and the resume
+  assumes a single live source, with the files its rotations leave behind.
 - Whether the note belongs in the hint file or also in `info`.
