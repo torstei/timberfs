@@ -225,8 +225,8 @@ enum Command {
         /// Treat zoneless timestamps as UTC instead of local time
         #[arg(long)]
         utc: bool,
-        /// On re-import, verify only the first/middle/last already-imported
-        /// chunks against the source instead of all of them
+        /// Accepted and ignored: a re-import already checks only a few KiB at
+        /// each end of what is stored against the source
         #[arg(long)]
         quick: bool,
         /// Declare and build the .grain token index for this log

@@ -357,45 +357,46 @@ impl Stamper {
     }
 }
 
-/// Re-import safety: the target is its own checkpoint. The source must be
-/// a pure-growth descendant of what was imported, which we prove by
-/// comparing already-imported chunks against the same source byte ranges
-/// (all chunks, or first/middle/last with `quick`) BEFORE writing anything.
-fn verify_prefix(
-    chunks: &[crate::format::ChunkRecord],
-    trunk_path: &Path,
-    src: &File,
-    quick: bool,
-) -> anyhow::Result<()> {
+/// How much of each end of the store is compared with the file.
+const TAIL_CHECK: u64 = 16 * 1024;
+
+enum Continuation {
+    /// The file is the one the store was fed from, and this is where it ends.
+    Yes(u64),
+    /// The file is shorter than the store's data: truncated or rotated.
+    TooSmall,
+    /// The bytes at the join are not the store's.
+    Differs,
+}
+
+/// Is `src` the file the store's data came from, grown since? The store's last
+/// bytes must be the file's bytes just before the offset where the store ends,
+/// and, while the store still has its head, its first bytes the file's first. A
+/// few KiB at each end and not the store, which is what answering "same file?"
+/// has to cost.
+fn continuation(f: &mut crate::store::FileStore, src: &File) -> anyhow::Result<Continuation> {
     use std::os::unix::fs::FileExt;
-    let trunk =
-        File::open(trunk_path).with_context(|| format!("opening {}", trunk_path.display()))?;
-    let picks: Vec<usize> = if quick && chunks.len() > 3 {
-        vec![0, chunks.len() / 2, chunks.len() - 1]
-    } else {
-        (0..chunks.len()).collect()
-    };
-    for i in picks {
-        let c = chunks[i];
-        let comp = crate::format::read_frame(&trunk, &c)?;
-        let imported = crate::format::decode_frame(&comp, c.uncomp_len)
-            .with_context(|| "decompressing a stored chunk — the .trunk may be corrupt")?;
-        if imported.len() as u64 != c.uncomp_len {
-            bail!("chunk uncompressed length does not match index");
-        }
-        let mut current = vec![0u8; imported.len()];
-        src.read_exact_at(&mut current, c.uncomp_start)
-            .context("reading the source range matching already-imported data")?;
-        if imported != current {
-            bail!(
-                "already-imported data differs from the source (bytes {}..{}) — \
-                 rotated or rewritten file? import it to a new target instead",
-                c.uncomp_start,
-                c.uncomp_end()
-            );
-        }
+    let size = f.size();
+    let end = f.tape_end();
+    if src.metadata()?.len() < end {
+        return Ok(Continuation::TooSmall);
     }
-    Ok(())
+    let n = size.min(TAIL_CHECK);
+    let has_head = f.tape_start() == 0;
+    let mut same = |store_at: u64, file_at: u64| -> anyhow::Result<bool> {
+        let held = f.read(store_at, n as u32)?;
+        let mut file = vec![0u8; n as usize];
+        src.read_exact_at(&mut file, file_at)
+            .context("reading the source where the store's data ends")?;
+        Ok(held == file)
+    };
+    if !same(size - n, end - n)? {
+        return Ok(Continuation::Differs);
+    }
+    if has_head && !same(0, 0)? {
+        return Ok(Continuation::Differs);
+    }
+    Ok(Continuation::Yes(end))
 }
 
 /// FNV-1a 128 of a line (trailing newline stripped). Overlap dedup only
@@ -606,7 +607,8 @@ pub struct ImportOpts {
     /// --timestamp-format / --utc); merged with the store's declared
     /// format before extraction.
     pub time: crate::bark::TimeFormat,
-    /// Sample-verify re-imports instead of full byte verification.
+    /// Accepted and ignored: a re-import compares a few KiB at each end of what
+    /// the store holds with the file, which is already the cheap check.
     pub quick: bool,
     /// Declare and maintain the .grain content index.
     pub index: bool,
@@ -622,7 +624,7 @@ pub fn cmd_import(
 ) -> anyhow::Result<()> {
     let ImportOpts {
         time,
-        quick,
+        quick: _,
         index,
         wal,
     } = opts;
@@ -779,43 +781,45 @@ pub fn cmd_import(
         return Ok(());
     }
 
-    // A non-empty target. A single plain source STARTING WHERE THE STORE
-    // STARTS is the same file, regrown: verify the imported prefix and
-    // resume (truncated/rewritten files are refused here). Every other
-    // plain source is handled per-source below by its first timestamp —
-    // after the store's end it simply appends; inside the store's window
-    // it is deduplicated line-by-line against the overlap. Timberfs
-    // sources append behind the ordering guard (segments already covered
-    // are skipped below).
+    // A non-empty target. A single plain source that continues what the store
+    // holds is the same file, grown: resume where the store's data ends in it.
+    // That is decided by the bytes at the join, not by a timestamp, so it holds
+    // for a store whose head retention has dropped. A file that begins where the
+    // store begins says it is the same one, so for that file a mismatch is
+    // refused. Every other plain source is handled per-source below by its first
+    // timestamp: after the store's end it simply appends; inside the store's
+    // window it is deduplicated line-by-line against the overlap. Timberfs
+    // sources append behind the ordering guard (segments already covered are
+    // skipped below).
     let mut resume_from: u64 = 0;
     let mut last_ts: Option<u64> = None;
     {
-        let f = st.files.get(&name).unwrap();
+        let f = st.files.get_mut(&name).unwrap();
         if f.size() > 0 {
             let store_first = f.chunks.first().map(|c| c.first_write_ms);
             if let (false, (t0, Source::Plain(src_path))) = (multi, &sources[0]) {
-                if Some(*t0) == store_first {
-                    resume_from = f.size();
-                    if total_bytes < resume_from {
-                        bail!(
-                            "source ({total_bytes} bytes) is smaller than the {resume_from} bytes \
-                             already imported — rotated or truncated file? import it to a new target"
+                let src = File::open(src_path)
+                    .with_context(|| format!("opening source {}", src_path.display()))?;
+                let claims_same = Some(*t0) == store_first;
+                match continuation(f, &src)? {
+                    Continuation::Yes(end) => {
+                        resume_from = end;
+                        crate::note!(
+                            "timberfs: {} of {} bytes already imported and verified; resuming",
+                            resume_from,
+                            total_bytes
                         );
                     }
-                    let src = File::open(src_path)
-                        .with_context(|| format!("opening source {}", src_path.display()))?;
-                    verify_prefix(
-                        &f.chunks,
-                        &crate::format::trunk_path(&dir, &name),
-                        &src,
-                        quick,
-                    )?;
-                    crate::note!(
-                        "timberfs: {} of {} bytes already imported and verified{}; resuming",
-                        resume_from,
-                        total_bytes,
-                        if quick { " (quick)" } else { "" }
-                    );
+                    Continuation::TooSmall if claims_same => bail!(
+                        "source ({total_bytes} bytes) is smaller than the {} bytes \
+                         already imported — rotated or truncated file? import it to a new target",
+                        f.tape_end()
+                    ),
+                    Continuation::Differs if claims_same => bail!(
+                        "already-imported data differs from the source — \
+                         rotated or rewritten file? import it to a new target instead"
+                    ),
+                    _ => {}
                 }
             }
             // Seed timestamp inheritance with the last imported stamp.
@@ -1232,5 +1236,227 @@ mod tests {
             dated.extract("1999 Oct 01 00:00:00 x").unwrap()
                 < anchor as u64 - 20 * 365 * 86_400_000 / 4
         );
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("timberfs-import-test-{}-{n}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cfg() -> Config {
+        Config {
+            chunk_size: 1024,
+            level: 1,
+            flush_age_ms: u64::MAX,
+        }
+    }
+
+    /// Stamped lines whose padding is pseudo-random, so a store of a few
+    /// thousand of them is several filesystem blocks of compressed data (the
+    /// size retention aims a couple of blocks below its budget).
+    fn lines(from: usize, to: usize) -> String {
+        let mix = |mut x: u64| {
+            x = x.wrapping_add(0x9e3779b97f4a7c15);
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+            x ^ (x >> 31)
+        };
+        (from..to)
+            .map(|i| {
+                format!(
+                    "2026-10-03T{:02}:{:02}:{:02}Z line {i} {:016x}{:016x}{:016x}\n",
+                    10 + i / 3600,
+                    i / 60 % 60,
+                    i % 60,
+                    mix(i as u64 * 3),
+                    mix(i as u64 * 3 + 1),
+                    mix(i as u64 * 3 + 2)
+                )
+            })
+            .collect()
+    }
+
+    fn import_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
+        cmd_import(
+            &[src.to_path_buf()],
+            dest,
+            cfg(),
+            ImportOpts {
+                time: crate::bark::TimeFormat {
+                    regex: None,
+                    format: None,
+                    utc: true,
+                },
+                quick: false,
+                index: false,
+                wal: false,
+            },
+        )
+    }
+
+    /// What the store holds, and where its tape starts.
+    fn stored(dest: &Path) -> (u64, Vec<u8>) {
+        let (dir, name) = resolve_backing(dest).unwrap();
+        let mut f = crate::store::FileStore::open(&dir, &name, &cfg()).unwrap();
+        let start = f.tape_start();
+        let size = f.size();
+        (start, f.read(0, size as u32).unwrap())
+    }
+
+    #[test]
+    fn a_grown_file_adds_only_the_growth() {
+        let d = TempDir::new();
+        let (src, dest) = (d.0.join("app.log"), d.0.join("store.log"));
+        fs::write(&src, lines(0, 200)).unwrap();
+        import_file(&src, &dest).unwrap();
+        let before = stored(&dest).1;
+
+        fs::write(&src, lines(0, 260)).unwrap();
+        import_file(&src, &dest).unwrap();
+
+        let (start, now) = stored(&dest);
+        assert_eq!(start, 0);
+        assert_eq!(now, fs::read(&src).unwrap(), "the store is the file");
+        assert!(now.starts_with(&before));
+    }
+
+    #[test]
+    fn a_store_whose_head_retention_dropped_still_resumes() {
+        let d = TempDir::new();
+        let (src, dest) = (d.0.join("app.log"), d.0.join("store.log"));
+        fs::write(&src, lines(0, 3000)).unwrap();
+        import_file(&src, &dest).unwrap();
+
+        // What a writer's retention tick does: drop the oldest chunks.
+        let (dir, name) = resolve_backing(&dest).unwrap();
+        let mut st = crate::store::Store::open(&dir, cfg()).unwrap();
+        let comp = st.files.get(&name).unwrap().comp_size;
+        st.enforce_retention(&name, None, Some(comp / 2), None)
+            .unwrap();
+        drop(st);
+        let (start, _) = stored(&dest);
+        assert!(start > 0, "the head is gone");
+
+        fs::write(&src, lines(0, 3200)).unwrap();
+        import_file(&src, &dest).unwrap();
+
+        let (start, now) = stored(&dest);
+        let file = fs::read(&src).unwrap();
+        assert_eq!(
+            &now[..],
+            &file[start as usize..],
+            "what remains is the file's tail"
+        );
+        assert_eq!(start + now.len() as u64, file.len() as u64);
+    }
+
+    #[test]
+    fn a_line_imported_in_part_is_completed_in_place() {
+        let d = TempDir::new();
+        let (src, dest) = (d.0.join("app.log"), d.0.join("store.log"));
+        let mut text = lines(0, 50);
+        text.push_str("2026-10-03T11:00:00Z a line still being writ");
+        fs::write(&src, &text).unwrap();
+        import_file(&src, &dest).unwrap();
+
+        text.push_str("ten when the import ran\n");
+        text.push_str(&lines(50, 80));
+        fs::write(&src, &text).unwrap();
+        import_file(&src, &dest).unwrap();
+
+        assert_eq!(
+            stored(&dest).1,
+            text.as_bytes(),
+            "byte for byte, no duplicated start"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_that_begins_the_same_is_refused() {
+        let d = TempDir::new();
+        let (src, dest) = (d.0.join("app.log"), d.0.join("store.log"));
+        fs::write(&src, lines(0, 1500)).unwrap();
+        import_file(&src, &dest).unwrap();
+        let held = stored(&dest).1;
+
+        // Same start, same size, different bytes where the store ends (a store
+        // several windows long, so the edit is outside the head's window).
+        let mut text = lines(0, 1500).into_bytes();
+        let at = text.len() - 100;
+        text[at..].fill(b'X');
+        fs::write(&src, &text).unwrap();
+        let e = import_file(&src, &dest).unwrap_err();
+        assert!(e.to_string().contains("differs from the source"), "{e}");
+        assert_eq!(stored(&dest).1, held, "nothing was written");
+    }
+
+    #[test]
+    fn a_truncated_file_that_begins_the_same_is_refused() {
+        let d = TempDir::new();
+        let (src, dest) = (d.0.join("app.log"), d.0.join("store.log"));
+        fs::write(&src, lines(0, 200)).unwrap();
+        import_file(&src, &dest).unwrap();
+
+        fs::write(&src, lines(0, 100)).unwrap();
+        let e = import_file(&src, &dest).unwrap_err();
+        assert!(e.to_string().contains("smaller than"), "{e}");
+    }
+
+    #[test]
+    fn a_different_file_after_the_store_is_appended_not_mistaken_for_a_regrowth() {
+        let d = TempDir::new();
+        let (a, b, dest) = (d.0.join("a.log"), d.0.join("b.log"), d.0.join("store.log"));
+        fs::write(&a, lines(0, 100)).unwrap();
+        import_file(&a, &dest).unwrap();
+
+        let later: String = (0..150)
+            .map(|i| {
+                format!(
+                    "2026-10-03T12:{:02}:{:02}Z other {i} padding padding\n",
+                    i / 60,
+                    i % 60
+                )
+            })
+            .collect();
+        fs::write(&b, &later).unwrap();
+        import_file(&b, &dest).unwrap();
+
+        let want = format!("{}{later}", lines(0, 100));
+        assert_eq!(stored(&dest).1, want.as_bytes());
+    }
+
+    #[test]
+    fn a_file_whose_start_changed_is_refused_even_when_its_end_matches() {
+        let d = TempDir::new();
+        let (src, dest) = (d.0.join("app.log"), d.0.join("store.log"));
+        fs::write(&src, lines(0, 1500)).unwrap();
+        import_file(&src, &dest).unwrap();
+        let held = stored(&dest).1;
+
+        // The join is untouched; the first line's text is not (a store several
+        // windows long, so the edit is outside the tail's window).
+        let mut text = lines(0, 1560).into_bytes();
+        text[30..40].fill(b'Y');
+        fs::write(&src, &text).unwrap();
+        let e = import_file(&src, &dest).unwrap_err();
+        assert!(e.to_string().contains("differs from the source"), "{e}");
+        assert_eq!(stored(&dest).1, held, "nothing was written");
     }
 }

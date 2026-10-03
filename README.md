@@ -94,12 +94,12 @@ restart).
 Five ways in, in increasing order of commitment:
 
 **a) Keep importing on a timer** — zero changes to your logging. Re-import
-verifies what's already stored and appends only the growth, so a cron or
-logrotate hook is cheap even on huge files:
+checks the join between what's stored and the file and appends only the growth,
+so a cron or logrotate hook is cheap even on huge files:
 
 ```sh
 # cron, or logrotate postrotate:
-timberfs import --quiet /var/log/myapp/app.log --into backing/app.log --quick
+timberfs import --quiet /var/log/myapp/app.log --into backing/app.log
 ```
 
 **a2) Follow a whole system's files** — `timberfs file-intake` tails a NAMED

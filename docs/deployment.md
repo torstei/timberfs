@@ -719,14 +719,11 @@ requirement: the rotated file must still be readable as text at tick time, so
 keep logrotate's `delaycompress` (Debian's exim4 config already does).
 `import` reads plain logs and `.timber` bundles, not `.gz`.
 
-`--quick` matters once the store is large: a full import verifies every
-already-imported chunk against the source, which is proportional to the store
-(a cold-cache read of the whole thing), while `--quick` checks the first,
-middle and last chunks and is therefore constant. On a 22 MiB, 348-chunk store
-a redundant run measured 0.05 s full versus 0.02 s quick — small either way,
-but one of those grows with the archive and the other does not. What `--quick`
-gives up is noticing a source that was rewritten in the middle, which an
-append-only log does not do.
+A re-import compares a few KiB at each end of what is stored with the source,
+so its cost does not grow with the archive, and it still works after retention
+has dropped the head. What that gives up is noticing a source that was
+rewritten in the middle, which an append-only log does not do. `--quick`, which
+the unit files above pass, is accepted and has no effect.
 
 **A path unit (inotify)** — right for a log that is written *rarely*, wrong for
 a firehose. `PathModified=` fires on every write; `PathChanged=` only when a
