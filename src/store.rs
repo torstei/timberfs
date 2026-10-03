@@ -713,6 +713,18 @@ impl FileStore {
         self.buffer_start + self.buffer.len() as u64
     }
 
+    /// How many bytes retention has dropped from the head: what `size()`, which
+    /// counts from the current head, leaves out of a position on the tape.
+    pub fn tape_start(&self) -> u64 {
+        self.dropped.uncomp_bytes
+    }
+
+    /// Where the data ends on the tape, counting what retention dropped. For a
+    /// store fed by one file from its first byte, the offset in that file.
+    pub fn tape_end(&self) -> u64 {
+        self.tape_start() + self.size()
+    }
+
     pub fn append(&mut self, data: &[u8], cfg: &Config) -> io::Result<()> {
         self.append_stamped(data, now_ms(), cfg)
     }
