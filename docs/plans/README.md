@@ -40,6 +40,9 @@ messages and pull requests are for.
 - [file-intake.md](file-intake.md) — the same move on the INGEST side: a named
   set of a system's log files tailed by one process, and why this one needs no
   registry.
+- [import-resume.md](import-resume.md) — where in a growing source the store's
+  data ends: the tail as the anchor, a byte match inside a bisected region, and
+  a failure policy for a unit that restarts on any exit.
 - [yearless-stamps.md](yearless-stamps.md) — syslog's `Oct  1 00:00:02`: a
   built-in stamp whose year is the latest not after the source's mtime, so one
   file-intake set serves old and new hosts alike.

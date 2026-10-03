@@ -1,0 +1,144 @@
+# Resuming a source: where the store's data ends in the file
+
+**Status: proposed.** Nothing here is built. It replaces how `import` and
+`import --follow` decide where in a plain-text source to carry on.
+
+A source file grows, is read, and is read again later. The question each time:
+**which byte of the file is the first one the store does not have?**
+
+## Today
+
+Two paths answer it, differently.
+
+- **`import`** resumes by offset when the file's first timestamp equals the
+  store's first chunk's: it seeks to `size()` and `verify_prefix` decompresses
+  every imported chunk and compares it with the same range of the file
+  (`--quick`: first, middle and last chunk). O(store) per resume.
+- **`import --follow` and file intake** (`catch_up`) resume by content: the
+  store's lines from the file's first stamp to the end of the store go into a
+  hash multiset, and the whole file is read with the lines it holds dropped.
+  O(file) read, O(overlap) decompress, memory O(overlap lines).
+
+What is wrong with both:
+
+1. **The head is the anchor, and retention removes it.** `first stamp ==
+   store's first` stops holding once the head is dropped, and `size()` is
+   relative to the current head (the dropped bytes are counted separately, in
+   the rings header), so the offset it seeks to is only right before the first
+   drop.
+2. **A regrown file costs the store, or the overlap, every time.**
+3. **The first stamp is weak evidence of identity.** A fixed header line, a
+   boot time, or a coarse stamp makes two different files agree.
+4. **Both run under `Restart=always`, `RestartSec=2`.** Any exit, clean or not,
+   is retried every two seconds, and each retry would repeat the resume.
+
+## Principles
+
+- **Content decides.** Never an offset on its own, never a stamp on its own.
+- **The store's tail is the anchor.** It always exists; the head does not.
+- **No line is skipped because of its timestamp.** The store holds the file's
+  lines in the file's order, so "already imported" is monotone in *file
+  position* even where stamps are not monotone in time. A stamp may locate a
+  probe, and say a line is older than anything the store still retains; it
+  never decides that a line is old.
+- **A resume always ends in progress** (see Failure policy).
+- **A hint is a guess that is verified.** Losing one costs time, not data.
+
+## The resume
+
+`B` is the store's last `N` bytes (`N` about 16 KiB, or what the store holds),
+read from its last chunk or two. The answer is the offset in the file where `B`
+ends.
+
+**Step 0, the aligned candidate.** A store fed only by this file, from byte 0,
+holds the file's bytes verbatim, so the file offset of its end is the tape
+position `dropped + size()`. Compare `B` with the file just before that offset.
+Equal: resume there. One chunk and `N` bytes read.
+
+**Step 1, the hinted candidate.** When the store and the file are no longer
+aligned (an earlier run dropped lines, the store holds several sources, the
+file was regenerated), the hint file records where the last run ended, as a
+file offset and the tape position it matched. If the store's tape end still
+equals the recorded one, compare `B` just before the recorded file offset.
+
+**Step 2, the search.** For everything else.
+
+- *Head check, when the store still has its head* (`dropped == 0`): compare the
+  first couple of KiB of the file with the store's. One chunk. It says "this
+  is not the file" or "this is it" without depending on one record; a store
+  whose head was retained away skips it and relies on the tail.
+- *Narrow by bisection.* Probe at a file offset: seek, skip to the next record
+  start (a line that parses as a stamp), classify it:
+  - older than the store's first retained stamp: before the cutoff;
+  - found in the store: before the cutoff;
+  - anything else: after the cutoff.
+
+  Narrow until the region is small (about 1 MiB). A file of a few chunks skips
+  this and is scanned whole.
+- *Byte-match inside the region.* Search it for `B`; the end of the match is
+  the cutoff. Verify all `N` bytes.
+
+A record is looked up in the store by its stamp (the rings select the chunks
+whose write window can hold it, widened by the clock skew), then the `.grain`
+narrows them if the store has one, then an exact comparison. About
+`log2(file / 1 MiB)` probes, each a chunk or a few.
+
+The last line the store holds may be partial (a live file read to EOF), so the
+final match is on bytes, not records: the resume then continues in the middle
+of a line.
+
+## Failure policy
+
+Nobody is watching, and the units restart on any exit. An exit is therefore not
+a report, it is a loop that repeats the expensive part. So:
+
+**Ambiguity never exits.** `B` not found in the file means a new generation of
+it (copytruncate and regrow, a rewrite, a different file), and each case has an
+action that makes progress:
+
+| Situation | Action |
+|---|---|
+| `B` found | resume at the cutoff |
+| `B` not found, the file's first stamp is after the store's last | append the whole file: there is no overlap to dedup |
+| `B` not found, the file overlaps what the store retains | import from the start, dropping lines the store's last `W` already holds (a bounded set); older lines are imported, because a duplicate is the cheaper mistake |
+
+One line to stderr (the journal) and a note in the hint file say which. The
+hint is then written, so the next start takes Step 1: the fallback runs once
+per change of generation, not once per restart.
+
+**Permanent errors stop the unit.** No timestamp found in the first lines, a
+regex that does not compile: retrying cannot help. These exit with a distinct
+status (78, `EX_CONFIG`), and the units gain `RestartPreventExitStatus=78`.
+Transient faults (the source is missing, a writer holds the lock, the disk is
+full) exit non-zero as now, because a restart is the right answer to them.
+
+## Hints
+
+`<name>.resume`, a sidecar beside the store, listed in `format::every_path`.
+Derived data under the sidecar contract: deleting it costs a search.
+
+Per source: its identity (dev, ino, path), the file offset and tape position the
+last run ended at, when, and the note of the last fallback taken. Written
+atomically, when a run ends and (for `--follow`) when the tape end moves at a
+flush tick.
+
+Not the `.bark`: that holds what was *declared* and travels with the store; a
+hint is a volatile guess about one file on one host.
+
+## What this replaces
+
+- `verify_prefix`, and `--quick` with it (still accepted, ignored).
+- The `first stamp == store's first` gate.
+- `overlap_line_counts` for a file regrown in place. It stays for two
+  genuinely different sources that overlap, bounded by `W` under the same
+  policy.
+- `catch_up`'s read-everything-and-dedup for the same case: both importers
+  share one resume.
+
+## Open questions
+
+- `N`, the region size, and `W`.
+- A source with no parseable stamps: no probe can be classified older than the
+  window, so only Steps 0 and 1 apply, then the whole file is scanned for `B`.
+- A store fed by several files: Step 0 does not hold, Step 1 is per source.
+- Whether the note belongs in the hint file or also in `info`.
