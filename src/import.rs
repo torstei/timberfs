@@ -429,6 +429,70 @@ pub(crate) fn resume_point(
     }
 }
 
+/// The shortest tail worth searching a file for: a store holding less has none,
+/// and it is the last resort when a longer one straddles a gap.
+const SEARCH_MIN: u64 = 1024;
+
+/// The offset just past the first place `needle` occurs in `file`, or None.
+/// Read in blocks, so memory is one block and a match across a block boundary is
+/// found; stopping at the first match errs towards a duplicate and not a loss.
+pub(crate) fn find_end_of(file: &File, needle: &[u8]) -> std::io::Result<Option<u64>> {
+    use std::os::unix::fs::FileExt;
+    const BLOCK: usize = 1 << 20;
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    let finder = memchr::memmem::Finder::new(needle);
+    let keep = needle.len() - 1;
+    let mut buf = vec![0u8; keep + BLOCK];
+    // `at` is the file offset of buf[0]; `have` how much of buf holds file.
+    let (mut at, mut have) = (0u64, 0usize);
+    loop {
+        let n = file.read_at(&mut buf[have..], at + have as u64)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        have += n;
+        if let Some(i) = finder.find(&buf[..have]) {
+            return Ok(Some(at + (i + needle.len()) as u64));
+        }
+        // A match may straddle the next block: keep the end of this one.
+        let drop = have.saturating_sub(keep);
+        buf.copy_within(drop..have, 0);
+        at += drop as u64;
+        have -= drop;
+    }
+}
+
+/// Where in `src` the store's data ends, found by searching it for the store's
+/// last bytes. The store's tail is contiguous in the file wherever an earlier
+/// gap is, so this holds for a store that lost lines, for a log that rotated
+/// (the tail is in the new file), and for a store that lost its unflushed tail.
+/// It needs no timestamp and no copy of the store.
+///
+/// The longest tail goes first, because it is the strongest evidence. A gap
+/// closer to the end than that makes it straddle the gap, so it is in no file,
+/// and then the last KiB, which is still many stamped lines, is tried.
+pub(crate) fn search_point(
+    f: &mut crate::store::FileStore,
+    src: &File,
+) -> anyhow::Result<Option<u64>> {
+    let size = f.size();
+    if size < SEARCH_MIN {
+        return Ok(None);
+    }
+    for n in [size.min(TAIL_CHECK), SEARCH_MIN] {
+        let tail = f.read(size - n, n as u32)?;
+        if let Some(end) = find_end_of(src, &tail)? {
+            return Ok(Some(end));
+        }
+        if n == SEARCH_MIN {
+            break;
+        }
+    }
+    Ok(None)
+}
+
 /// FNV-1a 128 of a line (trailing newline stripped). Overlap dedup only
 /// needs collisions to be unlikelier than hardware failure, not
 /// cryptography: for 10^8 distinct lines the collision odds are ~10^-23.
@@ -1476,5 +1540,87 @@ mod tests {
         let e = import_file(&src, &dest).unwrap_err();
         assert!(e.to_string().contains("differs from the source"), "{e}");
         assert_eq!(stored(&dest).1, held, "nothing was written");
+    }
+
+    /// Bytes no needle of letters will match by accident.
+    fn noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 56) as u8 | 0x80
+            })
+            .collect()
+    }
+
+    fn file_of(d: &TempDir, bytes: &[u8]) -> File {
+        let p = d.0.join("search.bin");
+        fs::write(&p, bytes).unwrap();
+        File::open(p).unwrap()
+    }
+
+    #[test]
+    fn a_needle_is_found_wherever_it_falls_against_the_block_boundaries() {
+        let d = TempDir::new();
+        let needle = b"the store's last bytes, as plain text";
+        let block = 1usize << 20;
+        let keep = needle.len() - 1;
+        for around in [block, block + keep, 2 * block, 2 * block + keep] {
+            for pos in around - 3..=around + 3 {
+                let mut bytes = noise(pos + needle.len() + 5000, 7);
+                bytes[pos..pos + needle.len()].copy_from_slice(needle);
+                let f = file_of(&d, &bytes);
+                assert_eq!(
+                    find_end_of(&f, needle).unwrap(),
+                    Some((pos + needle.len()) as u64),
+                    "needle at {pos}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_occurrence_wins_and_the_edges_are_found() {
+        let d = TempDir::new();
+        let needle = b"needle-needle-needle";
+        let mut bytes = noise(300_000, 1);
+        bytes[100..100 + needle.len()].copy_from_slice(needle);
+        bytes[200_000..200_000 + needle.len()].copy_from_slice(needle);
+        assert_eq!(
+            find_end_of(&file_of(&d, &bytes), needle).unwrap(),
+            Some((100 + needle.len()) as u64)
+        );
+
+        let mut at_start = noise(5000, 2);
+        at_start[..needle.len()].copy_from_slice(needle);
+        assert_eq!(
+            find_end_of(&file_of(&d, &at_start), needle).unwrap(),
+            Some(needle.len() as u64)
+        );
+        let mut at_end = noise(5000, 3);
+        let n = at_end.len();
+        at_end[n - needle.len()..].copy_from_slice(needle);
+        assert_eq!(
+            find_end_of(&file_of(&d, &at_end), needle).unwrap(),
+            Some(n as u64)
+        );
+    }
+
+    #[test]
+    fn a_needle_that_is_not_there_is_not_found() {
+        let d = TempDir::new();
+        let bytes = noise(3 << 20, 4);
+        assert_eq!(
+            find_end_of(&file_of(&d, &bytes), b"not in this file").unwrap(),
+            None
+        );
+        assert_eq!(
+            find_end_of(&file_of(&d, b"short"), b"much longer than the file").unwrap(),
+            None
+        );
+        assert_eq!(find_end_of(&file_of(&d, b"anything"), b"").unwrap(), None);
+        assert_eq!(find_end_of(&file_of(&d, b""), b"x").unwrap(), None);
     }
 }

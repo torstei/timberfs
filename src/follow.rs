@@ -65,6 +65,10 @@ use crate::import::{first_stamp, line_hash, overlap_line_counts, Extractor, Impo
 use crate::query::{ensure_dest_is_not_plain_file, resolve_backing};
 use crate::store::{self, Config, Store};
 
+/// How much of the store's end a file that overlaps it is compared against:
+/// uncompressed bytes. It bounds the memory of that comparison.
+const DEDUP_WINDOW: u64 = 64 << 20;
+
 pub struct FollowOpts {
     /// How often to look for new data (and for a replaced file).
     pub poll_ms: u64,
@@ -228,18 +232,29 @@ fn commit_fragment(
 }
 
 /// Where in `path` the store's data ends, if the store was fed by that file:
-/// the store's last bytes are the file's bytes just before that offset. It
+/// the store's last bytes are the file's bytes just before that offset, or, when
+/// the file's offsets and the store's no longer line up, found by searching the
+/// file for them (the flag says which). It
 /// decides by bytes and not by timestamps, so it holds for a store whose head
 /// retention has dropped; and it never errors on an ambiguity, which would
 /// restart a service, only says it cannot tell.
-fn resume_offset(store: &Mutex<Store>, name: &str, path: &Path) -> anyhow::Result<Option<u64>> {
+fn resume_offset(
+    store: &Mutex<Store>,
+    name: &str,
+    path: &Path,
+) -> anyhow::Result<Option<(u64, bool)>> {
     let src = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut s = store.lock().unwrap();
     let f = s.files.get_mut(name).expect("the store this tail opened");
     if f.size() == 0 {
         return Ok(None);
     }
-    crate::import::resume_point(f, &src, false)
+    if let Some(end) = crate::import::resume_point(f, &src, false)? {
+        return Ok(Some((end, false)));
+    }
+    // Not where the file's offset says: a rotation, a store that lost lines.
+    // The store's last bytes are still in the file, so look for them.
+    Ok(crate::import::search_point(f, &src)?.map(|end| (end, true)))
 }
 
 /// Bring the store up to date with one file, dropping what it already holds.
@@ -263,10 +278,15 @@ fn catch_up(
     if size == 0 {
         return Ok(0);
     }
-    if let Some(end) = resume_offset(store, name, path)? {
+    if let Some((end, searched)) = resume_offset(store, name, path)? {
         crate::note!(
-            "timberfs: {}: {name} ends at byte {end} of it ({size} bytes); resuming there",
-            path.display()
+            "timberfs: {}: {name} ends at byte {end} of it ({size} bytes){}; resuming there",
+            path.display(),
+            if searched {
+                ", found by searching for its last bytes"
+            } else {
+                ""
+            }
         );
         if live {
             return Ok(end);
@@ -298,29 +318,49 @@ fn catch_up(
     };
 
     let mut dedup = None;
+    // Lines older than this are what retention dropped from the store's head.
+    let mut head = None;
     if let (Some(first), Some(last)) = (store_first, store_last) {
         if t0 < first {
-            // Older than anything the store holds. Either retention dropped
-            // that history or it was never imported; either way appending it
-            // now would write backwards along the write axis, which the index
-            // is ordered by. Say so and skip rather than wedge a service.
+            // Older than anything the store holds: that history is retention's
+            // to drop, and appending it now would write backwards along the
+            // write axis, which the index is ordered by. Only those lines are
+            // left out; what the file has since is still read.
             crate::note!(
-                "timberfs: skipping {} — it starts {} , before the oldest data in {name} ({}); \
-                 a store's write axis only moves forward, so import that history \
-                 into a store of its own if you need it",
+                "timberfs: {} starts {} , before the oldest data in {name} ({}); the lines \
+                 older than that are what retention dropped and are not imported, the rest are",
                 path.display(),
                 crate::query::fmt_ms(t0),
                 crate::query::fmt_ms(first)
             );
-            return Ok(size);
+            head = Some(first);
         }
         if t0 <= last {
             let trunk = crate::format::trunk_path(&store.lock().unwrap().dir.clone(), name);
-            let chunks = {
+            // Only the store's last stretch is compared against, so this stays
+            // bounded however large the store is; a line older than that
+            // stretch is imported again, which is the cheaper mistake.
+            let (chunks, cut) = {
                 let s = store.lock().unwrap();
-                s.files.get(name).unwrap().chunks.clone()
+                let all = &s.files.get(name).unwrap().chunks;
+                let (mut start, mut bytes) = (all.len(), 0u64);
+                while start > 0 && bytes + all[start - 1].uncomp_len <= DEDUP_WINDOW {
+                    start -= 1;
+                    bytes += all[start].uncomp_len;
+                }
+                (all[start..].to_vec(), start > 0)
             };
-            let counts = overlap_line_counts(&chunks, &trunk, t0)?;
+            if cut {
+                crate::note!(
+                    "timberfs: {name}: the overlap with {} is larger than {} MiB; lines older than \
+                     {} are compared with only the last {} MiB and may be repeated",
+                    path.display(),
+                    DEDUP_WINDOW >> 20,
+                    crate::query::fmt_ms(chunks.first().map(|c| c.first_write_ms).unwrap_or(first)),
+                    DEDUP_WINDOW >> 20
+                );
+            }
+            let counts = overlap_line_counts(&chunks, &trunk, t0.max(first))?;
             crate::note!(
                 "timberfs: {} overlaps what {name} already holds (through {}) — \
                  re-syncing against the store, line by line",
@@ -335,6 +375,7 @@ fn catch_up(
     let mut open = Open::at(path, 0)?;
     extractor.anchor_to(&open.file.metadata()?);
     let mut skipped = 0u64;
+    let mut retained_away = 0u64;
     let mut added = 0u64;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -352,6 +393,13 @@ fn catch_up(
         let f = s.files.get_mut(name).expect("the store this tail opened");
         for line in complete.split_inclusive(|b| *b == b'\n') {
             let ts = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]));
+            if head.is_some_and(|h| ts.or(stamper.last_ts()).is_some_and(|e| e < h)) {
+                retained_away += 1;
+                if let Some(t) = ts {
+                    stamper.observe(t);
+                }
+                continue;
+            }
             if let Some((counts, until)) = dedup.as_mut() {
                 if ts.or(stamper.last_ts()).is_some_and(|e| e > *until) {
                     dedup = None; // past the overlap: everything else is new
@@ -376,10 +424,15 @@ fn catch_up(
     if !live {
         commit_fragment(&mut open, store, name, extractor, stamper, cfg)?;
     }
-    if skipped > 0 || added > 0 {
+    if skipped > 0 || added > 0 || retained_away > 0 {
         crate::note!(
-            "timberfs: {}: {added} line(s) new, {skipped} already in {name}",
-            path.display()
+            "timberfs: {}: {added} line(s) new, {skipped} already in {name}{}",
+            path.display(),
+            if retained_away > 0 {
+                format!(", {retained_away} older than {name}'s head (dropped by retention)")
+            } else {
+                String::new()
+            }
         );
     }
     Ok(open.offset - open.pending.len() as u64)
@@ -912,6 +965,89 @@ mod tests {
         let store = start(&dir, &b, &[]);
         let want = format!("{}{}", lines(0, 1500), lines(1500, 2000));
         assert_eq!(stored(&store).1, want.as_bytes());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_store_that_lost_lines_resumes_after_its_tail_and_loses_no_more() {
+        let dir = scratch("gap");
+        // What an earlier restart left behind: the file, minus 100 lines in the middle.
+        let part = dir.join("part.log");
+        fs::write(&part, format!("{}{}", lines(0, 3000), lines(3100, 3200))).unwrap();
+        let store = start(&dir, &part, &[]);
+        drop_the_head(&store);
+        assert!(stored(&store).0 > 0, "the head is gone");
+        let held_before = stored(&store).1;
+        drop(store);
+
+        // The real file has the gap's lines too, and 100 more written while down.
+        let src = dir.join("app.log");
+        fs::write(&src, lines(0, 3300)).unwrap();
+        let store = start(&dir, &src, &[]);
+
+        let (_, held) = stored(&store);
+        assert_eq!(
+            held,
+            [held_before, lines(3200, 3300).into_bytes()].concat(),
+            "the new lines arrived, and nothing else did"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn after_a_rotation_the_new_file_is_found_by_the_stores_tail() {
+        let dir = scratch("rotation-search");
+        let src = dir.join("app.log");
+        fs::write(&src, lines(0, 1500)).unwrap();
+        start(&dir, &src, &[]);
+        let rotated = dir.join("app.log.1");
+        fs::rename(&src, &rotated).unwrap();
+        fs::write(&src, block(20, 0, 300)).unwrap();
+        let store = start(&dir, &src, std::slice::from_ref(&rotated));
+        let imported = block(20, 0, 300).len() as u64;
+
+        // The store now ends in the middle of the new file, and holds the old
+        // one before it, so the file's offsets and the store's do not line up.
+        append_to(&src, &block(20, 300, 400));
+        assert_eq!(
+            resume_offset(&store, "f.log", &src).unwrap(),
+            Some((imported, true)),
+            "found by searching, not by the offset"
+        );
+
+        let store = start(&dir, &src, std::slice::from_ref(&rotated));
+        let want = format!("{}{}", lines(0, 1500), block(20, 0, 400));
+        assert_eq!(stored(&store).1, want.as_bytes());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_without_the_tail_drops_only_what_retention_dropped() {
+        let dir = scratch("no-tail");
+        let src = dir.join("app.log");
+        fs::write(&src, lines(0, 3000)).unwrap();
+        let store = start(&dir, &src, &[]);
+        drop_the_head(&store);
+        let retained = String::from_utf8(stored(&store).1).unwrap();
+        assert!(stored(&store).0 > 0, "the head is gone");
+        drop(store);
+
+        // The file was rewritten: its last line differs, so the store's tail is
+        // nowhere in it. It also still begins before the store does.
+        let mut text = lines(0, 3100).into_bytes();
+        let end_of_2999 = lines(0, 3000).len() - 2;
+        text[end_of_2999] = b'Z';
+        fs::write(&src, &text).unwrap();
+        let store = start(&dir, &src, &[]);
+
+        let changed =
+            String::from_utf8(text[lines(0, 2999).len()..lines(0, 3000).len()].to_vec()).unwrap();
+        let want = format!("{retained}{changed}{}", lines(3000, 3100));
+        assert_eq!(
+            String::from_utf8(stored(&store).1).unwrap(),
+            want,
+            "the history retention dropped is not brought back, and the new lines are read"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
