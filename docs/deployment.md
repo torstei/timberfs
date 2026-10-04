@@ -541,6 +541,12 @@ exchange is that the plain file still exists and still needs rotating.
 | `timberfs-follow@` (follower) | poll + flush age | none — it is a reader | nothing lost — the store is the checkpoint |
 | `import` on a timer | the tick | none | nothing lost — same checkpoint |
 
+A followed file that has no timestamp yet is waited for, holding nothing in
+memory: when the first stamp arrives, the lines before it are read from the
+file and imported with that time. A note at 100 MiB and each doubling says it
+is still waiting. A file rotated away without ever having had a stamp is
+imported with its modification time.
+
 A third axis the table leaves out: a follower stamps chunks from the loglines,
 the FIFO pair from the wall clock at the time it reads them. For a producer
 whose line timestamp is not its write time, that decides whether a
