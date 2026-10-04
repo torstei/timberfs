@@ -1299,7 +1299,18 @@ fn report_sent(
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            let permanent = e.downcast_ref::<store::ConfigError>().is_some();
+            std::process::ExitCode::from(if permanent { store::EXIT_CONFIG } else { 1 } as u8)
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     // Die quietly when a pipe closes (query | head), like any Unix tool,
     // instead of Rust's default panic-on-EPIPE.
     unsafe {

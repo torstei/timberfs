@@ -4086,6 +4086,14 @@ zstd \-dc logs\-backing/app.log.trunk > app.log.recovered
 .fi
 .SH EXIT STATUS
 0 on success, non-zero on any error (2 for command-line usage errors).
+78 (EX_CONFIG) is a setting no retry can fix: a timestamp regex that does not
+compile or lacks its capture group, a retention that does not parse. The
+.B timberfs\-follow@
+and
+.B timberfs\-file@
+units stop on it (\c
+.BR RestartPreventExitStatus=78 )
+instead of restarting every two seconds.
 .SH THE STORE OBJECT
 One JSON shape for a store, wherever one is emitted:
 .B "info \-\-json"

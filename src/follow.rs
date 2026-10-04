@@ -65,7 +65,7 @@ use crate::import::{
     find_first_stamp, line_hash, overlap_line_counts, Extractor, ImportOpts, Stamper,
 };
 use crate::query::{ensure_dest_is_not_plain_file, resolve_backing};
-use crate::store::{self, Config, Store};
+use crate::store::{self, config_error, Config, Store};
 
 /// How much of the store's end a file that overlaps it is compared against:
 /// uncompressed bytes. It bounds the memory of that comparison.
@@ -636,8 +636,14 @@ pub fn cmd_follow(
     retain_size: Option<&str>,
     fopts: FollowOpts,
 ) -> anyhow::Result<()> {
-    retain.map(append::parse_duration_ms).transpose()?;
-    retain_size.map(append::parse_size_bytes).transpose()?;
+    if let Some(e) = retain
+        .map(append::parse_duration_ms)
+        .transpose()
+        .err()
+        .or_else(|| retain_size.map(append::parse_size_bytes).transpose().err())
+    {
+        return config_error(format!("{e:#}"));
+    }
     if crate::query::is_bundle(dest) {
         bail!(
             "{} is a .timber transfer bundle — bundles are read-only; \

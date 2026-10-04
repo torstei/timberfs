@@ -311,6 +311,28 @@ pub fn now_ms() -> u64 {
 /// real failure.
 pub const EXIT_BINARY_UPGRADED: i32 = 85;
 
+/// Exit status for a setting no restart can fix (EX_CONFIG): a timestamp
+/// regex that does not compile, a retention that does not parse. The units
+/// pair it with RestartPreventExitStatus so systemd stops instead of looping.
+pub const EXIT_CONFIG: i32 = 78;
+
+/// An error that exits with `EXIT_CONFIG`; `main` finds it in the error chain.
+#[derive(Debug)]
+pub struct ConfigError(pub String);
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// `Err(ConfigError)` carrying `message`.
+pub fn config_error<T>(message: impl Into<String>) -> anyhow::Result<T> {
+    Err(ConfigError(message.into()).into())
+}
+
 /// Watches the running executable so a supervised daemon can notice its
 /// own package being upgraded (dpkg replaces /usr/bin/timberfs with a new
 /// inode) and exit for a clean re-exec. Only acted on when the operator

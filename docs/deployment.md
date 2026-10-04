@@ -1525,6 +1525,10 @@ The units pass `--exit-on-upgrade`. When a package upgrade replaces
 with a dedicated code, `85`; `SuccessExitStatus=85` + `RestartForceExitStatus=85`
 make systemd restart it onto the new binary regardless of `Restart=`.
 
+A setting no restart can fix (a timestamp regex that does not compile, a
+retention that does not parse) exits `78` (EX_CONFIG), and the follow and file
+units carry `RestartPreventExitStatus=78`, so they stop instead of looping.
+
 - **FIFO intake** is seamless: the `.socket` holds the FIFO open across the
   swap, so the producer sees no gap.
 - **Mount** is clean: `auto_unmount` tears the old FUSE session down, and systemd
