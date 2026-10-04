@@ -582,11 +582,13 @@ should depend on this side. Position and rotation are the whole difficulty
 and are handled by three rules:
 .TP
 The store is the checkpoint.
-A start re-syncs against the lines the store already holds over the window
-the source covers, so a restart can neither lose nor duplicate, and there is
-no position file to go stale, be restored out of step, or disagree with the
-store. The cost is a scan of the source at startup, which is one reason to
-rotate a busy log hourly rather than daily.
+A start finds where the store's data ends in the source by comparing bytes, and
+carries on from there, which holds even after retention has dropped the
+store's head. Only where it cannot tell does it re-sync against the lines the
+store already holds over the window the source covers. Either way a restart can
+neither lose nor duplicate, and there is no position file to go stale, be
+restored out of step, or disagree with the store. The fallback costs a scan of
+the source, which is one reason to rotate a busy log hourly rather than daily.
 .TP
 A descriptor is never abandoned before EOF.
 When the path stops being the file it was, the file already open is read to
