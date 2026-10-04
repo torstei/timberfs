@@ -565,8 +565,10 @@ pub(crate) fn overlap_line_counts(
     Ok(counts)
 }
 
-/// First parsed timestamp in a file, scanning at most DETECT_WINDOW lines.
-pub(crate) fn first_stamp(path: &Path, extractor: &Extractor) -> anyhow::Result<u64> {
+/// First parsed timestamp in a file, scanning at most DETECT_WINDOW lines; None
+/// when there is none in them, which for a file that is still being written is
+/// a state and not an error.
+pub(crate) fn find_first_stamp(path: &Path, extractor: &Extractor) -> anyhow::Result<Option<u64>> {
     let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     extractor.anchor_to(&f.metadata()?);
     let mut reader = BufReader::new(f);
@@ -578,14 +580,21 @@ pub(crate) fn first_stamp(path: &Path, extractor: &Extractor) -> anyhow::Result<
         }
         if let Some(ts) = extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]))
         {
-            return Ok(ts);
+            return Ok(Some(ts));
         }
     }
-    bail!(
-        "no timestamp found in the first {DETECT_WINDOW} lines of {}; \
-         try --timestamp-regex/--timestamp-format",
-        path.display()
-    )
+    Ok(None)
+}
+
+/// As `find_first_stamp`, for a caller that cannot go on without one.
+pub(crate) fn first_stamp(path: &Path, extractor: &Extractor) -> anyhow::Result<u64> {
+    find_first_stamp(path, extractor)?.with_context(|| {
+        format!(
+            "no timestamp found in the first {DETECT_WINDOW} lines of {}; \
+             try --timestamp-regex/--timestamp-format",
+            path.display()
+        )
+    })
 }
 
 /// A source is either a plain log (lines get parsed and stamped) or an
