@@ -1,7 +1,10 @@
 # Resuming a source: where the store's data ends in the file
 
-**Status: proposed.** Nothing here is built. It replaces how `import` and
-`import --follow` decide where in a plain-text source to carry on.
+**Status: partly built.** Step 0, the aligned candidate with its byte
+comparison, is in `import` and in the live importer. Step 2 is being built in its
+simplest form, a scan of the file for the store's tail. The hint file and the
+bisection are not built. It replaces how `import` and `import --follow` decide
+where in a plain-text source to carry on.
 
 A source file grows, is read, and is read again later. The question each time:
 **which byte of the file is the first one the store does not have?**
@@ -68,7 +71,18 @@ that left the store and the file misaligned. It is only written by a run that
 verified its own position, so it never turns a guess into a belief.
 
 **Step 2, the search.** For everything else: a store with no hint yet (the first
-run after upgrading), a hint that no longer matches, a file regenerated in place.
+run after upgrading), a hint that no longer matches, a file regenerated in place,
+a store that lost lines.
+
+The first version is a scan: read the file in blocks and look for `B`; the end of
+the match is the cutoff. It is bounded memory and one pass over the file, which
+is what the fallback costs today, and it needs no timestamp and no copy of the
+store. It covers a store with a gap (the tail is contiguous in the file wherever
+the gap is), a rotated log (the tail is in the new file), and a store that lost
+its unflushed tail. It stops at the first match, so a repeated block errs towards
+a duplicate and not a loss. A store holding less than a KiB has no tail worth
+searching for. The bisection below only makes the scan cheaper on a very large
+file.
 
 - *Head check, when the store still has its head* (`dropped == 0`): compare the
   first couple of KiB of the file with the store's. One chunk. It says "this
@@ -107,7 +121,11 @@ action that makes progress:
 |---|---|
 | `B` found | resume at the cutoff |
 | `B` not found, the file's first stamp is after the store's last | append the whole file: there is no overlap to dedup |
-| `B` not found, the file overlaps what the store retains | import from the start, dropping lines the store's last `W` already holds (a bounded set); older lines are imported, because a duplicate is the cheaper mistake |
+| `B` not found, the file overlaps what the store retains | read it from the start; a line older than the store's first stamp is not imported (retention dropped that history on purpose), a line newer than its last is, and a line between is dropped only if the store's last `W` already holds it (a bounded set), because a duplicate is the cheaper mistake |
+
+The old startup got the overlap case wrong: it looked at the file's first stamp,
+found it older than the store's head, and skipped the whole file, then followed
+from its end. Only the lines older than the head are retention's to drop.
 
 One line to stderr (the journal) and a note in the hint file say which. The
 hint is then written, so the next start takes Step 1: the fallback runs once
