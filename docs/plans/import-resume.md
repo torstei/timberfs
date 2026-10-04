@@ -80,8 +80,10 @@ is what the fallback costs today, and it needs no timestamp and no copy of the
 store. It covers a store with a gap (the tail is contiguous in the file wherever
 the gap is), a rotated log (the tail is in the new file), and a store that lost
 its unflushed tail. It stops at the first match, so a repeated block errs towards
-a duplicate and not a loss. A store holding less than a KiB has no tail worth
-searching for. The bisection below only makes the scan cheaper on a very large
+a duplicate and not a loss. The needle is the store's last 16 KiB; a gap closer
+to the end than that makes it straddle the gap and it is in no file, so the last
+KiB is tried next. A store holding less than a KiB has no tail worth searching
+for. The bisection below only makes the scan cheaper on a very large
 file.
 
 - *Head check, when the store still has its head* (`dropped == 0`): compare the

@@ -43,6 +43,7 @@ flate2 = "1"
 fuser = { version = "0.15", default-features = false, features = ["abi-7-19"] }
 libc = "0.2"
 regex = "1"
+memchr = "2"
 rmpv = "1"
 # derive only: the query document is a WIRE format, and `deny_unknown_fields`
 # in one line beats a hand-written validator that has to remember to reject a

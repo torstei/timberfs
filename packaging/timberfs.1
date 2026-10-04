@@ -584,11 +584,15 @@ and are handled by three rules:
 The store is the checkpoint.
 A start finds where the store's data ends in the source by comparing bytes, and
 carries on from there, which holds even after retention has dropped the
-store's head. Only where it cannot tell does it re-sync against the lines the
-store already holds over the window the source covers. Either way a restart can
-neither lose nor duplicate, and there is no position file to go stale, be
-restored out of step, or disagree with the store. The fallback costs a scan of
-the source, which is one reason to rotate a busy log hourly rather than daily.
+store's head. If the source's offsets and the store's no longer line up (the log
+rotated, or the store lost lines) it searches the source for the store's last
+bytes instead, in one pass and constant memory. Only where those are nowhere in
+the source does it re-sync against the lines the store already holds over the
+window the source covers, leaving out only the lines older than the store's head,
+which retention dropped. Either way a restart can neither lose nor duplicate, and
+there is no position file to go stale, be restored out of step, or disagree with
+the store. The search and the re-sync each cost a pass over the source, which is
+one reason to rotate a busy log hourly rather than daily.
 .TP
 A descriptor is never abandoned before EOF.
 When the path stops being the file it was, the file already open is read to

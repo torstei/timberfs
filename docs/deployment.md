@@ -551,8 +551,8 @@ Rotation of the plain file stays the producer's business, and its retention is
 no longer your archive — only the follower's safety margin. That frees you to
 rotate far more often than you would otherwise: **hourly rotation on a busy
 site** is worth doing, because it bounds both the plain file's size and the
-scan a follower falls back to at startup when it cannot find where the store
-ends in the file.
+pass a follower makes over the file at startup when the store's offsets no longer
+line up with it.
 
 ```ini
 # /etc/timberfs/follow-exim-main.conf   (SOURCE is required)
@@ -621,11 +621,14 @@ look — in the journal, as it happens:
 
 - **The store is the checkpoint.** A start finds where the store's data ends in
   the source by comparing bytes and carries on from there, which holds even after
-  retention has dropped the store's head. Only where it cannot tell does it
-  re-sync against the lines the store already holds over the window the source
-  covers. Either way a restart can neither lose nor duplicate. There is no
-  position file to go stale, be restored out of step, or disagree with the
-  store.
+  retention has dropped the store's head. If the source's offsets and the store's
+  no longer line up (the log rotated, or the store lost lines) it searches the
+  source for the store's last bytes instead, in one pass and constant memory.
+  Only where those are nowhere in the source does it re-sync against the lines
+  the store already holds over the window the source covers, leaving out only the
+  lines older than the store's head. Either way a restart can neither lose nor
+  duplicate. There is no position file to go stale, be restored out of step, or
+  disagree with the store.
 - **A descriptor is never abandoned before EOF.** When the path stops being the
   file it was, the file already open is drained first — so the lines written
   between the last read and the rename cannot be stranded, which is exactly
