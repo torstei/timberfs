@@ -48,6 +48,62 @@ def raises(name, fn, contains):
     FAILED.append(f"{name}: no refusal, and {contains!r} was expected")
 
 
+def test_where_it_draws_is_one_rule_for_both_tools():
+    """`choose_terminal` is the whole of it, and timbersh calls this same
+    function — two copies would drift and the same words would then mean
+    different pictures depending which you typed them in.
+
+    The default is a window because ASCII cannot carry the detail. It
+    wants a display, an interactive gnuplot terminal AND a tty, and the
+    tty binds the default only: a redirected run keeps its answer as
+    text, while a NAMED window is what was asked for and a window is not
+    stdout.
+    """
+    at_a_desk = dict(term="qt", tty=True)
+    redirected = dict(term="qt", tty=False)
+    no_window = dict(term=None, tty=True)
+    check("default at a desk", "qt", g.choose_terminal(**at_a_desk))
+    check("default redirected", "dumb", g.choose_terminal(**redirected))
+    check("no interactive terminal", "dumb", g.choose_terminal(**no_window))
+    check("named window survives a pipe", "qt",
+          g.choose_terminal(window=True, **redirected))
+    check("named ascii at a desk", "dumb",
+          g.choose_terminal(want_ascii=True, **at_a_desk))
+    check("a file needs no window", "pngcairo",
+          g.choose_terminal(png="f.png", **no_window))
+    check("svg likewise", "svg", g.choose_terminal(svg="f.svg", **no_window))
+
+
+def test_a_window_that_cannot_be_drawn_is_refused_not_downgraded():
+    """Naming it is asking for it, so ASCII instead would answer a
+    question nobody asked. The message has to name BOTH things that
+    could be missing — a display and a gnuplot built for one — because
+    either alone looks the same from here."""
+    raises("no terminal", lambda: g.choose_terminal(window=True, term=None,
+                                                    tty=True),
+           "no interactive gnuplot terminal")
+    raises("names gnuplot-nox", lambda: g.choose_terminal(window=True,
+                                                          term=None, tty=True),
+           "gnuplot-nox")
+
+
+def test_two_places_to_draw_is_refused_rather_than_one_winning():
+    """`--window --png f` used to write the file and no window; `--png`
+    beside `--svg` quietly preferred the png. A statement whose
+    destination is picked for it means something other than what it
+    says, so both are named and neither wins."""
+    raises("window and ascii",
+           lambda: g.choose_terminal(window=True, want_ascii=True, term="qt"),
+           "different places to draw")
+    raises("png and svg",
+           lambda: g.choose_terminal(png="a.png", svg="b.svg", term="qt"),
+           "different places to draw")
+    raises("names the flags it was given",
+           lambda: g.choose_terminal(window=True, png="a.png", term="qt",
+                                     spell="--"),
+           "`--window` and `--png`")
+
+
 def test_a_line_says_what_it_holds():
     s = g.parse_line(
         '2026-09-06T13:37:00.000Z 60s m a=1 msg="two words" count=3 sum=1.5 @40+9'

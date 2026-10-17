@@ -166,10 +166,38 @@ where the name resolves to a different document or to none.
 .B \-\-list
 Say what the input holds and draw nothing.
 .TP
-.BI \-\-png " FILE" ", " \-\-svg " FILE" ", " \-\-window
-Draw somewhere other than the terminal.
+.BI \-\-png " FILE" ", " \-\-svg " FILE" ", " \-\-window ", " \-\-ascii
+WHERE to draw, and by DEFAULT that is a WINDOW \(em characters cannot
+carry the detail, five series an order of magnitude apart collapsing into
+two rows of them with one disappearing altogether. It needs three things
+and none implies another: a display
+.RB ( $DISPLAY
+or
+.BR $WAYLAND_DISPLAY ),
+a
+.BR gnuplot (1)
+built with an interactive terminal
+.RB ( gnuplot\-nox
+has none), and a TTY to be watching it \(em so a redirected or scripted
+run keeps its answer as text rather than losing it to a window nobody
+sees. Missing any of them, the default is ASCII.
+.IP
 .B \-\-window
-needs a display and gnuplot's qt or x11 terminal.
+and
+.B \-\-ascii
+say which outright, and
+.B \-\-window
+overrides the TTY test, a window not being stdout. A
+.B \-\-window
+that cannot be drawn is REFUSED rather than downgraded, because the point
+of naming it is to get one.
+.BI \-\-png " FILE"
+and
+.BI \-\-svg " FILE"
+write a file. One of the four at a time: two name different places to
+draw. ⚠ Identical in
+.BR timbersh (1),
+which calls this same rule rather than keeping its own.
 .TP
 .BI \-\-width " N" ", " \-\-height " N"
 The plot's size \(em CHARACTERS on the terminal, where it defaults to the

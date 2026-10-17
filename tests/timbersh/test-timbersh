@@ -29,7 +29,14 @@ ID_B = "bbbbbbbb-1111-2222-3333-444444444444"
 class Session:
     """One timbersh run against a scripted server."""
 
-    def __init__(self, scenario, hosts=None, extra=(), resolver=False):
+    def __init__(self, scenario, hosts=None, extra=(), resolver=False,
+                 env=None):
+        # `env` overrides the inherited environment per key; None as a
+        # value UNSETS one. Which is what lets a test say whether a
+        # display exists — `graph` draws a window where one can be drawn,
+        # so a suite that inherited the developer's DISPLAY would assert
+        # different things on a desk and in CI.
+        self.env = env or {}
         self.dir = tempfile.mkdtemp(prefix="timbersh-test-")
         json.dump(scenario, open(os.path.join(self.dir, "scenario.json"), "w"))
         self.hosts = hosts
@@ -90,7 +97,9 @@ class Session:
         try:
             p = subprocess.run(cmd, input="\n".join(statements) + "\n\\q\n",
                                capture_output=True, text=True, timeout=60,
-                               env={**os.environ, "FAKE_DIR": self.dir})
+                               env={k: v for k, v in
+                                    {**os.environ, "FAKE_DIR": self.dir,
+                                     **self.env}.items() if v is not None})
         except subprocess.TimeoutExpired as e:
             # `text=True` does not reach here: what was captured before the
             # timeout comes back as bytes.
@@ -166,7 +175,9 @@ class Pty(Session):
                "--histfile", os.path.join(self.dir, "history"),
                "--rc", os.path.join(self.dir, "nonexistent-rc")]
         cmd += self.where() + self.extra
-        env = {**os.environ, "FAKE_DIR": self.dir, "TERM": "xterm"}
+        env = {k: v for k, v in
+               {**os.environ, "FAKE_DIR": self.dir, "TERM": "xterm",
+                **self.env}.items() if v is not None}
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execve(cmd[0], cmd, env)
@@ -454,6 +465,139 @@ def a_graph_makes_the_fleet_a_dimension_rather_than_merging_it():
         "graph heap from [class=tally];")
     assert "gauge" in s.out, s.out
     assert "host" in s.out, s.out
+    s.cleanup()
+
+
+def with_gnuplot(terms):
+    """A PATH whose `gnuplot` is the fake, reporting `terms` as the
+    terminals it has. Which is the only way to test the choice: a real
+    window needs a real display, so CI would assert the opposite of a
+    desk and neither would be testing the decision.
+
+    ⚠ A DIRECTORY of one binary, prepended — not the whole of tests/,
+    which holds `fake-timberfs` and would shadow the real one.
+    """
+    d = tempfile.mkdtemp(prefix="timbersh-gnuplot-")
+    shutil.copy(os.path.join(HERE, "fake-gnuplot"),
+                os.path.join(d, "gnuplot"))
+    return {"PATH": d + os.pathsep + os.environ["PATH"],
+            "FAKE_TERMS": terms}
+
+
+@test
+def a_graph_draws_a_window_by_default_where_one_can_be_drawn():
+    """The default is a window where one can be drawn, and that decision
+    is what this pins: a display, a gnuplot reporting an interactive
+    terminal, and somebody watching a terminal. The fake prints its
+    marker only when asked for one with `-p`, so this fails if `dumb`
+    was chosen.
+
+    ⚠ On a PTY, because the default is gated on stdout being one — over
+    a pipe the answer is the text and a window would steal it."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    s = Pty({"": {"stores": [store("t", ID_A)], "loglines": gauge}},
+            env={**with_gnuplot("qt dumb"), "DISPLAY": ":99"}).start()
+    s.send("graph heap from [class=tally];\n")
+    s.expect("FAKE-GNUPLOT-WINDOW")
+    s.finish().cleanup()
+
+
+@test
+def a_redirected_run_keeps_its_answer_rather_than_losing_it_to_a_window():
+    """The suite itself is the case: stdout is a pipe. A DEFAULT window
+    there would turn `timbersh -q < script > out.txt` at a desk into an
+    empty file, so the default is a window only where somebody is
+    watching one. Naming `window` still gets one -- a window is not
+    stdout, and asking for it with the output redirected is coherent."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    env = {**with_gnuplot("qt dumb"), "DISPLAY": ":99"}
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": gauge}},
+                env=env).run("graph heap from [class=tally];")
+    assert "FAKE-GNUPLOT-TEXT" in s.out, s.out
+    s.cleanup()
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": gauge}},
+                env=env).run("graph heap from [class=tally] window;")
+    assert "FAKE-GNUPLOT-WINDOW" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_gnuplot_with_no_interactive_terminal_draws_ascii_though_a_display_exists():
+    """`gnuplot-nox` is the case a DISPLAY check alone gets wrong: the
+    display is there and the terminal is not, so a window cannot be
+    drawn and asking for one is an error rather than a picture."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    env = {**with_gnuplot("dumb svg pngcairo"), "DISPLAY": ":99"}
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": gauge}},
+                env=env).run("graph heap from [class=tally];")
+    assert "FAKE-GNUPLOT-TEXT" in s.out, s.out
+    s.cleanup()
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": gauge}},
+                env=env).run("graph heap from [class=tally] window;")
+    assert "no interactive gnuplot terminal" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_graph_draws_ascii_where_no_window_can_be_drawn():
+    """The default is a WINDOW where one can be drawn and ASCII where it
+    cannot, so a session over ssh still answers. With no display there is
+    nothing to put a window on, whatever gnuplot can do."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": gauge}},
+                env={"DISPLAY": None, "WAYLAND_DISPLAY": None}).run(
+        "graph heap from [class=tally];")
+    # The dumb terminal draws with characters; a window writes nothing to
+    # stdout at all.
+    assert "heap" in s.out, s.out
+    assert "no interactive gnuplot terminal" not in s.out, s.out
+    s.cleanup()
+
+
+@test
+def a_named_window_that_cannot_be_drawn_is_refused_not_downgraded():
+    """Saying `window` is asking for one. Falling back to ASCII there
+    would answer a question nobody asked and hide the reason — the two
+    things needed are a display and a gnuplot built with an interactive
+    terminal, and the message has to name both."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": gauge}},
+                env={"DISPLAY": None, "WAYLAND_DISPLAY": None}).run(
+        "graph heap from [class=tally] window;")
+    assert "no interactive gnuplot terminal" in s.out, s.out
+    assert "gnuplot-nox" in s.out, s.out
+    s.cleanup()
+
+
+@test
+def two_places_to_draw_is_refused_rather_than_one_of_them_winning():
+    """`window png 'f'` named a file and a window; the file won and the
+    window was dropped in silence. Two destinations is a statement that
+    means something other than what it says, so it is refused and both
+    are named."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    for stmt, want in (("window ascii", ("window", "ascii")),
+                       ("window png 'f.png'", ("window", "png")),
+                       ("png 'f.png' svg 'f.svg'", ("png", "svg"))):
+        s = Session({"": {"stores": [store("t", ID_A)],
+                          "loglines": gauge}}).run(
+            f"graph heap from [class=tally] {stmt};")
+        assert "different places to draw" in s.out, (stmt, s.out)
+        for w in want:
+            assert f"`{w}`" in s.out, (stmt, w, s.out)
+        s.cleanup()
+
+
+@test
+def ascii_is_sayable_where_a_window_would_otherwise_be_drawn():
+    """The inverse of the default: at a desk, one graph wanted as text
+    to paste somewhere. It must not depend on unsetting a variable."""
+    gauge = "2026-09-06T13:37:00.000Z 60s heap last=100\n"
+    s = Session({"": {"stores": [store("t", ID_A)], "loglines": gauge}},
+                env={"DISPLAY": ":99"}).run(
+        "graph heap from [class=tally] ascii;")
+    assert "heap" in s.out, s.out
+    assert "different places" not in s.out, s.out
     s.cleanup()
 
 
