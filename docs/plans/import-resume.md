@@ -2,8 +2,11 @@
 
 **Status: partly built.** Step 0, the aligned candidate with its byte
 comparison, is in `import` and in the live importer. Step 2 is being built in its
-simplest form, a scan of the file for the store's tail. The hint file and the
-bisection are not built. It replaces how `import` and `import --follow` decide
+simplest form, a scan of the file for the store's tail. A followed file with no
+stamp yet is waited for without holding its lines, and one rotated without ever
+having a stamp is imported at its modification time. The wait's position is not
+kept across a restart (a restart rescans from the start), and the hint file and
+the bisection are not built. It replaces how `import` and `import --follow` decide
 where in a plain-text source to carry on.
 
 A source file grows, is read, and is read again later. The question each time:

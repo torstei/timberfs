@@ -61,7 +61,9 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 
 use crate::append::{self, LivePolicy};
-use crate::import::{first_stamp, line_hash, overlap_line_counts, Extractor, ImportOpts, Stamper};
+use crate::import::{
+    find_first_stamp, line_hash, overlap_line_counts, Extractor, ImportOpts, Stamper,
+};
 use crate::query::{ensure_dest_is_not_plain_file, resolve_backing};
 use crate::store::{self, Config, Store};
 
@@ -117,7 +119,27 @@ struct Open {
     /// A fragment of the line now being written has already been committed
     /// (it ran past `LINE_CAP`), so the rest continues it and is not stamped.
     mid_line: bool,
+    /// Where the file was when it was opened, for messages: the descriptor
+    /// outlives the name.
+    label: String,
+    /// Set while the store holds nothing with a timestamp and this file has
+    /// not given one yet.
+    awaiting: Option<Awaiting>,
 }
+
+/// A file with no timestamp yet. What it has read so far is not held, only a
+/// position: it is a range of a file that still has it.
+struct Awaiting {
+    /// Where the unimported range begins.
+    from: u64,
+    /// The size read at which the next note says it is still waiting.
+    next_note: u64,
+}
+
+/// How much is read without a timestamp before saying so, and again at each
+/// doubling. Nothing is imported meanwhile, so a file that never has one looks
+/// exactly like a quiet one.
+const AWAITING_NOTE: u64 = 100 << 20;
 
 impl Open {
     fn at(path: &Path, from: u64) -> anyhow::Result<Open> {
@@ -131,8 +153,93 @@ impl Open {
             offset: from,
             pending: Vec::new(),
             mid_line: false,
+            label: path.display().to_string(),
+            awaiting: None,
         })
     }
+}
+
+/// `Open::at`, for a file the store is to be fed from. While the store holds
+/// nothing with a timestamp, the file's own first one is what every line before
+/// it will be stamped with, so it is waited for, without holding the lines.
+fn follow_open(path: &Path, from: u64, stamper: &Stamper, name: &str) -> anyhow::Result<Open> {
+    let mut open = Open::at(path, from)?;
+    if stamper.last_ts().is_none() {
+        open.awaiting = Some(Awaiting {
+            from,
+            next_note: from + AWAITING_NOTE,
+        });
+        crate::note!(
+            "timberfs: {}: {name} holds nothing with a timestamp yet and this file has none, so \
+             nothing is imported until a line has one (if its timestamps are not recognised, \
+             declare them with `timberfs set` or --timestamp-regex)",
+            open.label
+        );
+    }
+    Ok(open)
+}
+
+/// A file's modification time, which is the end of its content's life.
+fn modified_ms(file: &File) -> anyhow::Result<u64> {
+    let t = file.metadata()?.modified()?;
+    Ok(t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0))
+}
+
+/// Append `[from, to)` of `file` to the store stamped `ts`, a block at a time so
+/// nothing is held; `to` of None reads to the end of the file. Returns how many
+/// bytes.
+fn import_range(
+    file: &File,
+    from: u64,
+    to: Option<u64>,
+    ts: u64,
+    f: &mut store::FileStore,
+    cfg: &Config,
+) -> anyhow::Result<u64> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut at = from;
+    loop {
+        let want = match to {
+            Some(t) => t.saturating_sub(at).min(buf.len() as u64) as usize,
+            None => buf.len(),
+        };
+        if want == 0 {
+            break;
+        }
+        let n = file.read_at(&mut buf[..want], at)?;
+        if n == 0 {
+            break;
+        }
+        f.append_stamped(&buf[..n], ts, cfg)?;
+        at += n as u64;
+    }
+    Ok(at - from)
+}
+
+/// The file's first timestamp has arrived, at `at`: everything before it is the
+/// unimported range, and takes that time.
+fn first_stamp_arrived(
+    open: &mut Open,
+    at: u64,
+    ts: u64,
+    f: &mut store::FileStore,
+    cfg: &Config,
+) -> anyhow::Result<()> {
+    let Some(waiting) = open.awaiting.take() else {
+        return Ok(());
+    };
+    let n = import_range(&open.file, waiting.from, Some(at), ts, f, cfg)?;
+    if n > 0 {
+        crate::note!(
+            "timberfs: {}: its first timestamp is at byte {at}; the {n} byte(s) before it are \
+             imported with that time",
+            open.label
+        );
+    }
+    Ok(())
 }
 
 /// Read what is there and commit every COMPLETE line; a trailing fragment is
@@ -157,6 +264,16 @@ fn drain(
         if let Ok(m) = open.file.metadata() {
             extractor.anchor_to(&m);
         }
+        if let Some(w) = open.awaiting.as_mut() {
+            if open.offset >= w.next_note {
+                crate::note!(
+                    "timberfs: {}: still no timestamp after {} MiB; nothing of it is imported yet",
+                    open.label,
+                    open.offset >> 20
+                );
+                w.next_note = open.offset.max(w.next_note) * 2;
+            }
+        }
         open.pending.extend_from_slice(&buf[..n]);
         // Commit up to the last newline; keep the rest. What was pending
         // had none, so only a read that brought one needs the search.
@@ -165,6 +282,7 @@ fn drain(
             .then(|| open.pending.iter().rposition(|b| *b == b'\n'))
             .flatten();
         if let Some(last) = last {
+            let mut line_at = open.offset - open.pending.len() as u64;
             let complete: Vec<u8> = open.pending.drain(..=last).collect();
             let mut s = store.lock().unwrap();
             let f = s.files.get_mut(name).expect("the store this tail opened");
@@ -174,7 +292,19 @@ fn drain(
                 } else {
                     extractor.extract(&String::from_utf8_lossy(&line[..line.len().min(256)]))
                 };
+                if open.awaiting.is_some() {
+                    // Without a timestamp yet a line is not imported and not
+                    // held either: it stays a range of the file.
+                    match ts {
+                        None => {
+                            line_at += line.len() as u64;
+                            continue;
+                        }
+                        Some(t) => first_stamp_arrived(open, line_at, t, f, cfg)?,
+                    }
+                }
                 stamper.feed(f, line, ts, cfg)?;
+                line_at += line.len() as u64;
             }
             open.mid_line = false;
             // Once per batch, not per line: put what we just read in front
@@ -187,6 +317,7 @@ fn drain(
         // with carriage returns) must not grow this without end: what has
         // accumulated is committed as a fragment of the line it belongs to.
         if open.pending.len() >= crate::entry::LINE_CAP {
+            let fragment_at = open.offset - open.pending.len() as u64;
             let fragment = std::mem::take(&mut open.pending);
             let ts = if open.mid_line {
                 None
@@ -195,7 +326,16 @@ fn drain(
             };
             let mut s = store.lock().unwrap();
             let f = s.files.get_mut(name).expect("the store this tail opened");
-            stamper.feed(f, &fragment, ts, cfg)?;
+            match (open.awaiting.is_some(), ts) {
+                // Still no timestamp: the fragment stays a range of the file.
+                (true, None) => {}
+                (waiting, _) => {
+                    if waiting {
+                        first_stamp_arrived(open, fragment_at, ts.unwrap_or(0), f, cfg)?;
+                    }
+                    stamper.feed(f, &fragment, ts, cfg)?;
+                }
+            }
             open.mid_line = true;
         }
     }
@@ -212,7 +352,7 @@ fn commit_fragment(
     stamper: &mut Stamper,
     cfg: &Config,
 ) -> anyhow::Result<()> {
-    if open.pending.is_empty() {
+    if open.pending.is_empty() || open.awaiting.is_some() {
         return Ok(());
     }
     let line = std::mem::take(&mut open.pending);
@@ -229,6 +369,38 @@ fn commit_fragment(
     let mut s = store.lock().unwrap();
     let f = s.files.get_mut(name).expect("the store this tail opened");
     stamper.feed(f, &line, ts, cfg)
+}
+
+/// A file that will never grow again: read it to its end and commit its last
+/// line. If it never had a timestamp it is imported with its modification time
+/// instead, because nothing will ever read it again and a wait that cannot end is
+/// a loss that has not happened yet. Returns what the final read took.
+fn finish_rotated(
+    open: &mut Open,
+    store: &Mutex<Store>,
+    name: &str,
+    extractor: &Extractor,
+    stamper: &mut Stamper,
+    cfg: &Config,
+) -> anyhow::Result<u64> {
+    let tail = drain(open, store, name, extractor, stamper, cfg)?;
+    match open.awaiting.take() {
+        Some(waiting) => {
+            let ts = modified_ms(&open.file)?;
+            let mut s = store.lock().unwrap();
+            let f = s.files.get_mut(name).expect("the store this tail opened");
+            let n = import_range(&open.file, waiting.from, None, ts, f, cfg)?;
+            stamper.observe(ts);
+            crate::note!(
+                "timberfs: {} never had a timestamp and will not grow again; its {n} byte(s) are \
+                 imported with its modification time, {}",
+                open.label,
+                crate::query::fmt_ms(ts)
+            );
+        }
+        None => commit_fragment(open, store, name, extractor, stamper, cfg)?,
+    }
+    Ok(tail)
 }
 
 /// Where in `path` the store's data ends, if the store was fed by that file:
@@ -292,8 +464,7 @@ fn catch_up(
             return Ok(end);
         }
         let mut open = Open::at(path, end)?;
-        let tail = drain(&mut open, store, name, extractor, stamper, cfg)?;
-        commit_fragment(&mut open, store, name, extractor, stamper, cfg)?;
+        let tail = finish_rotated(&mut open, store, name, extractor, stamper, cfg)?;
         if tail > 0 {
             crate::note!(
                 "timberfs: {}: {tail} byte(s) it gained since {name} last read it",
@@ -302,7 +473,22 @@ fn catch_up(
         }
         return Ok(open.offset);
     }
-    let t0 = first_stamp(path, extractor)?;
+    let Some(t0) = find_first_stamp(path, extractor)? else {
+        // No timestamp in its first lines. For a file still being written that
+        // is a state and not an error: it may have one later, so it is read
+        // from the start and waited on, and one that will not grow again is
+        // imported with its modification time.
+        crate::note!(
+            "timberfs: {}: no timestamp in its first lines yet; reading it from the start",
+            path.display()
+        );
+        if live {
+            return Ok(0);
+        }
+        let mut open = follow_open(path, 0, stamper, name)?;
+        finish_rotated(&mut open, store, name, extractor, stamper, cfg)?;
+        return Ok(open.offset);
+    };
     // What does the store already cover?
     let (store_first, store_last) = {
         let mut s = store.lock().unwrap();
@@ -560,7 +746,7 @@ pub fn cmd_follow(
         catch_up(&store, &name, &c, &extractor, &mut stamper, &cfg, false)?;
     }
     let from = catch_up(&store, &name, source, &extractor, &mut stamper, &cfg, true)?;
-    let mut open = Open::at(source, from)?;
+    let mut open = follow_open(source, from, &stamper, &name)?;
 
     let policy = Arc::new(Mutex::new(LivePolicy {
         dir: dir.clone(),
@@ -602,15 +788,15 @@ pub fn cmd_follow(
                 if (m.dev(), m.ino()) != (open.dev, open.ino) {
                     // Rotation. Finish the file we hold BEFORE looking at the
                     // new one: its tail is the data a `tail -F` loses.
-                    let tail = drain(&mut open, &store, &name, &extractor, &mut stamper, &cfg)?;
+                    let tail =
+                        finish_rotated(&mut open, &store, &name, &extractor, &mut stamper, &cfg)?;
                     total += tail;
-                    commit_fragment(&mut open, &store, &name, &extractor, &mut stamper, &cfg)?;
                     crate::note!(
                         "timberfs: {} was replaced (rotation); drained its last {tail} byte(s) \
                          and switched to the new file",
                         source.display()
                     );
-                    open = Open::at(source, 0)?;
+                    open = follow_open(source, 0, &stamper, &name)?;
                 } else if m.len() < open.offset {
                     crate::note!(
                         "timberfs: {} shrank from {} to {} bytes (copytruncate?); re-reading it \
@@ -624,6 +810,10 @@ pub fn cmd_follow(
                     open.offset = 0;
                     open.pending.clear();
                     open.mid_line = false;
+                    open.awaiting = stamper.last_ts().is_none().then_some(Awaiting {
+                        from: 0,
+                        next_note: AWAITING_NOTE,
+                    });
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -810,38 +1000,92 @@ mod tests {
         }
     }
 
-    /// What a process does when it starts: open the store, bring it level with
-    /// the rotated files and then the live one, and read on to the end. Returns
-    /// the store as a clean stop leaves it.
-    fn start(dir: &Path, source: &Path, rotated: &[PathBuf]) -> Mutex<Store> {
-        let cfg = test_cfg();
-        let mut st = Store {
-            dir: dir.join("store"),
-            cfg,
-            files: std::collections::BTreeMap::new(),
-        };
-        st.create("f.log").unwrap();
-        let last_ts = st.files.get("f.log").and_then(|f| f.last_write_ms());
-        let store = Mutex::new(st);
-        let extractor = Extractor::new(None, None, false).unwrap();
-        let mut stamper = Stamper::resuming_from(last_ts);
-        for c in rotated {
-            catch_up(&store, "f.log", c, &extractor, &mut stamper, &cfg, false).unwrap();
+    /// A process that keeps running: the store, what reads it, and the file it
+    /// holds open.
+    struct Session {
+        store: Mutex<Store>,
+        extractor: Extractor,
+        stamper: Stamper,
+        open: Open,
+        cfg: Config,
+    }
+
+    impl Session {
+        /// What a process does when it starts: open the store, bring it level
+        /// with the rotated files and then the live one, and open the live file.
+        fn new(dir: &Path, source: &Path, rotated: &[PathBuf]) -> Session {
+            let cfg = test_cfg();
+            let mut st = Store {
+                dir: dir.join("store"),
+                cfg,
+                files: std::collections::BTreeMap::new(),
+            };
+            st.create("f.log").unwrap();
+            let last_ts = st.files.get("f.log").and_then(|f| f.last_write_ms());
+            let store = Mutex::new(st);
+            let extractor = Extractor::new(None, None, false).unwrap();
+            let mut stamper = Stamper::resuming_from(last_ts);
+            for c in rotated {
+                catch_up(&store, "f.log", c, &extractor, &mut stamper, &cfg, false).unwrap();
+            }
+            let from = catch_up(
+                &store,
+                "f.log",
+                source,
+                &extractor,
+                &mut stamper,
+                &cfg,
+                true,
+            )
+            .unwrap();
+            let open = follow_open(source, from, &stamper, "f.log").unwrap();
+            Session {
+                store,
+                extractor,
+                stamper,
+                open,
+                cfg,
+            }
         }
-        let from = catch_up(
-            &store,
-            "f.log",
-            source,
-            &extractor,
-            &mut stamper,
-            &cfg,
-            true,
-        )
-        .unwrap();
-        let mut open = Open::at(source, from).unwrap();
-        drain(&mut open, &store, "f.log", &extractor, &mut stamper, &cfg).unwrap();
-        store.lock().unwrap().flush_all();
-        store
+
+        /// One pass of the main loop: read what is there.
+        fn poll(&mut self) {
+            drain(
+                &mut self.open,
+                &self.store,
+                "f.log",
+                &self.extractor,
+                &mut self.stamper,
+                &self.cfg,
+            )
+            .unwrap();
+        }
+
+        /// The path now names another file: finish the one held, open the new.
+        fn rotate(&mut self, source: &Path) {
+            finish_rotated(
+                &mut self.open,
+                &self.store,
+                "f.log",
+                &self.extractor,
+                &mut self.stamper,
+                &self.cfg,
+            )
+            .unwrap();
+            self.open = follow_open(source, 0, &self.stamper, "f.log").unwrap();
+        }
+
+        fn stop(self) -> Mutex<Store> {
+            self.store.lock().unwrap().flush_all();
+            self.store
+        }
+    }
+
+    /// A process that starts, reads to the end, and stops cleanly.
+    fn start(dir: &Path, source: &Path, rotated: &[PathBuf]) -> Mutex<Store> {
+        let mut session = Session::new(dir, source, rotated);
+        session.poll();
+        session.stop()
     }
 
     /// Where the store's tape starts, and what it holds.
@@ -1048,6 +1292,154 @@ mod tests {
             want,
             "the history retention dropped is not brought back, and the new lines are read"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn unstamped(from: usize, to: usize) -> String {
+        (from..to)
+            .map(|i| format!("no timestamp on this line, number {i} {}\n", "x".repeat(40)))
+            .collect()
+    }
+
+    fn held(session: &Session) -> Vec<u8> {
+        let mut s = session.store.lock().unwrap();
+        let f = s.files.get_mut("f.log").unwrap();
+        let size = f.size();
+        f.read(0, size as u32).unwrap()
+    }
+
+    #[test]
+    fn a_file_with_no_timestamp_yet_is_waited_for_and_imported_whole_when_one_arrives() {
+        let dir = scratch("waiting");
+        let src = dir.join("app.log");
+        fs::write(&src, unstamped(0, 50)).unwrap();
+        let mut session = Session::new(&dir, &src, &[]);
+        session.poll();
+        assert!(
+            held(&session).is_empty(),
+            "nothing is imported without a stamp"
+        );
+        assert!(session.open.awaiting.is_some());
+        assert_eq!(
+            session.stamper.unstamped_pending(),
+            0,
+            "and nothing is held"
+        );
+
+        append_to(&src, &lines(0, 100));
+        session.poll();
+        assert!(session.open.awaiting.is_none());
+        assert_eq!(
+            held(&session),
+            fs::read(&src).unwrap(),
+            "the prefix came with it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stamp_beyond_the_detection_window_is_still_found_and_nothing_is_held() {
+        let dir = scratch("long-prefix");
+        let src = dir.join("app.log");
+        // Far more lines than the window the first stamp is looked for in.
+        fs::write(&src, unstamped(0, 5000)).unwrap();
+        let mut session = Session::new(&dir, &src, &[]);
+        session.poll();
+        assert!(held(&session).is_empty());
+        assert_eq!(session.stamper.unstamped_pending(), 0);
+
+        append_to(&src, &lines(0, 100));
+        session.poll();
+        assert_eq!(held(&session), fs::read(&src).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_while_waiting_waits_again_and_loses_nothing() {
+        let dir = scratch("waiting-restart");
+        let src = dir.join("app.log");
+        fs::write(&src, unstamped(0, 3000)).unwrap();
+        let session = Session::new(&dir, &src, &[]);
+        drop(session.stop());
+
+        // It restarts, and only then does the file get its first stamp.
+        append_to(&src, &lines(0, 80));
+        let session = Session::new(&dir, &src, &[]);
+        let mut session = session;
+        session.poll();
+        assert_eq!(held(&session), fs::read(&src).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_rotated_without_ever_having_a_stamp_is_imported_at_its_modification_time() {
+        let dir = scratch("never-stamped");
+        let src = dir.join("app.log");
+        fs::write(&src, unstamped(0, 4000)).unwrap();
+        let when = std::time::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        let mut session = Session::new(&dir, &src, &[]);
+        session.poll();
+        assert!(held(&session).is_empty());
+
+        let rotated = dir.join("app.log.1");
+        fs::rename(&src, &rotated).unwrap();
+        fs::write(&src, lines(0, 100)).unwrap();
+        session.rotate(&src);
+        session.poll();
+
+        let want = format!("{}{}", fs::read_to_string(&rotated).unwrap(), lines(0, 100));
+        assert_eq!(held(&session), want.as_bytes(), "nothing was lost");
+        let store = session.stop();
+        let s = store.lock().unwrap();
+        assert_eq!(
+            s.files.get("f.log").unwrap().chunks[0].first_write_ms,
+            1_790_000_000_000,
+            "stamped with when the file was last written"
+        );
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rotated_file_with_no_stamp_found_at_startup_is_imported_at_its_modification_time() {
+        let dir = scratch("never-stamped-startup");
+        let rotated = dir.join("app.log.1");
+        fs::write(&rotated, unstamped(0, 3000)).unwrap();
+        let when = std::time::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&rotated)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        let src = dir.join("app.log");
+        fs::write(&src, lines(0, 100)).unwrap();
+
+        let mut session = Session::new(&dir, &src, std::slice::from_ref(&rotated));
+        session.poll();
+        let want = format!("{}{}", fs::read_to_string(&rotated).unwrap(), lines(0, 100));
+        assert_eq!(held(&session), want.as_bytes());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn once_the_store_has_a_stamp_unstamped_lines_inherit_it_and_nothing_waits() {
+        let dir = scratch("inherit");
+        let src = dir.join("app.log");
+        fs::write(&src, lines(0, 200)).unwrap();
+        let mut session = Session::new(&dir, &src, &[]);
+        session.poll();
+
+        append_to(&src, &unstamped(0, 20));
+        session.poll();
+        assert!(session.open.awaiting.is_none());
+        assert_eq!(held(&session), fs::read(&src).unwrap(), "imported at once");
         let _ = fs::remove_dir_all(&dir);
     }
 }
