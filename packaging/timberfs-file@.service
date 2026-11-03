@@ -63,6 +63,8 @@ RestartSec=2
 # failure log. (Keep --exit-on-upgrade in any ExecStart override.)
 SuccessExitStatus=85
 RestartForceExitStatus=85
+# 78 (EX_CONFIG): a setting no restart can fix, so stop rather than loop.
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=multi-user.target

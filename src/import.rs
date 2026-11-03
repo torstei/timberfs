@@ -39,7 +39,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 
 use crate::query::{fmt_ms, resolve_backing};
-use crate::store::{self, Config, Store};
+use crate::store::{self, config_error, Config, Store};
 
 /// How far past the reference a yearless stamp may sit and still be taken as
 /// this year: clocks and zones disagree by hours, never by a year.
@@ -122,14 +122,19 @@ impl Extractor {
     ) -> anyhow::Result<Extractor> {
         let custom = match (custom_regex, custom_format) {
             (Some(re), Some(f)) => {
-                let re = Regex::new(re).context("bad --timestamp-regex")?;
+                let re = match Regex::new(re) {
+                    Ok(re) => re,
+                    Err(e) => return config_error(format!("bad --timestamp-regex: {e}")),
+                };
                 if re.captures_len() < 2 {
-                    bail!("--timestamp-regex needs one capture group around the timestamp");
+                    return config_error(
+                        "--timestamp-regex needs one capture group around the timestamp",
+                    );
                 }
                 Some((re, f.to_string()))
             }
             (None, None) => None,
-            _ => bail!("--timestamp-regex and --timestamp-format go together"),
+            _ => return config_error("--timestamp-regex and --timestamp-format go together"),
         };
         let custom_yearless = custom.as_ref().is_some_and(|(_, f)| names_no_year(f));
         Ok(Extractor {
@@ -1188,6 +1193,18 @@ pub fn cmd_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bad_timestamp_declaration_is_a_config_error() {
+        for (re, fmt) in [
+            (Some("("), Some("%s")),
+            (Some("x"), Some("%s")),
+            (Some("(x)"), None),
+        ] {
+            let e = Extractor::new(re, fmt, true).err().unwrap();
+            assert!(e.downcast_ref::<store::ConfigError>().is_some(), "{re:?}");
+        }
+    }
 
     /// The built-in clocks, checked against real producer output. Apache's
     /// error log is the ctime one: no zone, year last, and (2.2) no

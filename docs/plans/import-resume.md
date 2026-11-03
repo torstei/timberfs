@@ -6,8 +6,11 @@ simplest form, a scan of the file for the store's tail. A followed file with no
 stamp yet is waited for without holding its lines, and one rotated without ever
 having a stamp is imported at its modification time. The wait's position is not
 kept across a restart (a restart rescans from the start), and the hint file and
-the bisection are not built. It replaces how `import` and `import --follow` decide
-where in a plain-text source to carry on.
+the bisection are not built. Exit 78 for a setting no restart can fix, with
+`RestartPreventExitStatus=78` in the follow and file units, is built.
+
+It replaces how `import` and `import --follow` decide where in a plain-text
+source to carry on.
 
 A source file grows, is read, and is read again later. The question each time:
 **which byte of the file is the first one the store does not have?**
